@@ -10,8 +10,10 @@ mod tests;
 
 pub mod inbound;
 pub mod location;
+pub mod merkle;
 pub mod operating_mode;
 pub mod outbound;
+pub mod outbound_v2;
 pub mod pricing;
 pub mod ringbuffer;
 
@@ -172,3 +174,13 @@ impl Default for AssetMetadata {
 
 /// Maximum length of a string field in ERC20 token metada
 const METADATA_FIELD_MAX_LEN: u32 = 32;
+
+// Origin for high-priority governance commands
+pub fn primary_governance_origin() -> H256 {
+	hex!("0000000000000000000000000000000000000000000000000000000000000001").into()
+}
+
+// Origin for lower-priority governance commands
+pub fn second_governance_origin() -> H256 {
+	hex!("0000000000000000000000000000000000000000000000000000000000000002").into()
+}
