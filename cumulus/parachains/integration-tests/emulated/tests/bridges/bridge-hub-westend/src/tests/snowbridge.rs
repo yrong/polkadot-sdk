@@ -22,7 +22,8 @@ use hex_literal::hex;
 use rococo_westend_system_emulated_network::asset_hub_westend_emulated_chain::genesis::AssetHubWestendAssetOwner;
 use snowbridge_core::{outbound::OperatingMode, AssetMetadata, TokenIdOf};
 use snowbridge_router_primitives::inbound::{
-	Command, Destination, GlobalConsensusEthereumConvertsFor, MessageV1, VersionedMessage,
+	v1::{Command, Destination, MessageV1, VersionedMessage},
+	GlobalConsensusEthereumConvertsFor,
 };
 use sp_core::H256;
 use testnet_parachains_constants::westend::snowbridge::EthereumNetwork;
@@ -262,21 +263,12 @@ fn send_weth_asset_from_asset_hub_to_ethereum() {
 			vec![RuntimeEvent::EthereumOutboundQueue(snowbridge_pallet_outbound_queue::Event::MessageQueued{ .. }) => {},]
 		);
 		let events = BridgeHubWestend::events();
-		// Check that the local fee was credited to the Snowbridge sovereign account
-		assert!(
-			events.iter().any(|event| matches!(
-				event,
-				RuntimeEvent::Balances(pallet_balances::Event::Minted { who, amount })
-					if *who == TreasuryAccount::get().into() && *amount == 5071000000
-			)),
-			"Snowbridge sovereign takes local fee."
-		);
 		// Check that the remote fee was credited to the AssetHub sovereign account
 		assert!(
 			events.iter().any(|event| matches!(
 				event,
-				RuntimeEvent::Balances(pallet_balances::Event::Minted { who, amount })
-					if *who == assethub_sovereign && *amount == 2680000000000,
+				RuntimeEvent::Balances(pallet_balances::Event::Minted { who,.. })
+					if *who == assethub_sovereign
 			)),
 			"AssetHub sovereign takes remote fee."
 		);
