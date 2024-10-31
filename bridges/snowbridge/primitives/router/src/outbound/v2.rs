@@ -13,10 +13,10 @@ use frame_support::{
 };
 use snowbridge_core::{
 	outbound::v2::{Command, Message, SendMessage},
-	AgentId, TokenId, TokenIdOf,
+	AgentId, TokenId, TokenIdOf, TokenIdOf as LocationIdOf,
 };
 use sp_core::{H160, H256};
-use sp_runtime::traits::{BlakeTwo256, Hash, MaybeEquivalence};
+use sp_runtime::traits::MaybeEquivalence;
 use sp_std::{iter::Peekable, marker::PhantomData, prelude::*};
 use xcm::prelude::*;
 use xcm_builder::{CreateMatcher, ExporterFor, MatchXcm};
@@ -181,6 +181,7 @@ enum XcmConverterError {
 	UnexpectedInstruction,
 	TooManyCommands,
 	AliasOriginExpected,
+	InvalidOrigin,
 }
 
 macro_rules! match_expression {
@@ -251,8 +252,9 @@ where
 				.ok_or(WithdrawAssetExpected)?;
 
 		// Check AliasOrigin.
-		let origin = match_expression!(self.next()?, AliasOrigin(origin), origin)
+		let origin_loc = match_expression!(self.next()?, AliasOrigin(origin), origin)
 			.ok_or(AliasOriginExpected)?;
+		let origin = LocationIdOf::convert_location(&origin_loc).ok_or(InvalidOrigin)?;
 
 		let (deposit_assets, beneficiary) = match_expression!(
 			self.next()?,
@@ -304,8 +306,7 @@ where
 
 		let message = Message {
 			id: (*topic_id).into(),
-			// Todo: Use DescribeLocation
-			origin: BlakeTwo256::hash_of(origin),
+			origin,
 			fee: fee_amount,
 			commands: BoundedVec::try_from(vec![Command::UnlockNativeToken {
 				agent_id: self.agent_id,
@@ -351,8 +352,9 @@ where
 				.ok_or(ReserveAssetDepositedExpected)?;
 
 		// Check AliasOrigin.
-		let origin = match_expression!(self.next()?, AliasOrigin(origin), origin)
+		let origin_loc = match_expression!(self.next()?, AliasOrigin(origin), origin)
 			.ok_or(AliasOriginExpected)?;
+		let origin = LocationIdOf::convert_location(&origin_loc).ok_or(InvalidOrigin)?;
 
 		let (deposit_assets, beneficiary) = match_expression!(
 			self.next()?,
@@ -404,7 +406,7 @@ where
 		let topic_id = match_expression!(self.next()?, SetTopic(id), id).ok_or(SetTopicExpected)?;
 
 		let message = Message {
-			origin: BlakeTwo256::hash_of(origin),
+			origin,
 			fee: fee_amount,
 			id: (*topic_id).into(),
 			commands: BoundedVec::try_from(vec![Command::MintForeignToken {
