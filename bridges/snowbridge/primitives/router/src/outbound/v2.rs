@@ -163,7 +163,7 @@ where
 
 /// Errors that can be thrown to the pattern matching step.
 #[derive(PartialEq, Debug)]
-enum XcmConverterError {
+pub enum XcmConverterError {
 	UnexpectedEndOfXcm,
 	EndOfXcmMessageExpected,
 	WithdrawAssetExpected,
@@ -193,7 +193,7 @@ macro_rules! match_expression {
 	};
 }
 
-struct XcmConverter<'a, ConvertAssetId, Call> {
+pub struct XcmConverter<'a, ConvertAssetId, Call> {
 	iter: Peekable<Iter<'a, Instruction<Call>>>,
 	message: Vec<Instruction<Call>>,
 	ethereum_network: NetworkId,
@@ -204,7 +204,7 @@ impl<'a, ConvertAssetId, Call> XcmConverter<'a, ConvertAssetId, Call>
 where
 	ConvertAssetId: MaybeEquivalence<TokenId, Location>,
 {
-	fn new(message: &'a Xcm<Call>, ethereum_network: NetworkId, agent_id: AgentId) -> Self {
+	pub fn new(message: &'a Xcm<Call>, ethereum_network: NetworkId, agent_id: AgentId) -> Self {
 		Self {
 			message: message.clone().inner().into(),
 			iter: message.inner().iter().peekable(),
@@ -214,7 +214,7 @@ where
 		}
 	}
 
-	fn convert(&mut self) -> Result<Message, XcmConverterError> {
+	pub fn convert(&mut self) -> Result<Message, XcmConverterError> {
 		let result = match self.jump_to() {
 			// PNA
 			Ok(ReserveAssetDeposited { .. }) => self.send_native_tokens_message(),

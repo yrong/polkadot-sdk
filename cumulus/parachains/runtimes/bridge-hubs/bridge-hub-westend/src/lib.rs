@@ -104,6 +104,10 @@ use xcm::VersionedLocation;
 
 use westend_runtime_constants::system_parachain::{ASSET_HUB_ID, BRIDGE_HUB_ID};
 
+use snowbridge_core::outbound::v2::{Fee as FeeV2, InboundMessage};
+
+use snowbridge_core::outbound::DryRunError;
+
 /// The address format for describing accounts.
 pub type Address = MultiAddress<AccountId, ()>;
 
@@ -903,6 +907,9 @@ impl_runtime_apis! {
 	impl snowbridge_outbound_queue_runtime_api_v2::OutboundQueueApiV2<Block, Balance> for Runtime {
 		fn prove_message(leaf_index: u64) -> Option<snowbridge_merkle_tree::MerkleProof> {
 			snowbridge_pallet_outbound_queue_v2::api::prove_message::<Runtime>(leaf_index)
+		}
+		fn dry_run(xcm: Xcm<()>) -> Result<(InboundMessage,FeeV2<Balance>),DryRunError> {
+			snowbridge_pallet_outbound_queue_v2::api::dry_run::<Runtime>(xcm)
 		}
 	}
 

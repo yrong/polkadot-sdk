@@ -171,6 +171,8 @@ impl snowbridge_pallet_outbound_queue_v2::Config for Runtime {
 	type GatewayAddress = EthereumGatewayAddress;
 	type WeightInfo = crate::weights::snowbridge_pallet_outbound_queue_v2::WeightInfo<Runtime>;
 	type RewardLedger = ();
+	type ConvertAssetId = EthereumSystem;
+	type EthereumNetwork = EthereumNetwork;
 }
 
 #[cfg(any(feature = "std", feature = "fast-runtime", feature = "runtime-benchmarks", test))]

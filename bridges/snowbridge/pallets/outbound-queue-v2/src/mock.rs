@@ -92,6 +92,8 @@ parameter_types! {
 		multiplier: FixedU128::from_rational(4, 3),
 	};
 	pub const GatewayAddress: H160 = H160(GATEWAY_ADDRESS);
+	pub EthereumNetwork: NetworkId = NetworkId::Ethereum { chain_id: 11155111 };
+
 }
 
 pub const DOT: u128 = 10_000_000_000;
@@ -108,6 +110,8 @@ impl crate::Config for Test {
 	type WeightToFee = IdentityFee<u128>;
 	type WeightInfo = ();
 	type RewardLedger = ();
+	type ConvertAssetId = ();
+	type EthereumNetwork = EthereumNetwork;
 }
 
 fn setup() {

@@ -115,7 +115,7 @@ use frame_support::{
 use snowbridge_core::{
 	inbound::Message as DeliveryMessage,
 	outbound::v2::{CommandWrapper, Fee, GasMeter, InboundMessage, Message},
-	BasicOperatingMode, RewardLedger,
+	BasicOperatingMode, RewardLedger, TokenId,
 };
 use snowbridge_merkle_tree::merkle_root;
 use sp_core::H256;
@@ -132,6 +132,10 @@ pub use pallet::*;
 use alloy_sol_types::SolValue;
 
 use sp_runtime::traits::TrailingZeroInput;
+
+use sp_runtime::traits::MaybeEquivalence;
+
+use xcm::prelude::{Location, NetworkId};
 
 #[frame_support::pallet]
 pub mod pallet {
@@ -180,6 +184,10 @@ pub mod pallet {
 
 		/// Reward leger
 		type RewardLedger: RewardLedger<<Self as frame_system::Config>::AccountId, Self::Balance>;
+
+		type ConvertAssetId: MaybeEquivalence<TokenId, Location>;
+
+		type EthereumNetwork: Get<NetworkId>;
 	}
 
 	#[pallet::event]
