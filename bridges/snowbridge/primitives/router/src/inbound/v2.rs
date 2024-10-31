@@ -4,7 +4,7 @@
 
 use codec::{Decode, Encode};
 use core::marker::PhantomData;
-use frame_support::{traits::tokens::Balance as BalanceT, weights::Weight, PalletError};
+use frame_support::{traits::tokens::Balance as BalanceT, PalletError};
 use scale_info::TypeInfo;
 use snowbridge_core::TokenId;
 use sp_core::{Get, RuntimeDebug, H160, H256};
@@ -32,26 +32,6 @@ pub struct Message {
 	pub origin: H160,
 	/// The command originating from the Gateway contract
 	pub xcm: Vec<u8>,
-}
-
-pub struct GlobalConsensusEthereumConvertsFor<AccountId>(PhantomData<AccountId>);
-impl<AccountId> ConvertLocation<AccountId> for GlobalConsensusEthereumConvertsFor<AccountId>
-where
-	AccountId: From<[u8; 32]> + Clone,
-{
-	fn convert_location(location: &Location) -> Option<AccountId> {
-		match location.unpack() {
-			(_, [GlobalConsensus(Ethereum { chain_id })]) =>
-				Some(Self::from_chain_id(chain_id).into()),
-			_ => None,
-		}
-	}
-}
-
-impl<AccountId> GlobalConsensusEthereumConvertsFor<AccountId> {
-	pub fn from_chain_id(chain_id: &u64) -> [u8; 32] {
-		(b"ethereum-chain", chain_id).using_encoded(blake2_256)
-	}
 }
 
 #[cfg(test)]

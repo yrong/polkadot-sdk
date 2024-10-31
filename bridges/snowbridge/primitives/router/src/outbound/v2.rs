@@ -16,7 +16,7 @@ use snowbridge_core::{
 	AgentId, TokenId, TokenIdOf,
 };
 use sp_core::{H160, H256};
-use sp_runtime::traits::MaybeEquivalence;
+use sp_runtime::traits::{BlakeTwo256, Hash, MaybeEquivalence};
 use sp_std::{iter::Peekable, marker::PhantomData, prelude::*};
 use xcm::prelude::*;
 use xcm_builder::{CreateMatcher, ExporterFor, MatchXcm};
@@ -74,7 +74,7 @@ where
 		}
 
 		// Cloning destination to avoid modifying the value so subsequent exporters can use it.
-		let dest = destination.clone().take().ok_or(SendError::MissingArgument)?;
+		let dest = destination.clone().ok_or(SendError::MissingArgument)?;
 		if dest != Here {
 			log::trace!(target: TARGET, "skipped due to unmatched remote destination {dest:?}.");
 			return Err(SendError::NotApplicable)
@@ -82,7 +82,6 @@ where
 
 		// Cloning universal_source to avoid modifying the value so subsequent exporters can use it.
 		let (local_net, local_sub) = universal_source.clone()
-            .take()
             .ok_or_else(|| {
                 log::error!(target: TARGET, "universal source not provided.");
                 SendError::MissingArgument
@@ -97,14 +96,6 @@ where
 			log::trace!(target: TARGET, "skipped due to unmatched relay network {local_net:?}.");
 			return Err(SendError::NotApplicable)
 		}
-
-		let _para_id = match local_sub.as_slice() {
-			[Parachain(para_id)] => *para_id,
-			_ => {
-				log::error!(target: TARGET, "could not get parachain id from universal source '{local_sub:?}'.");
-				return Err(SendError::NotApplicable)
-			},
-		};
 
 		let source_location = Location::new(1, local_sub.clone());
 
@@ -121,13 +112,13 @@ where
 			SendError::MissingArgument
 		})?;
 
-		// An workaround to inspect ExpectAsset as V2 message
+		// Inspect AliasOrigin as V2 message
 		let mut instructions = message.clone().0;
 		let result = instructions.matcher().match_next_inst_while(
 			|_| true,
 			|inst| {
 				return match inst {
-					ExpectAsset(..) => Err(ProcessMessageError::Unsupported),
+					AliasOrigin(..) => Err(ProcessMessageError::Yield),
 					_ => Ok(ControlFlow::Continue(())),
 				}
 			},
@@ -189,6 +180,7 @@ enum XcmConverterError {
 	InvalidAsset,
 	UnexpectedInstruction,
 	TooManyCommands,
+	AliasOriginExpected,
 }
 
 macro_rules! match_expression {
@@ -202,6 +194,7 @@ macro_rules! match_expression {
 
 struct XcmConverter<'a, ConvertAssetId, Call> {
 	iter: Peekable<Iter<'a, Instruction<Call>>>,
+	message: Vec<Instruction<Call>>,
 	ethereum_network: NetworkId,
 	agent_id: AgentId,
 	_marker: PhantomData<ConvertAssetId>,
@@ -212,6 +205,7 @@ where
 {
 	fn new(message: &'a Xcm<Call>, ethereum_network: NetworkId, agent_id: AgentId) -> Self {
 		Self {
+			message: message.clone().inner().into(),
 			iter: message.inner().iter().peekable(),
 			ethereum_network,
 			agent_id,
@@ -220,9 +214,10 @@ where
 	}
 
 	fn convert(&mut self) -> Result<Message, XcmConverterError> {
-		let result = match self.peek() {
+		let result = match self.jump_to() {
+			// PNA
 			Ok(ReserveAssetDeposited { .. }) => self.send_native_tokens_message(),
-			// Get withdraw/deposit and make native tokens create message.
+			// ENA
 			Ok(WithdrawAsset { .. }) => self.send_tokens_message(),
 			Err(e) => Err(e),
 			_ => return Err(XcmConverterError::UnexpectedInstruction),
@@ -236,33 +231,28 @@ where
 		Ok(result)
 	}
 
+	/// Convert the xcm for Ethereum-native token from AH into the Message which will be executed
+	/// on Ethereum Gateway contract, we expect an input of the form:
+	/// # WithdrawAsset(WETH_FEE)
+	/// # PayFees(WETH_FEE)
+	/// # WithdrawAsset(ENA)
+	/// # AliasOrigin(Origin)
+	/// # DepositAsset(ENA)
+	/// # SetTopic
 	fn send_tokens_message(&mut self) -> Result<Message, XcmConverterError> {
 		use XcmConverterError::*;
+
+		// Get fee amount
+		let fee_amount = self.extract_remote_fee()?;
 
 		// Get the reserve assets from WithdrawAsset.
 		let reserve_assets =
 			match_expression!(self.next()?, WithdrawAsset(reserve_assets), reserve_assets)
 				.ok_or(WithdrawAssetExpected)?;
 
-		// Check if clear origin exists and skip over it.
-		if match_expression!(self.peek(), Ok(ClearOrigin), ()).is_some() {
-			let _ = self.next();
-		}
-
-		// Extract the fee asset item from BuyExecution|PayFees(V5)
-		let fee_asset = match_expression!(self.next()?, BuyExecution { fees, .. }, fees)
-			.ok_or(InvalidFeeAsset)?;
-		// Todo: Validate fee asset is WETH
-		let fee_amount = match fee_asset {
-			Asset { id: _, fun: Fungible(amount) } => Some(*amount),
-			_ => None,
-		}
-		.ok_or(AssetResolutionFailed)?;
-
-		// Check if ExpectAsset exists and skip over it.
-		if match_expression!(self.peek(), Ok(ExpectAsset { .. }), ()).is_some() {
-			let _ = self.next();
-		}
+		// Check AliasOrigin.
+		let origin = match_expression!(self.next()?, AliasOrigin(origin), origin)
+			.ok_or(AliasOriginExpected)?;
 
 		let (deposit_assets, beneficiary) = match_expression!(
 			self.next()?,
@@ -294,6 +284,7 @@ where
 		ensure!(reserve_assets.len() == 1, TooManyAssets);
 		let reserve_asset = reserve_assets.get(0).ok_or(AssetResolutionFailed)?;
 
+		// only fungible asset is allowed
 		let (token, amount) = match reserve_asset {
 			Asset { id: AssetId(inner_location), fun: Fungible(amount) } =>
 				match inner_location.unpack() {
@@ -308,13 +299,13 @@ where
 		// transfer amount must be greater than 0.
 		ensure!(amount > 0, ZeroAssetTransfer);
 
-		// Check if there is a SetTopic and skip over it if found.
+		// ensure SetTopic exists
 		let topic_id = match_expression!(self.next()?, SetTopic(id), id).ok_or(SetTopicExpected)?;
 
 		let message = Message {
 			id: (*topic_id).into(),
-			// Todo: from XCMV5 AliasOrigin
-			origin: H256::zero(),
+			// Todo: Use DescribeLocation
+			origin: BlakeTwo256::hash_of(origin),
 			fee: fee_amount,
 			commands: BoundedVec::try_from(vec![Command::UnlockNativeToken {
 				agent_id: self.agent_id,
@@ -332,10 +323,6 @@ where
 		self.iter.next().ok_or(XcmConverterError::UnexpectedEndOfXcm)
 	}
 
-	fn peek(&mut self) -> Result<&&'a Instruction<Call>, XcmConverterError> {
-		self.iter.peek().ok_or(XcmConverterError::UnexpectedEndOfXcm)
-	}
-
 	fn network_matches(&self, network: &Option<NetworkId>) -> bool {
 		if let Some(network) = network {
 			*network == self.ethereum_network
@@ -344,40 +331,28 @@ where
 		}
 	}
 
-	/// Convert the xcm for Polkadot-native token from AH into the Command
-	/// To match transfers of Polkadot-native tokens, we expect an input of the form:
-	/// # ReserveAssetDeposited
-	/// # ClearOrigin
-	/// # BuyExecution
-	/// # DepositAsset
+	/// Convert the xcm for Polkadot-native token from AH into the Message which will be executed
+	/// on Ethereum Gateway contract, we expect an input of the form:
+	/// # WithdrawAsset(WETH)
+	/// # PayFees(WETH)
+	/// # ReserveAssetDeposited(PNA)
+	/// # AliasOrigin(Origin)
+	/// # DepositAsset(PNA)
 	/// # SetTopic
 	fn send_native_tokens_message(&mut self) -> Result<Message, XcmConverterError> {
 		use XcmConverterError::*;
+
+		// Get fee amount
+		let fee_amount = self.extract_remote_fee()?;
 
 		// Get the reserve assets.
 		let reserve_assets =
 			match_expression!(self.next()?, ReserveAssetDeposited(reserve_assets), reserve_assets)
 				.ok_or(ReserveAssetDepositedExpected)?;
 
-		// Check if clear origin exists and skip over it.
-		if match_expression!(self.peek(), Ok(ClearOrigin), ()).is_some() {
-			let _ = self.next();
-		}
-
-		// Extract the fee asset item from BuyExecution|PayFees(V5)
-		let fee_asset = match_expression!(self.next()?, BuyExecution { fees, .. }, fees)
-			.ok_or(InvalidFeeAsset)?;
-		// Todo: Validate fee asset is WETH
-		let fee_amount = match fee_asset {
-			Asset { id: _, fun: Fungible(amount) } => Some(*amount),
-			_ => None,
-		}
-		.ok_or(AssetResolutionFailed)?;
-
-		// Check if ExpectAsset exists and skip over it.
-		if match_expression!(self.peek(), Ok(ExpectAsset { .. }), ()).is_some() {
-			let _ = self.next();
-		}
+		// Check AliasOrigin.
+		let origin = match_expression!(self.next()?, AliasOrigin(origin), origin)
+			.ok_or(AliasOriginExpected)?;
 
 		let (deposit_assets, beneficiary) = match_expression!(
 			self.next()?,
@@ -409,6 +384,7 @@ where
 		ensure!(reserve_assets.len() == 1, TooManyAssets);
 		let reserve_asset = reserve_assets.get(0).ok_or(AssetResolutionFailed)?;
 
+		// only fungible asset is allowed
 		let (asset_id, amount) = match reserve_asset {
 			Asset { id: AssetId(inner_location), fun: Fungible(amount) } =>
 				Some((inner_location.clone(), *amount)),
@@ -419,17 +395,16 @@ where
 		// transfer amount must be greater than 0.
 		ensure!(amount > 0, ZeroAssetTransfer);
 
+		// Ensure PNA already registered
 		let token_id = TokenIdOf::convert_location(&asset_id).ok_or(InvalidAsset)?;
-
 		let expected_asset_id = ConvertAssetId::convert(&token_id).ok_or(InvalidAsset)?;
-
 		ensure!(asset_id == expected_asset_id, InvalidAsset);
 
-		// Check if there is a SetTopic and skip over it if found.
+		// ensure SetTopic exists
 		let topic_id = match_expression!(self.next()?, SetTopic(id), id).ok_or(SetTopicExpected)?;
 
 		let message = Message {
-			origin: H256::zero(),
+			origin: BlakeTwo256::hash_of(origin),
 			fee: fee_amount,
 			id: (*topic_id).into(),
 			commands: BoundedVec::try_from(vec![Command::MintForeignToken {
@@ -441,6 +416,28 @@ where
 		};
 
 		Ok(message)
+	}
+
+	/// Skip fee instructions and jump to the primary asset instruction
+	fn jump_to(&mut self) -> Result<&Instruction<Call>, XcmConverterError> {
+		ensure!(self.message.len() > 3, XcmConverterError::UnexpectedEndOfXcm);
+		self.message.get(2).ok_or(XcmConverterError::UnexpectedEndOfXcm)
+	}
+
+	/// Extract the fee asset item from PayFees(V5)
+	fn extract_remote_fee(&mut self) -> Result<u128, XcmConverterError> {
+		use XcmConverterError::*;
+		let _ = match_expression!(self.next()?, WithdrawAsset(fee), fee)
+			.ok_or(WithdrawAssetExpected)?;
+		let fee_asset =
+			match_expression!(self.next()?, PayFees { asset: fee }, fee).ok_or(InvalidFeeAsset)?;
+		// Todo: Validate fee asset is WETH
+		let fee_amount = match fee_asset {
+			Asset { id: _, fun: Fungible(amount) } => Some(*amount),
+			_ => None,
+		}
+		.ok_or(AssetResolutionFailed)?;
+		Ok(fee_amount)
 	}
 }
 
@@ -486,7 +483,10 @@ mod tests {
 	use frame_support::parameter_types;
 	use hex_literal::hex;
 	use snowbridge_core::{
-		outbound::v2::{Fee, SendError, SendMessageFeeProvider},
+		outbound::{
+			v2::{Fee, SendError},
+			SendMessageFeeProvider,
+		},
 		AgentIdOf,
 	};
 	use sp_std::default::Default;
