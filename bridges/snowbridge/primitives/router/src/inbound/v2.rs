@@ -30,8 +30,14 @@ pub enum VersionedMessage {
 pub struct Message {
 	/// The origin address
 	pub origin: H160,
+	/// The assets
+	pub assets: Vec<Vec<u8>>,
 	/// The command originating from the Gateway contract
 	pub xcm: Vec<u8>,
+	/// The claimer in the case that funds get trapped.
+	pub claimer: MultiAddres,
+	/// The relayer reward that will be allocated after the delivery of this message.
+	pub reward: u128
 }
 
 #[cfg(test)]
