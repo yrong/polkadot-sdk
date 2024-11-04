@@ -9,7 +9,12 @@ use sp_keyring::AccountKeyring as Keyring;
 use sp_runtime::DispatchError;
 
 use crate::{mock::*, Error, Event as InboundQueueEvent};
-use snowbridge_router_primitives::inbound::v2::Asset;
+use snowbridge_router_primitives::inbound::v2::Asset as InboundAsset;
+use sp_core::H256;
+use xcm::opaque::latest::prelude::ClearOrigin;
+use xcm::opaque::latest::Asset;
+use xcm::opaque::latest::prelude::ReceiveTeleportedAsset;
+use codec::DecodeLimit;
 
 #[test]
 fn test_submit_happy_path() {
@@ -158,7 +163,7 @@ fn test_send_native_erc20_token_payload() {
 
 		assert_eq!(expected_origin, inbound_message.origin);
 		assert_eq!(1, inbound_message.assets.len());
-		if let Asset::NativeTokenERC20 { token_id, value } = &inbound_message.assets[0] {
+		if let InboundAsset::NativeTokenERC20 { token_id, value } = &inbound_message.assets[0] {
 			assert_eq!(expected_token_id, *token_id);
 			assert_eq!(expected_value, *value);
 		} else {
@@ -168,3 +173,105 @@ fn test_send_native_erc20_token_payload() {
 		assert_eq!(expected_claimer, inbound_message.claimer);
 	});
 }
+
+#[test]
+fn test_send_foreign_erc20_token_payload() {
+	new_tester().execute_with(|| {
+		let payload = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf040197874824853fb4ad04794ccfd1cc8d2a7463839cfcbc6a315a1045c60ab85f400000b2d3595bf00600000000000000000000").to_vec();
+		let message = MessageV2::decode(&mut payload.as_ref());
+		assert_ok!(message.clone());
+
+		let inbound_message = message.unwrap();
+
+		let expected_origin: H160 = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf").into();
+		let expected_token_id: H256 = hex!("97874824853fb4ad04794ccfd1cc8d2a7463839cfcbc6a315a1045c60ab85f40").into();
+		let expected_value = 500000000000000000u128;
+		let expected_xcm: Vec<u8> = vec![];
+		let expected_claimer: Option<Vec<u8>> = None;
+
+		assert_eq!(expected_origin, inbound_message.origin);
+		assert_eq!(1, inbound_message.assets.len());
+		if let InboundAsset::ForeignTokenERC20 { token_id, value } = &inbound_message.assets[0] {
+			assert_eq!(expected_token_id, *token_id);
+			assert_eq!(expected_value, *value);
+		} else {
+			panic!("Expected ForeignTokenERC20 asset");
+		}
+		assert_eq!(expected_xcm, inbound_message.xcm);
+		assert_eq!(expected_claimer, inbound_message.claimer);
+	});
+}
+
+#[test]
+fn test_inbound_message_with_xcm() {
+	new_tester().execute_with(|| {
+		let payload = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf040197874824853fb4ad04794ccfd1cc8d2a7463839cfcbc6a315a1045c60ab85f400000b2d3595bf00600000000000000000c0508020401000002286bee0a00").to_vec();
+		let message = MessageV2::decode(&mut payload.as_ref());
+		assert_ok!(message.clone());
+
+		let inbound_message = message.unwrap();
+
+		let expected_origin: H160 = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf").into();
+		let expected_token_id: H256 = hex!("97874824853fb4ad04794ccfd1cc8d2a7463839cfcbc6a315a1045c60ab85f40").into();
+		let expected_value = 500000000000000000u128;
+		let expected_xcm: Vec<u8> = vec![];
+		let expected_claimer: Option<Vec<u8>> = None;
+
+		assert_eq!(expected_origin, inbound_message.origin);
+		assert_eq!(1, inbound_message.assets.len());
+		if let InboundAsset::ForeignTokenERC20 { token_id, value } = &inbound_message.assets[0] {
+			assert_eq!(expected_token_id, *token_id);
+			assert_eq!(expected_value, *value);
+		} else {
+			panic!("Expected ForeignTokenERC20 asset");
+		}
+		assert_eq!(expected_xcm, inbound_message.xcm);
+		assert_eq!(expected_claimer, inbound_message.claimer);
+	});
+}
+
+#[test]
+fn encode_xcm() {
+	new_tester().execute_with(|| {
+		let total_fee_asset: Asset = (Location::parent(), 1_000_000_000).into();
+
+		let mut instructions: Xcm<()> = vec![
+			ReceiveTeleportedAsset(total_fee_asset.into()),
+			ClearOrigin,
+		].into();
+
+		let versioned_xcm_message = VersionedXcm::V5(instructions.clone());
+
+		let xcm_bytes = VersionedXcm::encode(&versioned_xcm_message);
+		let hex_string = hex::encode(xcm_bytes.clone());
+
+		println!("xcm hex: {}", hex_string);
+
+		let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
+			MAX_XCM_DECODE_DEPTH,
+			&mut xcm_bytes.as_ref(),
+		);
+
+		assert_ok!(versioned_xcm.clone());
+
+		// Check if decoding was successful
+		let decoded_instructions = match versioned_xcm.unwrap() {
+			VersionedXcm::V5(decoded) => decoded,
+			_ => {
+				panic!("unexpected xcm version found")
+			}
+		};
+
+		let mut original_instructions = instructions.into_iter();
+		let mut decoded_instructions = decoded_instructions.into_iter();
+
+		let original_first = original_instructions.next().take();
+		let decoded_first = decoded_instructions.next().take();
+		assert_eq!(original_first, decoded_first, "First instruction (ReceiveTeleportedAsset) does not match.");
+
+		let original_second = original_instructions.next().take();
+		let decoded_second = decoded_instructions.next().take();
+		assert_eq!(original_second, decoded_second, "Second instruction (ClearOrigin) does not match.");
+	});
+}
+
