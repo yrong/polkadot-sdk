@@ -31,13 +31,27 @@ pub struct Message {
 	/// The origin address
 	pub origin: H160,
 	/// The assets
-	pub assets: Vec<Vec<u8>>,
-	/// The command originating from the Gateway contract
+	pub assets: Vec<Asset>,
+	// The command originating from the Gateway contract
 	pub xcm: Vec<u8>,
-	/// The claimer in the case that funds get trapped.
-	pub claimer: MultiAddres,
-	/// The relayer reward that will be allocated after the delivery of this message.
-	pub reward: u128
+	// The claimer in the case that funds get trapped.
+	pub claimer: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Encode, Decode, RuntimeDebug)]
+pub enum Asset {
+	NativeTokenERC20 {
+		/// The token ID, native or foreign
+		token_id: H160,
+		/// The monetary value of the asset
+		value: u128
+	},
+	ForeignTokenERC20 {
+		/// The token ID, native or foreign
+		token_id: H256,
+		/// The monetary value of the asset
+		value: u128
+	}
 }
 
 #[cfg(test)]

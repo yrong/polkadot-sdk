@@ -7,11 +7,9 @@ use hex_literal::hex;
 use snowbridge_core::{inbound::Proof, ChannelId};
 use sp_keyring::AccountKeyring as Keyring;
 use sp_runtime::DispatchError;
-use sp_std::convert::From;
 
-use crate::{Error, Event as InboundQueueEvent};
-
-use crate::mock::*;
+use crate::{mock::*, Error, Event as InboundQueueEvent};
+use snowbridge_router_primitives::inbound::v2::Asset;
 
 #[test]
 fn test_submit_happy_path() {
@@ -108,25 +106,6 @@ fn test_submit_with_invalid_nonce() {
 }
 
 #[test]
-fn test_submit_no_funds_to_reward_relayers_just_ignore() {
-	new_tester().execute_with(|| {
-		let relayer: AccountId = Keyring::Bob.into();
-		let origin = RuntimeOrigin::signed(relayer);
-
-		// Submit message
-		let message = Message {
-			event_log: mock_event_log(),
-			proof: Proof {
-				receipt_proof: Default::default(),
-				execution_proof: mock_execution_proof(),
-			},
-		};
-		// Check submit successfully in case no funds available
-		assert_ok!(InboundQueue::submit(origin.clone(), message.clone()));
-	});
-}
-
-#[test]
 fn test_set_operating_mode() {
 	new_tester().execute_with(|| {
 		let relayer: AccountId = Keyring::Bob.into();
@@ -162,31 +141,30 @@ fn test_set_operating_mode_root_only() {
 }
 
 #[test]
-fn test_submit_no_funds_to_reward_relayers_and_ed_preserved() {
+fn test_send_native_erc20_token_payload() {
 	new_tester().execute_with(|| {
-		let relayer: AccountId = Keyring::Bob.into();
-		let origin = RuntimeOrigin::signed(relayer);
+		// To generate test data: forge test --match-test testSendEther  -vvvv
+		let payload = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf04005615deb798bb3e4dfa0139dfa1b3d433cc23b72f0000b2d3595bf00600000000000000000000").to_vec();
+		let message = MessageV2::decode(&mut payload.as_ref());
+		assert_ok!(message.clone());
 
-		// Submit message successfully
-		let message = Message {
-			event_log: mock_event_log(),
-			proof: Proof {
-				receipt_proof: Default::default(),
-				execution_proof: mock_execution_proof(),
-			},
-		};
-		assert_ok!(InboundQueue::submit(origin.clone(), message.clone()));
+		let inbound_message = message.unwrap();
 
-		// Submit another message with nonce set as 2
-		let mut event_log = mock_event_log();
-		event_log.data[31] = 2;
-		let message = Message {
-			event_log,
-			proof: Proof {
-				receipt_proof: Default::default(),
-				execution_proof: mock_execution_proof(),
-			},
-		};
-		assert_ok!(InboundQueue::submit(origin.clone(), message.clone()));
+		let expected_origin: H160 = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf").into();
+		let expected_token_id: H160 = hex!("5615deb798bb3e4dfa0139dfa1b3d433cc23b72f").into();
+		let expected_value = 500000000000000000u128;
+		let expected_xcm: Vec<u8> = vec![];
+		let expected_claimer: Option<Vec<u8>> = None;
+
+		assert_eq!(expected_origin, inbound_message.origin);
+		assert_eq!(1, inbound_message.assets.len());
+		if let Asset::NativeTokenERC20 { token_id, value } = &inbound_message.assets[0] {
+			assert_eq!(expected_token_id, *token_id);
+			assert_eq!(expected_value, *value);
+		} else {
+			panic!("Expected NativeTokenERC20 asset");
+		}
+		assert_eq!(expected_xcm, inbound_message.xcm);
+		assert_eq!(expected_claimer, inbound_message.claimer);
 	});
 }
