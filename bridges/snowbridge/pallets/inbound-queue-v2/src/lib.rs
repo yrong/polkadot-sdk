@@ -95,7 +95,8 @@ pub mod pallet {
 		type GatewayAddress: Get<H160>;
 
 		type WeightInfo: WeightInfo;
-
+		/// AssetHub parachain ID
+		type AssetHubParaId: Get<u32>;
 		#[cfg(feature = "runtime-benchmarks")]
 		type Helper: BenchmarkHelper<Self>;
 	}
@@ -139,6 +140,8 @@ pub mod pallet {
 		Verification(VerificationError),
 		/// XCMP send failure
 		Send(SendError),
+		/// Message conversion error
+		ConvertMessage(ConvertMessageError),
 	}
 
 	#[derive(Clone, Encode, Decode, Eq, PartialEq, Debug, TypeInfo, PalletError)]
@@ -204,25 +207,7 @@ pub mod pallet {
 			let message = MessageV2::decode_all(&mut envelope.payload.as_ref())
 				.map_err(|_| Error::<T>::InvalidPayload)?;
 
-			// Decode xcm
-			let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
-				MAX_XCM_DECODE_DEPTH,
-				&mut message.xcm.as_ref(),
-			)
-			.map_err(|_| Error::<T>::InvalidPayload)?;
-			let xcm: Xcm<()> = versioned_xcm.try_into().map_err(|_| <Error<T>>::InvalidPayload)?;
-
-			log::info!(
-				target: LOG_TARGET,
-				"💫 xcm decoded as {:?}",
-				xcm,
-			);
-
-			// Set nonce flag to true
-			<Nonce<T>>::try_mutate(envelope.nonce, |done| -> DispatchResult {
-				*done = true;
-				Ok(())
-			})?;
+			let xcm = convert_message(message)?;
 
 			// Todo: Deposit fee(in Ether) to RewardLeger which should cover all of:
 			// T::RewardLeger::deposit(who, envelope.fee.into())?;
@@ -233,10 +218,16 @@ pub mod pallet {
 			// e. The reward
 
 			// Attempt to forward XCM to AH
-			let dest = Location::new(1, [Parachain(1000)]);
+			let dest = Location::new(1, [Parachain(T::AssetHubParaId)]);
 			let (message_id, _) = send_xcm::<T::XcmSender>(dest, xcm).map_err(Error::<T>::from)?;
 
 			Self::deposit_event(Event::MessageReceived { nonce: envelope.nonce, message_id });
+
+			// Set nonce flag to true
+			<Nonce<T>>::try_mutate(envelope.nonce, |done| -> DispatchResult {
+				*done = true;
+				Ok(())
+			})?;
 
 			Ok(())
 		}

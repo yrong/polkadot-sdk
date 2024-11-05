@@ -4,17 +4,18 @@
 
 use codec::{Decode, Encode};
 use core::marker::PhantomData;
-use frame_support::{traits::tokens::Balance as BalanceT, PalletError};
+use frame_support::PalletError;
 use scale_info::TypeInfo;
 use snowbridge_core::TokenId;
 use sp_core::{Get, RuntimeDebug, H160, H256};
-use sp_io::hashing::blake2_256;
-use sp_runtime::{traits::MaybeEquivalence, MultiAddress};
+use sp_runtime::MultiAddress;
 use sp_std::prelude::*;
 use xcm::prelude::{Junction::AccountKey20, *};
-use xcm_executor::traits::ConvertLocation;
+use xcm::MAX_XCM_DECODE_DEPTH;
+use codec::DecodeLimit;
 
 const MINIMUM_DEPOSIT: u128 = 1;
+const LOG_TARGET: &str = "snowbridge-router-primitives";
 
 /// Messages from Ethereum are versioned. This is because in future,
 /// we may want to evolve the protocol so that the ethereum side sends XCM messages directly.
@@ -51,6 +52,71 @@ pub enum Asset {
 		token_id: H256,
 		/// The monetary value of the asset
 		value: u128
+	}
+}
+
+/// Reason why a message conversion failed.
+#[derive(Copy, Clone, TypeInfo, PalletError, Encode, Decode, RuntimeDebug)]
+pub enum ConvertMessageError {
+	/// The XCM provided with the message could not be decoded into XCM.
+	InvalidXCM,
+	/// Invalid claimer MultiAddress provided in payload.
+	InvalidClaimer,
+}
+
+pub trait ConvertMessage {
+	fn convert(
+		message: Message,
+	) -> Result<Xcm<()>, ConvertMessageError>;
+}
+
+pub struct MessageToXcm<
+	EthereumUniversalLocation,
+	AssetHubLocation,
+> where
+	EthereumUniversalLocation: Get<InteriorLocation>,
+	AssetHubLocation: Get<InteriorLocation>,
+{
+	_phantom: PhantomData<(
+		EthereumUniversalLocation,
+		AssetHubLocation,
+	)>,
+}
+
+impl<
+	EthereumUniversalLocation,
+	AssetHubLocation,
+> ConvertMessage
+for MessageToXcm<
+	EthereumUniversalLocation,
+	AssetHubLocation,
+>
+	where
+		EthereumUniversalLocation: Get<InteriorLocation>,
+		AssetHubLocation: Get<InteriorLocation>,
+{
+	fn convert(message: Message) -> Result<Xcm<()>, ConvertMessageError> {
+		// Decode xcm
+		let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
+			MAX_XCM_DECODE_DEPTH,
+			&mut message.xcm.as_ref(),
+		).map_err(|_| ConvertMessageError::InvalidXCM)?;
+		let message_xcm: Xcm<()> = versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
+
+		log::debug!(target: LOG_TARGET,"xcm decoded as {:?}", message_xcm);
+
+		let origin_location: Location = Location::new(2, [EthereumUniversalLocation::get().into(), Junction::AccountKey20{ key: message.origin.into(), network: None}.into()]);
+		let instructions = vec![
+			AliasOrigin(origin_location),
+		];
+
+		if let Some(claimer) = message.claimer {
+			let claimer = MultiAddress::decode(&mut claimer.as_ref()).map_err(|_| ConvertMessageError::InvalidClaimer)?;
+			let claimer_location: Location = Location::new(1, [AssetHubLocation::get().into(), claimer.into()]);
+			instructions.push(SetAssetClaimer { location: claimer_location });
+		}
+
+		Ok(instructions.into())
 	}
 }
 
