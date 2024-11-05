@@ -29,3 +29,8 @@ pub trait SendMessageFeeProvider {
 	/// The local component of the message processing fees in native currency
 	fn local_fee() -> Self::Balance;
 }
+
+#[derive(Copy, Clone, Encode, Decode, Eq, PartialEq, Debug, TypeInfo)]
+pub enum DryRunError {
+	ConvertFailed,
+}
