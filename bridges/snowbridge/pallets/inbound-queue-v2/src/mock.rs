@@ -18,7 +18,7 @@ use sp_runtime::{
 };
 use sp_std::{convert::From, default::Default};
 use xcm::{latest::SendXcm, prelude::*};
-
+use snowbridge_router_primitives::inbound::v2::MessageToXcm;
 use crate::{self as inbound_queue};
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -100,20 +100,6 @@ impl Verifier for MockVerifier {
 
 const GATEWAY_ADDRESS: [u8; 20] = hex!["eda338e4dc46038493b885327842fd3e301cab39"];
 
-parameter_types! {
-	pub const EthereumNetwork: xcm::v3::NetworkId = xcm::v3::NetworkId::Ethereum { chain_id: 11155111 };
-	pub const GatewayAddress: H160 = H160(GATEWAY_ADDRESS);
-	pub const CreateAssetCall: [u8;2] = [53, 0];
-	pub const CreateAssetExecutionFee: u128 = 2_000_000_000;
-	pub const CreateAssetDeposit: u128 = 100_000_000_000;
-	pub const SendTokenExecutionFee: u128 = 1_000_000_000;
-	pub const InitialFund: u128 = 1_000_000_000_000;
-	pub const InboundQueuePalletInstance: u8 = 80;
-	pub UniversalLocation: InteriorLocation =
-		[GlobalConsensus(Westend), Parachain(1002)].into();
-	pub AssetHubFromEthereum: Location = Location::new(1,[GlobalConsensus(Westend),Parachain(1000)]);
-}
-
 #[cfg(feature = "runtime-benchmarks")]
 impl<T: snowbridge_pallet_ethereum_client::Config> BenchmarkHelper<T> for Test {
 	// not implemented since the MockVerifier is used for tests
@@ -158,12 +144,25 @@ impl MaybeEquivalence<TokenId, Location> for MockTokenIdConvert {
 	}
 }
 
+parameter_types! {
+	pub const EthereumNetwork: xcm::v5::NetworkId = xcm::v5::NetworkId::Ethereum { chain_id: 11155111 };
+	pub const GatewayAddress: H160 = H160(GATEWAY_ADDRESS);
+	pub const InboundQueuePalletInstance: u8 = 80;
+	pub AssetHubLocation: InteriorLocation = Parachain(1000).into();
+}
+
 impl inbound_queue::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type Verifier = MockVerifier;
 	type XcmSender = MockXcmSender;
 	type WeightInfo = ();
 	type GatewayAddress = GatewayAddress;
+	type AssetHubParaId = ConstU32<1000>;
+	type MessageConverter = MessageToXcm<
+		EthereumNetwork,
+		AssetHubLocation,
+		InboundQueuePalletInstance,
+	>;
 	#[cfg(feature = "runtime-benchmarks")]
 	type Helper = Test;
 }

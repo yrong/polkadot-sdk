@@ -44,8 +44,7 @@ use scale_info::TypeInfo;
 use sp_core::H160;
 use sp_std::vec;
 use xcm::{
-	prelude::{send_xcm, Junction::*, Location, SendError as XcmpSendError, SendXcm, Xcm},
-	VersionedXcm, MAX_XCM_DECODE_DEPTH,
+	prelude::{send_xcm, Junction::*, Location, SendError as XcmpSendError, SendXcm},
 };
 
 use snowbridge_core::{
@@ -53,11 +52,14 @@ use snowbridge_core::{
 	BasicOperatingMode,
 };
 use snowbridge_router_primitives::inbound::v2::Message as MessageV2;
+use snowbridge_router_primitives::inbound::v2::ConvertMessage;
 
 pub use weights::WeightInfo;
 
 #[cfg(feature = "runtime-benchmarks")]
 use snowbridge_beacon_primitives::BeaconHeader;
+
+use snowbridge_router_primitives::inbound::v2::ConvertMessageError;
 
 pub use pallet::*;
 
@@ -66,11 +68,9 @@ pub const LOG_TARGET: &str = "snowbridge-inbound-queue:v2";
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
-	use codec::DecodeLimit;
 
 	use frame_support::pallet_prelude::*;
 	use frame_system::pallet_prelude::*;
-	use sp_core::H256;
 
 	#[pallet::pallet]
 	pub struct Pallet<T>(_);
@@ -97,6 +97,7 @@ pub mod pallet {
 		type WeightInfo: WeightInfo;
 		/// AssetHub parachain ID
 		type AssetHubParaId: Get<u32>;
+		type MessageConverter: ConvertMessage;
 		#[cfg(feature = "runtime-benchmarks")]
 		type Helper: BenchmarkHelper<Self>;
 	}
@@ -207,7 +208,7 @@ pub mod pallet {
 			let message = MessageV2::decode_all(&mut envelope.payload.as_ref())
 				.map_err(|_| Error::<T>::InvalidPayload)?;
 
-			let xcm = convert_message(message)?;
+			let xcm = T::MessageConverter::convert(message).map_err(|e| Error::<T>::ConvertMessage(e))?;
 
 			// Todo: Deposit fee(in Ether) to RewardLeger which should cover all of:
 			// T::RewardLeger::deposit(who, envelope.fee.into())?;
@@ -218,7 +219,7 @@ pub mod pallet {
 			// e. The reward
 
 			// Attempt to forward XCM to AH
-			let dest = Location::new(1, [Parachain(T::AssetHubParaId)]);
+			let dest = Location::new(1, [Parachain(T::AssetHubParaId::get())]);
 			let (message_id, _) = send_xcm::<T::XcmSender>(dest, xcm).map_err(Error::<T>::from)?;
 
 			Self::deposit_event(Event::MessageReceived { nonce: envelope.nonce, message_id });

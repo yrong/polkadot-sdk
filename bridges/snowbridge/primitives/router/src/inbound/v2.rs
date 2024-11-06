@@ -6,15 +6,12 @@ use codec::{Decode, Encode};
 use core::marker::PhantomData;
 use frame_support::PalletError;
 use scale_info::TypeInfo;
-use snowbridge_core::TokenId;
 use sp_core::{Get, RuntimeDebug, H160, H256};
-use sp_runtime::MultiAddress;
 use sp_std::prelude::*;
 use xcm::prelude::{Junction::AccountKey20, *};
 use xcm::MAX_XCM_DECODE_DEPTH;
 use codec::DecodeLimit;
 
-const MINIMUM_DEPOSIT: u128 = 1;
 const LOG_TARGET: &str = "snowbridge-router-primitives";
 
 /// Messages from Ethereum are versioned. This is because in future,
@@ -32,7 +29,7 @@ pub struct Message {
 	/// The origin address
 	pub origin: H160,
 	/// The assets
-	pub assets: Vec<Asset>,
+	pub assets: Vec<InboundAsset>,
 	// The command originating from the Gateway contract
 	pub xcm: Vec<u8>,
 	// The claimer in the case that funds get trapped.
@@ -40,15 +37,15 @@ pub struct Message {
 }
 
 #[derive(Clone, Encode, Decode, RuntimeDebug)]
-pub enum Asset {
+pub enum InboundAsset {
 	NativeTokenERC20 {
-		/// The token ID, native or foreign
+		/// The native token ID
 		token_id: H160,
 		/// The monetary value of the asset
 		value: u128
 	},
 	ForeignTokenERC20 {
-		/// The token ID, native or foreign
+		/// The foreign token ID
 		token_id: H256,
 		/// The monetary value of the asset
 		value: u128
@@ -71,29 +68,35 @@ pub trait ConvertMessage {
 }
 
 pub struct MessageToXcm<
-	EthereumUniversalLocation,
+	EthereumNetwork,
 	AssetHubLocation,
+	InboundQueuePalletInstance,
 > where
-	EthereumUniversalLocation: Get<InteriorLocation>,
+	EthereumNetwork: Get<NetworkId>,
 	AssetHubLocation: Get<InteriorLocation>,
+	InboundQueuePalletInstance: Get<u8>,
 {
 	_phantom: PhantomData<(
-		EthereumUniversalLocation,
+		EthereumNetwork,
 		AssetHubLocation,
+		InboundQueuePalletInstance,
 	)>,
 }
 
 impl<
-	EthereumUniversalLocation,
+	EthereumNetwork,
 	AssetHubLocation,
+	InboundQueuePalletInstance,
 > ConvertMessage
 for MessageToXcm<
-	EthereumUniversalLocation,
+	EthereumNetwork,
 	AssetHubLocation,
+	InboundQueuePalletInstance,
 >
 	where
-		EthereumUniversalLocation: Get<InteriorLocation>,
+		EthereumNetwork: Get<NetworkId>,
 		AssetHubLocation: Get<InteriorLocation>,
+		InboundQueuePalletInstance: Get<u8>,
 {
 	fn convert(message: Message) -> Result<Xcm<()>, ConvertMessageError> {
 		// Decode xcm
@@ -105,16 +108,53 @@ for MessageToXcm<
 
 		log::debug!(target: LOG_TARGET,"xcm decoded as {:?}", message_xcm);
 
-		let origin_location: Location = Location::new(2, [EthereumUniversalLocation::get().into(), Junction::AccountKey20{ key: message.origin.into(), network: None}.into()]);
-		let instructions = vec![
-			AliasOrigin(origin_location),
+		let network = EthereumNetwork::get();
+
+		let mut origin_location = Location::new(2, GlobalConsensus(network)).push_interior(AccountKey20 {
+			key: message.origin.into(), network: None
+		}).map_err(|_| ConvertMessageError::InvalidXCM)?;
+
+		let network = EthereumNetwork::get();
+
+		let fee_asset = Location::new(1, Here);
+		let fee_value = 1_000_000_000u128; // TODO configure
+		let fee: Asset = (fee_asset, fee_value).into();
+		let mut instructions = vec![
+			ReceiveTeleportedAsset(fee.clone().into()),
+		  	BuyExecution{fees: fee, weight_limit: Unlimited},
+			DescendOrigin(PalletInstance(InboundQueuePalletInstance::get()).into()),
+		  	UniversalOrigin(GlobalConsensus(network)),
+			AliasOrigin(origin_location.into()),
 		];
 
+		for asset in &message.assets {
+			match asset {
+				InboundAsset::NativeTokenERC20 { token_id, value } => {
+					let token_location: Location = Location::new(2, [GlobalConsensus(EthereumNetwork::get()), AccountKey20{network: None, key: (*token_id).into()}]);
+					instructions.push(ReserveAssetDeposited((token_location, *value).into()));
+				}
+				InboundAsset::ForeignTokenERC20 { token_id, value } => {
+					// TODO check how token is represented as H256 on AH, assets pallet?
+					let token_location: Location = Location::new(0, [AccountId32 {network: None, id: (*token_id).into()}]);
+					// TODO Is this token always on AH? Would probably need to distinguish between tokens on other parachains eventually
+					instructions.push(WithdrawAsset((token_location, *value).into()));
+				}
+			}
+		}
+
 		if let Some(claimer) = message.claimer {
-			let claimer = MultiAddress::decode(&mut claimer.as_ref()).map_err(|_| ConvertMessageError::InvalidClaimer)?;
-			let claimer_location: Location = Location::new(1, [AssetHubLocation::get().into(), claimer.into()]);
+			let claimer = Junction::decode(&mut claimer.as_ref()).map_err(|_| ConvertMessageError::InvalidClaimer)?;
+			let claimer_location: Location = Location::new(0, [claimer.into()]);
 			instructions.push(SetAssetClaimer { location: claimer_location });
 		}
+
+		// TODO not sure this is correct, should the junction be prefixed with GlobalConsensus(EthereumNetwork::get()?
+		instructions.push(DescendOrigin(AccountKey20 {
+			key: message.origin.into(), network: None
+		}.into()));
+
+		// Add the XCM the user specified to the end of the XCM
+		instructions.extend(message_xcm.0);
 
 		Ok(instructions.into())
 	}

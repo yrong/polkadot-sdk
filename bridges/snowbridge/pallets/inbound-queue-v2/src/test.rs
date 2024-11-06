@@ -10,12 +10,16 @@ use sp_runtime::DispatchError;
 
 use crate::{mock::*, Error, Event as InboundQueueEvent};
 use codec::DecodeLimit;
-use snowbridge_router_primitives::inbound::v2::Asset as InboundAsset;
+use snowbridge_router_primitives::inbound::v2::InboundAsset;
 use sp_core::H256;
 use xcm::opaque::latest::{
 	prelude::{ClearOrigin, ReceiveTeleportedAsset},
 	Asset, AssetId, Assets,
 };
+use xcm::VersionedXcm;
+use xcm::MAX_XCM_DECODE_DEPTH;
+use snowbridge_router_primitives::inbound::v2::ConvertMessage;
+use xcm::prelude::{Junction::AccountKey20, *};
 
 #[test]
 fn test_submit_happy_path() {
@@ -245,9 +249,6 @@ fn test_register_token_inbound_message_with_xcm_and_claimer() {
 				panic!("unexpected xcm version found")
 			}
 		};
-
-		let total_fee_asset: Asset = (Location::parent(), 1_000_000_000).into();
-		let first_instruction = ReceiveTeleportedAsset(total_fee_asset.into());
 
 		let mut decoded_instructions = decoded_instructions.into_iter();
 		let decoded_first = decoded_instructions.next().take();
