@@ -114,7 +114,6 @@ where
 			BuyExecution { fees: fee, weight_limit: Unlimited },
 			DescendOrigin(PalletInstance(InboundQueuePalletInstance::get()).into()),
 			UniversalOrigin(GlobalConsensus(network)),
-			AliasOrigin(origin_location.into()),
 		];
 
 		for asset in &message.assets {
@@ -147,10 +146,9 @@ where
 			instructions.push(SetAssetClaimer { location: claimer_location });
 		}
 
-		// TODO not sure this is correct, should the junction be prefixed with
-		// GlobalConsensus(EthereumNetwork::get()?
-		instructions
-			.push(DescendOrigin(AccountKey20 { key: message.origin.into(), network: None }.into()));
+		// Set the alias origin to the original sender on Ethereum. Important to be before the
+		// arbitrary XCM that is appended to the message on the next line.
+		instructions.push(AliasOrigin(origin_location.into()));
 
 		// Add the XCM sent in the message to the end of the xcm instruction
 		instructions.extend(message_xcm.0);
