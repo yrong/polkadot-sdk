@@ -58,6 +58,8 @@ pub enum InboundAsset {
 pub enum ConvertMessageError {
 	/// The XCM provided with the message could not be decoded into XCM.
 	InvalidXCM,
+	/// The XCM provided with the message could not be decoded into versioned XCM.
+	InvalidVersionedXCM,
 	/// Invalid claimer MultiAddress provided in payload.
 	InvalidClaimer,
 }
@@ -81,14 +83,17 @@ where
 	InboundQueuePalletInstance: Get<u8>,
 {
 	fn convert(message: Message) -> Result<Xcm<()>, ConvertMessageError> {
-		// Decode xcm
-		let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
-			MAX_XCM_DECODE_DEPTH,
-			&mut message.xcm.as_ref(),
-		)
-		.map_err(|_| ConvertMessageError::InvalidXCM)?;
-		let message_xcm: Xcm<()> =
-			versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
+		let mut message_xcm : Xcm<()> = Xcm::new();
+		if message.xcm.len() > 0{
+			// Decode xcm
+			let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
+				MAX_XCM_DECODE_DEPTH,
+				&mut message.xcm.as_ref(),
+			)
+				.map_err(|_| ConvertMessageError::InvalidVersionedXCM)?;
+			message_xcm =
+				versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
+		}
 
 		log::debug!(target: LOG_TARGET,"xcm decoded as {:?}", message_xcm);
 
@@ -147,7 +152,7 @@ where
 		instructions
 			.push(DescendOrigin(AccountKey20 { key: message.origin.into(), network: None }.into()));
 
-		// Add the XCM the user specified to the end of the XCM
+		// Add the XCM sent in the message to the end of the xcm instruction
 		instructions.extend(message_xcm.0);
 
 		Ok(instructions.into())
