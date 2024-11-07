@@ -21174,6 +21174,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "snowbridge-inbound-queue-v2-runtime-api"
+version = "0.2.0"
+dependencies = [
+ "snowbridge-core",
+ "snowbridge-merkle-tree",
+ "snowbridge-router-primitives",
+ "sp-api 26.0.0",
+ "staging-xcm",
+]
+
+[[package]]
 name = "snowbridge-merkle-tree"
 version = "0.2.0"
 dependencies = [

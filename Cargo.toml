@@ -51,6 +51,7 @@ members = [
 	"bridges/snowbridge/pallets/inbound-queue",
 	"bridges/snowbridge/pallets/inbound-queue-v2",
 	"bridges/snowbridge/pallets/inbound-queue-v2/fixtures",
+	"bridges/snowbridge/pallets/inbound-queue-v2/runtime-api",
 	"bridges/snowbridge/pallets/inbound-queue/fixtures",
 	"bridges/snowbridge/pallets/outbound-queue",
 	"bridges/snowbridge/pallets/outbound-queue-v2",

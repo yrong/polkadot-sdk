@@ -25,7 +25,7 @@ pub enum VersionedMessage {
 
 /// For V2, the ethereum side sends messages which are transcoded into XCM. These messages are
 /// self-contained, in that they can be transcoded using only information in the message.
-#[derive(Clone, Encode, Decode, RuntimeDebug)]
+#[derive(Clone, Encode, Decode, RuntimeDebug, TypeInfo)]
 pub struct Message {
 	/// The origin address
 	pub origin: H160,
@@ -37,7 +37,7 @@ pub struct Message {
 	pub claimer: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Encode, Decode, RuntimeDebug)]
+#[derive(Clone, Encode, Decode, RuntimeDebug, TypeInfo)]
 pub enum InboundAsset {
 	NativeTokenERC20 {
 		/// The native token ID

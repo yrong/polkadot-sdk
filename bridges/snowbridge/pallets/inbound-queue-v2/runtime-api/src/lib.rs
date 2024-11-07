@@ -2,16 +2,14 @@
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use frame_support::traits::tokens::Balance as BalanceT;
-use snowbridge_core::{
-	inbound::v2::InboundMessage,
-	PricingParameters,
-};
+use snowbridge_core::inbound::Proof;
+use snowbridge_router_primitives::inbound::v2::Message;
+use xcm::latest::Xcm;
 
 sp_api::decl_runtime_apis! {
-	pub trait InboundQueueApi<Balance> where Balance: BalanceT
+	pub trait InboundQueueApiV2
 	{
 		/// Dry runs the provided message on AH to provide the XCM payload and execution cost.
-		fn dry_run(message: InboundMessage, proof: ) -> (Xcm, u128);
+		fn dry_run(message: Message, proof: Proof) -> (Xcm<()>, u128);
 	}
 }
