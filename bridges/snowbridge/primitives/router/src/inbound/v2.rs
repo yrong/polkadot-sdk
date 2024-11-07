@@ -2,15 +2,16 @@
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
 //! Converts messages from Ethereum to XCM messages
 
-use codec::{Decode, Encode};
+use codec::{Decode, DecodeLimit, Encode};
 use core::marker::PhantomData;
 use frame_support::PalletError;
 use scale_info::TypeInfo;
 use sp_core::{Get, RuntimeDebug, H160, H256};
 use sp_std::prelude::*;
-use xcm::prelude::{Junction::AccountKey20, *};
-use xcm::MAX_XCM_DECODE_DEPTH;
-use codec::DecodeLimit;
+use xcm::{
+	prelude::{Junction::AccountKey20, *},
+	MAX_XCM_DECODE_DEPTH,
+};
 
 const LOG_TARGET: &str = "snowbridge-router-primitives";
 
@@ -42,14 +43,14 @@ pub enum InboundAsset {
 		/// The native token ID
 		token_id: H160,
 		/// The monetary value of the asset
-		value: u128
+		value: u128,
 	},
 	ForeignTokenERC20 {
 		/// The foreign token ID
 		token_id: H256,
 		/// The monetary value of the asset
-		value: u128
-	}
+		value: u128,
+	},
 }
 
 /// Reason why a message conversion failed.
@@ -62,96 +63,89 @@ pub enum ConvertMessageError {
 }
 
 pub trait ConvertMessage {
-	fn convert(
-		message: Message,
-	) -> Result<Xcm<()>, ConvertMessageError>;
+	fn convert(message: Message) -> Result<Xcm<()>, ConvertMessageError>;
 }
 
-pub struct MessageToXcm<
-	EthereumNetwork,
-	AssetHubLocation,
-	InboundQueuePalletInstance,
-> where
+pub struct MessageToXcm<EthereumNetwork, InboundQueuePalletInstance>
+where
 	EthereumNetwork: Get<NetworkId>,
-	AssetHubLocation: Get<InteriorLocation>,
 	InboundQueuePalletInstance: Get<u8>,
 {
-	_phantom: PhantomData<(
-		EthereumNetwork,
-		AssetHubLocation,
-		InboundQueuePalletInstance,
-	)>,
+	_phantom: PhantomData<(EthereumNetwork, InboundQueuePalletInstance)>,
 }
 
-impl<
-	EthereumNetwork,
-	AssetHubLocation,
-	InboundQueuePalletInstance,
-> ConvertMessage
-for MessageToXcm<
-	EthereumNetwork,
-	AssetHubLocation,
-	InboundQueuePalletInstance,
->
-	where
-		EthereumNetwork: Get<NetworkId>,
-		AssetHubLocation: Get<InteriorLocation>,
-		InboundQueuePalletInstance: Get<u8>,
+impl<EthereumNetwork, InboundQueuePalletInstance> ConvertMessage
+	for MessageToXcm<EthereumNetwork, InboundQueuePalletInstance>
+where
+	EthereumNetwork: Get<NetworkId>,
+	InboundQueuePalletInstance: Get<u8>,
 {
 	fn convert(message: Message) -> Result<Xcm<()>, ConvertMessageError> {
 		// Decode xcm
 		let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
 			MAX_XCM_DECODE_DEPTH,
 			&mut message.xcm.as_ref(),
-		).map_err(|_| ConvertMessageError::InvalidXCM)?;
-		let message_xcm: Xcm<()> = versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
+		)
+		.map_err(|_| ConvertMessageError::InvalidXCM)?;
+		let message_xcm: Xcm<()> =
+			versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
 
 		log::debug!(target: LOG_TARGET,"xcm decoded as {:?}", message_xcm);
 
 		let network = EthereumNetwork::get();
 
-		let mut origin_location = Location::new(2, GlobalConsensus(network)).push_interior(AccountKey20 {
-			key: message.origin.into(), network: None
-		}).map_err(|_| ConvertMessageError::InvalidXCM)?;
+		let origin_location = Location::new(2, GlobalConsensus(network))
+			.push_interior(AccountKey20 { key: message.origin.into(), network: None })
+			.map_err(|_| ConvertMessageError::InvalidXCM)?;
 
 		let network = EthereumNetwork::get();
 
 		let fee_asset = Location::new(1, Here);
-		let fee_value = 1_000_000_000u128; // TODO configure
+		let fee_value = 1_000_000_000u128; // TODO needs to be dry-run to get the fee but also
+									 // need to add a fee here for the dry run... Chicken/egg problem?
 		let fee: Asset = (fee_asset, fee_value).into();
 		let mut instructions = vec![
 			ReceiveTeleportedAsset(fee.clone().into()),
-		  	BuyExecution{fees: fee, weight_limit: Unlimited},
+			BuyExecution { fees: fee, weight_limit: Unlimited },
 			DescendOrigin(PalletInstance(InboundQueuePalletInstance::get()).into()),
-		  	UniversalOrigin(GlobalConsensus(network)),
+			UniversalOrigin(GlobalConsensus(network)),
 			AliasOrigin(origin_location.into()),
 		];
 
 		for asset in &message.assets {
 			match asset {
 				InboundAsset::NativeTokenERC20 { token_id, value } => {
-					let token_location: Location = Location::new(2, [GlobalConsensus(EthereumNetwork::get()), AccountKey20{network: None, key: (*token_id).into()}]);
+					let token_location: Location = Location::new(
+						2,
+						[
+							GlobalConsensus(EthereumNetwork::get()),
+							AccountKey20 { network: None, key: (*token_id).into() },
+						],
+					);
 					instructions.push(ReserveAssetDeposited((token_location, *value).into()));
-				}
+				},
 				InboundAsset::ForeignTokenERC20 { token_id, value } => {
 					// TODO check how token is represented as H256 on AH, assets pallet?
-					let token_location: Location = Location::new(0, [AccountId32 {network: None, id: (*token_id).into()}]);
-					// TODO Is this token always on AH? Would probably need to distinguish between tokens on other parachains eventually
+					let token_location: Location =
+						Location::new(0, [AccountId32 { network: None, id: (*token_id).into() }]);
+					// TODO Is this token always on AH? Would probably need to distinguish between
+					// tokens on other parachains eventually
 					instructions.push(WithdrawAsset((token_location, *value).into()));
-				}
+				},
 			}
 		}
 
 		if let Some(claimer) = message.claimer {
-			let claimer = Junction::decode(&mut claimer.as_ref()).map_err(|_| ConvertMessageError::InvalidClaimer)?;
+			let claimer = Junction::decode(&mut claimer.as_ref())
+				.map_err(|_| ConvertMessageError::InvalidClaimer)?;
 			let claimer_location: Location = Location::new(0, [claimer.into()]);
 			instructions.push(SetAssetClaimer { location: claimer_location });
 		}
 
-		// TODO not sure this is correct, should the junction be prefixed with GlobalConsensus(EthereumNetwork::get()?
-		instructions.push(DescendOrigin(AccountKey20 {
-			key: message.origin.into(), network: None
-		}.into()));
+		// TODO not sure this is correct, should the junction be prefixed with
+		// GlobalConsensus(EthereumNetwork::get()?
+		instructions
+			.push(DescendOrigin(AccountKey20 { key: message.origin.into(), network: None }.into()));
 
 		// Add the XCM the user specified to the end of the XCM
 		instructions.extend(message_xcm.0);
@@ -162,9 +156,14 @@ for MessageToXcm<
 
 #[cfg(test)]
 mod tests {
-	use crate::inbound::{CallIndex, GlobalConsensusEthereumConvertsFor};
+	use crate::inbound::{
+		v2::{ConvertMessage, Message, MessageToXcm},
+		CallIndex, GlobalConsensusEthereumConvertsFor,
+	};
+	use codec::Decode;
 	use frame_support::{assert_ok, parameter_types};
 	use hex_literal::hex;
+	use sp_runtime::traits::ConstU8;
 	use xcm::prelude::*;
 	use xcm_executor::traits::ConvertLocation;
 
@@ -231,5 +230,14 @@ mod tests {
 			);
 			assert_eq!(reanchored_asset_with_ethereum_context, asset.clone());
 		}
+	}
+
+	#[test]
+	fn test_convert_message() {
+		let payload = hex!("29e3b139f4393adda86303fcdaa35f60bb7092bf040197874824853fb4ad04794ccfd1cc8d2a7463839cfcbc6a315a1045c60ab85f400000b2d3595bf00600000000000000000000").to_vec();
+		let message = Message::decode(&mut payload.as_ref());
+		assert_ok!(message.clone());
+		let result = MessageToXcm::<EthereumNetwork, ConstU8<80>>::convert(message.unwrap());
+		assert_ok!(result);
 	}
 }

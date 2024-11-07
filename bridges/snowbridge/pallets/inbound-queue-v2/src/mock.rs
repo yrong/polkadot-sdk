@@ -160,7 +160,6 @@ impl inbound_queue::Config for Test {
 	type AssetHubParaId = ConstU32<1000>;
 	type MessageConverter = MessageToXcm<
 		EthereumNetwork,
-		AssetHubLocation,
 		InboundQueuePalletInstance,
 	>;
 	#[cfg(feature = "runtime-benchmarks")]
