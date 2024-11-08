@@ -22,7 +22,7 @@
 //! * [`Call::submit`]: Submit a message for verification and dispatch the final destination
 //!   parachain.
 #![cfg_attr(not(feature = "std"), no_std)]
-
+pub mod api;
 mod envelope;
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -41,9 +41,11 @@ use envelope::Envelope;
 use frame_support::PalletError;
 use frame_system::ensure_signed;
 use scale_info::TypeInfo;
+use snowbridge_core::inbound::Proof;
 use sp_core::H160;
 use sp_std::vec;
 use xcm::{
+	latest::Xcm,
 	prelude::{send_xcm, Junction::*, Location, SendError as XcmpSendError, SendXcm},
 };
 
@@ -51,8 +53,7 @@ use snowbridge_core::{
 	inbound::{Message, VerificationError, Verifier},
 	BasicOperatingMode,
 };
-use snowbridge_router_primitives::inbound::v2::Message as MessageV2;
-use snowbridge_router_primitives::inbound::v2::ConvertMessage;
+use snowbridge_router_primitives::inbound::v2::{ConvertMessage, Message as MessageV2};
 
 pub use weights::WeightInfo;
 
@@ -89,7 +90,6 @@ pub mod pallet {
 
 		/// XCM message sender
 		type XcmSender: SendXcm;
-
 		/// Address of the Gateway contract
 		#[pallet::constant]
 		type GatewayAddress: Get<H160>;
@@ -208,7 +208,8 @@ pub mod pallet {
 			let message = MessageV2::decode_all(&mut envelope.payload.as_ref())
 				.map_err(|_| Error::<T>::InvalidPayload)?;
 
-			let xcm = T::MessageConverter::convert(message).map_err(|e| Error::<T>::ConvertMessage(e))?;
+			let xcm =
+				T::MessageConverter::convert(message).map_err(|e| Error::<T>::ConvertMessage(e))?;
 
 			// Todo: Deposit fee(in Ether) to RewardLeger which should cover all of:
 			// T::RewardLeger::deposit(who, envelope.fee.into())?;
@@ -244,6 +245,21 @@ pub mod pallet {
 			OperatingMode::<T>::set(mode);
 			Self::deposit_event(Event::OperatingModeChanged { mode });
 			Ok(())
+		}
+	}
+
+	impl<T: Config> Pallet<T> {
+		pub fn dry_run_message(
+			message: Message,
+			proof: Proof,
+		) -> Result<(Xcm<()>, u128), Error<T>> {
+			let xcm =
+				T::MessageConverter::convert(message).map_err(|e| Error::<T>::ConvertMessage(e))?;
+			let origin_location = Location::new(1, Parachain(1002).into());
+			let dry_run_result =
+				pallet_xcm::dry_run_xcm(origin_location, xcm).map_err(Error::<T>::from)?;
+
+			Ok((xcm, 0))
 		}
 	}
 }

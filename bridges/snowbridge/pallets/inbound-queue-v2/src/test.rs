@@ -10,16 +10,16 @@ use sp_runtime::DispatchError;
 
 use crate::{mock::*, Error, Event as InboundQueueEvent};
 use codec::DecodeLimit;
-use snowbridge_router_primitives::inbound::v2::InboundAsset;
+use snowbridge_router_primitives::inbound::v2::{ConvertMessage, InboundAsset};
 use sp_core::H256;
-use xcm::opaque::latest::{
-	prelude::{ClearOrigin, ReceiveTeleportedAsset},
-	Asset, AssetId, Assets,
+use xcm::{
+	opaque::latest::{
+		prelude::{ClearOrigin, ReceiveTeleportedAsset},
+		Asset, AssetId, Assets,
+	},
+	prelude::{Junction::AccountKey20, *},
+	VersionedXcm, MAX_XCM_DECODE_DEPTH,
 };
-use xcm::VersionedXcm;
-use xcm::MAX_XCM_DECODE_DEPTH;
-use snowbridge_router_primitives::inbound::v2::ConvertMessage;
-use xcm::prelude::{Junction::AccountKey20, *};
 
 #[test]
 fn test_submit_happy_path() {

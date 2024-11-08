@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
 use super::*;
 
+use crate::{self as inbound_queue};
 use frame_support::{derive_impl, parameter_types, traits::ConstU32, weights::IdentityFee};
 use hex_literal::hex;
 use snowbridge_beacon_primitives::{
@@ -11,6 +12,7 @@ use snowbridge_core::{
 	inbound::{Log, Proof, VerificationError},
 	TokenId,
 };
+use snowbridge_router_primitives::inbound::v2::MessageToXcm;
 use sp_core::{H160, H256};
 use sp_runtime::{
 	traits::{IdentifyAccount, IdentityLookup, MaybeEquivalence, Verify},
@@ -18,8 +20,6 @@ use sp_runtime::{
 };
 use sp_std::{convert::From, default::Default};
 use xcm::{latest::SendXcm, prelude::*};
-use snowbridge_router_primitives::inbound::v2::MessageToXcm;
-use crate::{self as inbound_queue};
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
@@ -158,10 +158,7 @@ impl inbound_queue::Config for Test {
 	type WeightInfo = ();
 	type GatewayAddress = GatewayAddress;
 	type AssetHubParaId = ConstU32<1000>;
-	type MessageConverter = MessageToXcm<
-		EthereumNetwork,
-		InboundQueuePalletInstance,
-	>;
+	type MessageConverter = MessageToXcm<EthereumNetwork, InboundQueuePalletInstance>;
 	#[cfg(feature = "runtime-benchmarks")]
 	type Helper = Test;
 }

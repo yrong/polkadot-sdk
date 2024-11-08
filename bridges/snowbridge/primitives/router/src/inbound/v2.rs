@@ -83,16 +83,15 @@ where
 	InboundQueuePalletInstance: Get<u8>,
 {
 	fn convert(message: Message) -> Result<Xcm<()>, ConvertMessageError> {
-		let mut message_xcm : Xcm<()> = Xcm::new();
-		if message.xcm.len() > 0{
+		let mut message_xcm: Xcm<()> = Xcm::new();
+		if message.xcm.len() > 0 {
 			// Decode xcm
 			let versioned_xcm = VersionedXcm::<()>::decode_with_depth_limit(
 				MAX_XCM_DECODE_DEPTH,
 				&mut message.xcm.as_ref(),
 			)
-				.map_err(|_| ConvertMessageError::InvalidVersionedXCM)?;
-			message_xcm =
-				versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
+			.map_err(|_| ConvertMessageError::InvalidVersionedXCM)?;
+			message_xcm = versioned_xcm.try_into().map_err(|_| ConvertMessageError::InvalidXCM)?;
 		}
 
 		log::debug!(target: LOG_TARGET,"xcm decoded as {:?}", message_xcm);
