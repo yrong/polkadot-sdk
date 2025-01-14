@@ -19,7 +19,7 @@ use bridge_hub_westend_runtime::{
 };
 use codec::{Decode, Encode};
 use emulated_integration_tests_common::{PENPAL_B_ID, RESERVABLE_ASSET_ID};
-use frame_support::pallet_prelude::TypeInfo;
+use frame_support::{pallet_prelude::TypeInfo, traits::fungibles::Mutate};
 use hex_literal::hex;
 use rococo_westend_system_emulated_network::asset_hub_westend_emulated_chain::genesis::AssetHubWestendAssetOwner;
 use snowbridge_core::{
@@ -1322,4 +1322,169 @@ fn transfer_ah_token() {
 			"Token minted to beneficiary."
 		);
 	});
+}
+
+/// Tests sending WETH from PenPal to Ethereum
+#[test]
+fn send_weth_from_penpal_to_ethereum() {
+	let asset_hub_sovereign = BridgeHubWestend::sovereign_account_id_of(Location::new(
+		1,
+		[Parachain(AssetHubWestend::para_id().into())],
+	));
+	// Fund AssetHub sovereign account so it can pay execution fees for the asset transfer
+	BridgeHubWestend::fund_accounts(vec![(asset_hub_sovereign.clone(), INITIAL_FUND)]);
+
+	// Fund PenPal receiver
+	let native_id: Location = Parent.into();
+	let receiver: AccountId = PenpalBSender::get();
+	PenpalB::mint_foreign_asset(
+		<PenpalB as Chain>::RuntimeOrigin::signed(PenpalAssetOwner::get()),
+		native_id,
+		receiver,
+		INITIAL_FUND,
+	);
+
+	PenpalB::execute_with(|| {
+		assert_ok!(<PenpalB as Chain>::System::set_storage(
+			<PenpalB as Chain>::RuntimeOrigin::root(),
+			vec![(
+				PenpalCustomizableAssetFromSystemAssetHub::key().to_vec(),
+				Location::new(2, [GlobalConsensus(Ethereum { chain_id: CHAIN_ID })]).encode(),
+			)],
+		));
+	});
+
+	let ethereum_network_v5: NetworkId = EthereumNetwork::get().into();
+
+	// The Weth asset location, identified by the contract address on Ethereum
+	let weth_asset_location: Location =
+		(Parent, Parent, ethereum_network_v5, AccountKey20 { network: None, key: WETH }).into();
+
+	let origin_location = (Parent, Parent, ethereum_network_v5).into();
+
+	// Fund ethereum sovereign on AssetHub
+	let ethereum_sovereign: AccountId =
+		EthereumLocationsConverterFor::<AccountId>::convert_location(&origin_location).unwrap();
+	AssetHubWestend::fund_accounts(vec![(ethereum_sovereign.clone(), INITIAL_FUND)]);
+
+	let penpal_sovereign = AssetHubWestend::sovereign_account_id_of(Location::new(
+		1,
+		[Parachain(PenpalB::para_id().into())],
+	));
+	// Fund AssetHub sovereign account so it can pay execution fees for the asset transfer
+	AssetHubWestend::fund_accounts(vec![(penpal_sovereign.clone(), INITIAL_FUND)]);
+
+	// Create asset on the AH.
+	AssetHubWestend::execute_with(|| {
+		assert_ok!(<AssetHubWestend as AssetHubWestendPallet>::ForeignAssets::force_create(
+			<AssetHubWestend as Chain>::RuntimeOrigin::root(),
+			weth_asset_location.clone(),
+			ethereum_sovereign.clone().into(),
+			true,
+			1,
+		));
+
+		assert!(<AssetHubWestend as AssetHubWestendPallet>::ForeignAssets::asset_exists(
+			weth_asset_location.clone()
+		));
+
+		assert_ok!(<AssetHubWestend as AssetHubWestendPallet>::ForeignAssets::mint_into(
+			weth_asset_location.clone(),
+			&ethereum_sovereign.clone(),
+			TOKEN_AMOUNT,
+		));
+
+		assert_ok!(<AssetHubWestend as AssetHubWestendPallet>::ForeignAssets::mint_into(
+			weth_asset_location.clone(),
+			&penpal_sovereign.clone(),
+			TOKEN_AMOUNT,
+		));
+	});
+
+	// Create asset on the Penpal parachain.
+	PenpalB::execute_with(|| {
+		assert_ok!(<PenpalB as PenpalBPallet>::ForeignAssets::force_create(
+			<PenpalB as Chain>::RuntimeOrigin::root(),
+			weth_asset_location.clone(),
+			ethereum_sovereign.into(),
+			true,
+			1,
+		));
+
+		assert!(<PenpalB as PenpalBPallet>::ForeignAssets::asset_exists(
+			weth_asset_location.clone()
+		));
+
+		assert_ok!(<PenpalB as PenpalBPallet>::ForeignAssets::mint_into(
+			weth_asset_location.clone(),
+			&PenpalBSender::get(),
+			TOKEN_AMOUNT,
+		));
+	});
+
+	PenpalB::execute_with(|| {
+		type RuntimeEvent = <PenpalB as Chain>::RuntimeEvent;
+		type RuntimeOrigin = <PenpalB as Chain>::RuntimeOrigin;
+
+		let remote_fee_asset_location: Location = Location::new(
+			2,
+			[EthereumNetwork::get().into(), AccountKey20 { network: None, key: WETH }],
+		)
+		.into();
+
+		let remote_fee_asset: Asset = (remote_fee_asset_location.clone(), TOKEN_AMOUNT).into();
+
+		let exploited_weth = Asset {
+			id: AssetId(Location::new(0, [AccountKey20 { network: None, key: WETH.into() }])),
+			// A big amount without burning
+			fun: Fungible(TOKEN_AMOUNT * 1_000_000_000),
+		};
+
+		let local_fee_asset =
+			Asset { id: AssetId(Location::parent()), fun: Fungible(TOKEN_AMOUNT) };
+
+		let half_local_fee_asset =
+			Asset { id: AssetId(Location::parent()), fun: Fungible(TOKEN_AMOUNT / 2) };
+
+		let assets = VersionedAssets::from(vec![local_fee_asset.clone(), remote_fee_asset.clone()]);
+
+		let beneficiary = Location::new(
+			0,
+			[AccountKey20 { network: None, key: ETHEREUM_DESTINATION_ADDRESS.into() }],
+		);
+
+		assert_ok!(<PenpalB as PenpalBPallet>::PolkadotXcm::transfer_assets_using_type_and_then(
+			RuntimeOrigin::signed(PenpalBSender::get()),
+			bx!(VersionedLocation::from(Location::new(
+				1,
+				Parachain(AssetHubWestend::para_id().into())
+			))),
+			bx!(assets),
+			bx!(TransferType::DestinationReserve),
+			bx!(VersionedAssetId::from(remote_fee_asset_location.clone())),
+			bx!(TransferType::DestinationReserve),
+			bx!(VersionedXcm::from(Xcm(vec![InitiateTeleport {
+				assets: Definite(local_fee_asset.clone().into()),
+				dest: Location::new(1, Parachain(BridgeHubWestend::para_id().into())),
+				xcm: Xcm(vec![
+					BuyExecution { fees: half_local_fee_asset.clone(), weight_limit: Unlimited },
+					ExportMessage {
+						network: Ethereum { chain_id: CHAIN_ID },
+						destination: Here,
+						xcm: Xcm(vec![
+							WithdrawAsset(exploited_weth.clone().into()),
+							DepositAsset { assets: Wild(All), beneficiary },
+							SetTopic([0; 32]),
+						]
+						.into())
+					},
+				]),
+			}]))),
+			Unlimited
+		));
+	});
+
+	AssetHubWestend::execute_with(|| {});
+
+	BridgeHubWestend::execute_with(|| {});
 }
