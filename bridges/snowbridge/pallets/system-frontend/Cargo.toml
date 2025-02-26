@@ -25,7 +25,7 @@ log = { workspace = true }
 pallet-xcm = { workspace = true }
 scale-info = { features = ["derive"], workspace = true }
 snowbridge-core = { workspace = true }
-snowbridge-test-helper-primitives = { workspace = true }
+snowbridge-test-utils = { optional = true, workspace = true }
 sp-core = { workspace = true }
 sp-io = { workspace = true }
 sp-runtime = { workspace = true }
@@ -50,7 +50,6 @@ std = [
 	"pallet-xcm/std",
 	"scale-info/std",
 	"snowbridge-core/std",
-	"snowbridge-test-helper-primitives/std",
 	"sp-core/std",
 	"sp-io/std",
 	"sp-runtime/std",
@@ -66,7 +65,7 @@ runtime-benchmarks = [
 	"pallet-balances/runtime-benchmarks",
 	"pallet-xcm/runtime-benchmarks",
 	"snowbridge-core/runtime-benchmarks",
-    "snowbridge-test-helper-primitives/runtime-benchmarks",
+    "snowbridge-test-utils/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 	"xcm-executor/runtime-benchmarks",
 	"xcm/runtime-benchmarks",

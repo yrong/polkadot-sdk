@@ -1,6 +1,6 @@
 [package]
-name = "snowbridge-test-helper-primitives"
-description = "Snowbridge test helper primitives"
+name = "snowbridge-test-utils"
+description = "Snowbridge test utils"
 version = "0.1.0"
 authors = ["Snowfork <contact@snowfork.com>"]
 edition.workspace = true
