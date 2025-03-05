@@ -9,7 +9,7 @@ pub use polkadot_parachain_primitives::primitives::{
 };
 pub use sp_core::U256;
 
-use codec::Encode;
+use codec::{Compact, Encode};
 use sp_core::H256;
 use sp_std::prelude::*;
 use xcm::prelude::{
@@ -51,7 +51,7 @@ pub struct DescribeHere;
 impl DescribeLocation for DescribeHere {
 	fn describe_location(l: &Location) -> Option<Vec<u8>> {
 		match l.unpack() {
-			(0, []) => Some(Vec::<u8>::new().encode()),
+			(0, []) => Some(Vec::<u8>::new()),
 			_ => None,
 		}
 	}
@@ -78,14 +78,14 @@ pub struct DescribeTokenTerminal;
 impl DescribeLocation for DescribeTokenTerminal {
 	fn describe_location(l: &Location) -> Option<Vec<u8>> {
 		match l.unpack().1 {
-			[] => Some(Vec::<u8>::new().encode()),
+			[] => Some(Vec::<u8>::new()),
 			[GeneralIndex(index)] => Some((b"GeneralIndex", *index).encode()),
 			[GeneralKey { data, .. }] => Some((b"GeneralKey", *data).encode()),
 			[AccountKey20 { key, .. }] => Some((b"AccountKey20", *key).encode()),
 			[AccountId32 { id, .. }] => Some((b"AccountId32", *id).encode()),
 
 			// Pallet
-			[PalletInstance(instance)] => Some((b"PalletInstance", *instance).encode()),
+			[PalletInstance(i)] => Some((b"Pallet", Compact::<u32>::from(*i as u32)).encode()),
 			[PalletInstance(instance), GeneralIndex(index)] =>
 				Some((b"PalletInstance", *instance, b"GeneralIndex", *index).encode()),
 			[PalletInstance(instance), GeneralKey { data, .. }] =>
