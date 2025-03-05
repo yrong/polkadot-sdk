@@ -140,7 +140,10 @@ where
 		);
 		ensure!(result.is_err(), SendError::NotApplicable);
 
-		let mut converter = XcmConverter::<ConvertAssetId, ()>::new(&message, expected_network);
+		let mut converter = XcmConverter::<ConvertAssetId, AgentHashedDescription, ()>::new(
+			&message,
+			expected_network,
+		);
 		let message = converter.convert().map_err(|err| {
 			log::error!(target: TARGET, "unroutable due to pattern matching error '{err:?}'.");
 			SendError::Unroutable

@@ -34,7 +34,7 @@ pub use weights::*;
 
 use frame_support::{pallet_prelude::*, traits::EnsureOrigin};
 use frame_system::pallet_prelude::*;
-use snowbridge_core::{AgentIdOf as LocationHashOf, AssetMetadata, TokenId, TokenIdOf};
+use snowbridge_core::{AssetMetadata, TokenId};
 use snowbridge_outbound_queue_primitives::{
 	v2::{Command, Initializer, Message, SendMessage},
 	OperatingMode, SendError,
@@ -81,6 +81,8 @@ pub mod pallet {
 
 		/// Origin for governance calls
 		type GovernanceOrigin: EnsureOrigin<Self::RuntimeOrigin, Success = Location>;
+
+		type LocationHashOf: ConvertLocation<H256>;
 
 		type WeightInfo: WeightInfo;
 		#[cfg(feature = "runtime-benchmarks")]
@@ -194,14 +196,11 @@ pub mod pallet {
 			let asset_location: Location =
 				(*asset_id).try_into().map_err(|_| Error::<T>::UnsupportedLocationVersion)?;
 
-			let location = Self::reanchor(&asset_location)?;
-
-			let token_id = TokenIdOf::convert_location(&location)
-				.ok_or(Error::<T>::LocationConversionFailed)?;
+			let token_id = Self::location_to_message_origin(&asset_location)?;
 
 			if !ForeignToNativeId::<T>::contains_key(token_id) {
-				NativeToForeignId::<T>::insert(location.clone(), token_id);
-				ForeignToNativeId::<T>::insert(token_id, location.clone());
+				NativeToForeignId::<T>::insert(asset_location.clone(), token_id);
+				ForeignToNativeId::<T>::insert(token_id, asset_location.clone());
 			}
 
 			let command = Command::RegisterForeignToken {
@@ -215,7 +214,7 @@ pub mod pallet {
 			Self::send(message_origin, command, 0)?;
 
 			Self::deposit_event(Event::<T>::RegisterToken {
-				location: location.clone().into(),
+				location: asset_location.clone().into(),
 				foreign_token_id: token_id,
 			});
 
@@ -252,8 +251,7 @@ pub mod pallet {
 		}
 
 		pub fn location_to_message_origin(location: &Location) -> Result<H256, Error<T>> {
-			let reanchored_location = Self::reanchor(location)?;
-			LocationHashOf::convert_location(&reanchored_location)
+			T::LocationHashOf::convert_location(location)
 				.ok_or(Error::<T>::LocationConversionFailed)
 		}
 	}

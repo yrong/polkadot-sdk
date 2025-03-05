@@ -12,13 +12,14 @@ use frame_system::EnsureRootWithSuccess;
 use snowbridge_core::{
 	gwei, meth, sibling_sovereign_account, AllowSiblingsOnly, ParaId, PricingParameters, Rewards,
 };
-
+use snowbridge_outbound_queue_primitives::v2::location::DescribeForEthereum;
 pub use snowbridge_test_utils::{mock_origin::pallet_xcm_origin, mock_outbound_queue::*};
 use sp_runtime::{
 	traits::{AccountIdConversion, BlakeTwo256, IdentityLookup},
 	AccountId32, BuildStorage, FixedU128,
 };
 use xcm::{opaque::latest::WESTEND_GENESIS_HASH, prelude::*};
+use xcm_builder::{DescribeAllTerminal, DescribeFamily, DescribeTerminus, HashedDescription};
 
 #[cfg(feature = "runtime-benchmarks")]
 use crate::BenchmarkHelper;
@@ -113,6 +114,14 @@ impl crate::Config for Test {
 	type OutboundQueue = MockOkOutboundQueue;
 	type FrontendOrigin = pallet_xcm_origin::EnsureXcm<AllowFromAssetHub>;
 	type GovernanceOrigin = EnsureRootWithSuccess<AccountId, RootLocation>;
+	type LocationHashOf = HashedDescription<
+		H256,
+		DescribeForEthereum<
+			EthereumDestination,
+			UniversalLocation,
+			(DescribeTerminus, DescribeFamily<DescribeAllTerminal>),
+		>,
+	>;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type Helper = ();

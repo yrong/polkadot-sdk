@@ -37,7 +37,7 @@ fn agent_id_from_location() {
 		);
 		let agent_id = EthereumSystemV2::location_to_message_origin(&origin).unwrap();
 		let expected_agent_id =
-			hex_literal::hex!("fa2d646322a1c6db25dd004f44f14f3d39a9556bed9655f372942a84a5b3d93b")
+			hex_literal::hex!("09d6d403dcdd264c2916751e9d89afa0ab878a0c73adb544df49a5fdcc8d6821")
 				.into();
 		assert_eq!(agent_id, expected_agent_id);
 	});
@@ -132,22 +132,21 @@ fn register_all_tokens_succeeds() {
 				Default::default()
 			));
 
-			let reanchored_location = EthereumSystemV2::reanchor(&tc.native).unwrap();
 			let foreign_token_id =
 				EthereumSystemV2::location_to_message_origin(&tc.native).unwrap();
 
 			assert_eq!(
-				NativeToForeignId::<Test>::get(reanchored_location.clone()),
+				NativeToForeignId::<Test>::get(tc.native.clone()),
 				Some(foreign_token_id.clone())
 			);
 			assert_eq!(
 				ForeignToNativeId::<Test>::get(foreign_token_id.clone()),
-				Some(reanchored_location.clone())
+				Some(tc.native.clone())
 			);
 
 			System::assert_last_event(RuntimeEvent::EthereumSystemV2(
 				Event::<Test>::RegisterToken {
-					location: reanchored_location.into(),
+					location: tc.native.clone().into(),
 					foreign_token_id,
 				},
 			));
