@@ -224,6 +224,8 @@ pub mod pallet {
 		InvalidPendingNonce,
 		/// Reward payment failed
 		RewardPaymentFailed,
+		/// Invalid Reward account
+		InvalidRewardAccount,
 	}
 
 	/// Messages to be committed in the current block. This storage value is killed in
@@ -282,7 +284,7 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			event: Box<EventProof>,
 		) -> DispatchResult {
-			let relayer = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 
 			// submit message to verifier for verification
 			T::Verifier::verify(&event.event_log, &event.proof)
@@ -291,7 +293,7 @@ pub mod pallet {
 			let receipt = DeliveryReceipt::try_from(&event.event_log)
 				.map_err(|_| Error::<T>::InvalidEnvelope)?;
 
-			Self::process_delivery_receipt(relayer, receipt)
+			Self::process_delivery_receipt(receipt)
 		}
 	}
 
@@ -417,12 +419,12 @@ pub mod pallet {
 		}
 
 		/// Process a delivery receipt from a relayer, to allocate the relayer reward.
-		pub fn process_delivery_receipt(
-			relayer: <T as frame_system::Config>::AccountId,
-			receipt: DeliveryReceipt,
-		) -> DispatchResult {
+		pub fn process_delivery_receipt(receipt: DeliveryReceipt) -> DispatchResult {
 			// Verify that the message was submitted from the known Gateway contract
 			ensure!(T::GatewayAddress::get() == receipt.gateway, Error::<T>::InvalidGateway);
+
+			let reward_account = T::AccountId::decode(&mut receipt.reward_address.as_slice())
+				.map_err(|_| Error::<T>::InvalidRewardAccount)?;
 
 			let nonce = receipt.nonce;
 
@@ -430,7 +432,11 @@ pub mod pallet {
 
 			if order.fee > 0 {
 				// Pay relayer reward
-				T::RewardPayment::register_reward(&relayer, T::DefaultRewardKind::get(), order.fee);
+				T::RewardPayment::register_reward(
+					&reward_account,
+					T::DefaultRewardKind::get(),
+					order.fee,
+				);
 			}
 
 			<PendingOrders<T>>::remove(nonce);
