@@ -224,8 +224,6 @@ pub mod pallet {
 		InvalidPendingNonce,
 		/// Reward payment failed
 		RewardPaymentFailed,
-		/// Invalid Reward account
-		InvalidRewardAccount,
 	}
 
 	/// Messages to be committed in the current block. This storage value is killed in
@@ -277,13 +275,16 @@ pub mod pallet {
 	}
 
 	#[pallet::call]
-	impl<T: Config> Pallet<T> {
+	impl<T: Config> Pallet<T>
+	where
+		<T as frame_system::Config>::AccountId: From<[u8; 32]>
+	{
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::submit_delivery_receipt())]
 		pub fn submit_delivery_receipt(
 			origin: OriginFor<T>,
 			event: Box<EventProof>,
-		) -> DispatchResult {
+		) -> DispatchResult where <T as frame_system::Config>::AccountId: From<[u8; 32]> {
 			ensure_signed(origin)?;
 
 			// submit message to verifier for verification
@@ -419,12 +420,14 @@ pub mod pallet {
 		}
 
 		/// Process a delivery receipt from a relayer, to allocate the relayer reward.
-		pub fn process_delivery_receipt(receipt: DeliveryReceipt) -> DispatchResult {
+		pub fn process_delivery_receipt(receipt: DeliveryReceipt) -> DispatchResult
+		where
+			<T as frame_system::Config>::AccountId: From<[u8; 32]>
+		{
 			// Verify that the message was submitted from the known Gateway contract
 			ensure!(T::GatewayAddress::get() == receipt.gateway, Error::<T>::InvalidGateway);
 
-			let reward_account = T::AccountId::decode(&mut receipt.reward_address.as_slice())
-				.map_err(|_| Error::<T>::InvalidRewardAccount)?;
+			let reward_account: T::AccountId = receipt.reward_address.into();
 
 			let nonce = receipt.nonce;
 
