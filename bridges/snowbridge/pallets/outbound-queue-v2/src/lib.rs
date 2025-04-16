@@ -277,15 +277,18 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T>
 	where
-		<T as frame_system::Config>::AccountId: From<[u8; 32]>
+		<T as frame_system::Config>::AccountId: From<[u8; 32]>,
 	{
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::submit_delivery_receipt())]
 		pub fn submit_delivery_receipt(
 			origin: OriginFor<T>,
 			event: Box<EventProof>,
-		) -> DispatchResult where <T as frame_system::Config>::AccountId: From<[u8; 32]> {
-			ensure_signed(origin)?;
+		) -> DispatchResult
+		where
+			<T as frame_system::Config>::AccountId: From<[u8; 32]>,
+		{
+			let relayer = ensure_signed(origin)?;
 
 			// submit message to verifier for verification
 			T::Verifier::verify(&event.event_log, &event.proof)
@@ -294,7 +297,7 @@ pub mod pallet {
 			let receipt = DeliveryReceipt::try_from(&event.event_log)
 				.map_err(|_| Error::<T>::InvalidEnvelope)?;
 
-			Self::process_delivery_receipt(receipt)
+			Self::process_delivery_receipt(relayer, receipt)
 		}
 	}
 
@@ -420,14 +423,20 @@ pub mod pallet {
 		}
 
 		/// Process a delivery receipt from a relayer, to allocate the relayer reward.
-		pub fn process_delivery_receipt(receipt: DeliveryReceipt) -> DispatchResult
+		pub fn process_delivery_receipt(
+			relayer: <T as frame_system::Config>::AccountId,
+			receipt: DeliveryReceipt,
+		) -> DispatchResult
 		where
-			<T as frame_system::Config>::AccountId: From<[u8; 32]>
+			<T as frame_system::Config>::AccountId: From<[u8; 32]>,
 		{
 			// Verify that the message was submitted from the known Gateway contract
 			ensure!(T::GatewayAddress::get() == receipt.gateway, Error::<T>::InvalidGateway);
 
-			let reward_account: T::AccountId = receipt.reward_address.into();
+			let reward_address: [u8; 32] = receipt.reward_address;
+
+			let reward_account =
+				if reward_address == &H256::zero()[..] { relayer } else { reward_address.into() };
 
 			let nonce = receipt.nonce;
 
