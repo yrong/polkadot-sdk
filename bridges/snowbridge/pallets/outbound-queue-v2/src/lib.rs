@@ -433,10 +433,11 @@ pub mod pallet {
 			// Verify that the message was submitted from the known Gateway contract
 			ensure!(T::GatewayAddress::get() == receipt.gateway, Error::<T>::InvalidGateway);
 
-			let reward_address: [u8; 32] = receipt.reward_address;
-
-			let reward_account =
-				if reward_address == &H256::zero()[..] { relayer } else { reward_address.into() };
+			let reward_account = if receipt.reward_address == [0u8; 32] {
+				relayer
+			} else {
+				receipt.reward_address.into()
+			};
 
 			let nonce = receipt.nonce;
 
