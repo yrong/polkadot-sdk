@@ -114,6 +114,7 @@ pub mod pallet {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
+		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
 		type Hashing: Hash<Output = H256>;
@@ -320,7 +321,8 @@ pub mod pallet {
 			Self::deposit_event(Event::MessagesCommitted { root, count });
 		}
 
-		/// Process a message delivered by the MessageQueue pallet
+		/// Process a message delivered by the MessageQueue pallet.
+		/// IMPORTANT!! This method does not roll back storage changes on error.
 		pub(crate) fn do_process_message(
 			_: ProcessMessageOriginOf<T>,
 			mut message: &[u8],
@@ -337,8 +339,6 @@ pub mod pallet {
 				});
 				return Err(Yield);
 			}
-
-			let nonce = Nonce::<T>::get();
 
 			// Decode bytes into Message
 			let Message { origin, id, fee, commands } =
@@ -360,6 +360,16 @@ pub mod pallet {
 					payload: command.abi_encode(),
 				})
 				.collect();
+
+			let nonce = <Nonce<T>>::get().checked_add(1).ok_or_else(|| {
+				Self::deposit_event(Event::MessageRejected {
+					id: None,
+					payload: message.to_vec(),
+					error: Unsupported,
+				});
+				Unsupported
+			})?;
+
 			let outbound_message = OutboundMessage {
 				origin,
 				nonce,
@@ -408,14 +418,7 @@ pub mod pallet {
 			};
 			<PendingOrders<T>>::insert(nonce, order);
 
-			Nonce::<T>::set(nonce.checked_add(1).ok_or_else(|| {
-				Self::deposit_event(Event::MessageRejected {
-					id: Some(id),
-					payload: message.to_vec(),
-					error: Unsupported,
-				});
-				Unsupported
-			})?);
+			<Nonce<T>>::set(nonce);
 
 			Self::deposit_event(Event::MessageAccepted { id, nonce });
 
