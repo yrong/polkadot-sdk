@@ -269,8 +269,10 @@ fn register_all_tokens_succeeds() {
 				Default::default()
 			));
 
-			assert_eq!(NativeToForeignId::<Test>::get(tc.reanchored.clone()), Some(tc.foreign));
-			assert_eq!(ForeignToNativeId::<Test>::get(tc.foreign), Some(tc.reanchored.clone()));
+			assert_eq!(
+				ForeignToNativeId::<Test>::get(tc.foreign),
+				Some(VersionedLocation::from(tc.reanchored.clone()))
+			);
 
 			System::assert_last_event(RuntimeEvent::EthereumSystem(Event::<Test>::RegisterToken {
 				location: tc.reanchored.clone().into(),

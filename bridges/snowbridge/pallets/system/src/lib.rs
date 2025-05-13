@@ -231,12 +231,7 @@ pub mod pallet {
 	/// Lookup table for foreign token ID to native location relative to ethereum
 	#[pallet::storage]
 	pub type ForeignToNativeId<T: Config> =
-		StorageMap<_, Blake2_128Concat, TokenId, xcm::v5::Location, OptionQuery>;
-
-	/// Lookup table for native location relative to ethereum to foreign token ID
-	#[pallet::storage]
-	pub type NativeToForeignId<T: Config> =
-		StorageMap<_, Blake2_128Concat, xcm::v5::Location, TokenId, OptionQuery>;
+		StorageMap<_, Blake2_128Concat, TokenId, VersionedLocation, OptionQuery>;
 
 	#[pallet::genesis_config]
 	#[derive(frame_support::DefaultNoBound)]
@@ -494,8 +489,7 @@ pub mod pallet {
 				.ok_or(Error::<T>::LocationConversionFailed)?;
 
 			if !ForeignToNativeId::<T>::contains_key(token_id) {
-				NativeToForeignId::<T>::insert(location.clone(), token_id);
-				ForeignToNativeId::<T>::insert(token_id, location.clone());
+				ForeignToNativeId::<T>::insert(token_id, VersionedLocation::from(location.clone()));
 			}
 
 			let command = Command::RegisterForeignToken {
@@ -538,9 +532,10 @@ pub mod pallet {
 	impl<T: Config> MaybeEquivalence<TokenId, Location> for Pallet<T> {
 		fn convert(foreign_id: &TokenId) -> Option<Location> {
 			ForeignToNativeId::<T>::get(foreign_id)
+				.and_then(|versioned_location| versioned_location.try_into().ok())
 		}
-		fn convert_back(location: &Location) -> Option<TokenId> {
-			NativeToForeignId::<T>::get(location)
+		fn convert_back(_: &Location) -> Option<TokenId> {
+			None
 		}
 	}
 }

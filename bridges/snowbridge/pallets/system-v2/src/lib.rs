@@ -36,7 +36,7 @@ use snowbridge_outbound_queue_primitives::{
 	v2::{Command, Initializer, Message, SendMessage},
 	OperatingMode, SendError,
 };
-use snowbridge_pallet_system::{ForeignToNativeId, NativeToForeignId};
+use snowbridge_pallet_system::ForeignToNativeId;
 use sp_core::{H160, H256};
 use sp_io::hashing::blake2_256;
 use sp_runtime::traits::MaybeEquivalence;
@@ -200,8 +200,7 @@ pub mod pallet {
 				.ok_or(Error::<T>::LocationConversionFailed)?;
 
 			if !ForeignToNativeId::<T>::contains_key(token_id) {
-				NativeToForeignId::<T>::insert(location.clone(), token_id);
-				ForeignToNativeId::<T>::insert(token_id, location.clone());
+				ForeignToNativeId::<T>::insert(token_id, VersionedLocation::from(location.clone()));
 			}
 
 			let command = Command::RegisterForeignToken {
@@ -257,10 +256,10 @@ pub mod pallet {
 
 	impl<T: Config> MaybeEquivalence<TokenId, Location> for Pallet<T> {
 		fn convert(foreign_id: &TokenId) -> Option<Location> {
-			ForeignToNativeId::<T>::get(foreign_id)
+			snowbridge_pallet_system::Pallet::<T>::convert(foreign_id)
 		}
 		fn convert_back(location: &Location) -> Option<TokenId> {
-			NativeToForeignId::<T>::get(location)
+			snowbridge_pallet_system::Pallet::<T>::convert_back(location)
 		}
 	}
 }
