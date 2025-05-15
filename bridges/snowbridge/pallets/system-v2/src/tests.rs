@@ -137,7 +137,7 @@ fn register_all_tokens_succeeds() {
 
 			assert_eq!(
 				ForeignToNativeId::<Test>::get(foreign_token_id),
-				Some(VersionedLocation::from(reanchored_location.clone()))
+				Some(reanchored_location.clone())
 			);
 
 			System::assert_last_event(RuntimeEvent::EthereumSystemV2(
