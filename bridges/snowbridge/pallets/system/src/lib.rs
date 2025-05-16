@@ -52,7 +52,7 @@ use snowbridge_outbound_queue_primitives::{
 };
 use sp_core::{RuntimeDebug, H160, H256};
 use sp_io::hashing::blake2_256;
-use sp_runtime::{traits::MaybeEquivalence, DispatchError, SaturatedConversion};
+use sp_runtime::{traits::MaybeConvert, DispatchError, SaturatedConversion};
 use sp_std::prelude::*;
 use xcm::prelude::*;
 use xcm_executor::traits::ConvertLocation;
@@ -529,13 +529,10 @@ pub mod pallet {
 		}
 	}
 
-	impl<T: Config> MaybeEquivalence<TokenId, Location> for Pallet<T> {
-		fn convert(foreign_id: &TokenId) -> Option<Location> {
+	impl<T: Config> MaybeConvert<TokenId, Location> for Pallet<T> {
+		fn maybe_convert(foreign_id: TokenId) -> Option<Location> {
 			ForeignToNativeId::<T>::get(foreign_id)
 				.and_then(|versioned_location| versioned_location.try_into().ok())
-		}
-		fn convert_back(_: &Location) -> Option<TokenId> {
-			None
 		}
 	}
 }
