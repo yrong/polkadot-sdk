@@ -393,11 +393,9 @@ pub(crate) mod migrations {
 		fn on_runtime_upgrade() -> Weight {
 			let mut weight = T::DbWeight::get().reads(1);
 
-			let translate_westend = |pre: xcm::v4::Location| -> Option<VersionedLocation> {
+			let translate_westend = |pre: xcm::v4::Location| -> Option<xcm::v5::Location> {
 				weight.saturating_accrue(T::DbWeight::get().reads_writes(1, 1));
-				Some(VersionedLocation::V5(
-					xcm::v5::Location::try_from(pre).expect("valid location"),
-				))
+				Some(xcm::v5::Location::try_from(pre).expect("valid location"))
 			};
 			snowbridge_pallet_system::ForeignToNativeId::<T>::translate_values(translate_westend);
 

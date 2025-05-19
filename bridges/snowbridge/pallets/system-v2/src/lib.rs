@@ -200,7 +200,7 @@ pub mod pallet {
 				.ok_or(Error::<T>::LocationConversionFailed)?;
 
 			if !ForeignToNativeId::<T>::contains_key(token_id) {
-				ForeignToNativeId::<T>::insert(token_id, VersionedLocation::from(location.clone()));
+				ForeignToNativeId::<T>::insert(token_id, location.clone());
 			}
 
 			let command = Command::RegisterForeignToken {
