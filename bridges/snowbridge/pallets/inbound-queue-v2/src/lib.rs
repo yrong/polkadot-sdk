@@ -38,6 +38,7 @@ mod test;
 pub use crate::weights::WeightInfo;
 use frame_system::ensure_signed;
 use snowbridge_core::{
+	reward::{AddTip, AddTipError},
 	sparse_bitmap::{SparseBitmap, SparseBitmapImpl},
 	BasicOperatingMode,
 };
@@ -190,6 +191,12 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type OperatingMode<T: Config> = StorageValue<_, BasicOperatingMode, ValueQuery>;
 
+	/// Keep track of tips added for a message as an additional relayer incentivization. The
+	/// key for the storage map is the nonce of the message to which the tip should be added.
+	/// The value is the tip amount, in Ether.
+	#[pallet::storage]
+	pub type Tips<T: Config> = StorageMap<_, Blake2_128Concat, u64, u128, OptionQuery>;
+
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		/// Submit an inbound message originating from the Gateway contract on Ethereum
@@ -286,6 +293,19 @@ pub mod pallet {
 				SendError::Fees
 			})?;
 			T::XcmSender::deliver(ticket)
+		}
+	}
+
+	impl<T: Config> AddTip for Pallet<T> {
+		fn add_tip(nonce: u64, amount: u128) -> Result<(), AddTipError> {
+			ensure!(amount > 0, AddTipError::AmountZero);
+			// If the nonce is already processed, return an error
+			ensure!(!Nonce::<T>::get(nonce.into()), AddTipError::NonceConsumed);
+			// Otherwise add the tip.
+			Tips::<T>::mutate(nonce, |tip| {
+				*tip = Some(tip.unwrap_or_default().saturating_add(amount));
+			});
+			return Ok(())
 		}
 	}
 }
