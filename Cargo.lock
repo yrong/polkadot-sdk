@@ -21709,6 +21709,7 @@ dependencies = [
  "frame-support",
  "frame-system",
  "log",
+ "pallet-asset-conversion",
  "pallet-balances",
  "pallet-xcm",
  "parity-scale-codec",
@@ -21717,6 +21718,7 @@ dependencies = [
  "snowbridge-test-utils",
  "sp-core 36.1.0",
  "sp-io 40.0.1",
+ "sp-keyring",
  "sp-runtime 41.1.0",
  "sp-std 14.0.0",
  "staging-xcm",
@@ -21826,11 +21828,13 @@ dependencies = [
 name = "snowbridge-test-utils"
 version = "0.2.1"
 dependencies = [
+ "bp-relayers",
  "frame-benchmarking",
  "frame-support",
  "frame-system",
  "hex",
  "log",
+ "pallet-asset-conversion",
  "pallet-xcm",
  "parity-scale-codec",
  "scale-info",

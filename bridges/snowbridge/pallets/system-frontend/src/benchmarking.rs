@@ -5,10 +5,11 @@ use super::*;
 #[allow(unused)]
 use crate::Pallet as SnowbridgeControlFrontend;
 use frame_benchmarking::v2::*;
+use frame_system::RawOrigin;
 use xcm::prelude::{Location, *};
 use xcm_executor::traits::ConvertLocation;
 
-#[benchmarks]
+#[benchmarks(where <T as frame_system::Config>::AccountId: Into<Location>)]
 mod benchmarks {
 	use super::*;
 	#[benchmark]
@@ -34,6 +35,23 @@ mod benchmarks {
 
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, asset_id, asset_metadata, fee_asset);
+
+		Ok(())
+	}
+
+	#[benchmark]
+	fn add_tip() -> Result<(), BenchmarkError> {
+		let caller: T::AccountId = whitelisted_caller();
+
+		let ether = T::EthereumLocation::get();
+		T::Helper::setup_pools(caller.clone(), ether.clone());
+
+		let message_id = MessageId::Inbound(1);
+		let dot = Location::new(1, Here);
+		let asset = Asset::from((dot, 1_000_000_00u128));
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller.clone()), message_id, asset);
 
 		Ok(())
 	}

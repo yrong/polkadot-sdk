@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
-use crate::{mock::*, Error};
+use crate::{mock::*, DispatchError::Other, Error};
 use frame_support::{assert_err, assert_noop, assert_ok};
 use frame_system::RawOrigin;
-use snowbridge_core::{AssetMetadata, BasicOperatingMode};
+use snowbridge_core::{reward::MessageId, AssetMetadata, BasicOperatingMode};
+use snowbridge_test_utils::mock_swap_executor::TRIGGER_SWAP_ERROR_AMOUNT;
+use sp_keyring::sr25519::Keyring;
 use xcm::{
-	latest::{Assets, Error as XcmError, Location},
-	prelude::{GeneralIndex, Parachain, SendError},
+	latest::Error as XcmError,
+	prelude::{
+		Asset, AssetId, AssetInstance, Assets, Fungibility, GeneralIndex, Location, Parachain,
+		SendError,
+	},
 	VersionedLocation,
 };
 
@@ -142,8 +147,6 @@ fn test_switch_operating_mode() {
 		assert_ok!(EthereumSystemFrontend::register_token(origin, asset_id, asset_metadata, asset));
 	});
 }
-<<<<<<< HEAD
-=======
 
 #[test]
 fn add_tip_ether_asset_succeeds() {
@@ -289,4 +292,3 @@ fn register_token_with_non_ether_fee_asset_succeeds() {
 		));
 	});
 }
->>>>>>> 36c3039 (Snowbridge: enforce fee when registering Polkadot native asset (#8725))

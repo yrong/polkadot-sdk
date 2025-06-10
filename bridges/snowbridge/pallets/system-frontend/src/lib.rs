@@ -26,8 +26,10 @@ pub use backend_weights::*;
 
 use frame_support::{pallet_prelude::*, traits::EnsureOriginWithArg};
 use frame_system::pallet_prelude::*;
+use pallet_asset_conversion::Swap;
 use snowbridge_core::{
-	operating_mode::ExportPausedQuery, AssetMetadata, BasicOperatingMode as OperatingMode,
+	burn_for_teleport, operating_mode::ExportPausedQuery, reward::MessageId, AssetMetadata,
+	BasicOperatingMode as OperatingMode,
 };
 use sp_std::prelude::*;
 use xcm::{
@@ -40,20 +42,20 @@ use xcm_executor::traits::{FeeManager, FeeReason, TransactAsset};
 use frame_support::traits::OriginTrait;
 
 pub use pallet::*;
-
+pub type AccountIdOf<T> = <T as frame_system::Config>::AccountId;
 pub const LOG_TARGET: &str = "snowbridge-system-frontend";
 
 /// Call indices within BridgeHub runtime for dispatchables within `snowbridge-pallet-system-v2`
 #[allow(clippy::large_enum_variant)]
 #[derive(Encode, Decode, Debug, PartialEq, Clone, TypeInfo)]
-pub enum BridgeHubRuntime {
+pub enum BridgeHubRuntime<T: frame_system::Config> {
 	#[codec(index = 90)]
-	EthereumSystem(EthereumSystemCall),
+	EthereumSystem(EthereumSystemCall<T>),
 }
 
 /// Call indices for dispatchables within `snowbridge-pallet-system-v2`
 #[derive(Encode, Decode, Debug, PartialEq, Clone, TypeInfo)]
-pub enum EthereumSystemCall {
+pub enum EthereumSystemCall<T: frame_system::Config> {
 	#[codec(index = 2)]
 	RegisterToken {
 		sender: Box<VersionedLocation>,
@@ -61,15 +63,18 @@ pub enum EthereumSystemCall {
 		metadata: AssetMetadata,
 		amount: u128,
 	},
+	#[codec(index = 3)]
+	AddTip { sender: AccountIdOf<T>, message_id: MessageId, amount: u128 },
 }
 
 #[cfg(feature = "runtime-benchmarks")]
-pub trait BenchmarkHelper<O>
+pub trait BenchmarkHelper<O, AccountId>
 where
 	O: OriginTrait,
 {
 	fn make_xcm_origin(location: Location) -> O;
 	fn initialize_storage(asset_location: Location, asset_owner: Location);
+	fn setup_pools(caller: AccountId, asset: Location);
 }
 
 #[frame_support::pallet]
@@ -102,6 +107,9 @@ pub mod pallet {
 		/// Fee asset for the execution cost on ethereum
 		type EthereumLocation: Get<Location>;
 
+		/// To swap the provided tip asset for
+		type Swap: Swap<Self::AccountId, AssetKind = Location, Balance = u128>;
+
 		/// Location of bridge hub
 		type BridgeHubLocation: Get<Location>;
 
@@ -121,7 +129,7 @@ pub mod pallet {
 
 		/// A set of helper functions for benchmarking.
 		#[cfg(feature = "runtime-benchmarks")]
-		type Helper: BenchmarkHelper<Self::RuntimeOrigin>;
+		type Helper: BenchmarkHelper<Self::RuntimeOrigin, Self::AccountId>;
 	}
 
 	#[pallet::event]
@@ -155,6 +163,18 @@ pub mod pallet {
 		/// The desired destination was unreachable, generally because there is a no way of routing
 		/// to it.
 		Unreachable,
+		/// The asset provided for the tip is unsupported.
+		UnsupportedAsset,
+		/// Unable to withdraw asset.
+		WithdrawError,
+		/// Account could not be converted to a location.
+		InvalidAccount,
+		/// Provided tip asset could not be swapped for ether.
+		SwapError,
+		/// Ether could not be burned.
+		BurnError,
+		/// The tip provided is zero.
+		TipAmountZero,
 	}
 
 	impl<T: Config> From<SendError> for Error<T> {
@@ -173,7 +193,10 @@ pub mod pallet {
 	pub type ExportOperatingMode<T: Config> = StorageValue<_, OperatingMode, ValueQuery>;
 
 	#[pallet::call]
-	impl<T: Config> Pallet<T> {
+	impl<T: Config> Pallet<T>
+	where
+		<T as frame_system::Config>::AccountId: Into<Location>,
+	{
 		/// Set the operating mode for exporting messages to Ethereum.
 		#[pallet::call_index(0)]
 		#[pallet::weight((T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational))]
@@ -227,8 +250,6 @@ pub mod pallet {
 
 			Self::send_transact_call(origin_location, call)
 		}
-<<<<<<< HEAD
-=======
 
 		/// Add an additional relayer tip for a committed message identified by `message_id`.
 		/// The tip asset will be swapped for ether.
@@ -250,7 +271,6 @@ pub mod pallet {
 			let call = Self::build_add_tip_call(who.clone(), message_id.clone(), ether_gained);
 			Self::send_transact_call(who.into(), call)
 		}
->>>>>>> 36c3039 (Snowbridge: enforce fee when registering Polkadot native asset (#8725))
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -264,8 +284,6 @@ pub mod pallet {
 			T::XcmSender::deliver(ticket)
 		}
 
-<<<<<<< HEAD
-=======
 		/// Swaps a specified tip asset to Ether and then burns the resulting ether for
 		/// teleportation. Returns the amount of Ether gained if successful, or a DispatchError if
 		/// any step fails.
@@ -298,18 +316,13 @@ pub mod pallet {
 			Ok(ether_gained)
 		}
 
->>>>>>> 36c3039 (Snowbridge: enforce fee when registering Polkadot native asset (#8725))
 		// Build the call to dispatch the `EthereumSystem::register_token` extrinsic on BH
 		fn build_register_token_call(
 			sender: Location,
 			asset: Location,
 			metadata: AssetMetadata,
-<<<<<<< HEAD
-		) -> Result<BridgeHubRuntime, Error<T>> {
-=======
 			amount: u128,
 		) -> Result<BridgeHubRuntime<T>, Error<T>> {
->>>>>>> 36c3039 (Snowbridge: enforce fee when registering Polkadot native asset (#8725))
 			// reanchor locations relative to BH
 			let sender = Self::reanchored(sender)?;
 			let asset = Self::reanchored(asset)?;
@@ -322,6 +335,19 @@ pub mod pallet {
 			});
 
 			Ok(call)
+		}
+
+		// Build the call to dispatch the `EthereumSystem::add_tip` extrinsic on BH
+		fn build_add_tip_call(
+			sender: AccountIdOf<T>,
+			message_id: MessageId,
+			amount: u128,
+		) -> BridgeHubRuntime<T> {
+			BridgeHubRuntime::EthereumSystem(EthereumSystemCall::AddTip {
+				sender,
+				message_id,
+				amount,
+			})
 		}
 
 		fn build_remote_xcm(call: &impl Encode) -> Xcm<()> {

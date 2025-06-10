@@ -59,4 +59,29 @@ impl<T: frame_system::Config> snowbridge_pallet_system_frontend::WeightInfo for 
 			.saturating_add(T::DbWeight::get().reads(5_u64))
 			.saturating_add(T::DbWeight::get().writes(3_u64))
 	}
+
+	/// Storage: UNKNOWN KEY `0x1b38344db996cce0ee20ee2bfb1848ff` (r:1 w:0)
+	/// Proof: UNKNOWN KEY `0x1b38344db996cce0ee20ee2bfb1848ff` (r:1 w:0)
+	/// Storage: `System::Account` (r:1 w:1)
+	/// Proof: `System::Account` (`max_values`: None, `max_size`: Some(128), added: 2603, mode: `MaxEncodedLen`)
+	/// Storage: `ForeignAssets::Asset` (r:1 w:1)
+	/// Proof: `ForeignAssets::Asset` (`max_values`: None, `max_size`: Some(808), added: 3283, mode: `MaxEncodedLen`)
+	/// Storage: `ForeignAssets::Account` (r:2 w:2)
+	/// Proof: `ForeignAssets::Account` (`max_values`: None, `max_size`: Some(732), added: 3207, mode: `MaxEncodedLen`)
+	/// Storage: `ForeignAssetsFreezer::FrozenBalances` (r:2 w:1)
+	/// Proof: `ForeignAssetsFreezer::FrozenBalances` (`max_values`: None, `max_size`: Some(682), added: 3157, mode: `MaxEncodedLen`)
+	/// Storage: `ParachainInfo::ParachainId` (r:1 w:0)
+	/// Proof: `ParachainInfo::ParachainId` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+	/// Storage: `ForeignAssetsFreezer::Freezes` (r:1 w:1)
+	/// Proof: `ForeignAssetsFreezer::Freezes` (`max_values`: None, `max_size`: Some(685), added: 3160, mode: `MaxEncodedLen`)
+	fn add_tip() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `685`
+		//  Estimated: `7404`
+		// Minimum execution time: 136_000_000 picoseconds.
+		Weight::from_parts(139_000_000, 0)
+			.saturating_add(Weight::from_parts(0, 7404))
+			.saturating_add(T::DbWeight::get().reads(9))
+			.saturating_add(T::DbWeight::get().writes(6))
+	}
 }
