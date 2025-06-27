@@ -317,8 +317,8 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 			let mut task_manager = params.task_manager;
 
 			// Resolve parachain id based on runtime, or based on chain spec.
-			let para_id = Self::parachain_id(&client, &parachain_config)
-				.ok_or("Failed to retrieve the parachain id")?;
+			let para_id =
+				Self::parachain_id(&client, &parachain_config).unwrap_or(ParaId::from(1000));
 			let relay_chain_fork_id = polkadot_config.chain_spec.fork_id().map(ToString::to_string);
 			let (relay_chain_interface, collator_key, relay_chain_network, paranode_rx) =
 				build_relay_chain_interface(
