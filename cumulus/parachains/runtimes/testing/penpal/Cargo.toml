@@ -29,6 +29,7 @@ cumulus-primitives-core.workspace = true
 cumulus-primitives-utility.workspace = true
 frame-benchmarking = { optional = true, workspace = true }
 frame-executive.workspace = true
+frame-metadata-hash-extension.workspace = true
 frame-support.workspace = true
 frame-system-benchmarking = { optional = true, workspace = true }
 frame-system-rpc-runtime-api.workspace = true
@@ -50,6 +51,7 @@ pallet-sudo.workspace = true
 pallet-timestamp.workspace = true
 pallet-transaction-payment-rpc-runtime-api.workspace = true
 pallet-transaction-payment.workspace = true
+pallet-utility.workspace = true
 pallet-xcm.workspace = true
 parachain-info.workspace = true
 parachains-common.workspace = true
@@ -97,6 +99,7 @@ std = [
 	"cumulus-primitives-utility/std",
 	"frame-benchmarking?/std",
 	"frame-executive/std",
+	"frame-metadata-hash-extension/std",
 	"frame-support/std",
 	"frame-system-benchmarking?/std",
 	"frame-system-rpc-runtime-api/std",
