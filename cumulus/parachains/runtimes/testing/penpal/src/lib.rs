@@ -719,14 +719,16 @@ impl pallet_message_queue::Config for Runtime {
 impl cumulus_pallet_aura_ext::Config for Runtime {}
 
 parameter_types! {
-	/// The asset ID for the asset that we use to pay for message delivery fees.
+	/// The asset ID for the asset that we use to pay for message delivery fees to the relay chain.
 	pub FeeAssetId: AssetLocationId = AssetLocationId(xcm_config::RelayLocation::get());
+	/// The asset ID for the asset that we use to pay for message delivery fees to sibling chains.
+	pub NativeFeeAssetId: AssetLocationId = AssetLocationId(xcm_config::PenpalNativeCurrency::get());
 	/// The base fee for the message delivery fees (3 CENTS).
 	pub const BaseDeliveryFee: u128 = (1_000_000_000_000u128 / 100).saturating_mul(3);
 }
 
 pub type PriceForSiblingParachainDelivery = polkadot_runtime_common::xcm_sender::ExponentialPrice<
-	FeeAssetId,
+	NativeFeeAssetId,
 	BaseDeliveryFee,
 	TransactionByteFee,
 	XcmpQueue,
