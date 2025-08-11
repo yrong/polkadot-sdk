@@ -41,7 +41,8 @@ impl<T: Config> Pallet<T> {
 		receipt_proof: &[Vec<u8>],
 		log: &Log,
 	) -> Result<(), VerificationError> {
-		let receipt = verify_receipt_proof(receipts_root, receipt_proof).ok_or(InvalidProof)?;
+		let receipt =
+			verify_receipt_proof(receipts_root, receipt_proof).map_err(|_| InvalidProof)?;
 		if !receipt.logs().iter().any(|l| {
 			l.data.data.0 == log.data &&
 				l.address.0 == log.address.0 &&
