@@ -33,6 +33,11 @@ ssz_rs_derive = { workspace = true }
 
 milagro-bls = { workspace = true }
 snowbridge-ethereum = { workspace = true }
+alloy-consensus = { workspace = true }
+alloy-core = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-trie = { workspace = true }
 
 [dev-dependencies]
 hex-literal = { workspace = true, default-features = true }
@@ -40,18 +45,23 @@ hex-literal = { workspace = true, default-features = true }
 [features]
 default = ["std"]
 std = [
-	"byte-slice-cast/std",
-	"codec/std",
-	"frame-support/std",
-	"hex/std",
-	"milagro-bls/std",
-	"rlp/std",
-	"scale-info/std",
-	"serde",
-	"snowbridge-ethereum/std",
-	"sp-core/std",
-	"sp-io/std",
-	"sp-runtime/std",
-	"sp-std/std",
-	"ssz_rs/std",
+    "alloy-consensus/std",
+    "alloy-core/std",
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "alloy-trie/std",
+    "byte-slice-cast/std",
+    "codec/std",
+    "frame-support/std",
+    "hex/std",
+    "milagro-bls/std",
+    "rlp/std",
+    "scale-info/std",
+    "serde",
+    "snowbridge-ethereum/std",
+    "sp-core/std",
+    "sp-io/std",
+    "sp-runtime/std",
+    "sp-std/std",
+    "ssz_rs/std",
 ]

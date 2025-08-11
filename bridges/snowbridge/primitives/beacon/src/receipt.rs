@@ -1,37 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
-use snowbridge_ethereum::{mpt, Decodable, ReceiptEnvelope};
-use sp_core::H256;
-use sp_io::hashing::keccak_256;
+use alloy_consensus::ReceiptEnvelope;
+use alloy_primitives::{Bytes, B256};
+use alloy_rlp::Decodable;
+use alloy_trie::{nodes::LeafNode, proof};
+use snowbridge_ethereum::mpt;
+use sp_core::{keccak_256, H256};
 use sp_std::prelude::*;
 
-pub fn verify_receipt_proof(receipts_root: H256, values: &[Vec<u8>]) -> Option<ReceiptEnvelope> {
-	match apply_merkle_proof(values) {
-		Some((root, data)) if root == receipts_root =>
-			ReceiptEnvelope::decode(&mut data.as_slice()).ok(),
-		Some((_, _)) => None,
-		None => None,
-	}
-}
-
-fn apply_merkle_proof(proof: &[Vec<u8>]) -> Option<(H256, Vec<u8>)> {
-	let mut iter = proof.iter().rev();
+pub fn verify_receipt_proof(receipts_root: H256, proofs: &[Vec<u8>]) -> Option<ReceiptEnvelope> {
+	let mut iter = proofs.iter().rev();
 	let first_bytes = match iter.next() {
 		Some(b) => b,
 		None => return None,
 	};
-	let item_to_prove: mpt::ShortNode = rlp::decode(first_bytes).ok()?;
+	let item_to_prove: LeafNode = LeafNode::decode(&mut first_bytes.as_slice()).ok()?;
+	let key = item_to_prove.key;
+	let value = item_to_prove.value;
 
-	let final_hash: Option<[u8; 32]> = iter.try_fold(keccak_256(first_bytes), |acc, x| {
-		let node: Box<dyn mpt::Node> = x.as_slice().try_into().ok()?;
-		if (*node).contains_hash(acc.into()) {
-			return Some(keccak_256(x))
-		}
-		None
-	});
+	let raw_receipt_root: B256 = B256::from(receipts_root.0);
 
-	final_hash.map(|hash| (hash.into(), item_to_prove.value))
+	let proofs_without_value = proofs[0..proofs.len() - 1].to_vec();
+	let raw_proofs: Vec<Bytes> =
+		proofs_without_value.iter().map(|p| Bytes::from(p.clone())).collect();
+
+	proof::verify_proof(raw_receipt_root.into(), key, Some(value.clone()), &raw_proofs).ok();
+
+	ReceiptEnvelope::decode(&mut value.as_slice()).ok()
 }
+
+// pub fn verify_receipt_proof(receipts_root: H256, values: &[Vec<u8>]) -> Option<ReceiptEnvelope> {
+// 	match apply_merkle_proof(values) {
+// 		Some((root, data)) if root == receipts_root =>
+// 			ReceiptEnvelope::decode(&mut data.as_slice()).ok(),
+// 		Some((_, _)) => None,
+// 		None => None,
+// 	}
+// }
+//
+// fn apply_merkle_proof(proof: &[Vec<u8>]) -> Option<(H256, Vec<u8>)> {
+// 	let mut iter = proof.iter().rev();
+// 	let first_bytes = match iter.next() {
+// 		Some(b) => b,
+// 		None => return None,
+// 	};
+// 	let item_to_prove: mpt::ShortNode = rlp::decode(first_bytes).ok()?;
+//
+// 	let final_hash: Option<[u8; 32]> = iter.try_fold(keccak_256(first_bytes), |acc, x| {
+// 		let node: Box<dyn mpt::Node> = x.as_slice().try_into().ok()?;
+// 		if (*node).contains_hash(acc.into()) {
+// 			return Some(keccak_256(x))
+// 		}
+// 		None
+// 	});
+//
+// 	final_hash.map(|hash| (hash.into(), item_to_prove.value))
+// }
 
 #[cfg(test)]
 mod tests {
