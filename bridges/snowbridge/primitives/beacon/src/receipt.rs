@@ -4,7 +4,7 @@ use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Bytes, B256};
 use alloy_rlp::{Decodable, Error as RlpError};
 use alloy_trie::{
-	nodes::{LeafNode, RlpNode, TrieNode},
+	nodes::{LeafNode, LeafNodeRef, RlpNode, TrieNode},
 	proof,
 	proof::ProofVerificationError,
 };
@@ -36,6 +36,8 @@ pub fn verify_receipt_proof(
 	}
 	.ok_or(Error::TrieNode)?;
 
+	// let item_to_prove = LeafNode::decode(&mut first_bytes.as_slice()).map_err(Error::Decode)?;
+
 	let key = item_to_prove.key;
 	let value = item_to_prove.value;
 
@@ -47,33 +49,33 @@ pub fn verify_receipt_proof(
 	ReceiptEnvelope::decode(&mut value.as_slice()).map_err(Error::Decode)
 }
 
-// pub fn verify_receipt_proof(receipts_root: H256, values: &[Vec<u8>]) -> Option<ReceiptEnvelope> {
-// 	match apply_merkle_proof(values) {
-// 		Some((root, data)) if root == receipts_root =>
-// 			ReceiptEnvelope::decode(&mut data.as_slice()).ok(),
-// 		Some((_, _)) => None,
-// 		None => None,
-// 	}
-// }
-//
-// fn apply_merkle_proof(proof: &[Vec<u8>]) -> Option<(H256, Vec<u8>)> {
-// 	let mut iter = proof.iter().rev();
-// 	let first_bytes = match iter.next() {
-// 		Some(b) => b,
-// 		None => return None,
-// 	};
-// 	let item_to_prove: mpt::ShortNode = rlp::decode(first_bytes).ok()?;
-//
-// 	let final_hash: Option<[u8; 32]> = iter.try_fold(keccak_256(first_bytes), |acc, x| {
-// 		let node: Box<dyn mpt::Node> = x.as_slice().try_into().ok()?;
-// 		if (*node).contains_hash(acc.into()) {
-// 			return Some(keccak_256(x))
-// 		}
-// 		None
-// 	});
-//
-// 	final_hash.map(|hash| (hash.into(), item_to_prove.value))
-// }
+pub fn verify_receipt_proof_2(receipts_root: H256, values: &[Vec<u8>]) -> Option<ReceiptEnvelope> {
+	match apply_merkle_proof(values) {
+		Some((root, data)) if root == receipts_root =>
+			ReceiptEnvelope::decode(&mut data.as_slice()).ok(),
+		Some((_, _)) => None,
+		None => None,
+	}
+}
+
+fn apply_merkle_proof(proof: &[Vec<u8>]) -> Option<(H256, Vec<u8>)> {
+	let mut iter = proof.iter().rev();
+	let first_bytes = match iter.next() {
+		Some(b) => b,
+		None => return None,
+	};
+	let item_to_prove: mpt::ShortNode = rlp::decode(first_bytes).ok()?;
+
+	let final_hash: Option<[u8; 32]> = iter.try_fold(keccak_256(first_bytes), |acc, x| {
+		let node: Box<dyn mpt::Node> = x.as_slice().try_into().ok()?;
+		if (*node).contains_hash(acc.into()) {
+			return Some(keccak_256(x))
+		}
+		None
+	});
+
+	final_hash.map(|hash| (hash.into(), item_to_prove.value))
+}
 
 #[cfg(test)]
 mod tests {
