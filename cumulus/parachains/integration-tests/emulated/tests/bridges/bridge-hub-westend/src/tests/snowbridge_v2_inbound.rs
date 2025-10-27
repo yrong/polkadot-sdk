@@ -15,9 +15,10 @@
 use crate::{
 	imports::*,
 	tests::snowbridge_common::{
-		erc20_token_location, eth_location, fund_on_ah, fund_on_bh, register_assets_on_ah,
-		register_foreign_asset, set_up_eth_and_dot_pool, set_up_eth_and_dot_pool_on_penpal,
-		snowbridge_sovereign, weth_location, ETHEREUM_DESTINATION_ADDRESS,
+		asset_hub, erc20_token_location, eth_location, ethereum, ethereum_user_location,
+		fund_on_ah, fund_on_bh, register_assets_on_ah, register_foreign_asset,
+		set_up_eth_and_dot_pool, set_up_eth_and_dot_pool_on_penpal, snowbridge_sovereign,
+		weth_location, ETHEREUM_DESTINATION_ADDRESS,
 	},
 };
 use asset_hub_westend_runtime::ForeignAssets;
@@ -38,10 +39,14 @@ use snowbridge_inbound_queue_primitives::v2::{
 	EthereumAsset::{ForeignTokenERC20, NativeTokenERC20},
 	Message, Network, XcmPayload,
 };
+use snowbridge_outbound_queue_primitives::v2::ContractCall;
 use sp_core::{H160, H256};
 use sp_io::hashing::blake2_256;
 use sp_runtime::MultiAddress;
-use xcm::opaque::latest::{AssetTransferFilter, AssetTransferFilter::ReserveDeposit};
+use xcm::{
+	latest::Junctions::*,
+	opaque::latest::{AssetTransferFilter, AssetTransferFilter::ReserveDeposit},
+};
 use xcm_executor::traits::ConvertLocation;
 
 const TOKEN_AMOUNT: u128 = 100_000_000_000;
@@ -1335,6 +1340,239 @@ fn send_usdc_from_asset_hub_to_ethereum() {
 			vec![
 				RuntimeEvent::EthereumOutboundQueueV2(snowbridge_pallet_outbound_queue_v2::Event::MessageQueued{ .. }) => {},
 			]
+		);
+	});
+}
+
+#[test]
+fn send_token_to_penpal_and_bridge_back() {
+	let relayer_account = BridgeHubWestendSender::get();
+	let relayer_reward = 1_500_000_000_000u128;
+
+	let beneficiary_acc_id: H256 = H256::random();
+	let beneficiary_acc_bytes: [u8; 32] = beneficiary_acc_id.into();
+	let beneficiary =
+		Location::new(0, AccountId32 { network: None, id: beneficiary_acc_id.into() });
+
+	let claimer_acc_id = H256::random();
+	let claimer = AccountId32 { network: None, id: claimer_acc_id.into() };
+	let claimer_bytes = claimer.encode();
+
+	// To pay fees on Penpal.
+	let eth_fee_penpal_ah: xcm::prelude::Asset = (eth_location(), 3_000_000_000_000u128).into();
+
+	// To satisfy ED
+	PenpalB::fund_accounts(vec![(
+		sp_runtime::AccountId32::from(beneficiary_acc_bytes),
+		3_000_000_000_000,
+	)]);
+
+	let snowbridge_sovereign = snowbridge_sovereign();
+	PenpalB::execute_with(|| {
+		type RuntimeOrigin = <PenpalB as Chain>::RuntimeOrigin;
+
+		// Register eth on Penpal
+		assert_ok!(<PenpalB as PenpalBPallet>::ForeignAssets::force_create(
+			RuntimeOrigin::root(),
+			eth_location().try_into().unwrap(),
+			snowbridge_sovereign.clone().into(),
+			true,
+			1000,
+		));
+
+		assert!(<PenpalB as PenpalBPallet>::ForeignAssets::asset_exists(
+			eth_location().try_into().unwrap(),
+		));
+
+		assert_ok!(<PenpalB as Chain>::System::set_storage(
+			<PenpalB as Chain>::RuntimeOrigin::root(),
+			vec![(
+				PenpalCustomizableAssetFromSystemAssetHub::key().to_vec(),
+				Location::new(2, [GlobalConsensus(Ethereum { chain_id: SEPOLIA_ID })]).encode(),
+			)],
+		));
+	});
+
+	set_up_eth_and_dot_pool();
+	set_up_eth_and_dot_pool_on_penpal();
+
+	let remote_fee_amount_on_ah = 1_000_000_000_000_000u128;
+	let remote_fee_amount_on_ethereum = 1_000_000_000_000_000u128;
+	let extra_amount = 1_000_000_000_000_000u128;
+	let total_amount = remote_fee_amount_on_ah + remote_fee_amount_on_ethereum + extra_amount;
+
+	let eth_asset: Asset = (eth_location(), total_amount).into();
+	let remote_fee_asset_on_ah: Asset = (eth_location(), remote_fee_amount_on_ah).into();
+	let remote_fee_asset_on_ethereum: Asset =
+		(eth_location(), remote_fee_amount_on_ethereum).into();
+	let extra_asset_to_ethereum: Asset = (eth_location(), extra_amount).into();
+
+	let assets = vec![];
+
+	let transact_info =
+		ContractCall::V1 { target: Default::default(), calldata: vec![], gas: 40000, value: 0 };
+
+	BridgeHubWestend::execute_with(|| {
+		type RuntimeEvent = <BridgeHubWestend as Chain>::RuntimeEvent;
+		let instructions = vec![
+			// Send message to Penpal
+			InitiateTransfer {
+				destination: Location::new(1, [Parachain(PARA_ID_B)]),
+				remote_fees: Some(ReserveDeposit(Definite(vec![eth_fee_penpal_ah.clone()].into()))),
+				preserve_origin: true,
+				assets: BoundedVec::truncate_from(vec![ReserveDeposit(Definite(
+					vec![eth_asset.clone()].into(),
+				))]),
+				remote_xcm: vec![InitiateTransfer {
+					destination: asset_hub(),
+					remote_fees: Some(AssetTransferFilter::ReserveWithdraw(Definite(
+						remote_fee_asset_on_ah.clone().into(),
+					))),
+					preserve_origin: true,
+					assets: BoundedVec::truncate_from(vec![
+						AssetTransferFilter::ReserveWithdraw(Definite(
+							remote_fee_asset_on_ethereum.clone().into(),
+						)),
+						AssetTransferFilter::ReserveWithdraw(Definite(
+							extra_asset_to_ethereum.clone().into(),
+						)),
+					]),
+					remote_xcm: Xcm(vec![InitiateTransfer {
+						destination: ethereum(),
+						remote_fees: Some(AssetTransferFilter::ReserveWithdraw(Definite(
+							remote_fee_asset_on_ethereum.clone().into(),
+						))),
+						preserve_origin: true,
+						assets: BoundedVec::truncate_from(vec![
+							AssetTransferFilter::ReserveWithdraw(Definite(
+								extra_asset_to_ethereum.clone().into(),
+							)),
+						]),
+						remote_xcm: Xcm(vec![
+							DepositAsset {
+								assets: Wild(All),
+								beneficiary: Location::new(
+									0,
+									[AccountKey20 {
+										network: None,
+										key: ETHEREUM_DESTINATION_ADDRESS.into(),
+									}],
+								),
+							},
+							Transact {
+								origin_kind: OriginKind::SovereignAccount,
+								fallback_max_weight: None,
+								call: transact_info.encode().into(),
+							},
+						]),
+					}]),
+				}]
+				.into(),
+			},
+			RefundSurplus,
+			DepositAsset {
+				assets: Wild(AllOf { id: AssetId(eth_location()), fun: WildFungibility::Fungible }),
+				beneficiary,
+			},
+		];
+		let xcm: Xcm<()> = instructions.into();
+		let versioned_message_xcm = VersionedXcm::V5(xcm);
+		let origin = EthereumGatewayAddress::get();
+
+		let message = Message {
+			gateway: origin,
+			nonce: 1,
+			origin: ORIGIN.into(),
+			assets,
+			xcm: XcmPayload::Raw(versioned_message_xcm.encode()),
+			claimer: Some(claimer_bytes),
+			value: total_amount * 2,
+			execution_fee: 1_500_000_000_000u128,
+			relayer_fee: relayer_reward,
+		};
+
+		EthereumInboundQueueV2::process_message(relayer_account.clone(), message).unwrap();
+
+		assert_expected_events!(
+			BridgeHubWestend,
+			vec![
+				RuntimeEvent::XcmpQueue(cumulus_pallet_xcmp_queue::Event::XcmpMessageSent { .. }) => {},
+				// Check that the relayer reward was registered.
+				RuntimeEvent::BridgeRelayers(pallet_bridge_relayers::Event::RewardRegistered { relayer, reward_kind, reward_balance }) => {
+					relayer: *relayer == relayer_account,
+					reward_kind: *reward_kind == BridgeReward::Snowbridge,
+					reward_balance: *reward_balance == relayer_reward,
+				},
+			]
+		);
+	});
+
+	let _penpal_sov_on_ah = AssetHubWestend::sovereign_account_id_of(Location::new(
+		1,
+		[Parachain(PenpalB::para_id().into())],
+	));
+
+	AssetHubWestend::execute_with(|| {
+		type RuntimeEvent = <AssetHubWestend as Chain>::RuntimeEvent;
+		// Check that the assets were issued on AssetHub
+		assert_expected_events!(
+			AssetHubWestend,
+			vec![
+				// Message processed successfully
+				RuntimeEvent::MessageQueue(
+					pallet_message_queue::Event::Processed { success: true, .. }
+				) => {},
+				RuntimeEvent::XcmpQueue(cumulus_pallet_xcmp_queue::Event::XcmpMessageSent { .. }) => {},
+			]
+		);
+
+		let penpal_sovereign_origin =
+			Location::new(1, X1([Parachain(PenpalB::para_id().into())].into()));
+		let target = ethereum_user_location(ORIGIN.into());
+		// `target` adds `penpal_sovereign_origin` as authorized alias which requires to call from
+		// Ethereum or AH support EVM calls directly
+		assert_ok!(<AssetHubWestend as AssetHubWestendPallet>::PolkadotXcm::add_authorized_alias(
+			<AssetHubWestend as Chain>::RuntimeOrigin::signed(target.clone()),
+			Box::new(penpal_sovereign_origin.into()),
+			None
+		));
+	});
+
+	PenpalB::execute_with(|| {
+		type RuntimeEvent = <PenpalB as Chain>::RuntimeEvent;
+
+		assert_expected_events!(
+			PenpalB,
+			vec![
+				// Message processed successfully
+				RuntimeEvent::MessageQueue(
+					pallet_message_queue::Event::Processed { success: true, .. }
+				) => {},
+				RuntimeEvent::XcmpQueue(cumulus_pallet_xcmp_queue::Event::XcmpMessageSent { .. }) => {},
+			]
+		);
+	});
+
+	AssetHubWestend::execute_with(|| {
+		type RuntimeEvent = <AssetHubWestend as Chain>::RuntimeEvent;
+		// Check that the assets were issued on AssetHub
+		assert_expected_events!(
+			AssetHubWestend,
+			vec![
+				// Message processed successfully
+				RuntimeEvent::MessageQueue(
+					pallet_message_queue::Event::Processed { success: true, .. }
+				) => {},
+				RuntimeEvent::XcmpQueue(cumulus_pallet_xcmp_queue::Event::XcmpMessageSent { .. }) => {},
+			]
+		);
+	});
+
+	BridgeHubWestend::execute_with(|| {
+		type RuntimeEvent = <BridgeHubWestend as Chain>::RuntimeEvent;
+		assert_expected_events!(
+			BridgeHubWestend,
+			vec![RuntimeEvent::EthereumOutboundQueueV2(snowbridge_pallet_outbound_queue_v2::Event::MessageQueued{ .. }) => {},]
 		);
 	});
 }

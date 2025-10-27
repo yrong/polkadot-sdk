@@ -424,6 +424,16 @@ pub fn erc20_token_location(token_id: H160) -> Location {
 	)
 }
 
+pub fn ethereum_user_location(address: H160) -> Location {
+	Location::new(
+		2,
+		[
+			GlobalConsensus(EthereumNetwork::get().into()),
+			AccountKey20 { network: None, key: address.into() },
+		],
+	)
+}
+
 // ROC and wROC
 pub(crate) fn roc_at_ah_rococo() -> Location {
 	Parent.into()
