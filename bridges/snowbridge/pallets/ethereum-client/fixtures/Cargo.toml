@@ -32,4 +32,4 @@ std = [
 	"sp-core/std",
 	"sp-std/std",
 ]
-runtime-benchmarks = []
+runtime-benchmarks = ["snowbridge-verification-primitives/runtime-benchmarks"]

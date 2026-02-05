@@ -26,6 +26,7 @@ fn test_submit_happy_path() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -76,6 +77,7 @@ fn test_submit_xcm_invalid_channel() {
 		let event = EventProof {
 			event_log: mock_event_log_invalid_channel(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -101,6 +103,7 @@ fn test_submit_with_invalid_gateway() {
 		let event = EventProof {
 			event_log: mock_event_log_invalid_gateway(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -126,6 +129,7 @@ fn test_submit_with_invalid_nonce() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -159,6 +163,7 @@ fn test_submit_no_funds_to_reward_relayers_just_ignore() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -176,6 +181,7 @@ fn test_set_operating_mode() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -217,6 +223,7 @@ fn test_submit_no_funds_to_reward_relayers_and_ed_preserved() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -233,6 +240,7 @@ fn test_submit_no_funds_to_reward_relayers_and_ed_preserved() {
 		let event = EventProof {
 			event_log,
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},

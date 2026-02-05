@@ -25,6 +25,7 @@ fn test_submit_happy_path() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -56,6 +57,7 @@ fn test_submit_with_invalid_gateway() {
 		let event = EventProof {
 			event_log: mock_event_log_invalid_gateway(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -78,6 +80,7 @@ fn test_submit_verification_fails_with_invalid_proof() {
 		let mut event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -103,6 +106,7 @@ fn test_submit_fails_with_malformed_message() {
 		let event = EventProof {
 			event_log: mock_event_log_invalid_message(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -126,6 +130,7 @@ fn test_using_same_nonce_fails() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -158,6 +163,7 @@ fn test_set_operating_mode() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -209,6 +215,7 @@ fn test_xcm_send_failure() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -239,6 +246,7 @@ fn test_xcm_send_validate_failure() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -264,6 +272,7 @@ fn test_xcm_charge_fees_failure() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -284,6 +293,7 @@ fn test_register_token() {
 		let event = EventProof {
 			event_log: mock_event_log_v2(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},
@@ -301,6 +311,7 @@ fn test_switch_operating_mode() {
 		let event = EventProof {
 			event_log: mock_event_log(),
 			proof: Proof {
+				receipt_index: 0,
 				receipt_proof: Default::default(),
 				execution_proof: mock_execution_proof(),
 			},

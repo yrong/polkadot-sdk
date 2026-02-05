@@ -9,6 +9,11 @@ use snowbridge_beacon_primitives::{BeaconHeader, ExecutionProof};
 use sp_core::{H160, H256};
 use sp_std::prelude::*;
 
+pub mod receipt;
+
+#[cfg(any(feature = "runtime-benchmarks", feature = "std", test))]
+pub mod receipt_helper;
+
 /// A trait for verifying inbound messages from Ethereum.
 pub trait Verifier {
 	fn verify(event: &Log, proof: &Proof) -> Result<(), VerificationError>;
@@ -49,6 +54,8 @@ pub struct Log {
 /// Inclusion proof for a transaction receipt
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Debug, TypeInfo)]
 pub struct Proof {
+	// Receipt index in the block (trie key)
+	pub receipt_index: u64,
 	// Proof values from receipts tree
 	pub receipt_proof: Vec<Vec<u8>>,
 	// Proof that an execution header was finalized by the beacon chain
