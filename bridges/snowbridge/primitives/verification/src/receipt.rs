@@ -9,10 +9,10 @@ use sp_std::prelude::*;
 
 pub fn verify_receipt_proof(
 	receipts_root: H256,
-	receipt_index: u64,
+	tx_index: u64,
 	proof: &[Vec<u8>],
 ) -> Option<ReceiptEnvelope> {
-	let key = receipt_trie_key(receipt_index);
+	let key = receipt_trie_key(tx_index);
 	let value = extract_value_from_proof(&key, proof)?;
 	let root = B256::from_slice(receipts_root.as_bytes());
 	let proof_nodes: Vec<Bytes> = proof.iter().map(|node| Bytes::copy_from_slice(node)).collect();
@@ -20,8 +20,8 @@ pub fn verify_receipt_proof(
 	ReceiptEnvelope::decode(&mut value.as_slice()).ok()
 }
 
-fn receipt_trie_key(receipt_index: u64) -> Nibbles {
-	let encoded_index = rlp::encode(&receipt_index);
+fn receipt_trie_key(tx_index: u64) -> Nibbles {
+	let encoded_index = rlp::encode(&tx_index);
 	Nibbles::unpack(encoded_index.as_ref())
 }
 
