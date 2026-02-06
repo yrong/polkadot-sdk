@@ -24,7 +24,7 @@ impl<T: Config> Verifier for Pallet<T> {
 
 		Self::verify_receipt_inclusion(
 			proof.execution_proof.execution_header.receipts_root(),
-			proof.receipt_index,
+			event_log.tx_index,
 			&proof.receipt_proof,
 			event_log,
 		)?;

@@ -79,7 +79,6 @@ runtime-benchmarks = [
 	"pallet-timestamp?/runtime-benchmarks",
 	"snowbridge-core/runtime-benchmarks",
 	"snowbridge-pallet-ethereum-client-fixtures/runtime-benchmarks",
-	"snowbridge-verification-primitives/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 ]
 try-runtime = [

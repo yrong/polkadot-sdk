@@ -39,5 +39,4 @@ std = [
 runtime-benchmarks = [
 	"snowbridge-core/runtime-benchmarks",
 	"snowbridge-inbound-queue-primitives/runtime-benchmarks",
-	"snowbridge-verification-primitives/runtime-benchmarks",
 ]

@@ -45,5 +45,3 @@ std = [
 	"sp-core/std",
 	"sp-std/std",
 ]
-
-runtime-benchmarks = ["frame-support/runtime-benchmarks"]
