@@ -102,7 +102,18 @@ fn process_branch(
 					walked_path.extend(&leaf.key);
 					Some(NodeDecodingResult::Value(leaf.value))
 				},
-				TrieNode::Extension(_) | TrieNode::EmptyRoot => None,
+				TrieNode::Extension(nested_ext) => {
+					walked_path.extend(&nested_ext.key);
+					if nested_ext.child.is_hash() {
+						return Some(NodeDecodingResult::Node);
+					}
+					process_trie_node(
+						TrieNode::decode(&mut &nested_ext.child[..]).ok()?,
+						walked_path,
+						key,
+					)
+				},
+				TrieNode::EmptyRoot => None,
 			}
 		},
 		TrieNode::Leaf(leaf) => {
@@ -167,5 +178,47 @@ mod tests {
 		];
 		let receipt_index = 263;
 		assert!(verify_receipt_proof(root, receipt_index, &proof_receipt263).is_some());
+	}
+
+	/// Test that verify_receipt_proof correctly handles proofs with Extension->Extension
+	/// structure. Uses HashBuilder to construct a receipts trie with keys that may produce
+	/// nested Extension nodes, then verifies the generated proof.
+	#[test]
+	fn test_verify_receipt_proof_with_extension_extension() {
+		use alloy_trie::{hash_builder::HashBuilder, nodes::TrieNode, proof::ProofRetainer, Nibbles};
+
+		// Extract receipt value from existing proof (leaf node value)
+		let leaf_node = hex!("f901ae20b901aaf901a70183bb444eb9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000001000000000000000000000000000100000000000008000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000000010000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000080000000000000000000000000000000000000000000000002000000000000000000081000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000f89df89b94dac17f958d2ee523a2206206994597c13d831ec7f863a0ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3efa00000000000000000000000002e514404ff6823f1b46a8318a709251db414e5e1a000000000000000000000000055021c55847c00d764357a352e5803237d328954a0000000000000000000000000000000000000000000000000000000000201c370");
+		let receipt_value = match TrieNode::decode(&mut &leaf_node[..]).ok() {
+			Some(TrieNode::Leaf(leaf)) => leaf.value.to_vec(),
+			_ => panic!("Expected leaf node"),
+		};
+
+		// Keys that share prefix [8,2,0,1,0] - may produce Extension->Extension in some trie
+		// implementations. These correspond to tx indices 263, 264, 265 (RLP encoding).
+		let key_263 = Nibbles::unpack(&rlp::encode(&263u64));
+		let key_264 = Nibbles::unpack(&rlp::encode(&264u64));
+		let key_265 = Nibbles::unpack(&rlp::encode(&265u64));
+
+		let retainer = ProofRetainer::new(vec![key_263.clone()]);
+		let mut hb = HashBuilder::default().with_proof_retainer(retainer);
+
+		hb.add_leaf(key_263.clone(), &receipt_value);
+		hb.add_leaf(key_264, &receipt_value);
+		hb.add_leaf(key_265, &receipt_value);
+
+		let root = hb.root();
+		let proof_nodes = hb.take_proof_nodes();
+		let proof: Vec<Vec<u8>> = proof_nodes
+			.matching_nodes_sorted(&key_263)
+			.into_iter()
+			.map(|(_, bytes)| bytes.to_vec())
+			.collect();
+
+		let root_h256: H256 = root.0.into();
+		assert!(
+			verify_receipt_proof(root_h256, 263, &proof).is_some(),
+			"Proof with potential Extension->Extension structure should verify"
+		);
 	}
 }
