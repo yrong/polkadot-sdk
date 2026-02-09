@@ -3,7 +3,7 @@
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Bytes, B256};
 use alloy_rlp::Decodable;
-use alloy_trie::{nodes::TrieNode, proof::verify_proof, Nibbles};
+use alloy_trie::{proof::ProofVerificationError, proof::verify_proof, Nibbles};
 use sp_core::H256;
 use sp_std::prelude::*;
 
@@ -16,20 +16,19 @@ pub fn verify_receipt_proof(
 	let root = B256::from_slice(receipts_root.as_bytes());
 	let proof_nodes: Vec<Bytes> = proof.iter().map(|node| Bytes::copy_from_slice(node)).collect();
 
-	// The last proof node is the leaf node containing the receipt value
-	let leaf_bytes = proof.last()?;
-	let leaf_node = TrieNode::decode(&mut &leaf_bytes[..]).ok()?;
-	let value = match leaf_node {
-		TrieNode::Leaf(leaf) => leaf.value.to_vec(),
-		TrieNode::EmptyRoot | TrieNode::Extension(_) | TrieNode::Branch(_) => {
-			// EmptyRoot, Extension nodes, or Branch nodes cannot be the last node in a valid
-			// inclusion proof
-			return None;
-		}
+	// Call verify_proof with None to extract the value from an inclusion proof. For inclusion
+	// proofs, alloy_trie returns ValueMismatch with the extracted value in `got`. The proof is
+	// already cryptographically verified during this traversal.
+	let value = match verify_proof(root, key, None, proof_nodes.iter()) {
+		Ok(()) => return None, // Exclusion proof - key does not exist
+		Err(ProofVerificationError::ValueMismatch {
+			got: Some(v),
+			expected: None,
+			..
+		}) => v.to_vec(),
+		Err(_) => return None,
 	};
 
-	// Verify the proof is cryptographically valid
-	verify_proof(root, key, Some(value.clone()), proof_nodes.iter()).ok()?;
 	ReceiptEnvelope::decode(&mut value.as_slice()).ok()
 }
 
