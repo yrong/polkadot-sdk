@@ -266,6 +266,13 @@ pub mod well_known_keys {
 	pub const NEXT_AUTHORITIES: &[u8] =
 		&hex!["1cb6f36e027abb2091cfb5110ab5087faacf00b9b41fda7a9268821c2a2b3e4c"];
 
+	/// The MMR root hash from pallet_mmr.
+	///
+	/// The storage entry should be accessed as an `H256` encoded value.
+	/// This is used by parachains to verify cross-chain messages via XCMP MMD.
+	pub const MMR_ROOT_HASH: &[u8] =
+		&hex!["a8c65209d47ee80f56b0011e8fd91f50d42f676807518c67bb427546ba406fa1"];
+
 	/// Hash of the committed head data for a given registered para.
 	///
 	/// The storage entry stores wrapped `HeadData(Vec<u8>)`.

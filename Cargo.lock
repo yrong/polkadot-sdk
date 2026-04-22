@@ -5286,6 +5286,73 @@ dependencies = [
 ]
 
 [[package]]
+name = "cumulus-pallet-xcmp-mmd-inbox"
+version = "0.1.0"
+dependencies = [
+ "binary-merkle-tree 13.0.0",
+ "cumulus-pallet-parachain-system",
+ "cumulus-primitives-core",
+ "cumulus-primitives-xcmp-mmd",
+ "frame-support",
+ "frame-system",
+ "log",
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-parachain-primitives",
+ "polkadot-primitives",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-io 30.0.0",
+ "sp-mmr-primitives",
+ "sp-runtime 31.0.1",
+ "sp-std 14.0.0",
+]
+
+[[package]]
+name = "cumulus-pallet-xcmp-mmd-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "cumulus-pallet-xcmp-mmd-inbox",
+ "cumulus-pallet-xcmp-mmd-outbox",
+ "cumulus-primitives-xcmp-mmd",
+ "parity-scale-codec",
+ "polkadot-parachain-primitives",
+ "sp-core 28.0.0",
+ "sp-io 30.0.0",
+ "sp-runtime 31.0.1",
+]
+
+[[package]]
+name = "cumulus-pallet-xcmp-mmd-outbox"
+version = "0.1.0"
+dependencies = [
+ "cumulus-primitives-core",
+ "cumulus-primitives-xcmp-mmd",
+ "frame-support",
+ "frame-system",
+ "log",
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-parachain-primitives",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-io 30.0.0",
+ "sp-mmr-primitives",
+ "sp-runtime 31.0.1",
+ "sp-std 14.0.0",
+]
+
+[[package]]
+name = "cumulus-pallet-xcmp-mmd-outbox-runtime-api"
+version = "0.1.0"
+dependencies = [
+ "cumulus-primitives-xcmp-mmd",
+ "parity-scale-codec",
+ "sp-api 26.0.0",
+ "sp-core 28.0.0",
+]
+
+[[package]]
 name = "cumulus-pallet-xcmp-queue"
 version = "0.7.1"
 dependencies = [
@@ -5436,6 +5503,16 @@ dependencies = [
  "staging-xcm",
  "staging-xcm-builder",
  "staging-xcm-executor",
+]
+
+[[package]]
+name = "cumulus-primitives-xcmp-mmd"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-std 14.0.0",
 ]
 
 [[package]]
@@ -30832,6 +30909,58 @@ dependencies = [
  "staging-xcm-builder",
  "staging-xcm-executor",
  "xcm-simulator",
+]
+
+[[package]]
+name = "xcmp-mmd-test-runtime"
+version = "0.1.0"
+dependencies = [
+ "cumulus-pallet-aura-ext",
+ "cumulus-pallet-parachain-system",
+ "cumulus-pallet-session-benchmarking",
+ "cumulus-pallet-xcm",
+ "cumulus-pallet-xcmp-mmd-inbox",
+ "cumulus-pallet-xcmp-mmd-outbox",
+ "cumulus-pallet-xcmp-queue",
+ "cumulus-primitives-aura",
+ "cumulus-primitives-core",
+ "cumulus-primitives-utility",
+ "cumulus-primitives-xcmp-mmd",
+ "frame-executive",
+ "frame-support",
+ "frame-system",
+ "log",
+ "pallet-aura",
+ "pallet-authorship",
+ "pallet-balances",
+ "pallet-collator-selection",
+ "pallet-message-queue",
+ "pallet-session",
+ "pallet-sudo",
+ "pallet-timestamp",
+ "pallet-xcm",
+ "parachains-common",
+ "parity-scale-codec",
+ "polkadot-parachain-primitives",
+ "polkadot-runtime-common",
+ "scale-info",
+ "sp-api 26.0.0",
+ "sp-block-builder",
+ "sp-consensus-aura",
+ "sp-core 28.0.0",
+ "sp-genesis-builder 0.8.0",
+ "sp-inherents 26.0.0",
+ "sp-offchain",
+ "sp-runtime 31.0.1",
+ "sp-session",
+ "sp-std 14.0.0",
+ "sp-transaction-pool",
+ "sp-version 29.0.0",
+ "staging-parachain-info",
+ "staging-xcm",
+ "staging-xcm-builder",
+ "staging-xcm-executor",
+ "substrate-wasm-builder",
 ]
 
 [[package]]

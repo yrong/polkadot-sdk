@@ -1,0 +1,36 @@
+[package]
+name = "cumulus-pallet-xcmp-mmd-integration-tests"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Integration tests for XCMP MMD POC"
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codec = { workspace = true }
+sp-core = { workspace = true }
+sp-runtime = { workspace = true }
+sp-io = { workspace = true, default-features = true }
+
+cumulus-primitives-xcmp-mmd = { workspace = true }
+cumulus-pallet-xcmp-mmd-outbox = { workspace = true }
+cumulus-pallet-xcmp-mmd-inbox = { workspace = true }
+polkadot-parachain-primitives = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"cumulus-pallet-xcmp-mmd-inbox/std",
+	"cumulus-pallet-xcmp-mmd-outbox/std",
+	"cumulus-primitives-xcmp-mmd/std",
+	"polkadot-parachain-primitives/std",
+	"sp-core/std",
+	"sp-io/std",
+	"sp-runtime/std",
+]

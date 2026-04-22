@@ -1,0 +1,10 @@
+[package]
+name = "mmr-key-calculator"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp-io = { path = "../substrate/primitives/io", default-features = true }
+hex-literal = "0.4"
