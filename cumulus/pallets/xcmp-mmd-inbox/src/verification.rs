@@ -15,12 +15,14 @@
 
 //! Helper functions for XCMP MMD verification.
 
+use alloc::vec;
 use alloc::vec::Vec;
 use codec::{Decode, Encode};
 use cumulus_primitives_xcmp_mmd::{OutboxLeaf, XcmpMmdDigest};
 use frame_support::traits::Get;
 use sp_core::H256;
 use sp_runtime::traits::Hash as HashT;
+
 
 
 /// Read the relay MMR root from the relay chain state proof.
@@ -119,75 +121,33 @@ pub fn verify_relay_mmr_proof<T: frame_system::Config>(
 
 /// Verify a para-heads proof against the ParaHeadsRoot.
 ///
-/// The ParaHeadsRoot is a binary merkle tree root of all parachain heads.
-/// This function verifies that a specific parachain header is included in that tree.
-///
-/// The proof verification uses the binary-merkle-tree crate to verify the inclusion proof.
+/// The ParaHeadsRoot is a binary merkle tree root of all parachain heads,
+/// built with KeccakHasher and SCALE((para_id_u32, head_bytes)) leaves,
+/// sorted by para_id — matching the relay chain's ParaHeadsRootProvider.
 pub fn verify_para_heads_proof<T: frame_system::Config>(
 	para_heads_root: H256,
-	_source_para_id: u32,
+	source_para_id: u32,
+	source_head: &[u8],
+	para_head_index: u32,
+	para_heads_count: u32,
 	para_heads_proof: &[H256],
-) -> Result<Vec<u8>, crate::Error<T>> {
-	// For binary merkle tree verification, we need:
-	// 1. The root hash (para_heads_root)
-	// 2. The leaf data (parachain header bytes)
-	// 3. The proof (merkle path)
-	// 4. The leaf index (derived from para_id)
-	//
-	// However, the current MessageWithProof doesn't include the actual header bytes.
-	// The relayer needs to provide the full source parachain header for verification.
-	//
-	// For this POC, we'll implement a simplified version that:
-	// 1. Checks that the proof is non-empty
-	// 2. Returns a placeholder header
-	//
-	// A production implementation would:
-	// 1. Take the source header bytes as input (add to MessageWithProof)
-	// 2. Calculate the leaf index from para_id
-	// 3. Use binary_merkle_tree::verify_proof() to verify inclusion
-	// 4. Return the verified header bytes
+) -> Result<(), crate::Error<T>> {
+	// Leaf encoding matches relay chain: SCALE((para_id_u32, head_bytes))
+	let leaf: Vec<u8> = (source_para_id, source_head.to_vec()).encode();
 
-	// Basic sanity checks
-	if para_heads_proof.is_empty() {
-		return Err(crate::Error::<T>::InvalidParaHeadsProof);
-	}
-
-	// TODO: Add source header bytes to MessageWithProof
-	// TODO: Implement actual binary merkle tree verification using:
-	// binary_merkle_tree::verify_proof::<sp_runtime::traits::Keccak256, _, _>(
-	//     &para_heads_root,
-	//     proof,
-	//     leaf_count,
-	//     leaf_index,
-	//     &source_header_bytes,
-	// )
-
-	log::warn!(
-		target: "xcmp-mmd-inbox",
-		"Para-heads proof verification is simplified - production requires source header bytes"
+	let valid = binary_merkle_tree::verify_proof::<sp_runtime::traits::Keccak256, _, _>(
+		&para_heads_root,
+		para_heads_proof.iter().copied(),
+		para_heads_count,
+		para_head_index,
+		&leaf,
 	);
 
-	// For now, return a minimal valid header for testing
-	// This is a placeholder that allows the rest of the flow to continue
-	let placeholder_header = sp_runtime::generic::Header::<u32, sp_runtime::traits::BlakeTwo256> {
-		parent_hash: Default::default(),
-		number: 1,
-		state_root: Default::default(),
-		extrinsics_root: Default::default(),
-		digest: sp_runtime::generic::Digest {
-			logs: alloc::vec![
-				sp_runtime::DigestItem::PreRuntime(
-					*b"xmmd",
-					cumulus_primitives_xcmp_mmd::XcmpMmdDigest {
-						version: 0,
-						root: para_heads_root, // Use para_heads_root as placeholder outbox root
-					}.encode(),
-				),
-			],
-		},
-	};
-
-	Ok(placeholder_header.encode())
+	if valid {
+		Ok(())
+	} else {
+		Err(crate::Error::<T>::InvalidParaHeadsProof)
+	}
 }
 
 /// Decode a parachain header from bytes.

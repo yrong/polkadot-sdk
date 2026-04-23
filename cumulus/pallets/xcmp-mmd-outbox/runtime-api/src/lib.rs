@@ -22,10 +22,11 @@ extern crate alloc;
 use alloc::vec::Vec;
 use codec::{Decode, Encode};
 use cumulus_primitives_xcmp_mmd::OutboxLeaf;
+use scale_info::TypeInfo;
 use sp_core::H256;
 
 /// Proof for a single outbox leaf.
-#[derive(Clone, Encode, Decode, Debug)]
+#[derive(Clone, Encode, Decode, Debug, TypeInfo)]
 pub struct OutboxProof {
 	/// The outbox leaf being proven.
 	pub leaf: OutboxLeaf,

@@ -75,6 +75,9 @@ cumulus-pallet-parachain-system = { workspace = true }
 cumulus-pallet-session-benchmarking = { workspace = true }
 cumulus-pallet-xcm = { workspace = true }
 cumulus-pallet-xcmp-queue = { workspace = true }
+cumulus-pallet-xcmp-mmd-outbox = { workspace = true }
+cumulus-pallet-xcmp-mmd-outbox-runtime-api = { workspace = true }
+cumulus-pallet-xcmp-mmd-inbox = { workspace = true }
 cumulus-primitives-aura = { workspace = true }
 cumulus-primitives-core = { workspace = true }
 cumulus-primitives-utility = { workspace = true }
@@ -106,6 +109,9 @@ std = [
 	"cumulus-pallet-session-benchmarking/std",
 	"cumulus-pallet-xcm/std",
 	"cumulus-pallet-xcmp-queue/std",
+	"cumulus-pallet-xcmp-mmd-outbox/std",
+	"cumulus-pallet-xcmp-mmd-outbox-runtime-api/std",
+	"cumulus-pallet-xcmp-mmd-inbox/std",
 	"cumulus-primitives-aura/std",
 	"cumulus-primitives-core/std",
 	"cumulus-primitives-utility/std",

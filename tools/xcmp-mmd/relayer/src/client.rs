@@ -28,7 +28,7 @@ impl SubstrateClient {
     }
 
     /// Send a JSON-RPC request and return the result value
-    async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({

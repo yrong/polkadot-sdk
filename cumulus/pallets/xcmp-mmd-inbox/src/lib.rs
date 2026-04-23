@@ -174,14 +174,17 @@ pub mod pallet {
 			)?;
 
 			// Step 3: Verify para-heads proof against ParaHeadsRoot
-			let source_header_bytes = verification::verify_para_heads_proof::<T>(
+			verification::verify_para_heads_proof::<T>(
 				para_heads_root,
 				message.source.into(),
+				&message.source_head,
+				message.para_head_index,
+				message.para_heads_count,
 				&message.para_heads_proof,
 			)?;
 
 			// Step 4: Extract source outbox MMR root from header digest
-			let source_header = verification::decode_source_header::<T>(&source_header_bytes)?;
+			let source_header = verification::decode_source_header::<T>(&message.source_head)?;
 			let outbox_mmr_root = verification::extract_outbox_mmr_root::<T>(&source_header)?;
 
 			// Step 5: Verify outbox MMR proof

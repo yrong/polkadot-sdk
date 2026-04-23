@@ -51,6 +51,9 @@ pub struct MessageWithProof {
     pub relay_mmr_leaf: Vec<u8>,
     pub relay_mmr_size: u64,
     pub para_heads_proof: Vec<H256>,
+    pub source_head: Vec<u8>,
+    pub para_head_index: u32,
+    pub para_heads_count: u32,
     pub outbox_leaf: OutboxLeaf,
     pub outbox_mmr_proof: Vec<H256>,
     pub outbox_mmr_size: u64,
@@ -80,6 +83,8 @@ pub struct RelayMmrProof {
 pub struct ParaHeadsProof {
     pub proof_items: Vec<H256>,
     pub head_bytes: Vec<u8>,
+    pub leaf_index: u32,
+    pub number_of_leaves: u32,
 }
 
 /// SCALE-encoded para head entry as stored in the Merkle tree

@@ -5348,6 +5348,7 @@ version = "0.1.0"
 dependencies = [
  "cumulus-primitives-xcmp-mmd",
  "parity-scale-codec",
+ "scale-info",
  "sp-api 26.0.0",
  "sp-core 28.0.0",
 ]
@@ -15636,6 +15637,9 @@ dependencies = [
  "cumulus-pallet-parachain-system",
  "cumulus-pallet-session-benchmarking",
  "cumulus-pallet-xcm",
+ "cumulus-pallet-xcmp-mmd-inbox",
+ "cumulus-pallet-xcmp-mmd-outbox",
+ "cumulus-pallet-xcmp-mmd-outbox-runtime-api",
  "cumulus-pallet-xcmp-queue",
  "cumulus-primitives-aura",
  "cumulus-primitives-core",

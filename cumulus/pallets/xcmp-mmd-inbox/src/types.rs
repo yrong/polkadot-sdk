@@ -43,6 +43,12 @@ pub struct MessageWithProof {
 	pub relay_mmr_size: u64,
 	/// Proof for the source parachain head in the ParaHeadsRoot
 	pub para_heads_proof: Vec<H256>,
+	/// The encoded source parachain head bytes (SCALE-encoded parachain header)
+	pub source_head: Vec<u8>,
+	/// Leaf index of the source para in the sorted para-heads Merkle tree
+	pub para_head_index: u32,
+	/// Total number of leaves in the para-heads Merkle tree
+	pub para_heads_count: u32,
 	/// The outbox leaf data (needed for MMR verification)
 	pub outbox_leaf: OutboxLeaf,
 	/// Proof for the message in the source outbox MMR
@@ -63,6 +69,9 @@ pub struct MessageWithProofUnbounded {
 	pub relay_mmr_leaf: Vec<u8>,
 	pub relay_mmr_size: u64,
 	pub para_heads_proof: Vec<H256>,
+	pub source_head: Vec<u8>,
+	pub para_head_index: u32,
+	pub para_heads_count: u32,
 	pub outbox_leaf: OutboxLeaf,
 	pub outbox_mmr_proof: Vec<H256>,
 	pub outbox_mmr_size: u64,

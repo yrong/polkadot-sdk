@@ -602,7 +602,7 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	type SelfParaId = parachain_info::Pallet<Runtime>;
 	type DmpQueue = frame_support::traits::EnqueueWithOrigin<MessageQueue, RelayOrigin>;
 	type ReservedDmpWeight = ReservedDmpWeight;
-	type OutboundXcmpMessageSource = XcmpQueue;
+	type OutboundXcmpMessageSource = XcmpMmdOutbox;
 	type XcmpMessageHandler = XcmpQueue;
 	type ReservedXcmpWeight = ReservedXcmpWeight;
 	type CheckAssociatedRelayNumber = RelayNumberMonotonicallyIncreases;
@@ -808,6 +808,28 @@ impl pallet_utility::Config for Runtime {
 	type WeightInfo = pallet_utility::weights::SubstrateWeight<Runtime>;
 }
 
+parameter_types! {
+	pub const MaxPendingOutboxLeaves: u32 = 1024;
+	pub const MaxRelayMmrProofItems: u32 = 128;
+	pub const MaxParaHeadsProofItems: u32 = 128;
+	pub const MaxOutboxMmrProofItems: u32 = 64;
+	pub const MaxPayloadBytes: u32 = 256 * 1024;
+}
+
+impl cumulus_pallet_xcmp_mmd_outbox::Config for Runtime {
+	type OutboundXcmpMessageSource = XcmpQueue;
+	type MaxPendingOutboxLeaves = MaxPendingOutboxLeaves;
+}
+
+impl cumulus_pallet_xcmp_mmd_inbox::Config for Runtime {
+	type XcmpMessageHandler = XcmpQueue;
+	type SelfParaId = parachain_info::Pallet<Runtime>;
+	type MaxRelayMmrProofItems = MaxRelayMmrProofItems;
+	type MaxParaHeadsProofItems = MaxParaHeadsProofItems;
+	type MaxOutboxMmrProofItems = MaxOutboxMmrProofItems;
+	type MaxPayloadBytes = MaxPayloadBytes;
+}
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime
@@ -848,6 +870,10 @@ construct_runtime!(
 		AssetConversion: pallet_asset_conversion = 53,
 
 		Revive: pallet_revive = 60,
+
+		// XCMP MMD
+		XcmpMmdOutbox: cumulus_pallet_xcmp_mmd_outbox = 70,
+		XcmpMmdInbox: cumulus_pallet_xcmp_mmd_inbox = 71,
 
 		Sudo: pallet_sudo = 255,
 	}
@@ -1182,6 +1208,38 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 			slot: cumulus_primitives_aura::Slot,
 		) -> bool {
 			ConsensusHook::can_build_upon(included_hash, slot)
+		}
+	}
+
+	impl cumulus_primitives_core::KeyToIncludeInRelayProof<Block> for Runtime {
+		fn keys_to_prove() -> cumulus_primitives_core::RelayProofRequest {
+			use cumulus_primitives_core::RelayStorageKey;
+			use polkadot_primitives::well_known_keys;
+			cumulus_primitives_core::RelayProofRequest {
+				keys: vec![
+					// Include the relay MMR root so the inbox pallet can verify
+					// relay MMR proofs without a separate storage proof.
+					RelayStorageKey::Top(well_known_keys::MMR_ROOT_HASH.to_vec()),
+				],
+			}
+		}
+	}
+
+	impl cumulus_pallet_xcmp_mmd_outbox_runtime_api::XcmpMmdOutboxApi<Block> for Runtime {
+		fn generate_outbox_proof(
+			leaf_index: u64,
+		) -> Option<cumulus_pallet_xcmp_mmd_outbox_runtime_api::OutboxProof> {
+			XcmpMmdOutbox::generate_proof(leaf_index).map(|(leaf, proof, mmr_size)| {
+				cumulus_pallet_xcmp_mmd_outbox_runtime_api::OutboxProof { leaf, proof, mmr_size }
+			})
+		}
+
+		fn mmr_root() -> sp_core::H256 {
+			XcmpMmdOutbox::get_mmr_root()
+		}
+
+		fn mmr_leaf_count() -> u64 {
+			XcmpMmdOutbox::get_mmr_leaf_count()
 		}
 	}
 );

@@ -1,0 +1,113 @@
+# XCMP MMD POC - Zombienet Network Configuration
+#
+# Two-parachain setup for end-to-end testing of XCMP MMD message delivery.
+#
+# Topology:
+#   relay: westend-local  (4 validators, BEEFY enabled, pallet_mmr active)
+#   para 1000: source parachain  (xcmp-mmd-outbox pallet, sends messages)
+#   para 2000: dest parachain    (xcmp-mmd-inbox pallet, receives messages)
+#
+# Prerequisites:
+#   - polkadot binary with BEEFY support (cargo build -p polkadot --release)
+#   - polkadot-parachain binary with xcmp-mmd pallets integrated
+#     (until pallets are merged, build a custom binary from this branch)
+#   - zombienet v1.3+ installed
+#
+# Usage:
+#   zombienet --provider native spawn tools/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
+
+[settings]
+timeout = 1200
+node_spawn_timeout = 120
+provider = "native"
+
+[relaychain]
+# Point to locally built binary (relative to repo root)
+default_command = "../../target/release/polkadot"
+default_args = [
+    "-lbeefy=trace,mmr=trace,parachain=debug,xcm=debug",
+    # Required for mmr_generateProof RPC: MMR leaf data is stored in the offchain DB.
+    # Without this the RPC returns no proof items.
+    "--enable-offchain-indexing=true",
+    "--pruning",
+    "archive",
+]
+chain = "westend-local"
+
+    # 4 validators required for BEEFY finality
+    [[relaychain.nodes]]
+    name = "alice"
+    validator = true
+    rpc_port = 9900
+    ws_port = 9901
+    balance = 200000000000000000
+
+    [[relaychain.nodes]]
+    name = "bob"
+    validator = true
+    balance = 200000000000000000
+
+    [[relaychain.nodes]]
+    name = "charlie"
+    validator = true
+    balance = 200000000000000000
+
+    [[relaychain.nodes]]
+    name = "dave"
+    validator = true
+    balance = 200000000000000000
+
+# Source parachain (para 1000) - runs xcmp-mmd-outbox pallet
+# Outbound messages are tracked in the outbox MMR; digest deposited in headers
+[[parachains]]
+id = 1000
+cumulus_based = true
+# Once pallets are integrated into a parachain binary, specify chain spec here.
+# For the initial POC, use a custom build of polkadot-parachain that includes
+# the xcmp-mmd-outbox pallet.
+chain = "penpal-westend-local-1000"
+
+    [[parachains.collators]]
+    name = "source-alice"
+    validator = true
+    command = "../../target/release/polkadot-parachain"
+    rpc_port = 9944
+    ws_port = 9945
+    args = [
+        "-lparachain=debug,xcmp_mmd=debug,xcm=debug",
+        # Archive + offchain indexing so the relayer can query historic state
+        # and the runtime API can generate outbox MMR proofs at past blocks.
+        "--enable-offchain-indexing=true",
+        "--pruning=archive",
+        "--force-authoring",
+    ]
+
+    [[parachains.collators]]
+    name = "source-bob"
+    validator = true
+    command = "../../target/release/polkadot-parachain"
+    args = ["-lparachain=debug", "--force-authoring"]
+
+# Destination parachain (para 2000) - runs xcmp-mmd-inbox pallet
+# Accepts and verifies MessageWithProof submitted by the relayer
+[[parachains]]
+id = 2000
+cumulus_based = true
+chain = "penpal-westend-local-2000"
+
+    [[parachains.collators]]
+    name = "dest-alice"
+    validator = true
+    command = "../../target/release/polkadot-parachain"
+    rpc_port = 9955
+    ws_port = 9956
+    args = [
+        "-lparachain=debug,xcmp_mmd=debug,xcm=debug",
+        "--force-authoring",
+    ]
+
+    [[parachains.collators]]
+    name = "dest-bob"
+    validator = true
+    command = "../../target/release/polkadot-parachain"
+    args = ["-lparachain=debug", "--force-authoring"]

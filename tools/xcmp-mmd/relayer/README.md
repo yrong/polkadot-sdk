@@ -24,7 +24,9 @@ and submits `MessageWithProof` to the destination parachain's `submit_xcmp_mmd` 
 
 ```bash
 cd tools/xcmp-mmd/relayer
-cargo build --release
+# SKIP_WASM_BUILD is required because path deps reach into the polkadot-sdk
+# workspace which contains parachain runtimes with WASM build scripts.
+SKIP_WASM_BUILD=1 cargo build --release
 ```
 
 ## Configuration

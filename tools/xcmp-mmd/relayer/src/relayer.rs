@@ -1,6 +1,6 @@
 // Main relayer event loop
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use codec::Encode;
 use sp_core::H256;
 use std::collections::HashSet;
@@ -10,12 +10,14 @@ use tracing::{debug, error, info, warn};
 use crate::client::{DestClient, RelayClient, SourceClient};
 use crate::config::Config;
 use crate::proof::build_message_with_proof;
+use crate::signer::ExtrinsicSigner;
 use crate::types::{MessageWithProof, PendingMessage};
 
 pub struct Relayer {
     source: SourceClient,
     dest: DestClient,
     relay: RelayClient,
+    signer: ExtrinsicSigner,
     config: Config,
 }
 
@@ -24,7 +26,9 @@ impl Relayer {
         let source = SourceClient::new(&config.source_ws, config.source_para_id).await?;
         let dest = DestClient::new(&config.dest_ws, config.dest_para_id).await?;
         let relay = RelayClient::new(&config.relay_ws).await?;
-        Ok(Self { source, dest, relay, config })
+        let signer = ExtrinsicSigner::new(&config.signer_seed)?;
+        info!("Signer public key: 0x{}", hex::encode(signer.public().0));
+        Ok(Self { source, dest, relay, signer, config })
     }
 
     /// Main loop: poll source for new finalized blocks and relay messages
@@ -157,36 +161,14 @@ impl Relayer {
         self.submit_to_dest(&mwp).await
     }
 
-    /// Submit a MessageWithProof to the destination chain's submit_xcmp_mmd extrinsic.
-    ///
-    /// In a production relayer this would use subxt with a generated metadata type to
-    /// construct and sign the extrinsic properly. For this POC we construct the call
-    /// bytes manually: pallet_index ++ call_index ++ SCALE(message).
-    ///
-    /// The pallet/call indices should match the destination runtime's constructed extrinsic
-    /// table. Here we use placeholder indices 0x80/0x00 which callers can override via env.
+    /// Build a signed `submit_xcmp_mmd` extrinsic and submit it to the destination chain.
     async fn submit_to_dest(&self, message: &MessageWithProof) -> Result<H256> {
-        let pallet_index: u8 = std::env::var("XCMP_MMD_PALLET_INDEX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0x80);
-        let call_index: u8 = std::env::var("XCMP_MMD_CALL_INDEX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0x00);
+        let hex = self.signer
+            .build_signed_extrinsic(message, &self.dest.inner)
+            .await
+            .with_context(|| "Failed to build signed extrinsic")?;
 
-        // Bare call bytes (no signature - would need full extrinsic construction for real use)
-        let mut call_bytes = vec![pallet_index, call_index];
-        call_bytes.extend_from_slice(&message.encode());
-
-        let hex = format!("0x{}", hex::encode(&call_bytes));
-
-        // Submit via author_submitExtrinsic
-        // Note: in production this requires a signed extrinsic constructed with the
-        // correct nonce, era, tip, and SR25519 signature from self.config.signer_seed.
-        let tx_hash = self.dest.inner.submit_extrinsic(&hex).await
-            .with_context(|| "Failed to submit extrinsic to destination")?;
-
-        Ok(tx_hash)
+        self.dest.inner.submit_extrinsic(&hex).await
+            .with_context(|| "Failed to submit extrinsic to destination")
     }
 }

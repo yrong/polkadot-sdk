@@ -8,6 +8,7 @@ mod client;
 mod config;
 mod proof;
 mod relayer;
+mod signer;
 mod types;
 
 use config::Config;

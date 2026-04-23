@@ -65,6 +65,9 @@ pub async fn build_message_with_proof(
         relay_mmr_leaf: relay_mmr_proof.leaf_bytes,
         relay_mmr_size: relay_mmr_proof.mmr_size,
         para_heads_proof: para_heads_proof.proof_items,
+        source_head: para_heads_proof.head_bytes,
+        para_head_index: para_heads_proof.leaf_index,
+        para_heads_count: para_heads_proof.number_of_leaves,
         outbox_leaf: outbox_proof.leaf,
         outbox_mmr_proof: outbox_proof.proof_items,
         outbox_mmr_size: outbox_proof.mmr_size,
@@ -254,6 +257,8 @@ async fn build_para_heads_proof(
     Ok(ParaHeadsProof {
         proof_items: proof.proof,
         head_bytes: source_head_bytes,
+        leaf_index: leaf_index as u32,
+        number_of_leaves: sorted_heads.len() as u32,
     })
 }
 
