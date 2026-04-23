@@ -1,0 +1,35 @@
+[workspace]
+
+[package]
+name = "xcmp-mmd-relayer"
+version = "0.1.0"
+edition = "2021"
+description = "Off-chain relayer for XCMP MMD POC - watches source chain, constructs proofs, submits to destination"
+license = "Apache-2.0"
+
+[[bin]]
+name = "xcmp-mmd-relayer"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+codec = { package = "parity-scale-codec", version = "3", features = ["derive"] }
+
+# Substrate primitives (path deps to match host toolchain)
+sp-core = { path = "../../../substrate/primitives/core", default-features = false, features = ["std"] }
+binary-merkle-tree = { path = "../../../substrate/utils/binary-merkle-tree", features = ["std"] }
+
+# Logging / CLI
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+hex = "0.4"
+toml = "0.8"

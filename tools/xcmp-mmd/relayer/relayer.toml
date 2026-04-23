@@ -1,0 +1,22 @@
+# XCMP MMD Relayer configuration
+
+# Source parachain WebSocket endpoint
+source_ws = "ws://127.0.0.1:9944"
+
+# Destination parachain WebSocket endpoint
+dest_ws = "ws://127.0.0.1:9955"
+
+# Relay chain WebSocket endpoint
+relay_ws = "ws://127.0.0.1:9900"
+
+# Source parachain ID
+source_para_id = 1000
+
+# Destination parachain ID
+dest_para_id = 2000
+
+# Signer account seed phrase (used to sign submit_xcmp_mmd extrinsics)
+signer_seed = "//Alice"
+
+# How many blocks to scan backwards on startup for missed messages (default 0)
+lookback_blocks = 0
