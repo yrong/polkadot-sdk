@@ -88,6 +88,7 @@ Located in `bridges/xcmp-mmd/`. A proof-of-concept for trustless cross-chain mes
 - `bridges/xcmp-mmd/pallets/inbox/` - Destination parachain pallet that verifies three-tier proofs
 - `bridges/xcmp-mmd/primitives/` - Shared types (`OutboxLeaf`, `XcmpMmdDigest`)
 - `bridges/xcmp-mmd/relayer/` - Off-chain relayer that constructs proofs
+- `bridges/xcmp-mmd/testing/` - Zombienet configs and development tools
 
 **Key Innovation**: Uses MMR ancestry proofs to eliminate race conditions between proof generation and verification. When the destination's relay parent advances between proof generation and submission, the system uses `pallet_mmr::verify_ancestry_proof` to derive the historical MMR root, allowing proofs to remain valid across multiple relay blocks.
 

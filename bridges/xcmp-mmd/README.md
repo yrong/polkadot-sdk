@@ -11,7 +11,7 @@ A proof-of-concept implementation of trustless cross-chain message delivery betw
 - **[Documentation](docs/README.md)** - Complete design, implementation, and testing guides
 - **[Pallets](pallets/)** - Outbox, inbox, and integration tests
 - **[Relayer](relayer/)** - Off-chain proof construction and submission
-- **[Zombienet](zombienet/)** - End-to-end test network configuration
+- **[Testing](testing/)** - Zombienet configs and development tools
 
 ---
 
@@ -48,8 +48,10 @@ bridges/xcmp-mmd/
 │   └── integration-tests/    # Integration tests
 ├── primitives/                # Shared types and constants
 ├── relayer/                   # Off-chain relayer tool
-├── zombienet/                 # Test network configuration
-└── tools/                     # Development utilities
+└── testing/                   # Testing infrastructure
+    ├── runtime-integration/  # Test runtime (outdated)
+    ├── zombienet/            # Test network configuration
+    └── tools/                # Development utilities
 ```
 
 ---
@@ -80,10 +82,10 @@ SKIP_WASM_BUILD=1 cargo build --release
 
 ```bash
 # Start zombienet network
-zombienet --provider native spawn bridges/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
+zombienet --provider native spawn bridges/xcmp-mmd/testing/zombienet/xcmp-mmd-poc.toml
 
 # Run end-to-end test
-cd bridges/xcmp-mmd/zombienet
+cd bridges/xcmp-mmd/testing/zombienet
 ./e2e-test.sh
 ```
 
