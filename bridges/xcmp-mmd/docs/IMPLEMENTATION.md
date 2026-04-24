@@ -739,5 +739,5 @@ For production use, consider:
 - `cumulus/parachains/runtimes/testing/penpal/src/lib.rs`
 
 ### Testing
-- `tools/xcmp-mmd/zombienet/xcmp-mmd-poc.toml`
-- `tools/xcmp-mmd/zombienet/e2e-test.sh`
+- `bridges/xcmp-mmd/testing/zombienet/xcmp-mmd-poc.toml`
+- `bridges/xcmp-mmd/testing/zombienet/e2e-test.sh`

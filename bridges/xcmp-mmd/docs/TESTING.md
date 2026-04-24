@@ -8,13 +8,13 @@ All binaries must be built in release mode:
 # From polkadot-sdk repo root
 cargo build -p polkadot --release
 cargo build -p polkadot-parachain-bin --release
-cd tools/xcmp-mmd/relayer && SKIP_WASM_BUILD=1 cargo build --release
+cd bridges/xcmp-mmd/relayer && SKIP_WASM_BUILD=1 cargo build --release
 ```
 
 Verify binaries exist:
 - `target/release/polkadot`
 - `target/release/polkadot-parachain`
-- `tools/xcmp-mmd/relayer/target/release/xcmp-mmd-relayer`
+- `bridges/xcmp-mmd/relayer/target/release/xcmp-mmd-relayer`
 
 ## Running the Test Network
 
@@ -22,7 +22,7 @@ Verify binaries exist:
 
 ```bash
 # From repo root
-zombienet --provider native spawn tools/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
+zombienet --provider native spawn bridges/xcmp-mmd/testing/zombienet/xcmp-mmd-poc.toml
 ```
 
 This spawns:
@@ -43,7 +43,7 @@ This spawns:
 In a separate terminal:
 
 ```bash
-cd tools/xcmp-mmd/zombienet
+cd bridges/xcmp-mmd/testing/zombienet
 ./e2e-test.sh
 ```
 
@@ -122,7 +122,7 @@ The relayer should output:
 If you want to run the relayer separately:
 
 ```bash
-cd tools/xcmp-mmd/relayer
+cd bridges/xcmp-mmd/relayer
 
 # Optional: override pallet/call indices if needed
 export XCMP_MMD_PALLET_INDEX=71  # XcmpMmdInbox position in penpal

@@ -108,22 +108,22 @@ This leverages Substrate's built-in `pallet_mmr::verify_ancestry_proof` to deriv
 ## 📦 Implementation Locations
 
 ### Pallets
-- **Outbox**: `cumulus/pallets/xcmp-mmd-outbox/`
-- **Inbox**: `cumulus/pallets/xcmp-mmd-inbox/`
-- **Integration Tests**: `cumulus/pallets/xcmp-mmd-integration-tests/`
+- **Outbox**: `bridges/xcmp-mmd/pallets/outbox/`
+- **Inbox**: `bridges/xcmp-mmd/pallets/inbox/`
+- **Integration Tests**: `bridges/xcmp-mmd/pallets/integration-tests/`
 
 ### Primitives
-- **Core Types**: `cumulus/primitives/xcmp-mmd/`
+- **Core Types**: `bridges/xcmp-mmd/primitives/`
 
 ### Relayer
-- **Off-chain Tool**: `tools/xcmp-mmd/relayer/`
+- **Off-chain Tool**: `bridges/xcmp-mmd/relayer/`
 
 ### Infrastructure
 - **Well-Known Keys**: `polkadot/primitives/src/v9/mod.rs`
 - **Collator Client**: `cumulus/client/parachain-inherent/src/lib.rs`
 
 ### Testing
-- **Zombienet Config**: `tools/xcmp-mmd/zombienet/`
+- **Zombienet Config**: `bridges/xcmp-mmd/testing/zombienet/`
 
 ---
 
@@ -249,7 +249,7 @@ cargo build -p polkadot --release
 cargo build -p polkadot-parachain-bin --release
 
 # Build relayer
-cd tools/xcmp-mmd/relayer
+cd bridges/xcmp-mmd/relayer
 SKIP_WASM_BUILD=1 cargo build --release
 ```
 
@@ -264,8 +264,8 @@ SKIP_WASM_BUILD=1 cargo test -p cumulus-pallet-xcmp-mmd-inbox
 SKIP_WASM_BUILD=1 cargo test -p cumulus-pallet-xcmp-mmd-integration-tests
 
 # Run end-to-end test (requires zombienet)
-zombienet --provider native spawn tools/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
-cd tools/xcmp-mmd/zombienet && ./e2e-test.sh
+zombienet --provider native spawn bridges/xcmp-mmd/testing/zombienet/xcmp-mmd-poc.toml
+cd bridges/xcmp-mmd/testing/zombienet && ./e2e-test.sh
 ```
 
 See [TESTING.md](TESTING.md) for detailed instructions.
