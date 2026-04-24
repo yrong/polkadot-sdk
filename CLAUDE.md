@@ -79,6 +79,33 @@ Located in `polkadot/xcm/`. XCM is the messaging format for cross-chain communic
 - `xcm-executor/` - XCM instruction executor
 - `pallet-xcm/` - Runtime pallet for XCM
 
+### XCMP MMD (Proof-of-Concept)
+
+Located in `cumulus/pallets/xcmp-mmd-*` and `tools/xcmp-mmd/`. A proof-of-concept for trustless cross-chain message delivery using Merkle Mountain Ranges:
+
+**Components**:
+- `cumulus/pallets/xcmp-mmd-outbox/` - Source parachain pallet that commits messages to an MMR
+- `cumulus/pallets/xcmp-mmd-inbox/` - Destination parachain pallet that verifies three-tier proofs
+- `cumulus/primitives/xcmp-mmd/` - Shared types (`OutboxLeaf`, `XcmpMmdDigest`)
+- `tools/xcmp-mmd/relayer/` - Off-chain relayer that constructs proofs
+
+**Key Innovation**: Uses MMR ancestry proofs to eliminate race conditions between proof generation and verification. When the destination's relay parent advances between proof generation and submission, the system uses `pallet_mmr::verify_ancestry_proof` to derive the historical MMR root, allowing proofs to remain valid across multiple relay blocks.
+
+**Documentation**:
+- `cumulus/docs/xcmp-mmd/DESIGN.md` - Architecture and three-tier proof system
+- `cumulus/docs/xcmp-mmd/IMPLEMENTATION.md` - Code structure and integration guide
+- `cumulus/docs/xcmp-mmd/TESTING.md` - End-to-end testing instructions
+- `cumulus/docs/xcmp-mmd/STATUS.md` - Implementation status and completion details
+
+**Testing**:
+```bash
+# Run inbox pallet tests
+SKIP_WASM_BUILD=1 cargo test -p cumulus-pallet-xcmp-mmd-inbox
+
+# Run integration tests
+SKIP_WASM_BUILD=1 cargo test -p cumulus-pallet-xcmp-mmd-integration-tests
+```
+
 ### Key Directories
 
 - `substrate/primitives/` - Core types shared across the codebase

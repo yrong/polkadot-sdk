@@ -1,85 +1,112 @@
-# XCMP MMD - Proof of Concept
+# XCMP MMD Tools
 
-Trustless cross-chain message delivery between parachains using a three-tier cryptographic proof system.
+This directory contains tools and utilities for the XCMP MMD proof-of-concept.
+
+---
 
 ## 📚 Documentation
 
-### [DESIGN.md](DESIGN.md) - Architecture & Design
-**Purpose**: Understand how the system works
+**All documentation has been consolidated in:**
 
-**Contents**:
-- Problem statement and motivation
-- Three-tier proof system explanation
-- Architecture diagrams and message flow
-- Security properties and performance characteristics
-- Comparison to alternatives
+**`cumulus/docs/xcmp-mmd/`**
 
-**Audience**: Anyone wanting to understand the design
-
----
-
-### [IMPLEMENTATION.md](IMPLEMENTATION.md) - Implementation Guide
-**Purpose**: Understand what was built and how to integrate it
-
-**Contents**:
-- Components built (outbox pallet, inbox pallet, relayer)
-- Code structure and key files
-- Runtime integration steps
-- Building instructions and critical configuration
-- Known limitations and production considerations
-
-**Audience**: Developers integrating the pallets or modifying the code
+Please see:
+- **[cumulus/docs/xcmp-mmd/README.md](../../cumulus/docs/xcmp-mmd/README.md)** - Main documentation index
+- **[cumulus/docs/xcmp-mmd/DESIGN.md](../../cumulus/docs/xcmp-mmd/DESIGN.md)** - Architecture and design
+- **[cumulus/docs/xcmp-mmd/IMPLEMENTATION.md](../../cumulus/docs/xcmp-mmd/IMPLEMENTATION.md)** - Implementation guide
+- **[cumulus/docs/xcmp-mmd/TESTING.md](../../cumulus/docs/xcmp-mmd/TESTING.md)** - Testing guide
+- **[cumulus/docs/xcmp-mmd/STATUS.md](../../cumulus/docs/xcmp-mmd/STATUS.md)** - Implementation status
 
 ---
 
-### [TESTING.md](TESTING.md) - Testing Guide
-**Purpose**: Run the end-to-end test
+## 🛠️ Tools in This Directory
 
-**Contents**:
-- Prerequisites and setup
-- Running zombienet network
-- Running the e2e test script
-- Manual verification steps and troubleshooting
+### Relayer
+**Location**: `relayer/`
 
-**Audience**: Anyone testing the POC
+Off-chain service that monitors source parachains and constructs three-tier proofs for destination parachains.
+
+**Features**:
+- Polls source parachain for new messages
+- Constructs relay MMR proofs with ancestry proof support
+- Generates para-heads Merkle proofs
+- Generates outbox MMR proofs
+- Signs and submits extrinsics to destination
+
+**Usage**:
+```bash
+cd relayer
+SKIP_WASM_BUILD=1 cargo build --release
+./target/release/xcmp-mmd-relayer --config relayer.toml
+```
+
+See [relayer/README.md](relayer/README.md) for details.
 
 ---
 
-## Component-Specific Documentation
+### Zombienet Test Network
+**Location**: `zombienet/`
 
-- **Relayer**: `relayer/README.md` - Relayer configuration and usage
-- **Zombienet**: `zombienet/README.md` - Network topology and manual verification
+Network configuration and test scripts for end-to-end testing.
 
-## Quick Start
+**Contents**:
+- `xcmp-mmd-poc.toml` - Network topology (relay chain + 2 parachains)
+- `e2e-test.sh` - Automated test driver
+- `README.md` - Manual verification instructions
 
-1. **Understand the design**: Read [DESIGN.md](DESIGN.md)
-2. **Build the components**: Follow [IMPLEMENTATION.md](IMPLEMENTATION.md) build section
-3. **Run the test**: Follow [TESTING.md](TESTING.md)
+**Usage**:
+```bash
+zombienet --provider native spawn zombienet/xcmp-mmd-poc.toml
+cd zombienet && ./e2e-test.sh
+```
 
-## Overview
+See [zombienet/README.md](zombienet/README.md) for details.
 
-XCMP MMD uses three nested cryptographic proofs to enable trustless message delivery:
+---
 
-1. **Relay MMR Proof** - Proves a relay block is finalized by BEEFY
-2. **Para-heads Merkle Proof** - Proves source parachain header is in the relay block
-3. **Outbox MMR Proof** - Proves message is committed in source parachain
+### Development Utilities
 
-Off-chain relayers construct these proofs and submit them to destination parachains, which verify them on-chain without trusting the relayer.
+**MMR Storage Key Calculator**:
+- `calculate_mmr_key.rs` - Standalone script
+- `mmr-key-calculator/` - Cargo project version
 
-## Status
+These tools were used during POC development to verify the storage key calculation for reading the relay chain's MMR root from the relay state proof.
 
-✅ **Complete**:
-- Three-tier proof system fully implemented
-- Outbox and inbox pallets with verification
-- Off-chain relayer with SR25519 signing
-- Runtime integration (penpal)
-- End-to-end test setup
+**Storage key**: `0xa8c65209d47ee80f56b0011e8fd91f50d42f676807518c67bb427546ba406fa1`  
+**Calculation**: `twox_128("Mmr") ++ twox_128("RootHash")`
 
-## Tools
+---
 
-This directory also contains utility tools used during POC development:
+## 🚀 Quick Start
 
-- `calculate_mmr_key.rs` - Calculate storage key for `pallet_mmr::RootHash`
-- `mmr-key-calculator/` - Cargo project version of the key calculator
+1. **Read the documentation**: Start with [cumulus/docs/xcmp-mmd/README.md](../../cumulus/docs/xcmp-mmd/README.md)
+2. **Build the components**: Follow [IMPLEMENTATION.md](../../cumulus/docs/xcmp-mmd/IMPLEMENTATION.md)
+3. **Run the test**: Follow [TESTING.md](../../cumulus/docs/xcmp-mmd/TESTING.md)
 
-These tools were used to verify the storage key calculation for reading the relay chain's MMR root from the relay state proof.
+---
+
+## 📦 Directory Structure
+
+```
+tools/xcmp-mmd/
+├── README.md                    (this file)
+├── relayer/                     (off-chain relayer)
+│   ├── src/
+│   ├── Cargo.toml
+│   ├── relayer.toml
+│   └── README.md
+├── zombienet/                   (test network config)
+│   ├── xcmp-mmd-poc.toml
+│   ├── e2e-test.sh
+│   └── README.md
+├── calculate_mmr_key.rs         (dev utility)
+└── mmr-key-calculator/          (dev utility)
+```
+
+---
+
+## ✅ Status
+
+**POC Complete** - All components implemented and tested.
+
+See [cumulus/docs/xcmp-mmd/STATUS.md](../../cumulus/docs/xcmp-mmd/STATUS.md) for detailed status.

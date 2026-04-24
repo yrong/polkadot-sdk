@@ -6,10 +6,41 @@ XCMP MMD (Merkle Mountain Range based cross-chain messaging) is a proof-of-conce
 
 ## Problem Statement
 
-Current XCMP implementations rely on validators to deliver messages between parachains. This POC explores an alternative approach where:
-- Messages are committed to cryptographic accumulators (MMRs)
-- Off-chain relayers construct proofs of message inclusion
-- Destination parachains verify proofs on-chain without trusting relayers
+**HRMP** (Horizontal Relay-routed Message Passing) stores message payloads on the relay chain, which is expensive in terms of storage and execution costs.
+
+**XCMP MMD** replaces that with:
+- Payloads kept off the relay chain
+- Messages proven by nested Merkle proofs anchored to relay commitments
+
+### How MMD XCMP Replaces HRMP
+
+**HRMP approach:**
+- Relay chain acts as a payload mailbox (`HrmpChannelContents`)
+- Receiver reads relay state proofs and prunes via watermarks
+
+**MMD XCMP approach:**
+- Relay chain acts as a commitment anchor (no payload storage)
+- Receiver accepts payload + proof bundle, verifies it, then executes the XCM
+
+### POC Semantics
+
+This minimal POC has the following characteristics:
+- **Unordered**: Messages can arrive in any order
+- **Best-effort**: If nobody submits the proof bundle, nothing happens
+- **No pruning**: Of message stores or MMRs
+- **No receipts/acknowledgments**
+- **No incentive mechanism** for relayers
+- **Replay protection required**: Prevents executing the same proven message repeatedly
+
+### Design Rationale
+
+This POC uses a **single global append-only `XcmpOutboxMmr`** that commits all outbound messages across all destinations. This differs from the forum sketch which proposed one `XcmpMessageMMR` per channel plus an `XcmpChannelTree` over those roots.
+
+Benefits of the single global MMR approach:
+- Simpler implementation (one accumulator)
+- Globally monotonic `mmr_leaf_index` serves as message nonce
+- Parachain header digest carries only `XcmpOutboxMmrRoot`
+- No per-block Merkle snapshot needed as primary commitment
 
 ## Architecture
 
@@ -118,6 +149,39 @@ This eliminates timing constraints - the relayer can wait for the destination to
 - Verification: `mmr-lib` calculates root from leaf + proof
 
 **Security**: If the message is in the outbox MMR, and the MMR root is in the finalized source header, then the message was committed by the source parachain.
+
+## BEEFY and Relay Chain Dependencies
+
+### BEEFY MMR Implementation
+
+The relay chain's `pallet_beefy_mmr` is configured with:
+- `LeafExtra = H256` set to `ParaHeadsRoot`
+- `ParaHeadsRootProvider` computes Merkle root over `sorted_para_heads()`
+  - Leaves are `SCALE((para_id: u32, head_bytes: Vec<u8>))` sorted by para_id
+  - Uses `binary_merkle_tree` with `KeccakHasher`
+
+This defines the exact proof format and hashing that the inbox verifier must match.
+
+### Relay MMR Root Access
+
+The destination parachain obtains the relay MMR root trustlessly via:
+
+1. **Trust anchor**: `ValidationData.relay_parent_storage_root` (already verified in `set_validation_data`)
+2. **Storage key**: `pallet_mmr::RootHash` at `twox_128("Mmr") ++ twox_128("RootHash")`
+3. **Collator integration**: Runtime implements `KeyToIncludeInRelayProof` to include this key in the inherent relay proof
+4. **Verification**: Inbox pallet reads the value from `RelayChainStateProof` (no extra proof in extrinsic)
+
+**Important**: The storage key must match the relay runtime's pallet name (e.g., "Mmr" on Westend).
+
+### Data Availability
+
+**On-chain commitment**: Only `payload_hash = Keccak256(payload)` is committed to the outbox MMR.
+
+**Payload retrieval**: The relayer obtains the full payload bytes from:
+- **Source parachain archival state** (recommended for POC): Fetch `HrmpOutboundMessages` from `cumulus_pallet_parachain_system` storage at the source block hash
+- Archive nodes can read historical state to recover the exact `Vec<u8>` bytes that were hashed
+
+**Cryptographic binding**: The hash commitment is on-chain; payload bytes are a data-availability problem solved off-chain.
 
 ## Message Flow
 
@@ -250,6 +314,85 @@ Dispatch message to XcmpQueue
 - Proof builder: Orchestrates three proof tiers
 - RPC clients: Source, destination, relay chain
 - Signer: SR25519 extrinsic signing (FRAME V2)
+
+## Technical Specifications
+
+### Hard Bounds
+
+The POC enforces the following limits:
+- `MAX_PAYLOAD_BYTES = 256 * 1024` (256 KiB) - Maximum message payload size
+- `MAX_RELAY_MMR_PROOF_ITEMS = 128` - Maximum proof items for relay MMR (grows with relay chain age)
+- `MAX_PARA_HEADS_PROOF_ITEMS = 128` - Maximum proof items for para-heads Merkle tree
+- `MAX_OUTBOX_MMR_PROOF_ITEMS = 64` - Maximum proof items for outbox MMR
+
+These bounds ensure:
+- Predictable weight calculation
+- Protection against DoS via oversized proofs
+- Reasonable extrinsic size (~768 KiB total)
+
+### Data Structures
+
+**OutboxLeaf**:
+```rust
+struct OutboxLeaf {
+    dest: u32,              // Destination para ID
+    payload_hash: H256,     // Keccak256(payload)
+}
+```
+
+**XcmpMmdDigest**:
+```rust
+struct XcmpMmdDigest {
+    version: u8,
+    root: H256,             // Outbox MMR root
+}
+// Deposited as: DigestItem::PreRuntime(*b"xmmd", SCALE(digest))
+```
+
+**MessageWithProof**:
+```rust
+struct MessageWithProof {
+    source: ParaId,
+    dest: ParaId,
+    mmr_leaf_index: u64,
+    relay_mmr_leaf_index: u64,
+    payload: Vec<u8>,
+    
+    // Tier 1: Relay MMR proof
+    relay_mmr_proof: Vec<H256>,
+    relay_mmr_leaf: Vec<u8>,        // BEEFY MMR leaf
+    relay_mmr_size: u64,
+    relay_anchor_number: u32,
+    relay_ancestry_proof: Option<AncestryProof<H256>>,
+    
+    // Tier 2: Para-heads Merkle proof
+    para_heads_proof: Vec<H256>,
+    source_head: Vec<u8>,           // Source header bytes
+    para_head_index: u32,
+    para_heads_count: u32,
+    
+    // Tier 3: Outbox MMR proof
+    outbox_leaf: OutboxLeaf,
+    outbox_mmr_proof: Vec<H256>,
+    outbox_mmr_size: u64,
+}
+```
+
+### Hashing and Encoding
+
+- **Payload hash**: `Keccak256(payload_bytes)`
+- **MMR merge**: `Keccak256(left_hash || right_hash)`
+- **Para-heads leaves**: `SCALE((para_id: u32, head_bytes: Vec<u8>))` sorted by para_id
+- **Binary Merkle tree**: Uses `KeccakHasher` (matches relay chain)
+
+### Verification Guards
+
+The inbox pallet enforces:
+- `dest == SelfParaId` (message is for this parachain)
+- `relay_mmr_proof` contains exactly 1 leaf at `relay_mmr_leaf_index`
+- `outbox_mmr_proof` contains exactly 1 leaf at `mmr_leaf_index`
+- `leaf.dest == dest && leaf.payload_hash == Keccak256(payload)`
+- `!seen((source, mmr_leaf_index))` (replay protection)
 
 ## Security Properties
 

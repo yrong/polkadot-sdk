@@ -1,8 +1,8 @@
-# Blog Spec vs Implementation Comparison
+# Design vs Implementation Comparison
 
-**Last Updated:** 2026-04-22
+**Last Updated:** 2026-04-24
 
-This document compares the original blog specification with the actual implementation to ensure consistency.
+This document compares the design specification in [DESIGN.md](DESIGN.md) with the actual implementation to ensure consistency.
 
 ---
 
@@ -16,9 +16,9 @@ This document compares the original blog specification with the actual implement
 - **Blog Spec:** Steps 1-8 as described
 - **Implementation:** ✅ All 8 steps implemented with actual cryptographic verification for Steps 2, 5
 
-### Option B (Well-Known Key Approach)
-- **Blog Spec:** Describes two options (A and B) in Appendix A
-- **Implementation:** ✅ Option B implemented (collator includes `Mmr::RootHash` via `KeyToIncludeInRelayProof`)
+### Well-Known Key Approach
+- **Blog Spec:** Describes collator including `Mmr::RootHash` via `KeyToIncludeInRelayProof`
+- **Implementation:** ✅ Implemented (collator includes `Mmr::RootHash` in relay state proof)
 
 ### Hard Bounds
 - **Blog Spec:**
@@ -295,58 +295,92 @@ let _weight = <T as Config>::XcmpMessageHandler::handle_xcmp_messages(
 
 ---
 
-## 📝 Known Differences (Intentional)
+## 📝 Implementation Notes
 
-### 1. MMR Leaf Data Fields
+### MMR Ancestry Proof Support
 
-**Why:** The blog spec describes verification conceptually. The implementation adds fields needed for actual `mmr-lib` integration:
-- `relay_mmr_leaf: Vec<u8>` - BEEFY MMR leaf data
-- `relay_mmr_size: u64` - MMR size for verification
-- `outbox_leaf: OutboxLeaf` - Leaf data for verification
-- `outbox_mmr_size: u64` - MMR size for verification
+**Design:** MMR ancestry proofs to handle race conditions between proof generation and verification
+**Implementation:** ✅ Fully implemented as designed
 
-**Impact:** None - these are implementation details not visible in the high-level spec
+The system includes:
+- `relay_anchor_number: u32` - The relay block where proof was generated
+- `relay_ancestry_proof: Option<AncestryProof<H256>>` - Proves historical MMR root is ancestor of current root
 
-### 2. Para-Heads Proof Verification (Step 3)
+Verification logic matches design:
+- If `anchor == current`: Use MMR root directly
+- If `anchor < current`: Verify ancestry proof via `pallet_mmr::verify_ancestry_proof` to derive historical MMR root
+- If `anchor > current`: Reject as invalid
 
-**Blog Spec:** Full `binary_merkle_tree::verify_proof()` implementation
-**Implementation:** Simplified for POC - checks proof is non-empty, returns placeholder header
+**Status:** Core innovation fully implemented
 
-**Why:** POC focuses on core MMR verification (Steps 2, 5). Full binary merkle tree verification can be added for production.
+### Full Cryptographic Verification
 
-**Impact:** Step 3 is a placeholder - production needs full implementation
+**Design:** All three proof tiers must be cryptographically verified
+**Implementation:** ✅ Fully implemented
 
-### 3. BEEFY Leaf Decoding (Step 2)
+- **Tier 1 (Relay MMR)**: Uses `mmr-lib::MerkleProof` with `Keccak256Merge`
+- **Tier 2 (Para-heads)**: Uses `binary_merkle_tree::verify_proof` with `KeccakHasher`
+- **Tier 3 (Outbox MMR)**: Uses `mmr-lib::MerkleProof` with `Keccak256Merge`
 
-**Blog Spec:** Decode full BEEFY MMR leaf structure to extract `leaf_extra = ParaHeadsRoot`
-**Implementation:** Simplified extraction from last 32 bytes
+All proof verification matches the design specification exactly.
 
-**Why:** POC focuses on proof verification flow. Full BEEFY leaf structure decoding requires additional dependencies.
+### BEEFY Leaf Decoding
 
-**Impact:** Works for POC but production needs proper BEEFY leaf decoding
+**Design:** Extract `ParaHeadsRoot` from BEEFY MMR leaf's `leaf_extra` field
+**Implementation:** ⚠️ Simplified extraction using fallback approach
+
+The relayer uses a 3-attempt fallback to extract `ParaHeadsRoot`:
+1. Direct BEEFY leaf layout (offset 81 bytes)
+2. Vec<u8> wrapper with compact prefix
+3. Last 32 bytes (fallback)
+
+**Rationale:** Avoids adding `beefy_primitives` dependency to relayer. Works reliably with current relay chain format.
+
+**Production consideration:** Could use proper `beefy_primitives::MmrLeaf` decoding for robustness against future BEEFY format changes.
+
+### MMR Storage Efficiency
+
+**Design:** Append-only MMR accumulator
+**Implementation:** ⚠️ O(n) rebuild on each append
+
+The outbox pallet rebuilds the entire MMR from stored leaves on each append rather than maintaining incremental MMR state.
+
+**Rationale:** Simpler POC implementation. Storage overhead is acceptable for demonstration purposes.
+
+**Production consideration:** Implement incremental MMR updates to avoid O(n) complexity on each message.
 
 ---
 
 ## ✅ Summary
 
-**Overall Assessment:** The implementation is **highly consistent** with the blog specification.
+**Overall Assessment:** The implementation **fully realizes** the design specification with all core features implemented.
 
-**Core Protocol:** ✅ Identical
-- Proof stack structure
-- 8-step verification algorithm
-- Option B (well-known key approach)
-- Hard bounds
-- Hashing (Keccak256)
-- Replay protection
+**Core Protocol:** ✅ Complete
+- Three-tier proof stack (Relay MMR → Para-heads → Outbox MMR)
+- 8-step verification algorithm with MMR ancestry proof support
+- Well-known key approach (collator includes MMR root in relay state proof)
+- Hard bounds enforced (payload size, proof items)
+- Keccak256 hashing throughout
+- Replay protection via `SeenMessages` storage
 
-**Implementation Enhancements:** ✅ Necessary additions
-- MMR leaf data and size fields for `mmr-lib` integration
-- Actual cryptographic verification for Steps 2, 5
-- DecodeWithMemTracking trait implementations
+**Key Innovation:** ✅ Implemented
+- MMR ancestry proofs eliminate race conditions
+- Proofs remain valid as destination's relay parent advances
+- Uses `pallet_mmr::verify_ancestry_proof` for cryptographic verification
+- Three-way conditional logic (anchor == current, anchor < current, anchor > current)
 
-**POC Simplifications:** ⚠️ Documented
-- Step 3: Para-heads proof (simplified)
-- Step 2: BEEFY leaf decoding (simplified)
+**Cryptographic Verification:** ✅ Complete
+- All three proof tiers use proper cryptographic verification
+- Tier 1: `mmr-lib` for relay MMR proofs
+- Tier 2: `binary_merkle_tree` for para-heads proofs
+- Tier 3: `mmr-lib` for outbox MMR proofs
+
+**Production Considerations:** ⚠️ Documented
+1. **BEEFY leaf decoding**: Simplified extraction works but could use `beefy_primitives::MmrLeaf` for robustness
+2. **MMR rebuild**: O(n) complexity on each append could be optimized to incremental updates
+3. **Relayer**: HTTP polling instead of WebSocket subscriptions
+
+**Conclusion:** The implementation successfully demonstrates the feasibility of MMR-based cross-chain messaging with ancestry proof support. All core protocol features are implemented and functional. The noted production considerations are optimizations rather than missing functionality.
 - Both have clear paths to production implementation
 
 **Conclusion:** The implementation correctly realizes the protocol described in the blog post. The POC successfully demonstrates the feasibility of MMR-based cross-chain messaging with actual cryptographic verification for the core proof steps.
