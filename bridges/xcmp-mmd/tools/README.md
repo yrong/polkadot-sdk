@@ -88,7 +88,7 @@ These tools were used during POC development to verify the storage key calculati
 ## 📦 Directory Structure
 
 ```
-tools/xcmp-mmd/
+bridges/xcmp-mmd/tools/
 ├── README.md                    (this file)
 ├── relayer/                     (off-chain relayer)
 │   ├── src/

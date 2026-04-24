@@ -8,7 +8,7 @@ This document describes what was built, the code structure, and how to integrate
 
 ### 1. Outbox Pallet
 
-**Location**: `cumulus/pallets/xcmp-mmd-outbox/`
+**Location**: `bridges/xcmp-mmd/pallets/outbox/`
 
 **Purpose**: Maintains an MMR of outbound XCMP messages and publishes the root in block headers.
 
@@ -64,7 +64,7 @@ pub trait Config: frame_system::Config {
 
 ### 2. Inbox Pallet
 
-**Location**: `cumulus/pallets/xcmp-mmd-inbox/`
+**Location**: `bridges/xcmp-mmd/pallets/inbox/`
 
 **Purpose**: Verifies three-tier proofs and dispatches messages to XcmpQueue.
 
@@ -254,7 +254,7 @@ The relay chain's `pallet-mmr` provides `mmr_generateAncestryProof` RPC that pro
 
 ### 3. Relayer
 
-**Location**: `tools/xcmp-mmd/relayer/`
+**Location**: `bridges/xcmp-mmd/relayer/`
 
 **Purpose**: Off-chain service that monitors source parachains and constructs proofs.
 
@@ -656,7 +656,7 @@ cargo build -p polkadot-parachain-bin --release
 
 ### Relayer
 ```bash
-cd tools/xcmp-mmd/relayer
+cd bridges/xcmp-mmd/relayer
 SKIP_WASM_BUILD=1 cargo build --release
 ```
 
@@ -716,23 +716,23 @@ For production use, consider:
 ## Files Reference
 
 ### Pallets
-- `cumulus/pallets/xcmp-mmd-outbox/src/lib.rs`
-- `cumulus/pallets/xcmp-mmd-outbox/src/mmr.rs`
-- `cumulus/pallets/xcmp-mmd-outbox/runtime-api/src/lib.rs`
-- `cumulus/pallets/xcmp-mmd-inbox/src/lib.rs`
-- `cumulus/pallets/xcmp-mmd-inbox/src/types.rs`
-- `cumulus/pallets/xcmp-mmd-inbox/src/verification.rs`
+- `bridges/xcmp-mmd/pallets/outbox/src/lib.rs`
+- `bridges/xcmp-mmd/pallets/outbox/src/mmr.rs`
+- `bridges/xcmp-mmd/pallets/outbox/runtime-api/src/lib.rs`
+- `bridges/xcmp-mmd/pallets/inbox/src/lib.rs`
+- `bridges/xcmp-mmd/pallets/inbox/src/types.rs`
+- `bridges/xcmp-mmd/pallets/inbox/src/verification.rs`
 
 ### Relayer
-- `tools/xcmp-mmd/relayer/src/main.rs`
-- `tools/xcmp-mmd/relayer/src/config.rs`
-- `tools/xcmp-mmd/relayer/src/types.rs`
-- `tools/xcmp-mmd/relayer/src/client.rs`
-- `tools/xcmp-mmd/relayer/src/relayer.rs`
-- `tools/xcmp-mmd/relayer/src/proof.rs`
-- `tools/xcmp-mmd/relayer/src/signer.rs`
-- `tools/xcmp-mmd/relayer/Cargo.toml`
-- `tools/xcmp-mmd/relayer/relayer.toml`
+- `bridges/xcmp-mmd/relayer/src/main.rs`
+- `bridges/xcmp-mmd/relayer/src/config.rs`
+- `bridges/xcmp-mmd/relayer/src/types.rs`
+- `bridges/xcmp-mmd/relayer/src/client.rs`
+- `bridges/xcmp-mmd/relayer/src/relayer.rs`
+- `bridges/xcmp-mmd/relayer/src/proof.rs`
+- `bridges/xcmp-mmd/relayer/src/signer.rs`
+- `bridges/xcmp-mmd/relayer/Cargo.toml`
+- `bridges/xcmp-mmd/relayer/relayer.toml`
 
 ### Runtime Integration
 - `cumulus/parachains/runtimes/testing/penpal/Cargo.toml`

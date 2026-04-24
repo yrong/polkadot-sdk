@@ -25,7 +25,7 @@ The **XCMP MMD POC is complete** with all phases implemented:
 ## 📦 Components Built
 
 ### Outbox Pallet
-**Location**: `cumulus/pallets/xcmp-mmd-outbox/`
+**Location**: `bridges/xcmp-mmd/pallets-outbox/`
 
 - Wraps `XcmpMessageSource` to intercept outbound messages
 - Maintains MMR of outbound messages using `mmr-lib`
@@ -34,7 +34,7 @@ The **XCMP MMD POC is complete** with all phases implemented:
 - 9 passing tests
 
 ### Inbox Pallet
-**Location**: `cumulus/pallets/xcmp-mmd-inbox/`
+**Location**: `bridges/xcmp-mmd/pallets-inbox/`
 
 - Verifies three-tier proofs with MMR ancestry proof support
 - 8-step verification algorithm
@@ -43,14 +43,14 @@ The **XCMP MMD POC is complete** with all phases implemented:
 - 6 passing tests
 
 ### Primitives
-**Location**: `cumulus/primitives/xcmp-mmd/`
+**Location**: `bridges/xcmp-mmd/primitives/`
 
 - `OutboxLeaf` - Message commitment structure
 - `XcmpMmdDigest` - Header digest format
 - Hard bounds constants
 
 ### Relayer
-**Location**: `tools/xcmp-mmd/relayer/`
+**Location**: `bridges/xcmp-mmd/relayer/`
 
 - Polls source parachain for new messages
 - Constructs three-tier proofs:
@@ -61,7 +61,7 @@ The **XCMP MMD POC is complete** with all phases implemented:
 - SR25519 signing (FRAME V2)
 
 ### Integration Tests
-**Location**: `cumulus/pallets/xcmp-mmd-integration-tests/`
+**Location**: `bridges/xcmp-mmd/pallets-integration-tests/`
 
 - 7 passing tests validating end-to-end flow
 - Data structure encoding/decoding

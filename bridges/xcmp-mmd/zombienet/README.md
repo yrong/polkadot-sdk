@@ -27,14 +27,14 @@ westend-local relay (4 validators, BEEFY enabled)
 
 3. **Build the relayer**:
    ```bash
-   cd tools/xcmp-mmd/relayer && SKIP_WASM_BUILD=1 cargo build --release
+   cd bridges/xcmp-mmd/relayer && SKIP_WASM_BUILD=1 cargo build --release
    ```
 
 ## Running the test network
 
 ```bash
 # From repo root
-zombienet --provider native spawn tools/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
+zombienet --provider native spawn bridges/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
 ```
 
 Zombienet will print WebSocket endpoints for each node. The defaults match the
@@ -48,7 +48,7 @@ relayer config:
 Once the network is running:
 
 ```bash
-./tools/xcmp-mmd/zombienet/e2e-test.sh
+./bridges/xcmp-mmd/zombienet/e2e-test.sh
 ```
 
 The script will:
@@ -87,7 +87,7 @@ and navigate to **Network → Explorer** to see events. Look for:
 ### Run relayer manually
 
 ```bash
-cd tools/xcmp-mmd/relayer
+cd bridges/xcmp-mmd/relayer
 XCMP_MMD_PALLET_INDEX=<N> \
 XCMP_MMD_CALL_INDEX=<M> \
 ./target/release/xcmp-mmd-relayer \

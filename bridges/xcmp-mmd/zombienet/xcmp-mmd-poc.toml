@@ -14,7 +14,7 @@
 #   - zombienet v1.3+ installed
 #
 # Usage:
-#   zombienet --provider native spawn tools/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
+#   zombienet --provider native spawn bridges/xcmp-mmd/zombienet/xcmp-mmd-poc.toml
 
 [settings]
 timeout = 1200
