@@ -483,18 +483,13 @@ Note: Ancestry proofs are only needed when the destination's relay parent advanc
 
 ## Future Improvements
 
-### Short-term
 1. Batch multiple messages in one proof
 2. WebSocket subscriptions instead of polling
 3. Persistent relayer state (database)
 4. Retry logic and error handling
-
-### Long-term
-1. Economic incentives for relayers (fee mechanism)
-2. Proof compression (aggregate signatures, state proof compression)
-3. Parallel proof construction (multiple relayers)
-4. Integration with XCMP v3 (when available)
-5. Support for external chains (via light client)
+5. Economic incentives for relayers (fee mechanism)
+6. Proof compression (aggregate signatures, state proof compression)
+7. Parallel proof construction (multiple relayers)
 
 ## References
 

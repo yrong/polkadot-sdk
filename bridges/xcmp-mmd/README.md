@@ -168,11 +168,11 @@ Source Parachain                 Relay Chain                 Destination Paracha
 
 ## 🔑 Key Features
 
-✅ **Trustless** - No reliance on validators or relayers for security
-✅ **Censorship Resistant** - Anyone can run a relayer
-✅ **Cryptographically Verified** - All three proof tiers use proper verification
-✅ **Race Condition Free** - MMR ancestry proofs eliminate timing issues
-✅ **Replay Protected** - Messages identified by `(source, mmr_leaf_index)`
+- ✅ **Trustless** - No reliance on validators or relayers for security
+- ✅ **Censorship Resistant** - Anyone can run a relayer
+- ✅ **Cryptographically Verified** - All three proof tiers use proper verification
+- ✅ **Race Condition Free** - MMR ancestry proofs eliminate timing issues
+- ✅ **Replay Protected** - Messages identified by `(source, mmr_leaf_index)`
 
 ---
 
