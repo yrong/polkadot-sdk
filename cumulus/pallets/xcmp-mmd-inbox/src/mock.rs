@@ -45,6 +45,7 @@ parameter_types! {
 	pub const MaxParaHeadsProofItems: u32 = 32;
 	pub const MaxOutboxMmrProofItems: u32 = 64;
 	pub const MaxPayloadBytes: u32 = 256 * 1024;
+	pub const MaxMessagesPerCall: u32 = 4;
 }
 
 impl cumulus_pallet_parachain_system::Config for Test {
@@ -81,6 +82,7 @@ impl xcmp_mmd_inbox::Config for Test {
 	type MaxParaHeadsProofItems = MaxParaHeadsProofItems;
 	type MaxOutboxMmrProofItems = MaxOutboxMmrProofItems;
 	type MaxPayloadBytes = MaxPayloadBytes;
+	type MaxMessagesPerCall = MaxMessagesPerCall;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {

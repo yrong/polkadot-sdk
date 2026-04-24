@@ -88,6 +88,8 @@ pub struct MessageWithProof {
     pub relay_mmr_proof: Vec<H256>,
     pub relay_mmr_leaf: Vec<u8>,        // BEEFY MMR leaf
     pub relay_mmr_size: u64,
+    pub relay_anchor_number: u32,       // Relay block the proof is anchored at
+    pub relay_ancestry_proof: Option<AncestryProof<H256>>,  // Proves anchor is ancestor
     
     // Tier 2: Para-heads Merkle proof
     pub para_heads_proof: Vec<H256>,
@@ -99,6 +101,13 @@ pub struct MessageWithProof {
     pub outbox_leaf: OutboxLeaf,
     pub outbox_mmr_proof: Vec<H256>,
     pub outbox_mmr_size: u64,
+}
+
+pub struct AncestryProof<Hash> {
+    pub prev_peaks: Vec<Hash>,          // MMR peaks at anchor block
+    pub prev_leaf_count: u64,           // MMR size at anchor block
+    pub leaf_count: u64,                // MMR size at current block
+    pub items: Vec<(u64, Hash)>,        // Proof items (index, hash)
 }
 ```
 
@@ -122,15 +131,37 @@ impl<T: Config> Pallet<T> {
 
 #### Verification Steps
 
-**Step 1: Read relay MMR root**
+**Step 1: Read relay MMR root and handle ancestry**
 ```rust
-let relay_mmr_root = verification::read_mmr_root_from_relay_proof::<T>()?;
+let validation_data = cumulus_pallet_parachain_system::ValidationData::<T>::get()
+    .ok_or(Error::<T>::FailedToReadRelayMmrRoot)?;
+
+let current_relay_mmr_root = verification::read_mmr_root_from_relay_proof::<T>()?;
+
+// Derive historical MMR root if needed via ancestry proof
+let relay_mmr_root = if message.relay_anchor_number == validation_data.relay_parent_number {
+    // Proof anchored at current relay parent - use directly
+    current_relay_mmr_root
+} else if message.relay_anchor_number < validation_data.relay_parent_number {
+    // Proof anchored at older relay block - verify ancestry and derive historical root
+    let ancestry_proof = message.relay_ancestry_proof
+        .ok_or(Error::<T>::MissingAncestryProof)?;
+    verification::verify_relay_ancestry_proof::<T>(
+        current_relay_mmr_root,
+        ancestry_proof,
+        message.relay_anchor_number,
+        validation_data.relay_parent_number,
+    )?
+} else {
+    // Proof anchored in the future - invalid
+    return Err(Error::<T>::InvalidAnchor.into());
+};
 ```
 
 **Step 2: Verify relay MMR proof**
 ```rust
 let para_heads_root = verification::verify_relay_mmr_proof::<T>(
-    relay_mmr_root,
+    relay_mmr_root,  // Uses derived historical root if ancestry proof was provided
     message.relay_mmr_leaf_index,
     message.relay_mmr_size,
     &message.relay_mmr_leaf,
@@ -186,6 +217,40 @@ pub trait Config: frame_system::Config + cumulus_pallet_parachain_system::Config
     type MaxPayloadBytes: Get<u32>;
 }
 ```
+
+#### MMR Ancestry Proof Mechanism
+
+**Problem**: Race condition between proof generation and verification.
+
+When the relayer generates a proof at relay block 100, but the destination parachain advances to relay block 105 before the extrinsic executes, the MMR roots don't match:
+- Proof was generated against MMR root at block 100
+- Destination reads MMR root at block 105
+- Verification fails because the roots are different
+
+**Solution**: MMR ancestry proofs.
+
+The relay chain's `pallet-mmr` provides `mmr_generateAncestryProof` RPC that proves an older MMR root is an ancestor of a newer MMR root. The proof contains:
+- `prev_peaks`: MMR peaks at the anchor block (block 100)
+- `prev_leaf_count`: MMR size at anchor block
+- `leaf_count`: MMR size at current block
+- `items`: Merkle proof items showing how prev_peaks are embedded in current MMR
+
+**Verification flow**:
+1. Destination reads current MMR root (at block 105)
+2. Calls `pallet_mmr::verify_ancestry_proof(mmr_root_105, ancestry_proof)`
+3. Returns the historical MMR root at block 100
+4. Verifies the original MMR proof against this historical root
+
+**Benefits**:
+- Eliminates tight timing requirements
+- Proofs remain valid even if destination advances
+- Relayer can wait for destination to catch up
+- Leverages Substrate's built-in MMR ancestry verification
+
+**Implementation**:
+- Relayer: Calls `mmr_generateAncestryProof(prev_block, current_block, at)` RPC
+- Inbox: Calls `pallet_mmr::verify_ancestry_proof::<Keccak256, MmrLeaf>(root, proof)`
+- Added dependency: `pallet-mmr` in inbox pallet
 
 ### 3. Relayer
 
@@ -249,6 +314,7 @@ pub async fn build_message_with_proof(
     message: &PendingMessage,
     source_client: &SourceClient,
     relay_client: &RelayClient,
+    dest_client: &DestClient,
 ) -> Result<MessageWithProof> {
     // Step 1: Generate outbox MMR proof
     let outbox_proof = build_outbox_proof(message, source_client).await?;
@@ -258,11 +324,19 @@ pub async fn build_message_with_proof(
         .find_relay_block_for_source(message.source_para_id, &source_header_bytes)
         .await?;
     
-    // Step 3: Generate relay MMR proof
+    // Step 2b: Read destination's current relay parent
+    let (_dest_at, stable_vd) = dest_client
+        .stabilized_persisted_validation_data(DEST_VFP_STABILIZE_ROUNDS)
+        .await?;
+    let anchor_num = stable_vd.relay_parent_number;
+    
+    // Step 3: Generate relay MMR proof (anchored at destination's relay parent)
     let relay_mmr_proof = build_relay_mmr_proof(
         relay_leaf_index,
         relay_block_num,
-        relay_client
+        relay_client,
+        anchor_num,
+        anchor_hash,
     ).await?;
     
     // Step 4: Generate para-heads Merkle proof
@@ -273,10 +347,32 @@ pub async fn build_message_with_proof(
         relay_client,
     ).await?;
     
+    // Step 5: Generate ancestry proof if needed
+    let relay_ancestry_proof = if anchor_num == relay_block_num {
+        None  // Proof anchored at same block
+    } else {
+        Some(build_relay_ancestry_proof(
+            relay_block_num,
+            anchor_num,
+            anchor_hash,
+            relay_client,
+        ).await?)
+    };
+    
     // Assemble MessageWithProof
-    Ok(MessageWithProof { /* all fields */ })
+    Ok(MessageWithProof {
+        relay_anchor_number: relay_block_num,
+        relay_ancestry_proof,
+        /* other fields */
+    })
 }
 ```
+
+**Key changes for ancestry proof support**:
+- Added `dest_client` parameter to read destination's relay parent
+- Generates MMR proof anchored at destination's current relay parent
+- Generates ancestry proof when anchor differs from source inclusion block
+- Sets `relay_anchor_number` to the actual source inclusion block (not destination's relay parent)
 
 #### Extrinsic Signing (signer.rs)
 

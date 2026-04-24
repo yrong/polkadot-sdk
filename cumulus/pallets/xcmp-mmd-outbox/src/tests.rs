@@ -16,7 +16,7 @@
 //! Tests for XCMP MMD outbox pallet.
 
 use crate::{mock::*, *};
-use codec::{Decode, Encode};
+use codec::Decode;
 use frame_support::traits::Hooks;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::traits::Hash;

@@ -24,6 +24,7 @@ codec = { package = "parity-scale-codec", version = "3", features = ["derive"] }
 # Substrate primitives (path deps to match host toolchain)
 sp-core = { path = "../../../substrate/primitives/core", default-features = false, features = ["std", "full_crypto"] }
 sp-runtime = { path = "../../../substrate/primitives/runtime", default-features = false, features = ["std"] }
+polkadot-primitives = { path = "../../../polkadot/primitives", default-features = false, features = ["std"] }
 binary-merkle-tree = { path = "../../../substrate/utils/binary-merkle-tree", features = ["std"] }
 
 # Logging / CLI

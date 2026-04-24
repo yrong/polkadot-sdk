@@ -19,6 +19,7 @@ scale-info = { workspace = true }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
 sp-core = { workspace = true }
+sp-consensus-beefy = { workspace = true }
 sp-runtime = { workspace = true }
 sp-std = { workspace = true }
 sp-io = { workspace = true }
@@ -34,6 +35,7 @@ polkadot-primitives = { workspace = true }
 
 # MMR
 sp-mmr-primitives = { workspace = true }
+pallet-mmr = { workspace = true }
 binary-merkle-tree = { workspace = true }
 mmr-lib = { workspace = true }
 
@@ -54,12 +56,14 @@ std = [
 	"polkadot-primitives/std",
 	"scale-info/std",
 	"sp-core/std",
+	"sp-consensus-beefy/std",
 	"sp-io/std",
 	"sp-mmr-primitives/std",
 	"sp-runtime/std",
 	"sp-std/std",
 	"binary-merkle-tree/std",
 	"mmr-lib/std",
+	"pallet-mmr/std",
 ]
 runtime-benchmarks = [
 	"cumulus-pallet-parachain-system/runtime-benchmarks",

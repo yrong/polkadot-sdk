@@ -50,7 +50,12 @@ fn test_message_with_proof_encoding() {
 		relay_mmr_proof: vec![H256::default()],
 		relay_mmr_leaf: vec![0u8; 64],
 		relay_mmr_size: 1,
+		relay_anchor_number: 0,
+		relay_ancestry_proof: None,
 		para_heads_proof: vec![H256::default()],
+		source_head: vec![],
+		para_head_index: 0,
+		para_heads_count: 1,
 		outbox_leaf: OutboxLeaf {
 			dest: 2000,
 			payload_hash: sp_runtime::traits::Keccak256::hash(b"test"),
@@ -118,7 +123,12 @@ fn test_end_to_end_data_flow() {
 		relay_mmr_proof: vec![H256::default()],
 		relay_mmr_leaf: vec![0u8; 64],
 		relay_mmr_size: 1,
+		relay_anchor_number: 0,
+		relay_ancestry_proof: None,
 		para_heads_proof: vec![H256::default()],
+		source_head: vec![],
+		para_head_index: 0,
+		para_heads_count: 1,
 		outbox_leaf: outbox_leaf.clone(),
 		outbox_mmr_proof: vec![],
 		outbox_mmr_size: 1,
@@ -202,7 +212,12 @@ fn test_message_size_bounds() {
 		relay_mmr_proof: vec![H256::default(); 128], // Max relay MMR proof items
 		relay_mmr_leaf: vec![0u8; 64],
 		relay_mmr_size: 1,
+		relay_anchor_number: 0,
+		relay_ancestry_proof: None,
 		para_heads_proof: vec![H256::default(); 32], // Max para-heads proof items
+		source_head: vec![],
+		para_head_index: 0,
+		para_heads_count: 1,
 		outbox_leaf: OutboxLeaf {
 			dest: 2000,
 			payload_hash,

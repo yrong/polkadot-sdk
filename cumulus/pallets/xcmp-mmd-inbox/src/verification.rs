@@ -21,6 +21,7 @@ use codec::{Decode, Encode};
 use cumulus_primitives_xcmp_mmd::{OutboxLeaf, XcmpMmdDigest};
 use frame_support::traits::Get;
 use sp_core::H256;
+use sp_mmr_primitives::AncestryProof;
 use sp_runtime::traits::Hash as HashT;
 
 
@@ -70,6 +71,8 @@ pub fn verify_relay_mmr_proof<T: frame_system::Config>(
 	relay_mmr_proof: &[H256],
 ) -> Result<H256, crate::Error<T>> {
 	use mmr_lib::{Merge, Result as MmrResult};
+	use sp_consensus_beefy::mmr::MmrLeaf;
+	use sp_mmr_primitives::EncodableOpaqueLeaf;
 
 	// Define Keccak256Merge for relay MMR (same as used by pallet-mmr)
 	struct Keccak256Merge;
@@ -102,19 +105,23 @@ pub fn verify_relay_mmr_proof<T: frame_system::Config>(
 		return Err(crate::Error::<T>::InvalidRelayMmrProof);
 	}
 
-	// Extract ParaHeadsRoot from the leaf
-	// For this POC, we use a simplified approach:
-	// The leaf data should contain the ParaHeadsRoot at a known offset.
-	// In a full implementation, we would decode the BEEFY MMR leaf structure.
+	// Extract ParaHeadsRoot from the proven relay leaf.
 	//
-	// For now, we'll extract the last 32 bytes as the ParaHeadsRoot
-	// (assuming it's appended at the end of the leaf for this POC)
-	if relay_mmr_leaf.len() < 32 {
-		return Err(crate::Error::<T>::InvalidRelayMmrProof);
-	}
+	// On Polkadot-style relays we rely on:
+	// - `pallet_beefy_mmr::LeafExtra = H256`
+	// - `LeafExtra` is the relay `ParaHeadsRoot`
+	//
+	// The leaf may come as:
+	// - raw SCALE-encoded `MmrLeaf<_, _, _, H256>`
+	// - SCALE-encoded `EncodableOpaqueLeaf(Vec<u8>)` wrapping the compact leaf bytes
+	let leaf: MmrLeaf<u32, H256, H256, H256> = MmrLeaf::decode(&mut &relay_mmr_leaf[..])
+		.or_else(|_| {
+			let enc = EncodableOpaqueLeaf::decode(&mut &relay_mmr_leaf[..])?;
+			MmrLeaf::decode(&mut &enc.0[..])
+		})
+		.map_err(|_| crate::Error::<T>::InvalidRelayMmrProof)?;
 
-	let para_heads_root_bytes = &relay_mmr_leaf[relay_mmr_leaf.len() - 32..];
-	let para_heads_root = H256::from_slice(para_heads_root_bytes);
+	let para_heads_root = leaf.leaf_extra;
 
 	Ok(para_heads_root)
 }
@@ -231,3 +238,30 @@ pub fn verify_payload_hash<T: frame_system::Config>(
 		Err(crate::Error::<T>::PayloadHashMismatch)
 	}
 }
+
+/// Verify relay ancestry proof and derive historical MMR root.
+///
+/// Given the current relay MMR root, proves that the anchor block is an ancestor
+/// and returns the MMR root at the anchor block.
+pub fn verify_relay_ancestry_proof<T: frame_system::Config>(
+	current_mmr_root: H256,
+	ancestry_proof: AncestryProof<H256>,
+	anchor_block_number: u32,
+	current_block_number: u32,
+) -> Result<H256, crate::Error<T>> {
+	// Sanity check: anchor must be in the past
+	if anchor_block_number >= current_block_number {
+		return Err(crate::Error::<T>::InvalidAncestryProof);
+	}
+
+	// Use pallet_mmr's stateless ancestry proof verification
+	// This returns the historical MMR root at the anchor block
+	let historical_mmr_root = pallet_mmr::verify_ancestry_proof::<
+		sp_runtime::traits::Keccak256,
+		sp_consensus_beefy::mmr::MmrLeaf<u32, H256, H256, H256>,
+	>(current_mmr_root, ancestry_proof)
+		.map_err(|_| crate::Error::<T>::InvalidAncestryProof)?;
+
+	Ok(historical_mmr_root)
+}
+

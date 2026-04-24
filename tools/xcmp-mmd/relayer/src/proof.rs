@@ -7,21 +7,27 @@
 
 use anyhow::{anyhow, Context, Result};
 use binary_merkle_tree::{merkle_proof, MerkleProof};
-use codec::Encode;
 use sp_core::H256;
-use tracing::{debug, info};
+use tokio::time::{sleep, Duration};
+use tracing::{debug, info, warn};
 
-use crate::client::{RelayClient, SourceClient};
+use crate::client::{DestClient, RelayClient, SourceClient};
 use crate::types::{
-    encode_para_head_leaf, MessageWithProof, OutboxLeaf, OutboxProof, ParaHeadsProof,
+    encode_para_head_leaf, MessageWithProof, OutboxProof, ParaHeadsProof,
     PendingMessage, RelayMmrProof,
 };
+
+/// Rounds: stabilize VFP, then re-check after the full proof bundle; outer loop if VFP drifts.
+const PROOF_BUNDLE_REBUILD_ATTEMPTS: usize = 20;
+/// Back-to-back reads of dest `ValidationData` until stable.
+const DEST_VFP_STABILIZE_ROUNDS: usize = 20;
 
 /// Build the complete MessageWithProof for a pending message.
 pub async fn build_message_with_proof(
     message: &PendingMessage,
     source_client: &SourceClient,
     relay_client: &RelayClient,
+    dest_client: &DestClient,
 ) -> Result<MessageWithProof> {
     info!(
         "Building proof for message: para={} leaf_index={}",
@@ -44,34 +50,103 @@ pub async fn build_message_with_proof(
 
     let relay_leaf_index = RelayClient::relay_block_to_leaf_index(relay_block_num);
 
-    // Step 3: Generate relay MMR proof
-    let relay_mmr_proof = build_relay_mmr_proof(relay_leaf_index, relay_block_num, relay_client).await?;
+    for bundle_attempt in 0..PROOF_BUNDLE_REBUILD_ATTEMPTS {
+        // Anchor to dest ValidationData: two consecutive reads agree (suggestion 1).
+        let (_dest_at, stable_vd) = dest_client
+            .stabilized_persisted_validation_data(DEST_VFP_STABILIZE_ROUNDS)
+            .await
+            .with_context(|| "stabilize dest ParachainSystem::ValidationData")?;
+        let anchor_num = stable_vd.relay_parent_number;
+        if anchor_num < relay_block_num {
+            return Err(anyhow!(
+                "Destination relay parent #{} is behind relay inclusion block #{}: wait and retry",
+                anchor_num,
+                relay_block_num
+            ));
+        }
+        let anchor_hash = relay_client
+            .inner
+            .block_hash_by_number(anchor_num)
+            .await
+            .with_context(|| "chain_getBlockHash(anchor) for MMR proof")?;
 
-    // Step 4: Generate para-heads Merkle proof
-    let para_heads_proof = build_para_heads_proof(
-        message.source_para_id,
-        &relay_mmr_proof.para_heads_root,
-        relay_block_hash,
-        relay_client,
-    ).await?;
+        // Step 3: Generate relay MMR proof
+        let relay_mmr_proof = build_relay_mmr_proof(
+            relay_leaf_index,
+            relay_block_num,
+            relay_client,
+            anchor_num,
+            anchor_hash,
+        )
+        .await?;
 
-    Ok(MessageWithProof {
-        source: message.source_para_id,
-        dest: message.dest_para_id,
-        mmr_leaf_index: message.mmr_leaf_index,
-        relay_mmr_leaf_index: relay_leaf_index,
-        payload: message.payload.clone(),
-        relay_mmr_proof: relay_mmr_proof.proof_items,
-        relay_mmr_leaf: relay_mmr_proof.leaf_bytes,
-        relay_mmr_size: relay_mmr_proof.mmr_size,
-        para_heads_proof: para_heads_proof.proof_items,
-        source_head: para_heads_proof.head_bytes,
-        para_head_index: para_heads_proof.leaf_index,
-        para_heads_count: para_heads_proof.number_of_leaves,
-        outbox_leaf: outbox_proof.leaf,
-        outbox_mmr_proof: outbox_proof.proof_items,
-        outbox_mmr_size: outbox_proof.mmr_size,
-    })
+        // Step 4: Generate para-heads Merkle proof
+        let para_heads_proof = build_para_heads_proof(
+            message.source_para_id,
+            &relay_mmr_proof.para_heads_root,
+            relay_block_hash,
+            relay_client,
+        )
+        .await?;
+
+        // Step 5: Generate ancestry proof if anchor != relay_block_num
+        let relay_ancestry_proof = if anchor_num == relay_block_num {
+            // Proof anchored at same block - no ancestry proof needed
+            None
+        } else {
+            // Proof anchored at newer block - generate ancestry proof
+            Some(build_relay_ancestry_proof(
+                relay_block_num,
+                anchor_num,
+                anchor_hash,
+                relay_client,
+            ).await?)
+        };
+
+        let mwp = MessageWithProof {
+            source: message.source_para_id,
+            dest: message.dest_para_id,
+            mmr_leaf_index: message.mmr_leaf_index,
+            relay_mmr_leaf_index: relay_leaf_index,
+            payload: message.payload.clone(),
+            relay_mmr_proof: relay_mmr_proof.proof_items,
+            relay_mmr_leaf: relay_mmr_proof.leaf_bytes,
+            relay_mmr_size: relay_mmr_proof.mmr_size,
+            relay_anchor_number: relay_block_num,
+            relay_ancestry_proof,
+            para_heads_proof: para_heads_proof.proof_items,
+            source_head: para_heads_proof.head_bytes,
+            para_head_index: para_heads_proof.leaf_index,
+            para_heads_count: para_heads_proof.number_of_leaves,
+            outbox_leaf: outbox_proof.leaf.clone(),
+            outbox_mmr_proof: outbox_proof.proof_items.clone(),
+            outbox_mmr_size: outbox_proof.mmr_size,
+        };
+
+        // Re-read before returning: if dest VFP moved while we built, rebuild (suggestion 1).
+        let head_after = dest_client.inner.finalized_head().await?;
+        let vd_after = dest_client
+            .persisted_validation_data(Some(head_after))
+            .await
+            .with_context(|| "re-read dest ValidationData after proof bundle")?;
+        if vd_after.relay_parent_number == stable_vd.relay_parent_number
+            && vd_after.relay_parent_storage_root == stable_vd.relay_parent_storage_root
+        {
+            return Ok(mwp);
+        }
+        warn!(
+            bundle_attempt,
+            "dest ValidationData changed after building proof (relay parent {:?} -> {:?}); rebuilding",
+            stable_vd.relay_parent_number,
+            vd_after.relay_parent_number
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    Err(anyhow!(
+        "Could not produce a MessageWithProof consistent with dest ValidationData after {} bundle attempts",
+        PROOF_BUNDLE_REBUILD_ATTEMPTS
+    ))
 }
 
 /// Step 1: Call XcmpMmdOutboxApi::generate_outbox_proof on source chain
@@ -115,10 +190,21 @@ async fn build_relay_mmr_proof(
     relay_leaf_index: u64,
     relay_block_num: u32,
     relay_client: &RelayClient,
+    anchor_num: u32,
+    anchor_hash: H256,
 ) -> Result<RelayMmrProof> {
-    let result = relay_client.inner
-        .mmr_generate_proof(vec![relay_block_num as u64], None)
-        .await?;
+    // `anchor_num` / `anchor_hash` come from the stabilized dest `ParachainSystem::ValidationData`
+    // (see `stabilized_persisted_validation_data` + `read_mmr_root` in the inbox).
+
+    let result = relay_client
+        .inner
+        .mmr_generate_proof(
+            vec![relay_block_num as u64],
+            Some(anchor_num as u64),
+            Some(anchor_hash),
+        )
+        .await
+        .with_context(|| "mmr_generateProof")?;
 
     // Parse the mmr_generateProof response
     // Response: { blockHash, leaves: [hex], proof: { leafIndices, leafCount, items: [hex] } }
@@ -271,4 +357,78 @@ fn encode_para_header_for_relay(payload: &[u8]) -> Vec<u8> {
     // Returning payload here is incorrect; see PendingMessage construction
     // in relayer.rs which should capture head_bytes at message discovery time.
     payload.to_vec()
+}
+
+/// Step 5: Generate relay MMR ancestry proof
+async fn build_relay_ancestry_proof(
+    prev_block_num: u32,
+    current_block_num: u32,
+    current_block_hash: H256,
+    relay_client: &RelayClient,
+) -> Result<crate::types::AncestryProof> {
+    let result = relay_client
+        .inner
+        .mmr_generate_ancestry_proof(
+            prev_block_num as u64,
+            Some(current_block_num as u64),
+            Some(current_block_hash),
+        )
+        .await
+        .with_context(|| "mmr_generateAncestryProof")?;
+
+    // Parse the mmr_generateAncestryProof response
+    // Response: { prevPeaks: [hex], prevLeafCount: hex, leafCount: hex, items: [[index, hash], ...] }
+    let prev_peaks = result["prevPeaks"].as_array()
+        .ok_or_else(|| anyhow!("Expected 'prevPeaks' array in mmr_generateAncestryProof response"))?;
+    let prev_peaks: Vec<H256> = prev_peaks.iter()
+        .map(|peak| {
+            let hex_str = peak.as_str().unwrap_or("0x");
+            let bytes = hex::decode(hex_str.trim_start_matches("0x")).unwrap_or_default();
+            if bytes.len() == 32 {
+                H256::from_slice(&bytes)
+            } else {
+                H256::default()
+            }
+        })
+        .collect();
+
+    let prev_leaf_count = result["prevLeafCount"].as_str()
+        .ok_or_else(|| anyhow!("Expected 'prevLeafCount' in ancestry proof"))?;
+    let prev_leaf_count = u64::from_str_radix(prev_leaf_count.trim_start_matches("0x"), 16)?;
+
+    let leaf_count = result["leafCount"].as_str()
+        .ok_or_else(|| anyhow!("Expected 'leafCount' in ancestry proof"))?;
+    let leaf_count = u64::from_str_radix(leaf_count.trim_start_matches("0x"), 16)?;
+
+    let items = result["items"].as_array()
+        .ok_or_else(|| anyhow!("Expected 'items' in ancestry proof"))?;
+    let items: Vec<(u64, H256)> = items.iter()
+        .filter_map(|item| {
+            let arr = item.as_array()?;
+            if arr.len() != 2 {
+                return None;
+            }
+            let index_str = arr[0].as_str()?;
+            let index = u64::from_str_radix(index_str.trim_start_matches("0x"), 16).ok()?;
+            let hash_str = arr[1].as_str()?;
+            let bytes = hex::decode(hash_str.trim_start_matches("0x")).ok()?;
+            if bytes.len() == 32 {
+                Some((index, H256::from_slice(&bytes)))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    info!(
+        "Ancestry proof: prev_block={}, current_block={}, {} prev_peaks, {} items",
+        prev_block_num, current_block_num, prev_peaks.len(), items.len()
+    );
+
+    Ok(crate::types::AncestryProof {
+        prev_peaks,
+        prev_leaf_count,
+        leaf_count,
+        items,
+    })
 }

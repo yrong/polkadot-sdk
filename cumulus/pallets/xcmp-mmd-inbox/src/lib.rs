@@ -85,6 +85,10 @@ pub mod pallet {
 		/// Maximum payload size in bytes.
 		#[pallet::constant]
 		type MaxPayloadBytes: Get<u32>;
+
+		/// Maximum number of messages that can be submitted in a single call.
+		#[pallet::constant]
+		type MaxMessagesPerCall: Get<u32>;
 	}
 
 	/// Tracks seen messages for replay protection.
@@ -124,6 +128,18 @@ pub mod pallet {
 		MessageAlreadySeen,
 		/// Payload exceeds maximum size.
 		PayloadTooLarge,
+		/// Too many messages submitted in a single call.
+		TooManyMessages,
+		/// Destination does not match this parachain.
+		WrongDestination,
+		/// One of the proof vectors exceeds its configured maximum.
+		ProofTooLarge,
+		/// Relay ancestry proof verification failed.
+		InvalidAncestryProof,
+		/// Ancestry proof is required but missing.
+		MissingAncestryProof,
+		/// Relay anchor is invalid (future block).
+		InvalidAnchor,
 	}
 
 	#[pallet::call]
@@ -136,6 +152,11 @@ pub mod pallet {
 			messages: Vec<types::MessageWithProof>,
 		) -> DispatchResult {
 			ensure_signed(origin)?;
+
+			ensure!(
+				messages.len() <= T::MaxMessagesPerCall::get() as usize,
+				Error::<T>::TooManyMessages
+			);
 
 			for message in messages {
 				Self::verify_and_dispatch_message(message)?;
@@ -155,14 +176,50 @@ pub mod pallet {
 				message.mmr_leaf_index
 			);
 
+			// Reject unless the message is destined to this parachain.
+			ensure!(
+				message.dest == <T as Config>::SelfParaId::get(),
+				Error::<T>::WrongDestination
+			);
+
 			// Check payload size
 			ensure!(
 				message.payload.len() <= T::MaxPayloadBytes::get() as usize,
 				Error::<T>::PayloadTooLarge
 			);
 
+			// Bound proof vector sizes (DoS protection; required by spec hard bounds).
+			ensure!(
+				message.relay_mmr_proof.len() <= T::MaxRelayMmrProofItems::get() as usize &&
+					message.para_heads_proof.len() <= T::MaxParaHeadsProofItems::get() as usize &&
+					message.outbox_mmr_proof.len() <= T::MaxOutboxMmrProofItems::get() as usize,
+				Error::<T>::ProofTooLarge
+			);
+
 			// Step 1: Get relay MMR root from RelayChainStateProof
-			let relay_mmr_root = verification::read_mmr_root_from_relay_proof::<T>()?;
+			let validation_data = cumulus_pallet_parachain_system::ValidationData::<T>::get()
+				.ok_or(Error::<T>::FailedToReadRelayMmrRoot)?;
+
+			let current_relay_mmr_root = verification::read_mmr_root_from_relay_proof::<T>()?;
+
+			// Step 1b: Derive historical MMR root if needed via ancestry proof
+			let relay_mmr_root = if message.relay_anchor_number == validation_data.relay_parent_number {
+				// Proof anchored at current relay parent - use directly
+				current_relay_mmr_root
+			} else if message.relay_anchor_number < validation_data.relay_parent_number {
+				// Proof anchored at older relay block - verify ancestry and derive historical root
+				let ancestry_proof = message.relay_ancestry_proof
+					.ok_or(Error::<T>::MissingAncestryProof)?;
+				verification::verify_relay_ancestry_proof::<T>(
+					current_relay_mmr_root,
+					ancestry_proof,
+					message.relay_anchor_number,
+					validation_data.relay_parent_number,
+				)?
+			} else {
+				// Proof anchored in the future - invalid
+				return Err(Error::<T>::InvalidAnchor.into());
+			};
 
 			// Step 2: Verify relay MMR proof and extract ParaHeadsRoot
 			let para_heads_root = verification::verify_relay_mmr_proof::<T>(
@@ -207,8 +264,8 @@ pub mod pallet {
 			SeenMessages::<T>::insert(key, ());
 
 			// Step 8: Dispatch to XcmpMessageHandler
-			// TODO: Get actual relay block number from relay state
-			let relay_block_number = 0u32;
+			// Relay parent number is part of persisted validation data (already fetched above).
+			let relay_block_number = validation_data.relay_parent_number;
 			let messages_iter = core::iter::once((
 				message.source,
 				relay_block_number,

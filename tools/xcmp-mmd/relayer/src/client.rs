@@ -2,8 +2,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use codec::Decode;
+use polkadot_primitives::PersistedValidationData;
 use serde_json::Value;
+use sp_core::hashing::twox_128;
 use sp_core::H256;
+use tokio::time::{sleep, Duration};
 use tracing::{debug, info};
 
 use crate::types::{OutboxLeaf, OutboxProof, XcmpMmdDigest};
@@ -79,6 +82,23 @@ impl SubstrateClient {
         Ok(num)
     }
 
+    /// `chain_getBlockHash` for a block number (hex-encoded in JSON-RPC)
+    pub async fn block_hash_by_number(&self, block_number: u32) -> Result<H256> {
+        let result = self
+            .rpc_call(
+                "chain_getBlockHash",
+                serde_json::json!([format!("0x{:x}", block_number)]),
+            )
+            .await?;
+        let hash_str = result
+            .as_str()
+            .ok_or_else(|| anyhow!("chain_getBlockHash: expected a hash string"))?;
+        if hash_str.is_empty() {
+            return Err(anyhow!("chain_getBlockHash: empty result for block {block_number}"));
+        }
+        parse_h256(hash_str)
+    }
+
     /// Subscribe to finalized blocks - returns hashes as they arrive
     /// For POC simplicity, polls via HTTP rather than WS subscription
     pub async fn poll_finalized_head(&self) -> Result<H256> {
@@ -142,25 +162,51 @@ impl SubstrateClient {
         Ok(hex::decode(hex_str.trim_start_matches("0x"))?)
     }
 
-    /// Generate MMR proof via relay chain's mmr_generateProof RPC
-    /// Returns (leaf_bytes, proof_items, mmr_size, leaf_index)
+    /// Generate MMR proof via relay chain's `mmr_generateProof` RPC
+    ///
+    /// Matches Substrate [`MmrApi::generate_proof`]:
+    /// `block_numbers` — relay block numbers to fetch MMR leaves for,
+    /// `best_known_block_number` — MMR is built with this relay block as head; must be high enough
+    /// to include all `block_numbers`. For XCMP MMD, use the **destination** parachain's
+    /// `ParachainSystem::ValidationData.relay_parent_number` so the result verifies against
+    /// the same `pallet_mmr::RootHash` the destination reads from the relay state proof,
+    /// `at` — relay **block hash** the runtime (and MMR offchain data) is queried at.
     pub async fn mmr_generate_proof(
         &self,
         block_numbers: Vec<u64>,
         best_known_block: Option<u64>,
+        at: Option<H256>,
     ) -> Result<Value> {
-        let block_nums_hex: Vec<String> = block_numbers.iter()
+        let block_nums_hex: Vec<String> = block_numbers
+            .iter()
             .map(|n| format!("0x{:x}", n))
             .collect();
-        let best_known = best_known_block.map(|n| format!("0x{:x}", n));
-
-        let params = match best_known {
-            Some(b) => serde_json::json!([block_nums_hex, b]),
-            None => serde_json::json!([block_nums_hex]),
-        };
+        let best = best_known_block.map(|n| format!("0x{:x}", n));
+        let at = at.map(|h| format!("0x{}", hex::encode(h)));
+        let params = serde_json::json!([block_nums_hex, best, at]);
 
         let result = self.rpc_call("mmr_generateProof", params).await?;
         debug!("mmr_generateProof result: {:?}", result);
+        Ok(result)
+    }
+
+    /// Generate MMR ancestry proof via relay chain's `mmr_generateAncestryProof` RPC
+    ///
+    /// Proves that the MMR root at `prev_block_number` is an ancestor of the MMR root
+    /// at `best_known_block_number`.
+    pub async fn mmr_generate_ancestry_proof(
+        &self,
+        prev_block_number: u64,
+        best_known_block_number: Option<u64>,
+        at: Option<H256>,
+    ) -> Result<Value> {
+        let prev_hex = format!("0x{:x}", prev_block_number);
+        let best = best_known_block_number.map(|n| format!("0x{:x}", n));
+        let at = at.map(|h| format!("0x{}", hex::encode(h)));
+        let params = serde_json::json!([prev_hex, best, at]);
+
+        let result = self.rpc_call("mmr_generateAncestryProof", params).await?;
+        debug!("mmr_generateAncestryProof result: {:?}", result);
         Ok(result)
     }
 
@@ -394,5 +440,65 @@ impl DestClient {
             inner: SubstrateClient::new(url).await?,
             para_id,
         })
+    }
+
+    /// `cumulus_pallet_parachain_system::ValidationData` storage at `at` (finalized head if None)
+    fn validation_data_storage_key() -> String {
+        let mut key = Vec::new();
+        key.extend_from_slice(&twox_128(b"ParachainSystem"));
+        key.extend_from_slice(&twox_128(b"ValidationData"));
+        format!("0x{}", hex::encode(key))
+    }
+
+    /// Relay parent number / storage root the **destination** will use in `set_validation_data`
+    /// (same as on-chain `cumulus_pallet_parachain_system::ValidationData`).
+    pub async fn persisted_validation_data(
+        &self,
+        at: Option<H256>,
+    ) -> Result<PersistedValidationData<H256, u32>> {
+        let k = Self::validation_data_storage_key();
+        let raw = self
+            .inner
+            .storage(&k, at)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "ParachainSystem::ValidationData missing (dest not ready or wrong chain? para={})",
+                    self.para_id
+                )
+            })?;
+        PersistedValidationData::decode(&mut &raw[..])
+            .map_err(|e| anyhow!("Failed to decode ValidationData: {e}"))
+    }
+
+    /// Read [`PersistedValidationData`] twice in a row (at finalized head each time) until both
+    /// `relay_parent_number` and `relay_parent_storage_root` match. This is the off-chain
+    /// counterpart to using the same anchor the inbox will see when it reads `Mmr::RootHash`
+    /// from the relay state proof.
+    pub async fn stabilized_persisted_validation_data(
+        &self,
+        max_rounds: usize,
+    ) -> Result<(H256, PersistedValidationData<H256, u32>)> {
+        for round in 0..max_rounds {
+            let h1 = self.inner.finalized_head().await?;
+            let vd1 = self.persisted_validation_data(Some(h1)).await?;
+            let h2 = self.inner.finalized_head().await?;
+            let vd2 = self.persisted_validation_data(Some(h2)).await?;
+            if vd1.relay_parent_number == vd2.relay_parent_number
+                && vd1.relay_parent_storage_root == vd2.relay_parent_storage_root
+            {
+                return Ok((h2, vd1));
+            }
+            debug!(
+                target: "xcmp-mmd-relayer",
+                round,
+                "dest ValidationData changed between back-to-back reads; retrying stabilization"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        Err(anyhow!(
+            "Could not stabilize dest ParachainSystem::ValidationData after {} rounds",
+            max_rounds
+        ))
     }
 }

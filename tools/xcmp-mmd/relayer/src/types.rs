@@ -50,6 +50,8 @@ pub struct MessageWithProof {
     pub relay_mmr_proof: Vec<H256>,
     pub relay_mmr_leaf: Vec<u8>,
     pub relay_mmr_size: u64,
+    pub relay_anchor_number: u32,
+    pub relay_ancestry_proof: Option<AncestryProof>,
     pub para_heads_proof: Vec<H256>,
     pub source_head: Vec<u8>,
     pub para_head_index: u32,
@@ -57,6 +59,15 @@ pub struct MessageWithProof {
     pub outbox_leaf: OutboxLeaf,
     pub outbox_mmr_proof: Vec<H256>,
     pub outbox_mmr_size: u64,
+}
+
+/// Relay MMR ancestry proof (matches sp_mmr_primitives::AncestryProof)
+#[derive(Clone, Debug, Encode, Decode, Serialize, Deserialize)]
+pub struct AncestryProof {
+    pub prev_peaks: Vec<H256>,
+    pub prev_leaf_count: u64,
+    pub leaf_count: u64,
+    pub items: Vec<(u64, H256)>,
 }
 
 /// Result of outbox proof generation from source runtime API

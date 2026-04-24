@@ -1,7 +1,6 @@
 // Main relayer event loop
 
-use anyhow::{Context, Result};
-use codec::Encode;
+use anyhow::{anyhow, Context, Result};
 use sp_core::H256;
 use std::collections::HashSet;
 use tokio::time::{sleep, Duration};
@@ -12,6 +11,10 @@ use crate::config::Config;
 use crate::proof::build_message_with_proof;
 use crate::signer::ExtrinsicSigner;
 use crate::types::{MessageWithProof, PendingMessage};
+
+/// Retries with fresh VFP + proof if submit fails (e.g. anchor drift, pool drop).
+const SUBMIT_MAX_ATTEMPTS: u32 = 10;
+const SUBMIT_RETRY_BACKOFF_MS: u64 = 500;
 
 pub struct Relayer {
     source: SourceClient,
@@ -155,10 +158,35 @@ impl Relayer {
 
     /// Build proof and submit to destination chain. Returns tx hash.
     async fn relay_message(&self, message: &PendingMessage) -> Result<H256> {
-        let mwp = build_message_with_proof(message, &self.source, &self.relay).await
-            .with_context(|| format!("Proof construction failed for leaf_index={}", message.mmr_leaf_index))?;
+        for attempt in 0..SUBMIT_MAX_ATTEMPTS {
+            let mwp = build_message_with_proof(message, &self.source, &self.relay, &self.dest)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Proof construction failed for leaf_index={} (submit attempt {}/{})",
+                        message.mmr_leaf_index,
+                        attempt + 1,
+                        SUBMIT_MAX_ATTEMPTS
+                    )
+                })?;
 
-        self.submit_to_dest(&mwp).await
+            match self.submit_to_dest(&mwp).await {
+                Ok(h) => return Ok(h),
+                Err(e) if attempt + 1 < SUBMIT_MAX_ATTEMPTS => {
+                    warn!(
+                        "submit_to_dest failed (attempt {}/{}), rebuilding proof and retrying: {:#}",
+                        attempt + 1,
+                        SUBMIT_MAX_ATTEMPTS,
+                        e
+                    );
+                    sleep(Duration::from_millis(SUBMIT_RETRY_BACKOFF_MS)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(anyhow!(
+            "submit: loop completed without return (this should be impossible if SUBMIT_MAX_ATTEMPTS > 0)"
+        ))
     }
 
     /// Build a signed `submit_xcmp_mmd` extrinsic and submit it to the destination chain.

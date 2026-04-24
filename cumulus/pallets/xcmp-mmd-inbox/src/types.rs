@@ -20,6 +20,7 @@ use cumulus_primitives_xcmp_mmd::OutboxLeaf;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use scale_info::TypeInfo;
 use sp_core::H256;
+use sp_mmr_primitives::AncestryProof;
 use sp_std::vec::Vec;
 
 /// A cross-chain message with all proofs needed for verification.
@@ -41,6 +42,10 @@ pub struct MessageWithProof {
 	pub relay_mmr_leaf: Vec<u8>,
 	/// The relay MMR size at proof generation time
 	pub relay_mmr_size: u64,
+	/// Relay block number the MMR proof was anchored at
+	pub relay_anchor_number: u32,
+	/// Ancestry proof showing relay_anchor_number is ancestor of current relay parent
+	pub relay_ancestry_proof: Option<AncestryProof<H256>>,
 	/// Proof for the source parachain head in the ParaHeadsRoot
 	pub para_heads_proof: Vec<H256>,
 	/// The encoded source parachain head bytes (SCALE-encoded parachain header)
@@ -68,6 +73,8 @@ pub struct MessageWithProofUnbounded {
 	pub relay_mmr_proof: Vec<H256>,
 	pub relay_mmr_leaf: Vec<u8>,
 	pub relay_mmr_size: u64,
+	pub relay_anchor_number: u32,
+	pub relay_ancestry_proof: Option<AncestryProof<H256>>,
 	pub para_heads_proof: Vec<H256>,
 	pub source_head: Vec<u8>,
 	pub para_head_index: u32,

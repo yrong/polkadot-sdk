@@ -60,15 +60,26 @@ The system uses three nested proofs to establish a chain of trust from the desti
 1. The relay chain maintains a Merkle Mountain Range (MMR) of all blocks via `pallet-mmr`
 2. BEEFY validators sign MMR roots, providing finality guarantees
 3. Each BEEFY MMR leaf contains a `ParaHeadsRoot` in its `leaf_extra` field
-4. The relayer fetches an MMR proof for a specific relay block
+4. The relayer fetches an MMR proof for a specific relay block (the "anchor" block)
 5. The destination parachain verifies this proof against the relay MMR root (available via relay state proof)
+
+**Ancestry Proof Mechanism**:
+
+To handle the race condition where the destination's relay parent advances between proof generation and verification, the system uses **MMR ancestry proofs**:
+
+- **Problem**: Relayer generates proof at relay block 100, but destination is now at relay block 105
+- **Solution**: Include an ancestry proof showing that MMR root at block 100 is an ancestor of MMR root at block 105
+- **Verification**: Destination uses `pallet_mmr::verify_ancestry_proof(mmr_root_105, ancestry_proof)` to derive `mmr_root_100`, then verifies the original proof against it
+
+This eliminates timing constraints - the relayer can wait for the destination to advance, and proofs remain valid across multiple relay blocks.
 
 **Data structure**:
 - MMR leaf: BEEFY `MmrLeaf` (version, parent_hash, authority_set, **ParaHeadsRoot**)
 - Proof: Vector of sibling hashes (Merkle path)
-- Verification: `mmr-lib` calculates root from leaf + proof
+- Ancestry proof (optional): `AncestryProof { prev_peaks, prev_leaf_count, leaf_count, items }`
+- Verification: `mmr-lib` calculates root from leaf + proof, with ancestry proof deriving historical root if needed
 
-**Security**: Relies on BEEFY finality - if 2/3+ validators signed the MMR root, the relay block is finalized.
+**Security**: Relies on BEEFY finality - if 2/3+ validators signed the MMR root, the relay block is finalized. Ancestry proofs are cryptographically verified using the MMR structure itself.
 
 ### Tier 2: Para-heads Merkle Proof
 
@@ -141,15 +152,24 @@ Build Tier 3 proof (outbox MMR)
 Find relay block containing source header
   - Scan relay chain for matching para head
     ↓
+Read destination's current relay parent
+  - Stabilize ValidationData reading
+    ↓
 Build Tier 1 proof (relay MMR)
-  - Call mmr_generateProof RPC
+  - Call mmr_generateProof RPC (anchored at source inclusion block)
   - Extract ParaHeadsRoot from BEEFY leaf
+    ↓
+Build ancestry proof (if needed)
+  - If dest relay parent > source inclusion block:
+    - Call mmr_generateAncestryProof RPC
+    - Proves source block MMR root is ancestor of current MMR root
     ↓
 Build Tier 2 proof (para-heads Merkle)
   - Fetch all para heads from relay state
   - Reconstruct Merkle proof
     ↓
 Assemble MessageWithProof
+  - Include ancestry proof if generated
     ↓
 Sign and submit to destination
 ```
@@ -161,7 +181,14 @@ Receive submit_xcmp_mmd(MessageWithProof)
     ↓
 Read relay MMR root from relay state proof
     ↓
+Check relay anchor vs current relay parent
+  - If anchor == current: use MMR root directly
+  - If anchor < current: verify ancestry proof
+    - Derive historical MMR root at anchor block
+  - If anchor > current: reject (invalid)
+    ↓
 Verify Tier 1 (relay MMR proof)
+  - Verify against derived/current MMR root
   - Extract ParaHeadsRoot from BEEFY leaf
     ↓
 Verify Tier 2 (para-heads Merkle proof)
@@ -265,10 +292,14 @@ Breakdown:
 
 Approximate sizes:
 - Relay MMR proof: ~5-10 sibling hashes (160-320 bytes)
+- Relay ancestry proof (when needed): ~3-8 items (96-256 bytes)
 - Para-heads Merkle proof: ~1-5 sibling hashes (32-160 bytes)
 - Outbox MMR proof: ~5-15 sibling hashes (160-480 bytes)
 - Source header: ~100-200 bytes
-- Total: **~500-1200 bytes** per message
+- Total without ancestry: **~500-1200 bytes** per message
+- Total with ancestry: **~600-1500 bytes** per message
+
+Note: Ancestry proofs are only needed when the destination's relay parent advances between proof generation and submission, which is common in practice.
 
 ### Scalability
 
