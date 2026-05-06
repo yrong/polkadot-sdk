@@ -539,11 +539,36 @@ inspect the already-validated `provides` / `requires` fields, check dependency
 satisfaction, and persist the newest provides root. This is a relay-runtime
 inclusion rule change, not a new protocol stage.
 
+The two matching paths exist because persisted `ProvidesRoots` is only updated
+on successful enactment — it lags behind the current block's in-progress
+enactments:
+
+- **Same-block enacted provides** cover the case where source and receiver
+  candidates are enacted together in the same relay block. The source's provides
+  root hasn't been persisted yet, so the receiver finds it in the in-memory
+  `enacted_provides_in_block` set.
+- **Latest persisted `ProvidesRoots`** covers the case where the source was
+  enacted in a prior relay block. Its root was persisted during that earlier
+  enactment and is available in storage.
+
+Both paths are necessary. Without same-block tracking, simultaneous enactment of
+dependent candidates would fail (the receiver can't find the source's root in
+storage). Without persisted roots, cross-block dependencies would fail (the
+in-memory set from a prior block is gone).
+
 When the source root has advanced beyond what the receiver built against, Late
 Block Proofs (§6.2) transform the `RequiresCommitment` to reference the current
 root before the relay chain sees it. From the relay chain's perspective, the rule
 is always "latest persisted root OR same-block root" — the PVF handles the
 transformation.
+
+Note that this problem is asymmetric: LateBlockProofs are only needed when the
+source chain outpaces the destination (i.e., the source produces more blocks, or
+the destination's candidate is delayed in the backing pipeline). If the
+destination produces blocks faster than the source, the source root remains
+stable across multiple destination blocks, and each can match against the
+unchanged `ProvidesRoots[source]` without a proof. Faster destination production
+is not a problem; slower destination *inclusion* is.
 
 ### 4.3 New Error
 
@@ -1041,13 +1066,42 @@ the `provides_root` of the fetched batch. If they differ, the collator fetches a
 2. Appends the serialized proof to the PoV after the block data, with a
    well-known length-prefixed format.
 
-**PoV format.** The proof data is appended to the PoV block data:
+**PoV format and construction.** The collator builds the PoV as normal (block
+data), then appends the proof section. In the current Cumulus codebase, the
+collator constructs the PoV during block proposal — `block_data` is the SCALE-
+encoded block. The integration point is after block construction and before
+candidate submission:
+
+```rust
+// In the collator's proposal path (cumulus/client/consensus/aura/src/collator.rs):
+let block_data = build_block(...)?;  // existing PoV content
+
+// Append late block proof section
+let mut pov = block_data.encode();
+let num_proofs = late_block_proofs.len() as u32;
+pov.extend(&num_proofs.encode());
+for proof in &late_block_proofs {
+    let proof_bytes = proof.encode();
+    pov.extend(&(proof_bytes.len() as u32).encode());
+    pov.extend(&proof_bytes);
+}
+
+// Submit candidate with the extended PoV
+```
+
+The PoV wire format is:
 
 ```
 [ block_data bytes ]
 [ u32: num_proofs ]
 [ for each proof: u32 length || LateBlockProof bytes ]
 ```
+
+On the PVF side, `validate_block` receives the PoV via `ValidationParams.pov`.
+The existing block execution path reads `block_data` from the PoV as it does
+today. After execution, `read_late_block_proofs_from_pov` reads the trailing
+bytes and parses the proof section. No PVF host changes needed — the PoV is
+already passed to the PVF as opaque bytes.
 
 **PVF verification.** During `validate_block`, after executing the block, the PVF
 reads the proof data from the PoV and verifies each proof:
@@ -1529,7 +1583,7 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 
 - **Speculative (acknowledged) delivery mode**: requires Low-Latency v2's collator acknowledgement signatures, which are not yet implemented in the codebase. The receiver cannot optimistically build on an un-included sender block without a signed canonicality commitment from the sender's collators.
 - **Super-chain (intra-block) delivery mode**: requires a shared collator set infrastructure where one collator produces blocks for multiple parachains atomically in the same slot. This infrastructure does not exist yet in the codebase.
-- **Trust domains**: all collators trust each other; no cross-domain fallback
+- **Trust domains**: a concept from the high-level design (§8) where parachains declare which peers' collators they trust for speculative (acknowledged) delivery. Trust domains require three things that don't exist yet: LLv2 collator acknowledgement signatures, a `TrustedPeers: Vec<ParaId>` runtime configuration, and collator logic for trust-domain-aware acknowledgement rules. The POC uses inclusion-based delivery only, which relies purely on relay chain enforcement of `ProvidesRoots` — no trust assumptions between chains.
 - **Low-Latency v2 integration**: no acknowledgement signatures, no scheduling parent
 - **Relaxed or unordered delivery semantics**: Phase 1 requires contiguous per-source subtree advancement
 - **Message pruning or MMR garbage collection**: leaves grow indefinitely
