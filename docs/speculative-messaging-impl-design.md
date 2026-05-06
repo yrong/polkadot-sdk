@@ -323,6 +323,9 @@ input when executing the block inside the PVF.
 pub struct SpeculativeIngress {
     /// Verified batches selected by the collator for this block.
     pub batches: Vec<MessageBatch>,
+    /// Late block proofs for sources whose provides_root has advanced
+    /// since the receiver block was built. At most one proof per source.
+    pub late_block_proofs: Vec<LateBlockProof>,
 }
 ```
 
@@ -330,7 +333,7 @@ For Phase 1, `SpeculativeIngress.batches` follows simple canonical selection
 rules: batches are grouped logically per `source`, for a given source they appear
 oldest-to-newest, and duplicate or overlapping batches for the same source in a
 single block should be rejected by both collator precheck and runtime
-re-verification.
+re-verification. `late_block_proofs` must have at most one entry per source.
 
 Phase 1 uses a single inherent-like dispatch, following the same pattern as
 `ParachainSystem::set_validation_data`: a node-local component fetches batches
@@ -384,23 +387,28 @@ For empty blocks (no outbound messages, no inbound messages):
 ### 3.5 Late Block Proof Types
 
 When a receiver block is built against an older source `provides_root` than
-what's now current on the relay chain, the receiver's PoV carries a proof
+what's now current on the relay chain, the receiver runtime verifies a proof
 demonstrating that the messages it consumed are still valid under the current
-root. The PVF verifies this proof and transforms the block's `RequiresCommitment`
-to reference the current root, so the relay chain can match it against
-`ProvidesRoots`.
+root. The proof is carried in the block body via `SpeculativeIngress`, alongside
+the message batches, and verified during `ingest_verified_messages`. The
+verified current root replaces the old root in `ConsumedSourcesThisBlock`, so
+the relay chain sees the correct `RequiresCommitment`.
 
 ```rust
-/// Included in the receiver candidate's PoV when the block was built against
-/// an older source root than what's now persisted on the relay chain.
+/// Carried in `SpeculativeIngress.late_block_proofs` when the receiver block
+/// was built against an older source root than what's persisted in ProvidesRoots.
 #[derive(Clone, Encode, Decode, Debug)]
 pub struct LateBlockProof {
     /// The source parachain this proof covers.
     pub source: ParaId,
 
+    /// The provides root the receiver block was built against (the old root
+    /// from the batch). This is the root that would appear in
+    /// RequiresCommitment.expected_root without the proof.
+    pub old_provides_root: Hash,
     /// The subtree root the receiver built against (from the old source block).
     pub old_subtree_root: Hash,
-    /// Merkle proof that old_subtree_root was in the old provides root.
+    /// Merkle proof that old_subtree_root was in old_provides_root.
     pub old_subtree_proof: Vec<Hash>,
 
     /// The current provides root of the source (what's now in ProvidesRoots).
@@ -988,96 +996,123 @@ The corresponding implementation work:
 3. update `polkadot/node/core/candidate-validation` to reconstruct the correct commitments type per descriptor version
 4. keep all pre-v4 candidates on the unchanged legacy reconstruction path
 
-### 6.2 Late Block Proof Verification (PVF)
+### 6.2 Late Block Proofs (Inherent Approach)
 
-When a receiver block's `RequiresCommitment.expected_root` references an older
-source root than what's now in `ProvidesRoots`, the receiver collator includes a
-`LateBlockProof` in the PoV. The PVF verifies that proof and **transforms** the
-block's `requires` commitment so the relay chain can match it against the current
-root. The relay chain itself never sees the proof — it only sees the transformed
-commitment.
+When a receiver block was built against an older source root than what's now in
+`ProvidesRoots`, the receiver collator includes a `LateBlockProof` in
+`SpeculativeIngress.late_block_proofs` alongside the message batches. The proof
+is verified during `ingest_verified_messages` — the same runtime call that
+processes batches. The verified current root replaces the old root in
+`ConsumedSourcesThisBlock`, so `get_requires_commitments()` returns the correct
+`RequiresCommitment` referencing the current root. No PVF changes are needed:
+`validate_block` deterministically replays `ingest_verified_messages`, so
+validators independently verify the same proofs and produce the same transformed
+commitments.
+
+**Design choice — inherent vs PoV.** The high-level design specifies a PoV-based
+approach where the PVF verifies proofs and transforms commitments in a separate
+pre-block stage (matching LLv2's scheduling-parent pattern). The POC uses the
+inherent approach instead: the runtime verifies proofs during normal block
+execution. This avoids building a new PVF input channel solely for late block
+proofs, at the cost of a small deviation from the source design. The verification
+logic is identical; moving to the PoV approach later is a mechanical refactor
+once LLv2's separate-PVF-inputs infrastructure is in place.
 
 **When this triggers.** The collator detects the mismatch before block proposal:
 it reads `ProvidesRoots[source]` from the relay parent's state and compares it to
 the `provides_root` of the fetched batch. If they differ, the collator fetches a
-`LateBlockProof` from the source/provider and includes it in the PoV. The proof
-is fetched off-chain just like `MessageBatch` data — the provider that serves
-batches should also serve extension proofs for the recent window.
+`LateBlockProof` from the source/provider and includes it in
+`SpeculativeIngress.late_block_proofs`.
 
-**PVF verification.** During `validate_block`, the PVF processes each
-`LateBlockProof` before returning the validation result:
+**Verification.** During `ingest_verified_messages`, the runtime first verifies
+all late block proofs and builds a map of `source -> new_provides_root`. Then
+when processing batches, it uses the transformed root instead of the batch's
+original `provides_root`:
 
 ```rust
-fn process_late_block_proof(
-    block_requires: &RequiresCommitment,  // what the block originally expected
-    proof: &LateBlockProof,               // from the PoV
-) -> Result<RequiresCommitment, Error> {
-    // 1. Verify old subtree was in the root the block expected
-    let old_leaf = (proof.source, proof.old_subtree_root).encode();
-    let old_leaf_hash = keccak_256(&old_leaf);
-    verify_merkle_proof(
-        block_requires.expected_root,
-        &proof.old_subtree_proof,
-        old_leaf_hash,
-    )?;
+pub fn ingest_verified_messages(
+    origin: OriginFor<T>,
+    ingress: SpeculativeIngress,
+) -> DispatchResult {
+    ensure_none(origin)?;
 
-    // 2. Verify new subtree is in the current root
-    let new_leaf = (proof.source, proof.new_subtree_root).encode();
-    let new_leaf_hash = keccak_256(&new_leaf);
-    verify_merkle_proof(
-        proof.new_provides_root,
-        &proof.new_subtree_proof,
-        new_leaf_hash,
-    )?;
+    // ── Pre-pass: verify late block proofs ──
+    let mut transformed_roots: BTreeMap<ParaId, Hash> = BTreeMap::new();
+    for proof in &ingress.late_block_proofs {
+        // 1. Verify old subtree was in the old provides root
+        let old_leaf = (T::SelfParaId::get(), proof.old_subtree_root).encode();
+        let old_leaf_hash = sp_io::hashing::keccak_256(&old_leaf);
+        verify_merkle_proof(
+            proof.old_provides_root,
+            &proof.old_subtree_proof,
+            old_leaf_hash,
+        ).map_err(|_| Error::<T>::InvalidLateBlockProof)?;
 
-    // 3. Subtrees must be identical or the old must be a valid prefix
-    if proof.old_subtree_root != proof.new_subtree_root {
-        let ext = proof.subtree_extension
-            .as_ref()
-            .ok_or(Error::SubtreeChangedWithoutProof)?;
-        verify_mmr_extension(
-            proof.old_subtree_root,
-            proof.new_subtree_root,
-            ext,
-        )?;
+        // 2. Verify new subtree is in the current root
+        let new_leaf = (T::SelfParaId::get(), proof.new_subtree_root).encode();
+        let new_leaf_hash = sp_io::hashing::keccak_256(&new_leaf);
+        verify_merkle_proof(
+            proof.new_provides_root,
+            &proof.new_subtree_proof,
+            new_leaf_hash,
+        ).map_err(|_| Error::<T>::InvalidLateBlockProof)?;
+
+        // 3. Subtrees must be identical or old must be a valid prefix
+        if proof.old_subtree_root != proof.new_subtree_root {
+            let ext = proof.subtree_extension
+                .as_ref()
+                .ok_or(Error::<T>::SubtreeChangedWithoutProof)?;
+            verify_mmr_extension(proof.old_subtree_root, proof.new_subtree_root, ext)
+                .map_err(|_| Error::<T>::InvalidLateBlockProof)?;
+        }
+
+        // 4. Record the transformed root for this source
+        ensure!(
+            !transformed_roots.contains_key(&proof.source),
+            Error::<T>::DuplicateLateBlockProof,
+        );
+        transformed_roots.insert(proof.source, proof.new_provides_root);
     }
 
-    // 4. Return transformed commitment — references the current root
-    Ok(RequiresCommitment {
-        source: block_requires.source,
-        expected_root: proof.new_provides_root,
-    })
+    // ── Main pass: process batches (section 5.2) ──
+    let mut consumed = Vec::new();
+    for batch in ingress.batches {
+        // ... subtree proof, message continuity, subtree root checks ...
+
+        // Use the transformed root if a late block proof was verified for this source
+        let effective_root = transformed_roots
+            .get(&batch.source)
+            .unwrap_or(&batch.provides_root);
+
+        // Phase 1 invariant: one distinct top-level provides root per source per block
+        // (checked against effective_root, not batch.provides_root)
+        //
+        // ... MultipleRootsPerSourceInOneBlock check, dispatch ...
+
+        consumed.push((batch.source, *effective_root));
+    }
+
+    ConsumedSourcesThisBlock::<T>::put(consumed);
+    Ok(())
 }
 ```
 
-The output of `process_late_block_proof` replaces the original
-`RequiresCommitment` in the candidate commitments that the PVF returns. The relay
-chain then matches this transformed `expected_root` against `ProvidesRoots`
-exactly as it does for non-late blocks.
+The `LateBlockProof` carries `old_provides_root` so the pre-pass is
+self-contained — it does not need to peek at batches to resolve the old root.
 
-**What the relay chain sees.** No change from section 4.2. The relay chain always
-matches `RequiresCommitment.expected_root` against `ProvidesRoots[source]`. The
-PVF handles the transformation, so the relay chain never knows whether a proof
-was needed.
+**What the relay chain sees.** No change. `get_requires_commitments()` returns
+the effective (transformed) root, and the relay chain matches it against
+`ProvidesRoots` exactly as in section 4.2. The relay chain never knows whether
+a proof was needed.
 
 **Proof size.** For a sender with D destinations and m messages to this receiver:
 the two top-level Merkle proofs are O(log D) each (~14 hashes for 100
 destinations), and the subtree extension is O(log m) (~10 hashes for 1000
-messages). Total: well under 2 KB in typical cases. The PoV size budget should
-reserve a small allowance for these proofs (e.g., 50 KB).
+messages). Total: well under 2 KB in typical cases.
 
-**Serving extension proofs.** The provider/source-side component described in
-section 7 must also serve `LateBlockProof` data on request. The same HTTP
-endpoint can accept an additional parameter:
-
-```
-GET /batches/{dest}?since_provides_root={old_root}&current_provides_root={new_root}
-```
-
-When `current_provides_root` differs from `since_provides_root`, the provider
-returns a `LateBlockProof` alongside (or instead of) the normal batches. The
-provider constructs it from the source chain's MMR state history, which it
-already retains for batch serving.
+**Serving extension proofs.** The provider serves `LateBlockProof` data via the
+same HTTP endpoint (section 7.3), returning proofs alongside or instead of
+batches when the cursor root differs from the current root.
 
 ---
 
@@ -1109,6 +1144,14 @@ pub trait SpeculativeOutboxApi {
     fn destination_state(dest: ParaId) -> Option<(Hash, u64)>;
     fn outbound_messages(dest: ParaId, from_position: u64, max_messages: u32) -> Vec<(u64, Vec<u8>)>;
     fn subtree_inclusion_proof(dest: ParaId, subtree_root: Hash) -> Option<Vec<Hash>>;
+    /// Return an MMR extension proof proving that `old_subtree_root` at
+    /// `old_subtree_size` is a valid prefix of the current subtree for
+    /// this destination.
+    fn mmr_extension_proof(
+        dest: ParaId,
+        old_subtree_root: Hash,
+        old_subtree_size: u64,
+    ) -> Option<MMRExtensionProof>;
 }
 ```
 
@@ -1398,18 +1441,18 @@ Decode the extended validation result for v4 candidates. Reconstruct v10
 `CandidateCommitments` from returned outputs. Keep pre-v4 candidates on the
 legacy path. Continue hash-checking against the candidate receipt.
 
-### 10.7 Step 7: Late Block Proofs (PVF + Provider)
+### 10.7 Step 7: Late Block Proofs (Runtime + Provider)
 
 **Files:**
-- `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`
-- provider/relayer process (same as step 8)
+- `cumulus/pallets/speculative-inbox/src/lib.rs` (or equivalent)
+- provider/relayer process (same as step 9)
 
 Add `LateBlockProof` and `MMRExtensionProof` types to `v10` primitives. Implement
-`process_late_block_proof` in the PVF: verify old subtree was in the expected
-root, verify new subtree is in the current root, verify subtree extension (if
-any), return the transformed `RequiresCommitment`. Extend the provider to serve
-extension proofs alongside batches when the receiver's cursor root differs from
-the current root.
+late block proof verification as a pre-pass in `ingest_verified_messages`: verify
+old subtree was in the expected root, verify new subtree is in the current root,
+verify subtree extension (if any), store the transformed root for use during
+batch processing. Because verification runs during normal block execution, no PVF
+changes are needed — `validate_block` deterministically replays the same path.
 
 ### 10.8 Step 8: Relay-Chain Runtime Enactment Rules
 
