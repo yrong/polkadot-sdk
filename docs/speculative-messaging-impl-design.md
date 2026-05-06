@@ -6,17 +6,18 @@ This is the **single source of truth** for the minimal speculative-messaging POC
 on the current codebase, covering implementation design, end-to-end workflow,
 off-chain networking, and the follow-up roadmap.
 
-**Phase 1 scope — Inclusion-based messaging.** Removes message storage from relay
-chain state while keeping latency at ~6–12s (1–2 relay blocks for inclusion).
-This is the first implementation slice of the broader offchain-XCMP replacement
-direction — the conservative inclusion-based path of the general
-commitment-driven speculative messaging model.
+**Phase 1 scope — Inclusion-based messaging with Late Block Proofs.** Removes
+message storage from relay chain state while keeping latency at ~6–12s (1–2 relay
+blocks for inclusion). This is the first implementation slice of the broader
+offchain-XCMP replacement direction — the conservative inclusion-based path of
+the general commitment-driven speculative messaging model.
 
-The POC assumes relatively timely destination block production. For
-**core-on-demand** chains that produce blocks sporadically, the happy-path
-assumption breaks down more often; **Late Block Proofs** are the main required
-follow-up. **Guaranteed eventual delivery** is a hard requirement for the full
-design but is deferred past Phase 1 (see section 12).
+The POC includes Late Block Proofs (section 6.2) so that receivers can
+successfully enact candidates even when the source chain's `provides_root` has
+advanced between block building and enactment — a normal case under any realistic
+backing pipeline, not just core-on-demand chains. **Guaranteed eventual delivery**
+is a hard requirement for the full design but is deferred past Phase 1 (see
+section 12).
 
 ---
 
@@ -380,6 +381,59 @@ For empty blocks (no outbound messages, no inbound messages):
 - `provides: None`
 - `requires: vec![]`
 
+### 3.5 Late Block Proof Types
+
+When a receiver block is built against an older source `provides_root` than
+what's now current on the relay chain, the receiver's PoV carries a proof
+demonstrating that the messages it consumed are still valid under the current
+root. The PVF verifies this proof and transforms the block's `RequiresCommitment`
+to reference the current root, so the relay chain can match it against
+`ProvidesRoots`.
+
+```rust
+/// Included in the receiver candidate's PoV when the block was built against
+/// an older source root than what's now persisted on the relay chain.
+#[derive(Clone, Encode, Decode, Debug)]
+pub struct LateBlockProof {
+    /// The source parachain this proof covers.
+    pub source: ParaId,
+
+    /// The subtree root the receiver built against (from the old source block).
+    pub old_subtree_root: Hash,
+    /// Merkle proof that old_subtree_root was in the old provides root.
+    pub old_subtree_proof: Vec<Hash>,
+
+    /// The current provides root of the source (what's now in ProvidesRoots).
+    pub new_provides_root: Hash,
+    /// The subtree root under the new provides root.
+    pub new_subtree_root: Hash,
+    /// Merkle proof that new_subtree_root is in new_provides_root.
+    pub new_subtree_proof: Vec<Hash>,
+
+    /// If the source produced additional messages to this receiver since the
+    /// block was built, this proof shows the old subtree is a valid prefix of
+    /// the new subtree.
+    pub subtree_extension: Option<MMRExtensionProof>,
+}
+
+/// Proves that an MMR root R_old is an ancestor of R_new, i.e. the MMR was
+/// only appended to, not mutated.
+#[derive(Clone, Encode, Decode, Debug)]
+pub struct MMRExtensionProof {
+    /// The peaks of the old MMR.
+    pub old_peaks: Vec<Hash>,
+    /// The peaks of the new (larger) MMR.
+    pub new_peaks: Vec<Hash>,
+    /// Nodes connecting old peaks to new peaks to prove prefix relationship.
+    pub connecting_nodes: Vec<Hash>,
+}
+```
+
+The canonical leaf format for top-level proofs matches section 3.1:
+`keccak256(SCALE(destination_para_id, subtree_root))`. Subtree extension proofs
+are per-destination MMR proofs — they follow the standard MMR append-only
+verification semantics of `sp-mmr-primitives`.
+
 ---
 
 ## 4. Relay Chain Runtime Changes
@@ -491,6 +545,30 @@ destinations is deferred to the Late Block Proofs phase.
 /// A requires commitment could not be matched to any provides.
 UnsatisfiedRequires,
 ```
+
+### 4.4 What the Relay Chain Does *Not* Do
+
+A common misconception is that the relay chain must verify cryptographic proofs.
+It does not. The division of labor is:
+
+- **No MMR verification.** All MMR proof verification (subtree inclusion, message
+  continuity, subtree extension) happens in the parachain runtime and is replayed
+  deterministically by the PVF. The relay chain only compares 32-byte hashes.
+- **No message storage.** Message payloads never touch relay chain state. They
+  flow off-chain via the relayer/provider, are embedded in the receiver's block
+  body as `SpeculativeIngress`, and are verified by the receiver runtime.
+- **No history.** `ProvidesRoots` stores one hash per parachain, overwritten each
+  time a candidate with a new provides root is enacted. There is no per-block
+  root history, no MMR of roots, no retention of old values. The relay chain only
+  needs the latest root for dependency matching.
+- **No new protocol stage.** The relay chain still backs candidates, admits them
+  to pending availability, and enacts them. Speculative messaging adds one
+  inclusion-time check: `RequiresCommitment.expected_root` must match either a
+  same-block enacted provides root or the latest persisted root. That check is a
+  hash comparison, not a cryptographic verification.
+
+In short: all cryptographic work lives in the PVF; the relay chain only adds
+hash-equality checks on already-validated commitment fields.
 
 ---
 
@@ -910,6 +988,97 @@ The corresponding implementation work:
 3. update `polkadot/node/core/candidate-validation` to reconstruct the correct commitments type per descriptor version
 4. keep all pre-v4 candidates on the unchanged legacy reconstruction path
 
+### 6.2 Late Block Proof Verification (PVF)
+
+When a receiver block's `RequiresCommitment.expected_root` references an older
+source root than what's now in `ProvidesRoots`, the receiver collator includes a
+`LateBlockProof` in the PoV. The PVF verifies that proof and **transforms** the
+block's `requires` commitment so the relay chain can match it against the current
+root. The relay chain itself never sees the proof — it only sees the transformed
+commitment.
+
+**When this triggers.** The collator detects the mismatch before block proposal:
+it reads `ProvidesRoots[source]` from the relay parent's state and compares it to
+the `provides_root` of the fetched batch. If they differ, the collator fetches a
+`LateBlockProof` from the source/provider and includes it in the PoV. The proof
+is fetched off-chain just like `MessageBatch` data — the provider that serves
+batches should also serve extension proofs for the recent window.
+
+**PVF verification.** During `validate_block`, the PVF processes each
+`LateBlockProof` before returning the validation result:
+
+```rust
+fn process_late_block_proof(
+    block_requires: &RequiresCommitment,  // what the block originally expected
+    proof: &LateBlockProof,               // from the PoV
+) -> Result<RequiresCommitment, Error> {
+    // 1. Verify old subtree was in the root the block expected
+    let old_leaf = (proof.source, proof.old_subtree_root).encode();
+    let old_leaf_hash = keccak_256(&old_leaf);
+    verify_merkle_proof(
+        block_requires.expected_root,
+        &proof.old_subtree_proof,
+        old_leaf_hash,
+    )?;
+
+    // 2. Verify new subtree is in the current root
+    let new_leaf = (proof.source, proof.new_subtree_root).encode();
+    let new_leaf_hash = keccak_256(&new_leaf);
+    verify_merkle_proof(
+        proof.new_provides_root,
+        &proof.new_subtree_proof,
+        new_leaf_hash,
+    )?;
+
+    // 3. Subtrees must be identical or the old must be a valid prefix
+    if proof.old_subtree_root != proof.new_subtree_root {
+        let ext = proof.subtree_extension
+            .as_ref()
+            .ok_or(Error::SubtreeChangedWithoutProof)?;
+        verify_mmr_extension(
+            proof.old_subtree_root,
+            proof.new_subtree_root,
+            ext,
+        )?;
+    }
+
+    // 4. Return transformed commitment — references the current root
+    Ok(RequiresCommitment {
+        source: block_requires.source,
+        expected_root: proof.new_provides_root,
+    })
+}
+```
+
+The output of `process_late_block_proof` replaces the original
+`RequiresCommitment` in the candidate commitments that the PVF returns. The relay
+chain then matches this transformed `expected_root` against `ProvidesRoots`
+exactly as it does for non-late blocks.
+
+**What the relay chain sees.** No change from section 4.2. The relay chain always
+matches `RequiresCommitment.expected_root` against `ProvidesRoots[source]`. The
+PVF handles the transformation, so the relay chain never knows whether a proof
+was needed.
+
+**Proof size.** For a sender with D destinations and m messages to this receiver:
+the two top-level Merkle proofs are O(log D) each (~14 hashes for 100
+destinations), and the subtree extension is O(log m) (~10 hashes for 1000
+messages). Total: well under 2 KB in typical cases. The PoV size budget should
+reserve a small allowance for these proofs (e.g., 50 KB).
+
+**Serving extension proofs.** The provider/source-side component described in
+section 7 must also serve `LateBlockProof` data on request. The same HTTP
+endpoint can accept an additional parameter:
+
+```
+GET /batches/{dest}?since_provides_root={old_root}&current_provides_root={new_root}
+```
+
+When `current_provides_root` differs from `since_provides_root`, the provider
+returns a `LateBlockProof` alongside (or instead of) the normal batches. The
+provider constructs it from the source chain's MMR state history, which it
+already retains for batch serving.
+
 ---
 
 ## 7. Off-Chain Networking
@@ -1229,7 +1398,20 @@ Decode the extended validation result for v4 candidates. Reconstruct v10
 `CandidateCommitments` from returned outputs. Keep pre-v4 candidates on the
 legacy path. Continue hash-checking against the candidate receipt.
 
-### 10.7 Step 7: Relay-Chain Runtime Enactment Rules
+### 10.7 Step 7: Late Block Proofs (PVF + Provider)
+
+**Files:**
+- `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`
+- provider/relayer process (same as step 8)
+
+Add `LateBlockProof` and `MMRExtensionProof` types to `v10` primitives. Implement
+`process_late_block_proof` in the PVF: verify old subtree was in the expected
+root, verify new subtree is in the current root, verify subtree extension (if
+any), return the transformed `RequiresCommitment`. Extend the provider to serve
+extension proofs alongside batches when the receiver's cursor root differs from
+the current root.
+
+### 10.8 Step 8: Relay-Chain Runtime Enactment Rules
 
 **Files:**
 - new `polkadot/runtime/parachains/src/speculative_messaging.rs`
@@ -1240,33 +1422,35 @@ Extend the enactment path to track same-block enacted provides and check v4
 `RequiresCommitment` against same-block + persisted roots. Add
 `UnsatisfiedRequires` error.
 
-### 10.8 Step 8: Off-Chain Networking
+### 10.9 Step 9: Off-Chain Networking
 
 **Files:** new node-side protocol module under `cumulus/client/...`
 
-Add a provider/relayer process serving bounded recent history. Add
-destination-side fetcher with static `ParaId -> Vec<ProviderEndpoint>`
-configuration. Optionally add native collator request/response later.
+Add a provider/relayer process serving bounded recent history of both
+`MessageBatch` data and `LateBlockProof` data. Add destination-side fetcher with
+static `ParaId -> Vec<ProviderEndpoint>` configuration. Optionally add native
+collator request/response later.
 
-### 10.9 Step 9: POC Runtime and Tests
+### 10.10 Step 10: POC Runtime and Tests
 
 Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 
 **Test milestones:**
 1. sender runtime emits a stable cumulative `provides` root
 2. receiver runtime accepts valid `SpeculativeIngress` and rejects invalid proofs/ordering/mixed-root cases
-3. PVF returns matching v4 validation outputs
+3. PVF returns matching v4 validation outputs (including transformed requires from late block proofs)
 4. node-side candidate validation reconstructs the correct v4 commitments hash
-5. relay-chain enactment accepts satisfied dependencies and rejects unsatisfied ones
+5. relay-chain enactment accepts satisfied dependencies (both same-root and late-block-proof cases) and rejects unsatisfied ones
 6. collator networking can fetch, precheck, and inject a recent batch end-to-end
+7. late block proof: receiver can consume messages from a source that has advanced past the root the receiver built against
 
 ---
 
 ## 11. What's NOT In This POC
 
-- **Late Block Proofs**: requires MMR extension proofs, PVF transformation
+- **Speculative (acknowledged) delivery mode**: requires Low-Latency v2's collator acknowledgement signatures, which are not yet implemented in the codebase. The receiver cannot optimistically build on an un-included sender block without a signed canonicality commitment from the sender's collators.
+- **Super-chain (intra-block) delivery mode**: requires a shared collator set infrastructure where one collator produces blocks for multiple parachains atomically in the same slot. This infrastructure does not exist yet in the codebase.
 - **Trust domains**: all collators trust each other; no cross-domain fallback
-- **Super chains**: no intra-block bidirectional messaging
 - **Low-Latency v2 integration**: no acknowledgement signatures, no scheduling parent
 - **Relaxed or unordered delivery semantics**: Phase 1 requires contiguous per-source subtree advancement
 - **Message pruning or MMR garbage collection**: leaves grow indefinitely
@@ -1276,11 +1460,6 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 ---
 
 ## 12. Follow-Up Roadmap
-
-### Late Block Proofs
-- Handle lagging destinations and core-on-demand chains robustly.
-- Transform source `provides` into receiver-ready `requires` via proof-bearing validation.
-- Define proof size bounds and failure behavior.
 
 ### Delivery Bounds and Pruning
 - Define what "eventual delivery" means operationally.
@@ -1292,8 +1471,7 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 - Enforce limits on outbox and inbox paths.
 
 ### Proof and Storage Bounds
-- Bound late-block-proof and MMR-extension-proof sizes.
-- Define fallback behavior when proofs are too large.
+- Define fallback behavior when late-block-proofs exceed PoV size limits.
 - Confirm relay-chain storage remains bounded to latest-per-para data only.
 
 ### Trust Domains and Acknowledgements
