@@ -9,9 +9,18 @@ tags:
 title: Polkadot XCMP MMD — Minimal POC
 ---
 
+> **Superseded.** This document describes an earlier proof-of-concept for
+> BEEFY-anchored, unordered cross-chain messaging. It has been superseded by
+> the [speculative messaging design](speculative-messaging-design.md) and its
+> [implementation design](speculative-messaging-impl-design.md), which provide
+> a lower-latency, ordered-delivery model with a more incremental upgrade path.
+> This document is retained for historical reference only. The pallet
+> `cumulus-pallet-xcmp-mmd-outbox` referenced here does not exist in the
+> current codebase.
+
 Forum background: [XCMP Design Discussion (Polkadot)](https://forum.polkadot.network/t/xcmp-design-discussion/7328).
 
-# XCMP MMD - Design Document
+# XCMP MMD - Design Document (Superseded)
 
 ## Overview
 
