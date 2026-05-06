@@ -14,6 +14,11 @@ passing" — removes message storage from relay chain state, but latency remains
 ~6–12s (1–2 relay blocks for inclusion). Low-latency requires Phase 2 (Late Block
 Proofs) and Phase 3 (acknowledgements from Low-Latency v2).
 
+This should also be understood as the **first implementation slice of the
+broader offchain-XCMP replacement direction**, not a separate competing design.
+Speculative messaging is the more general commitment-driven model; the Phase 1
+POC implements its conservative inclusion-based path first.
+
 This minimal POC therefore assumes a relatively timely destination block
 production / inclusion path. For destinations that are **core-on-demand** or
 otherwise produce blocks only sporadically, the happy-path assumption breaks
@@ -22,6 +27,17 @@ chain's current `provides` root may already have advanced beyond the old root
 the destination built against. In practice, this makes **Late Block Proofs**
 the main follow-up feature required for robust operation on core-on-demand
 chains, even though they are intentionally excluded from the minimal POC.
+
+One important scope boundary follows from that: **guaranteed eventual delivery**
+is a hard requirement for the full design, but the minimal Phase 1 POC only
+demonstrates the happy-path inclusion-based mechanism. Full eventual-delivery
+behavior depends on the follow-up work captured in
+`speculative-messaging-follow-up-roadmap.md`, especially:
+
+- late block proofs for lagging destinations
+- retention / pruning rules
+- bounded catch-up behavior
+- fallback and resubmission policy
 
 The document is organized in this order:
 
@@ -40,7 +56,7 @@ The document is organized in this order:
  ════════════════                         ══════════════════
 
  1. Execute block                         3. Pull MessageBatch off-chain
-    - Produce outbound XCM                    - Fetch from source-side peers
+    - Produce outbound XCM                    - Fetch from relayer/provider
     - Update per-destination MMR              - Precheck proof + continuity
     - Derive cumulative provides root
 
@@ -78,8 +94,13 @@ The minimal POC fits into the current parachain flow like this:
 2. **Off-chain batch serving and fetch**
    - After observing the sender candidate, source-side nodes retain a bounded
      recent history of speculative batch/proof data.
-   - Destination collators pull the corresponding `MessageBatch` off-chain from
-     source-side peers.
+   - Destination collators obtain the corresponding `MessageBatch` off-chain
+     from a provider.
+   - For the initial POC, that provider can be a **separate relayer / indexer /
+     helper process**, which is usually the simplest way to validate the
+     end-to-end path without first building custom collator-to-collator P2P.
+   - In a fuller deployment, the same data may also be served directly by
+     source-side peers through a native collator request/response protocol.
    - This networking step is only a data-fetch path; it is not consensus by
      itself.
 
@@ -146,8 +167,11 @@ order should be:
    - Add persisted `ProvidesRoots` and enactment-time matching of `requires`
      against same-block enacted roots plus persisted latest roots.
 6. **Off-chain networking**
-   - Add the request/response fetch path and the source-side bounded local
-     batch/proof history needed to serve recent requests.
+   - Add a provider fetch path and bounded recent batch/proof history needed to
+     serve recent requests.
+   - For the initial POC, prefer a separate relayer/provider process.
+   - Treat native collator request/response as an optional later transport
+     optimization.
 7. **Rollout and feature gating**
    - Enable the path only for v4 parachains, keep HRMP coexistence, and test
      the happy-path POC before any late-block-proof work.
@@ -332,6 +356,10 @@ pub struct MessageBatch {
     pub source_block: Hash,
     /// Relay-chain block number associated with the source batch when dispatching
     /// through the existing `XcmpMessageHandler` interface.
+    ///
+    /// This is the source chain's relay parent block number at the time the source
+    /// block executed — available in the sender runtime as
+    /// `frame_system::Pallet::<T>::parent_number()` or equivalent.
     pub source_relay_parent_number: RelayChainBlockNumber,
     /// The top-level provides root for this block
     pub provides_root: Hash,
@@ -852,9 +880,14 @@ UnsatisfiedRequires,
 
 ### 5.1 Outgoing Message MMR (Sender Side)
 
-New pallet or utility module in the parachain runtime. Pattern: **wrap `XcmpQueue` as
-`OutboundXcmpMessageSource`**, intercepting outbound messages — same pattern as the
-existing XCMP MMD outbox pallet (`cumulus-pallet-xcmp-mmd-outbox`).
+New pallet or utility module in the parachain runtime. Pattern: **wrap the
+runtime's configured `OutboundXcmpMessageSource`** (which is typically `XcmpQueue`) by
+implementing the `XcmpMessageSource` trait such that each outbound message is both
+recorded in the speculative outbox and forwarded to the inner source. The wrapping
+type then replaces `XcmpQueue` as the `type OutboundXcmpMessageSource` in the
+parachain runtime's `ParachainSystem` config. This is the same interception-point
+pattern that parachain-system already uses to drain outbound HRMP messages in
+`on_finalize` (see `cumulus/pallets/parachain-system/src/lib.rs` line ~409).
 
 This sender-side flow is **not** a separate off-chain-only pipeline. The
 collator does build the block off-chain, but the speculative outbox state must
@@ -909,37 +942,67 @@ pub type OutgoingMMRs<T: Config> = StorageMap<
 
 #[derive(Clone, Encode, Decode, TypeInfo, Default)]
 pub struct MMRState {
+    /// Leaf count for THIS destination's subtree MMR.
+    /// This is the position space used by `OutgoingMessage.position`.
     pub leaf_count: u64,
     pub root: H256,
     /// Nodes stored for proof generation (peaks + internal nodes).
     pub nodes: BTreeMap<u64, H256>,
 }
 
-/// Tracks leaf_count per block for correct mmr_size in proofs.
+/// Optional per-destination historical cache for proof serving.
+/// This is only needed if the implementation wants to reconstruct recent
+/// subtree proofs from runtime-managed state rather than an off-chain/provider
+/// index. The Phase 1 protocol does not require this to exist on-chain.
 #[pallet::storage]
-pub type LeafCountByBlock<T: Config> =
-    StorageMap<_, Twox64Concat, BlockNumberFor<T>, u64>;
+pub type DestinationLeafCountByBlock<T: Config> = StorageDoubleMap<
+    _,
+    Twox64Concat, ParaId,
+    Twox64Concat, BlockNumberFor<T>,
+    u64,
+>;
 
-/// Current total leaf count.
+/// Optional sender-wide append counter across all destinations.
+/// This can be useful for metrics or node-local indexing, but it is not part of
+/// the Phase 1 receiver verification model and is not required to compute
+/// `ProvidesCommitment.root`.
 #[pallet::storage]
 pub type TotalLeafCount<T: Config> = StorageValue<_, u64, ValueQuery>;
 ```
+
+The important distinction is:
+
+- `OutgoingMMRs[destination].leaf_count` is the authoritative leaf count for
+  that destination's subtree MMR
+- `OutgoingMessage.position` refers to that per-destination counter
+- `ProvidesCommitment.root` is derived from the set of current subtree roots
+- a single sender-wide `TotalLeafCount` does **not** define the proof/position
+  space used by receivers
+
+For Phase 1 correctness, only the per-destination subtree state is required on
+the consensus path. A sender-wide counter may still be kept as an implementation
+detail, but it should not be read as the primary leaf-count model for this
+hierarchical design.
 
 **Block lifecycle hook** (`on_finalize`, optional cache path):
 
 ```rust
 fn on_finalize(_n: BlockNumberFor<T>) {
-    let current_count = TotalLeafCount::<T>::get();
-    LeafCountByBlock::<T>::insert(
-        frame_system::Pallet::<T>::block_number(),
-        current_count,
-    );
+    let now = frame_system::Pallet::<T>::block_number();
+    for (destination, state) in OutgoingMMRs::<T>::iter() {
+        DestinationLeafCountByBlock::<T>::insert(destination, now, state.leaf_count);
+    }
 }
 ```
 
 This is one valid caching strategy, but it is not required for correctness.
 `compute_provides_root()` can still be derived deterministically from executed
 block state and read by the collator after execution via runtime API.
+
+For the initial POC, the simpler and more realistic approach is usually to keep
+recent `MessageBatch` / subtree-proof material in a node-local relayer/provider
+index, rather than storing historical subtree snapshots in runtime storage.
+That provider-side retained history is already assumed elsewhere in this design.
 
 **Computing the provides root** — called by the collator after block execution to
 populate `CandidateCommitments.provides`:
@@ -965,6 +1028,29 @@ roots. Each leaf is the SCALE encoding of `(destination_para_id, subtree_root)`,
 with leaves sorted by `destination_para_id` before Merkle root computation.
 Proof generation and proof verification must use this exact same leaf format.
 
+**MMR implementation approach.** The hierarchical accumulator structure uses two
+different constructions, each suited to its role:
+
+- **Per-destination subtrees** are MMRs that grow over time as messages are
+  appended. The codebase already ships `sp-mmr-primitives` (at
+  `substrate/primitives/merkle-mountain-range/`) with append, prove, and peek
+  operations. Per-destination subtrees can be implemented as instances of
+  `sp_mmr_primitives::MMR` stored in `OutgoingMMRs` and `IncomingState`.
+- **The top level** is rebuilt every block from the current set of
+  `(destination_para_id, subtree_root)` pairs. Since it never needs
+  append-only proofs connecting historical roots, a plain binary Merkle tree
+  (not an MMR) is sufficient. The canonical construction: sort leaves by
+  `destination_para_id`, compute each leaf as `keccak256(SCALE(key))`, and
+  build a standard binary Merkle tree.
+
+The top-level tree uses **Keccak256** rather than the Substrate-default Blake2.
+Two reasons: (a) the keyed-leaf pattern `keccak256(SCALE(para_id, root))`
+prevents second-preimage attacks where an attacker could interpret a leaf hash
+as an internal node hash, which is a known concern with unbalanced or non-padded
+Merkle trees; (b) Keccak256 is the EVM-native hash, which simplifies
+interop with EVM-side light-client or bridge verifiers that may need to check
+subtree inclusion against a top-level provides root in the future.
+
 ```rust
 pub fn compute_provides_root() -> Option<ProvidesCommitment> {
     let mut roots: Vec<(ParaId, H256)> = OutgoingMMRs::<T>::iter()
@@ -972,7 +1058,7 @@ pub fn compute_provides_root() -> Option<ProvidesCommitment> {
         .collect();
 
     if roots.is_empty() {
-        return None;  // no outbound messages this block
+        return None;  // no speculative outbox state exists yet
     }
 
     roots.sort_by_key(|(id, _)| *id);
@@ -1182,6 +1268,35 @@ impl<T: Config> Pallet<T> {
 Phase 1 keeps **per-source ordered consumption**: batches must advance the
 receiver's local subtree continuously for each source. This matches the main
 speculative messaging design and keeps the runtime replay rules simple.
+
+**Encoding for the XCMP handler.** The existing `XcmpMessageHandler::handle_xcmp_messages`
+interface (defined in `polkadot/parachain/src/primitives.rs`) takes an iterator
+of `(ParaId, RelayChainBlockNumber, &[u8])` where each `&[u8]` is an XCMP
+*page* — a byte slice prefixed with an `XcmpMessageFormat` tag followed by
+concatenated message data. The `encode_xcmp_batch` helper must therefore produce
+this page format from the verified speculative payloads:
+
+```rust
+/// Encode verified speculative message payloads into the XCMP page format
+/// expected by `XcmpMessageHandler::handle_xcmp_messages`.
+///
+/// The sender's outbox stores payloads in the same encoding used by the
+/// configured `XcmpMessageFormat` variant; here we assume
+/// `ConcatenatedVersionedXcm` (the default for sibling-parachain XCM).
+fn encode_xcmp_batch<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut page = XcmpMessageFormat::ConcatenatedVersionedXcm.encode();
+    for payload in payloads {
+        page.extend_from_slice(payload);
+    }
+    page
+}
+```
+
+If the sender stores payloads in a different format (e.g.
+`ConcatenatedEncodedBlob`), use the matching variant. The key constraint is that
+the format variant must match what the receiver's `XcmpMessageHandler`
+implementation knows how to decode. For the POC, using
+`ConcatenatedVersionedXcm` throughout is the simplest consistent choice.
 
 For the initial POC, this is the right level of integration with the current
 architecture:
@@ -1485,206 +1600,26 @@ That makes this step a clean fit for the current architecture:
 
 ---
 
-## 7. Off-Chain Networking (Collator Protocol)
+## 7. Off-Chain Networking
 
-This protocol is only for fetching candidate ingress data. It is not
-consensus-critical by itself; consensus only depends on the `SpeculativeIngress`
-payload embedded in the block body and re-verified during execution.
+The destination collator needs an off-chain path to fetch `MessageBatch` data
+before block construction. For the **initial POC**, this document assumes a
+**separate relayer/provider process** rather than native collator-to-collator
+P2P.
 
-This step is achievable in the current architecture. It should be implemented as
-a **node-side request/response service**, following the same pattern already used
-elsewhere in the codebase for parachain networking utilities. It does **not**
-require runtime changes beyond the sender/receiver runtime APIs already
-described in this document.
+That transport path is **not consensus-critical**. Consensus still depends only
+on `SpeculativeIngress` being embedded in the block body and re-verified during
+execution.
 
-The practical embedding is:
+The relayer/provider is responsible for:
 
-1. Register a new parachain-network request/response protocol for speculative
-   message batch fetching.
-2. Run a small responder task on source-side collator nodes that serves
-   `MessageBatchResponse` values from locally available parachain state.
-3. Run a small fetch task on destination-side collator nodes that queries known
-   source collators before block production and converts successful responses
-   into `SpeculativeIngress`.
-4. Keep consensus anchored only in the block-body ingress call; the networking
-   layer is just a transport and selection path.
+- watching source blocks
+- retaining a bounded recent window of batch/proof material
+- serving that data to destination collators before proposal
 
-This mirrors existing node-side patterns such as:
+The detailed relayer/provider transport design lives in:
 
-- registering request/response protocols through the network service
-- using `NetworkService::start_request(...)` for point-to-point queries
-- wiring the protocol receiver into a background async task
-
-For Phase 1, the protocol should be **pull-based**:
-
-- destination collators ask source-side peers for batches they want to import
-- source collators answer from their locally available view of recently imported
-  parachain blocks and speculative outbox data
-- if no peer answers, the destination simply skips speculative ingress for that
-  source in this block and can still fall back to HRMP where configured
-
-Pull fits the current codebase better than push because it reuses existing
-request/response plumbing, keeps the destination collator in control of block
-selection, and avoids introducing unsolicited cross-para message propagation
-state into the node.
-
-### 7.1 Protocol Specification
-
-**libp2p protocol name**: `/polkadot/speculative-messaging/1`
-
-**Serialization**: SCALE-encoded request and response.
-
-**Timeout**: 5 seconds per request. If timeout, skip that source for this block.
-
-```rust
-/// Request protocol identifier.
-pub const SPECULATIVE_MSG_PROTOCOL: &str = "/polkadot/speculative-messaging/1";
-
-#[derive(Encode, Decode, Debug)]
-pub struct MessageBatchRequest {
-    /// Source parachain to request messages from.
-    pub source: ParaId,
-    /// Destination parachain the requester is asking batches for.
-    /// This determines which destination-specific subtree/proof the responder
-    /// should return.
-    pub destination: ParaId,
-    /// Starting from this block (the last known block hash from this source).
-    pub from_block: Hash,
-    /// Optional: only request messages up to this block.
-    pub to_block: Option<Hash>,
-}
-
-#[derive(Encode, Decode, Debug)]
-pub struct MessageBatchResponse {
-    /// Batches, ordered by source block number (oldest first).
-    pub batches: Vec<MessageBatch>,
-}
-```
-
-**Current-codebase embedding**
-
-For a minimal POC, this should reuse the same networking style already used by
-`cumulus/client/bootnodes`:
-
-- define a request/response protocol config with an inbound request receiver
-- register that protocol during node/network initialization
-- spawn a handler task that decodes requests and sends SCALE-encoded responses
-- use `NetworkService::start_request(...)` from the destination collator to pull
-  batches from a source peer
-
-Conceptually:
-
-```rust
-// Node startup
-let (cfg, speculative_rx) =
-    speculative_message_request_response_config::<_, _, Network>(
-        genesis_hash,
-        fork_id,
-    );
-net_config.add_request_response_protocol(cfg);
-spawn_speculative_message_responder(speculative_rx, ...);
-
-// Destination collator before block build
-network.start_request(
-    peer_id,
-    speculative_msg_protocol_name.clone(),
-    request.encode(),
-    None,
-    tx,
-    IfDisconnected::TryConnect,
-);
-```
-
-The source-side responder should stay entirely in the node layer. Its job is to
-read locally available speculative outbox information and turn it into
-`MessageBatchResponse`. For the POC, a straightforward approach is:
-
-1. Read recent imported source-parachain blocks from local node state.
-2. For each candidate block, use the sender-side runtime APIs and/or locally
-   indexed outbox data to recover the data for the **requested destination**
-   subtree:
-   - the source `provides_root`
-   - the destination-specific `subtree_root`
-   - the `subtree_inclusion_proof`
-   - the `OutgoingMessage { position, payload }` items
-3. Return those as `MessageBatch` values ordered from oldest to newest.
-
-This responder does not introduce new consensus state. It is only serving data
-that can later be embedded into the destination block and deterministically
-re-verified in the runtime.
-
-One practical requirement should be made explicit: the source-side collator node
-must retain enough **local historical outbox/proof data** to answer these
-requests for a bounded recent window. In practice, the minimal POC should
-assume a small node-local index or cache that records, per recent source block
-and destination:
-
-- the `provides_root`
-- the destination subtree root
-- the subtree inclusion proof
-- the ordered outgoing messages and positions
-
-Runtime APIs alone are not sufficient for arbitrary historical serving unless
-the node also persists this data locally. That persistence/indexing remains a
-node-side implementation detail, not a new consensus object.
-
-For the minimal POC, `from_block` is a sufficient progress cursor: the
-destination asks the source for batches after the last source block it has
-already accepted for that source. More advanced cursors (for example,
-top-level-root or position-based resumption hints) can be added later if needed
-for efficiency, but they are not required for the initial design.
-
-### 7.2 Collator Discovery
-
-Collators discover peer collators for other parachains through the existing
-collator protocol infrastructure. A new mapping tracks which collators serve
-which parachain:
-
-```rust
-/// Mapping: ParaId → Set of PeerIds for collators serving that parachain.
-/// Populated from the collator protocol's peer discovery.
-struct CollatorDiscovery {
-    known_collators: HashMap<ParaId, Vec<PeerId>>,
-}
-
-impl CollatorDiscovery {
-    /// Get known collator peer IDs for a given parachain.
-    fn peers_for_para(&self, para_id: ParaId) -> Vec<PeerId> {
-        self.known_collators.get(&para_id).cloned().unwrap_or_default()
-    }
-}
-```
-
-For the POC, a simpler approach suffices: hardcode or configure the PeerIds of
-known collators for each source chain in a config file.
-
-That means the minimal implementation path is:
-
-1. Start with a static `ParaId -> Vec<PeerId>` configuration for trusted source
-   collators.
-2. Add dynamic discovery via the collator protocol only after the end-to-end
-   fetch/ingress path works.
-
-This keeps the networking dependency small for the initial POC while remaining
-fully compatible with a later discovery upgrade.
-
-### 7.3 Error Handling
-
-```
-For each source chain in the trust domain:
-  1. Try to connect to any known collator peer
-  2. Send MessageBatchRequest
-  3. If response received → precheck batch locally → encode accepted batches
-     into `SpeculativeIngress`
-  4. If timeout or error → log warning → SKIP this source for this block
-     (The block is built without messages from this source.
-      Next block will retry. No provides/requires for this source.)
-```
-
-**No messages are dropped permanently** — skipped sources are retried in the next
-block as long as the source-side data remains retrievable from peers' retained
-local history. The relay chain will include the receiver's block even if it has
-no requires for a particular source.
+- [speculative-messaging-networking-design.md](/Users/yangrong/Projects/polkadot-sdk/docs/speculative-messaging-networking-design.md)
 
 ---
 
@@ -1700,12 +1635,22 @@ message hash).
 2. Fetch pending messages via speculative messaging (off-chain)
 3. Locally precheck speculative batches and encode them into `SpeculativeIngress`
 4. Both sets of messages are executed in the same block
-4. Both HRMP watermark and provides/requires are emitted in `CandidateCommitments`
+5. Both HRMP watermark and provides/requires are emitted in `CandidateCommitments`
 
 The `horizontal_messages` field in `CandidateCommitments` continues to carry HRMP
 messages. Speculative messaging messages are NOT carried in `horizontal_messages`
 — they are carried in the block body's `SpeculativeIngress` call, while
 `requires` only commits to the source `provides` roots that were actually used.
+
+**Weight accounting.** Both HRMP (`handle_xcmp_messages` called from
+`ParachainSystem::set_validation_data`) and speculative ingress call
+`handle_xcmp_messages`, each consuming from the same
+`ReservedXcmpWeight`/`ReservedXcmpWeightOverride` budget. The simplest POC
+approach: set the total reserved XCMP weight high enough to cover both paths in
+the worst case, and let each call consume what it needs. The two calls are
+independent — speculative ingress does not share a weight meter with the HRMP
+path. For a more precise approach later, the weight budget can be split
+explicitly between the two sources, but this is not required for the POC.
 
 ---
 
@@ -1971,22 +1916,24 @@ deterministic block-body input model.
 
 **Implementation work**
 
-1. Register a pull-based request/response protocol such as
-   `/polkadot/speculative-messaging/1`.
-2. Add a source-side responder task that serves a bounded recent history of:
+1. For the initial POC, add a provider/relayer process that serves a bounded
+   recent history of:
    - `provides_root`
    - destination subtree root
    - subtree inclusion proof
    - ordered messages and positions
-3. Add a destination-side fetcher that queries known peers before proposal.
-4. Start with static/configured `ParaId -> Vec<PeerId>` discovery for the POC.
+2. Add a destination-side fetcher that queries known providers before proposal.
+3. Start with static/configured `ParaId -> Vec<ProviderId>` discovery for the
+   POC.
+4. Optionally add a native collator request/response protocol later, for
+   example `/polkadot/speculative-messaging/1`, as an additional provider path.
 
 **Concrete runtime hook**
 
 - `cumulus/client/bootnodes`
-  is the clearest existing example of a small request/response protocol wired
-  into the network service with `add_request_response_protocol(...)` and
-  `start_request(...)`.
+  remains the clearest existing example for a later native request/response
+  transport if we decide to add direct collator serving after the relayer-first
+  POC.
 
 ### 10.9 Step 9: Choose a POC Runtime and Wire Tests Around It
 
@@ -2026,51 +1973,58 @@ That keeps the first build focused on proving the deterministic end-to-end path:
 runtime execution -> v4 commitments -> PVF replay -> relay-chain enactment ->
 off-chain fetch/inject loop.
 
-### 10.11 Open Implementation Decisions
+### 10.11 Implementation Decisions (Settled)
 
-The core Phase 1 design is settled, but two upgrade-shape choices still need to
-be made explicitly before implementation starts. These are not conceptual
-blockers; they are concrete plumbing decisions.
+The core Phase 1 design is settled. The two upgrade-shape choices identified
+below have been resolved as follows.
 
-1. **Descriptor / receipt versioning shape**
-   - The current codebase still centers on:
-     - `CandidateDescriptorV2`
-     - `CandidateReceiptV2`
-     - `CommittedCandidateReceiptV2`
-   - So the implementation must decide whether to:
-     - introduce a new concrete descriptor/receipt version family for
-       speculative candidates, or
-     - evolve the existing version-tagged structures in a backward-compatible
-       way
-   - Whichever path is chosen, it must be applied consistently across:
-     - node-side candidate validation
-     - relay-chain pending-availability storage
-     - candidate hashing / receipt construction
-     - test helpers and fixtures
+1. **Descriptor / receipt versioning shape — new concrete version family.**
 
-2. **Validation-result / runtime-API type transition**
-   - The minimal POC should use one upgraded wasm validation-result schema for
-     upgraded runtimes, with speculative fields populated only when applicable.
-   - In parallel, the implementation must decide how to evolve relay-chain
-     runtime-API entrypoints that still accept the legacy unversioned
-     `CandidateCommitments`, especially:
-     - `ParachainHost::check_validation_outputs` in
-       `polkadot/primitives/src/runtime_api.rs`
-     - `check_validation_outputs_for_runtime_api(...)` in
-       `polkadot/runtime/parachains/src/inclusion/mod.rs`
-   - The practical requirement is simple: the runtime API, node-side decoding,
-     and relay-side acceptance path must all agree on the same upgraded
-     commitments layout for speculative-capable candidates.
+   The current codebase centers on `CandidateDescriptorV2` /
+   `CandidateReceiptV2` / `CommittedCandidateReceiptV2`. The chosen approach is
+   to introduce a new concrete descriptor/receipt version family for speculative
+   candidates rather than evolving the existing V2 struct. The V2 struct uses a
+   reserved-byte pattern for backward-compatible version detection; overloading
+   those reserved bytes with speculative fields would risk subtle
+   backward-compatibility bugs where a non-speculative node parsing a
+   speculative candidate could silently misinterpret fields.
 
-For the minimal POC, the simplest workable approach is usually:
+   Concretely:
+   - Introduce a new descriptor/receipt version (the next integer after V2 — the
+     document uses "v4" as a placeholder, but the actual numeral follows
+     whatever the next version is in the codebase).
+   - `v10` primitives module carries the extended `CandidateCommitments` with
+     `provides` and `requires` fields.
+   - Legacy candidates continue to use the unchanged `v9` path.
+   - This must be applied consistently across node-side candidate validation,
+     relay-chain pending-availability storage, candidate hashing, and test
+     helpers.
 
-- one new speculative-capable descriptor/receipt version family
-- one upgraded validation-result schema on the wasm ABI
-- version-gated reconstruction and acceptance on the node / relay sides
+2. **Validation-result / runtime-API type transition — one upgraded wasm schema.**
 
-That keeps the implementation model aligned with the rest of this document and
-avoids trying to support multiple partially overlapping speculative schemas at
-once.
+   The chosen approach is one upgraded wasm validation-result schema for
+   upgraded runtimes:
+   - The wasm entrypoint returns one extended `ValidationResult` containing all
+     legacy fields plus `provides: Option<ProvidesCommitment>` and
+     `requires: Vec<RequiresCommitment>`.
+   - Non-speculative candidates on upgraded runtimes return `provides: None` and
+     `requires: vec![]`.
+   - Version-gating happens on the node side: candidate validation branches on
+     the descriptor version to know whether to expect populated speculative
+     fields.
+   - The relay-chain runtime API (`ParachainHost::check_validation_outputs` in
+     `polkadot/primitives/src/runtime_api.rs` and
+     `check_validation_outputs_for_runtime_api(...)` in
+     `polkadot/runtime/parachains/src/inclusion/mod.rs`) must be evolved to
+     accept the extended commitments layout. The simplest path: make it accept
+     the extended type from the start, with optional speculative fields that
+     are ignored for pre-speculative candidates.
+
+This approach — one new speculative-capable descriptor/receipt version family
+plus one upgraded wasm validation-result schema with version-gated
+reconstruction — keeps the implementation model aligned with the rest of this
+document and avoids supporting multiple partially overlapping speculative
+schemas at once.
 
 ---
 

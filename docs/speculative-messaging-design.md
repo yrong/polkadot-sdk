@@ -93,6 +93,13 @@ While that design introduces older relay parents (for relay chain fork
 immunity), it would normally increase messaging latency. Speculative Messaging
 solves this problem entirely by decoupling message passing from relay parents.
 
+In the broader design space, this should also be read as the successor to the
+"offchain XCMP" direction rather than a parallel track. The commitment-driven
+model here is a more flexible superset: it can emulate the conservative
+offchain-XCMP behavior by only depending on relay-chain-visible state already
+seen, but it also allows more aggressive speculative consumption when the
+relevant proofs or confirmations are available.
+
 ---
 
 ## Motivation
@@ -324,6 +331,18 @@ struct SourceState {
 
 Messages are exchanged off-chain between collators. The relay chain never sees
 message contents—only commitments.
+
+In the **full design direction**, the default model is native peer/collator
+exchange of messages, acknowledgements, and proof material. That reflects the
+low-latency and trust-domain goals of this document.
+
+However, this should be read as a **transport preference**, not as a hard
+consensus requirement on the implementation shape. A practical implementation
+may instead use a separate relayer/provider service that fetches from source
+state and serves proof-bearing `MessageBatch` data to destination collators.
+That remains consistent with this design as long as the destination collator
+still embeds the selected ingress into the block and the runtime/PVF
+re-verifies it deterministically.
 
 ```rust
 /// Message exchanged off-chain between collators
