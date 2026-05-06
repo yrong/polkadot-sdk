@@ -11,6 +11,42 @@
 
 ---
 
+## Scope Note
+
+This document remains the **source design** for speculative messaging in its
+full form, including:
+
+- inclusion-based commitment matching
+- late block proofs
+- acknowledgement-based low-latency extensions
+- trust domains
+- super-chain / intra-block messaging
+
+The companion implementation document,
+[speculative-messaging-impl-design.md](/Users/yangrong/Projects/polkadot-sdk/docs/speculative-messaging-impl-design.md),
+currently realizes the **minimal Phase 1 / inclusion-based POC** only.
+
+That means the current implementation design intentionally covers:
+
+- off-chain message transport
+- runtime-local sender/receiver message tracking
+- deterministic ingress via block-body `SpeculativeIngress`
+- PVF / candidate-validation extensions for `provides` / `requires`
+- relay-chain inclusion-time matching of `provides` / `requires`
+
+And intentionally defers:
+
+- late block proofs
+- acknowledgement-based dependency confirmation
+- trust-domain behavior
+- super-chain production
+
+So the implementation document should be read as the first practical
+realization of the fallback / inclusion-based path described here, not as the
+complete end-state of this design.
+
+---
+
 ## Table of Contents
 
 1. [Introduction](#introduction)
