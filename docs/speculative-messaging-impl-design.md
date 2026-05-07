@@ -15,9 +15,11 @@ the general commitment-driven speculative messaging model.
 The POC includes Late Block Proofs (section 6.2) so that receivers can
 successfully enact candidates even when the source chain's `provides_root` has
 advanced between block building and enactment — a normal case under any realistic
-backing pipeline, not just core-on-demand chains. **Guaranteed eventual delivery**
-is a hard requirement for the full design but is deferred past Phase 1 (see
-section 12).
+backing pipeline, not just core-on-demand chains. A minimal collator resubmission
+loop (section 7.4) provides basic eventual-delivery behavior: if a candidate is
+rejected, the collator fetches fresh data and retries. Full eventual-delivery
+guarantees (bounded catch-up, persistent queues, production retry policy) are
+deferred to section 12.
 
 ---
 
@@ -1330,6 +1332,27 @@ are met. At most one distinct `provides_root` per source per block.
 injected into `InherentData` under `SPECULATIVE_INGRESS_IDENTIFIER`. Prechecked
 `LateBlockProof` data is appended to the PoV after block data.
 
+**Resubmission.** After submitting the candidate, the collator watches the relay
+chain for a configurable window (e.g., 6 relay blocks). If the candidate is not
+enacted within the window — either because a dependency was unsatisfied
+(`UnsatisfiedRequires`), a LateBlockProof was stale, or the candidate was
+dropped from the pipeline — the collator fetches fresh data from the provider
+(updated batches and/or proofs), rebuilds the block, and resubmits. This minimal
+retry loop converts transient failures into eventual success:
+
+```
+loop {
+    fetch fresh batches + proofs from provider
+    precheck → select → inject → build candidate → submit
+    wait for enactment (configurable N relay blocks)
+    if enacted { break; }
+}
+```
+
+The production-grade retry policy (exponential backoff, persistent message
+queues, bounded catch-up) is deferred to §12. The POC only needs enough
+resilience to survive the normal backing-pipeline variability on a testnet.
+
 ### 7.5 Provider Discovery
 
 For the POC, static configuration:
@@ -1596,15 +1619,16 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 5. relay-chain enactment accepts satisfied dependencies (both same-root and late-block-proof cases) and rejects unsatisfied ones
 6. collator networking can fetch, precheck, and inject a recent batch end-to-end
 7. late block proof: receiver can consume messages from a source that has advanced past the root the receiver built against
+8. resubmission: collator detects candidate rejection, fetches fresh data, rebuilds, and delivers the message on a subsequent attempt
 
 ---
 
 ## 11. What's NOT In This POC
 
 - **Speculative (acknowledged) delivery mode**: requires Low-Latency v2's collator acknowledgement signatures, which are not yet implemented in the codebase. The receiver cannot optimistically build on an un-included sender block without a signed canonicality commitment from the sender's collators.
-- **Super-chain (intra-block) delivery mode**: requires a shared collator set infrastructure where one collator produces blocks for multiple parachains atomically in the same slot. This infrastructure does not exist yet in the codebase.
+- **Super-chain (intra-block) delivery mode**: unlike speculative mode, super-chain does NOT require LLv2 (no cross-collator trust — one collator authors everything). It IS blocked by collator infrastructure that doesn't exist: collators today are tied to a single parachain; producing blocks for multiple parachains in one slot needs multi-parachain collator assignment, intra-block message dependency ordering (A's block before B's within the same slot), and atomic inclusion semantics on the relay chain. All three are design-only, not implemented.
 - **Trust domains**: a concept from the high-level design (§8) where parachains declare which peers' collators they trust for speculative (acknowledged) delivery. Trust domains require three things that don't exist yet: LLv2 collator acknowledgement signatures, a `TrustedPeers: Vec<ParaId>` runtime configuration, and collator logic for trust-domain-aware acknowledgement rules. The POC uses inclusion-based delivery only, which relies purely on relay chain enforcement of `ProvidesRoots` — no trust assumptions between chains.
-- **Low-Latency v2 integration**: no acknowledgement signatures, no scheduling parent
+- **Low-Latency v2 integration**: LLv2 is the most invasive dependency in the speculative messaging design space — its core components touch consensus-critical code across the codebase. It requires: new `scheduling_parent` and `scheduling_session_index` fields in the candidate descriptor (decoupling scheduling from relay parent); backing group selection based on scheduling parent (relay chain runtime, security-critical); inclusion rules for candidates with relay parents up to ~14,400 blocks old; collator acknowledgement signatures (new primitives + gossip protocol); slashing rules for ACK'd-but-never-included blocks; and PVF header-chain proofs. The POC establishes the integration model (descriptor version gating, PVF validation ABI extension, relay-chain enactment-time rules) that LLv2 builds on, but does not reduce LLv2's own scope — it is a separate large project.
 - **Relaxed or unordered delivery semantics**: Phase 1 requires contiguous per-source subtree advancement
 - **Message pruning or MMR garbage collection**: leaves grow indefinitely
 - **Economic incentives**: no fee mechanism for relayers/collators
