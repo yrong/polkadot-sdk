@@ -119,12 +119,24 @@ testing/debugging.
 ## 8. PVF Logic (Proposal §3.3)
 
 **Proposal:** `LateBlockProof` in PoV, separate PVF entry point for proof
-handling following LLv2's scheduling-parent pattern.
+handling following LLv2's scheduling-parent pattern. Describes the PVF as
+"transforming the block's RequiresCommitment to reference the current provides
+root before the relay chain sees it."
 
-**POC design:** Agrees on the PoV approach but uses inline parsing instead of a
-separate entry point. Proofs are appended to the PoV after block data
-(length-prefixed); `validate_block` reads and verifies them as a post-execution
-step before returning the validation result.
+**POC design:** Agrees on the PoV approach but differs on both the mechanism
+and the model:
+
+**Who transforms.** The proposal's language implies the PVF rewrites
+commitments after the fact. The accurate model is: the collator prechecks the
+proof, puts the transformed root directly in the candidate commitments, and the
+PVF verifies (using the PoV-carried proof) that this root is a valid extension
+from the originally consumed root. The commitments the relay chain sees were
+always the transformed ones; the PVF confirms them, it doesn't rewrite them.
+
+**How the PVF processes proofs.** Proofs are appended to the PoV after block
+data (length-prefixed); `validate_block` reads and verifies them inline as a
+post-execution step before returning the validation result. No separate PVF
+entry point needed — the existing entry point handles it.
 
 **Why not a separate entry point.** Both approaches work, but the separate
 entry point adds unnecessary overhead:
