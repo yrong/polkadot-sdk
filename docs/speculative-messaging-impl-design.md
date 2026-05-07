@@ -153,7 +153,20 @@ Concretely, the intended behavior:
 - node-side candidate validation reconstructs commitments according to the candidate descriptor version
 
 This means the upgrade is additive: pre-v4 parachains remain valid, v4 parachains
-opt into new semantics, and both formats coexist during migration.
+opt into new semantics, and both formats coexist during migration. Every component
+that touches commitments is version-aware:
+
+- **Collator** (§5.3): branches on `api_version` to include speculative fields for
+  v4 parachains, skips them for legacy.
+- **Relay chain backing** (§4.2): `process_candidates` accepts both formats
+  unchanged into `PendingAvailability`.
+- **Relay chain enactment** (§4.2): only enforces `requires`/`provides` matching
+  for `descriptor.version() >= V4` candidates.
+- **Node-side validation** (§6.1): reconstructs `v9::CandidateCommitments` for V1–V3,
+  `v10::CandidateCommitments` for V4.
+- **Relay chain runtime API** (`check_validation_outputs`): accepts the extended
+  type from the start, ignoring optional speculative fields for pre-speculative
+  candidates.
 
 ```rust
 // In v10/mod.rs:
@@ -558,6 +571,19 @@ dependent candidates would fail (the receiver can't find the source's root in
 storage). Without persisted roots, cross-block dependencies would fail (the
 in-memory set from a prior block is gone).
 
+**Relation to speculative delivery.** Same-block matching is a relay-chain-side
+optimization, not collator-side speculation. It does not depend on LLv2
+acknowledgement signatures, trust domains, or decoupled scheduling. The collator
+builds the block normally against whatever batches it has; the relay chain
+decides at enactment time whether the dependency can be satisfied — either from
+the in-memory same-block set or from persisted storage. This is distinct from
+the speculative (acknowledged) delivery mode, which requires the collator to
+optimistically include messages before seeing the source block's acknowledgement,
+an LLv2-gated feature deferred to §12. Same-block matching is valuable for the
+POC because it recovers a common case (closely-coupled chains producing at
+similar rates) at the cost of ~20 lines of `BTreeMap` tracking in the enactment
+path, with no new infrastructure.
+
 When the source root has advanced beyond what the receiver built against, Late
 Block Proofs (§6.2) transform the `RequiresCommitment` to reference the current
 root before the relay chain sees it. From the relay chain's perspective, the rule
@@ -717,10 +743,22 @@ pub struct SourceState {
     /// Last processed message position in the source's subtree MMR.
     pub last_processed: u64,
     /// The source's top-level provides root for the latest batch we accepted.
+    /// Used in the `MultipleRootsPerSourceInOneBlock` check.
     pub last_seen_provides_root: H256,
-    /// The source's subtree root we last synced to.
+    /// The source's subtree root we last accepted. The original design carried
+    /// a TODO asking why this was needed. In the current POC, subtree
+    /// continuity is already enforced by `last_processed + 1` (message
+    /// position) + `local_subtree.root == batch.subtree_root` (root
+    /// reconstruction). This field is a snapshot of the last verification
+    /// result, useful for diagnostics and forward-looking: in LateBlockProof
+    /// verification the PVF compares `proof.old_subtree_root` against the last
+    /// accepted root.
     pub last_seen_subtree_root: H256,
-    /// Local copy of the subtree MMR (only messages sent to us).
+    /// Local copy of the subtree MMR (only messages sent to us). Not present
+    /// in the original design. The receiver independently reconstructs the
+    /// per-destination subtree from ingested messages and verifies its root
+    /// matches the batch's `subtree_root`. Without this, the receiver would
+    /// trust the batch's subtree root claim without being able to verify it.
     pub local_subtree: MMRState,
 }
 
@@ -891,6 +929,36 @@ After block execution, the collator reads the provides/requires from runtime
 storage and populates `CandidateCommitments`. Phase 1 enforces at most one
 `RequiresCommitment` per source parachain per block.
 
+**Codebase integration.** In the current codebase,
+`cumulus/client/collator/src/service.rs` line 238 calls `fetch_collation_info`
+to retrieve `CollationInfo` (upward_messages, horizontal_messages, head_data,
+etc.) and assembles `CandidateCommitments` from it at line ~294. For speculative
+messaging, the collator makes two additional runtime API calls right after
+`fetch_collation_info` and adds the results to the commitments struct:
+
+```rust
+// In cumulus/client/collator/src/service.rs, after fetch_collation_info:
+let commitments = if api_version >= SPECULATIVE_API_VERSION {
+    // v4+ parachain: include speculative fields
+    CandidateCommitments {
+        // ... existing fields from collation_info ...
+        provides: self.runtime_api.compute_provides_root(block_hash)?,
+        requires: self.runtime_api.get_requires_commitments(block_hash)?,
+    }
+} else {
+    // Legacy parachain: unchanged v9 path, no speculative fields
+    CandidateCommitments {
+        // ... existing fields only ...
+    }
+};
+```
+
+The collator already branches on `api_version` for PoV encoding format in the
+existing code (line ~267). The same pattern gates speculative fields — a
+speculative-capable runtime exports `compute_provides_root` and
+`get_requires_commitments` at the known API version; a non-speculative runtime
+doesn't. No new `CollationInfo` fields or pipeline changes needed.
+
 ```rust
 pub fn get_requires_commitments() -> Vec<RequiresCommitment> {
     let mut consumed = ConsumedSourcesThisBlock::<T>::get();
@@ -903,38 +971,17 @@ pub fn get_requires_commitments() -> Vec<RequiresCommitment> {
     }).collect()
 }
 
-impl Collator {
-    async fn build_block_commitments(&self, block: &Block) -> v10::CandidateCommitments {
-        let provides = self.runtime_api
-            .compute_provides_root(block.hash())
-            .await?;
+If late block proofs were prechecked (§6.2), the collator overrides the
+transformed root for each source with a proof before assembling commitments:
 
-        let mut requires = self.runtime_api
-            .get_requires_commitments(block.hash())
-            .await?;
-
-        // If late block proofs were prechecked, override the old root with
-        // the transformed root for each source that has a proof.
-        for proof in &self.prechecked_late_block_proofs {
-            if let Some(req) = requires.iter_mut().find(|r| r.source == proof.source) {
-                req.expected_root = proof.new_provides_root;
-            }
-        }
-        // Re-sort after potential modifications.
-        requires.sort_by_key(|r| r.source);
-
-        v10::CandidateCommitments {
-            upward_messages: block.upward_messages(),
-            horizontal_messages: block.horizontal_messages(),
-            new_validation_code: block.new_code(),
-            head_data: block.head_data(),
-            processed_downward_messages: block.processed_dmp(),
-            hrmp_watermark: block.hrmp_watermark(),
-            provides,
-            requires,
-        }
+```rust
+for proof in &self.prechecked_late_block_proofs {
+    if let Some(req) = requires.iter_mut().find(|r| r.source == proof.source) {
+        req.expected_root = proof.new_provides_root;
     }
 }
+requires.sort_by_key(|r| r.source);
+```
 ```
 
 ---
@@ -1008,10 +1055,16 @@ result.
 After the PVF returns a `ValidationResultV4`, the node-side candidate validation
 subsystem reconstructs `CandidateCommitments` from the returned outputs, hashes
 them, and checks the hash against the candidate receipt's `commitments_hash`.
-This is the **validation checkpoint** that ensures the PVF produced the same
-commitments the collator claimed. If they differ — whether because the collator
-lied about `provides`, because a LateBlockProof was invalid, or for any other
-reason — the hash won't match and the candidate is rejected.
+This is a **hash comparison only** — it ensures the PVF produced the same
+commitments the collator claimed. If the PVF produced different `provides` or
+`requires` (e.g., the collator lied, or a LateBlockProof verification failed
+upstream inside the PVF), the hash won't match and the candidate is rejected.
+
+LateBlockProof verification itself happens earlier, inside `validate_block`
+(§6.2) — the PVF reads proofs from the PoV, verifies them, transforms requires,
+and returns the result. The hash check here is the downstream safety net that
+catches any mismatch between the PVF's output and what the collator put in the
+receipt.
 
 Once validated, these commitments flow to the relay chain (§4.2) where
 `requires` / `provides` matching happens. The relay chain trusts the commitments
