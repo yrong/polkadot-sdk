@@ -1003,8 +1003,20 @@ result.
 
 ### 6.1 Candidate Commitments Reconstruction
 
-Node-side candidate validation already reconstructs commitments inline after PVF
-execution. For the POC, update that logic to branch on candidate descriptor
+After the PVF returns a `ValidationResultV4`, the node-side candidate validation
+subsystem reconstructs `CandidateCommitments` from the returned outputs, hashes
+them, and checks the hash against the candidate receipt's `commitments_hash`.
+This is the **validation checkpoint** that ensures the PVF produced the same
+commitments the collator claimed. If they differ — whether because the collator
+lied about `provides`, because a LateBlockProof was invalid, or for any other
+reason — the hash won't match and the candidate is rejected.
+
+Once validated, these commitments flow to the relay chain (§4.2) where
+`requires` / `provides` matching happens. The relay chain trusts the commitments
+because they've already been PVF-verified and hash-checked here.
+
+Node-side candidate validation already reconstructs commitments for legacy fields
+today. For the POC, update that logic to branch on candidate descriptor
 version:
 
 ```rust
@@ -1100,8 +1112,16 @@ The PoV wire format is:
 On the PVF side, `validate_block` receives the PoV via `ValidationParams.pov`.
 The existing block execution path reads `block_data` from the PoV as it does
 today. After execution, `read_late_block_proofs_from_pov` reads the trailing
-bytes and parses the proof section. No PVF host changes needed — the PoV is
-already passed to the PVF as opaque bytes.
+bytes, parses the proof section, and calls `verify_and_transform` for each proof
+(see the PVF verification pseudocode below). No PVF host changes needed — the
+PoV is already passed to the PVF as opaque bytes.
+
+The relay chain never sees the proofs and never verifies them. The entire
+pipeline is: collator appends proofs to PoV → PVF verifies and transforms
+requires → node-side validation reconstructs commitments from the
+transformed result → relay chain matches `expected_root` against
+`ProvidesRoots`. See §4.4 for what the relay chain does *not* do, and
+§6.1 for commitments reconstruction.
 
 **PVF verification.** During `validate_block`, after executing the block, the PVF
 reads the proof data from the PoV and verifies each proof:

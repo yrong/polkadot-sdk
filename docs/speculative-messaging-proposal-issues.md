@@ -19,22 +19,37 @@ pub type OutgoingMessages<T>: DoubleMap<ParaId, u64, Bytes>; // (dest, leaf_inde
 (`leaf_count`, `root`, `nodes` — hashes only). The relayer/provider reads payload
 bytes from finalized block events and constructs `MessageBatch` structs.
 
-**Impact:** This is the core value proposition. Storing payloads on-chain
-(defeats the goal of removing message data from chain state — even if the
-storage moves from the relay chain to the sender parachain, the bytes are still
-in state. The MMR only needs the 32-byte payload hash for proof verification.
+**Impact:** This is the core value proposition. In HRMP, message payloads are
+stored in relay chain state (`HrmpChannelContents`) — replicated to every relay
+chain validator and full node, growing with total cross-chain traffic. Storing
+them in parachain state via `OutgoingMessages` would move the burden from relay
+chain to parachain but wouldn't eliminate the persistent storage cost. The MMR
+only needs the 32-byte payload hash for proof verification — the actual bytes
+are already in the sender parachain's block execution trace (the sender produced
+them during runtime execution). Parachain block data is only stored by nodes
+following that parachain, not replicated to all relay chain nodes. The relayer
+reads payload bytes from finalized block events. What speculative messaging
+removes is the persistent on-chain *storage map* of message data — the bytes
+stay scoped to the parachain's own block data.
 
 ## 2. LateBlockProof Location (Proposal §3.2)
 
-**Proposal:** Puts `late_block_proofs` inside `MessagingInherent` (block body),
-alongside batches.
+**Proposal:** Puts `late_block_proofs` inside a `MessagingInherent` struct
+alongside batches, with a comment acknowledging they belong in the PoV ("in PoV,
+not block"). This bundles two things that belong in different places:
 
-**POC design:** `LateBlockProof` goes in the PoV (appended after block data).
-The collator prechecks proofs locally and uses the transformed root in candidate
-commitments. The PVF independently reads proofs from the PoV during
-`validate_block` and confirms the transformation — commitments hash mismatch if
-the collator's precheck and the PVF's verification disagree. Matches the
-high-level design's PVF transformation model.
+| Data | Where it belongs | Why |
+|---|---|---|
+| `batches` (message data) | Block body, via `ProvideInherent` | Runtime state transition |
+| `late_block_proofs` | PoV, appended after block data | PVF-level commitment transformation |
+
+**POC design:** `LateBlockProof` goes in the PoV (appended after block data),
+not in any inherent struct. The collator prechecks proofs locally and uses the
+transformed root in candidate commitments. The PVF independently reads proofs
+from the PoV during `validate_block` and confirms the transformation —
+commitments hash mismatch if the collator's precheck and the PVF's verification
+disagree. Matches the high-level design's PVF transformation model. See also
+issue #3 (the `MessagingInherent` struct itself is unnecessary).
 
 ## 3. Custom `MessagingInherent` vs Standard `ProvideInherent` (Proposal §3.2)
 
@@ -50,15 +65,18 @@ struct MessagingInherent {
 
 **POC design:** Uses the standard `ProvideInherent` pattern already established
 by `ParachainSystem::set_validation_data`. The pallet declares an
-`INHERENT_IDENTIFIER`, the collator puts `SpeculativeIngress` under that key via
-the existing inherent-data pipeline, and `create_inherent` decodes it into
-`ingest_verified_messages`. No custom inherent struct, no new injection path.
+`INHERENT_IDENTIFIER`, the collator puts `SpeculativeIngress` (batches only)
+under that key via the existing inherent-data pipeline, and `create_inherent`
+decodes it into `ingest_verified_messages`. LateBlockProofs do NOT go through
+the inherent — they are appended directly to the PoV after block data (see issue
+#2). No custom inherent struct, no new injection path.
 
 **Why simpler:** Cumulus already has the full `ProvideInherent` lifecycle —
 `create_inherent_data_with_rp_offset` assembles inherents, the proposer includes
 them, and `validate_block` replays them. Our pallet plugs into this directly
 rather than defining a parallel mechanism. The `SpeculativeIngress` struct is
-just the typed payload under a standard inherent key.
+just the typed payload (batches only) under a standard inherent key. Proofs take
+a separate path (PoV) that matches their role as PVF-level inputs.
 
 ## 4. Relay Chain Enforcement (Proposal §1)
 
@@ -108,16 +126,24 @@ separate entry point. Proofs are appended to the PoV after block data
 (length-prefixed); `validate_block` reads and verifies them as a post-execution
 step before returning the validation result.
 
-**Why not a separate entry point.** LLv2's separate-entry-point pattern exists
-for inputs that are independent of block execution (scheduling parent headers,
-core assignments) — they determine *whether* the block is valid. Late Block
-Proofs are different: they transform an output the block execution already
-produced (the `requires` root). Processing that transformation inside
-`validate_block` after execution is the natural place — it's a post-processing
-step on the execution result, not an independent validation gate. A separate
-entry point would need to receive the execution output and couple two entry
-points, which adds complexity without benefit. This isn't a POC shortcut to fix
-later; it's the right architecture for this specific problem.
+**Why not a separate entry point.** Both approaches work, but the separate
+entry point adds unnecessary overhead:
+
+| | Separate entry point | Inline parsing |
+|---|---|---|
+| New PVF host registration | Yes | **No** |
+| Wasm ABI changes (new input channel) | Yes | **No** |
+| Parity coordination for host changes | Yes | **No** |
+| Collator PoV construction | Append to PoV | Append to PoV (same) |
+| Verification logic | Identical | Identical |
+
+The separate entry point only makes sense for independent validation inputs that
+gate whether the block can execute (LLv2's scheduling parent headers, core
+assignments). Late Block Proofs don't fit that model — they're a post-processing
+step on the execution result. Processing them inline in `validate_block` after
+execution is both simpler to implement (zero host changes) and architecturally
+correct (the result of execution is the natural input to the transformation).
+This isn't a POC shortcut; it's the right design.
 
 ## 9. Collator Responsibilities (Proposal §3.5)
 
