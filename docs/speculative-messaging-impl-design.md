@@ -118,6 +118,58 @@ enacted provides or the latest persisted provides root, then updates
 
 The detailed implementation order, including specific files and modules for each step, is in section 10.
 
+### 1.3 Protocol Pipeline (End-to-End)
+
+How our design maps onto the existing parachain–relay-chain communication flow.
+
+**Phase 1 — Collator builds the block**
+
+1. **Fetch off-chain data** (§7.4). Collator queries provider for `MessageBatch`es.
+   Prechecks proofs and message continuity. If source root has advanced, also
+   fetches and prechecks `LateBlockProof` (§6.2).
+2. **Assemble inherents** (§3.3). Collator creates `InherentData`: parachain-system
+   data + `SpeculativeIngress` (batches). Appends `LateBlockProof` bytes to PoV
+   after block data (§6.2).
+3. **Execute block** (§5.1, §5.2). Runtime executes. Outbox wrapper records
+   outbound XCM into `OutgoingMMRs`. `ingest_verified_messages` verifies batches,
+   updates `IncomingState`, dispatches XCM, records consumed sources.
+4. **Collect outputs** (§5.3). Collator calls `compute_provides_root()` and
+   `get_requires_commitments()` via runtime API. Overrides requires with
+   LateBlockProof transformed roots. Assembles `CandidateCommitments`.
+5. **Build receipt**. Collator hashes commitments → `commitments_hash`. Builds
+   `CommittedCandidateReceipt` with descriptor + hash + signature. Submits
+   (PoV, receipt) to backing validators.
+
+**Phase 2 — Backing**
+
+6. **PVF execution** (§6, §6.2). Each backing validator spins up Wasm sandbox,
+   loads the parachain's Wasm blob, calls `validate_block` with the PoV. PVF
+   executes the block deterministically — same inherents, same
+   `ingest_verified_messages`, same outbox updates. After execution, reads
+   `LateBlockProof` from PoV trailing bytes, verifies each proof, transforms
+   requires. Returns `ValidationResultV4`.
+7. **Commitments reconstruction** (§6.1). Node-side validation reconstructs
+   `CandidateCommitments` from `ValidationResultV4`, hashes, checks against the
+   receipt's `commitments_hash`. Match → commitments are valid. Validators sign,
+   candidate enters `PendingAvailability`.
+
+**Phase 3 — Inclusion / Enactment**
+
+8. **Dependency check** (§4.2). Relay block author decides which pending
+   candidates to include. For each v4 candidate, the relay chain checks every
+   `RequiresCommitment.expected_root` against: (a) same-block enacted provides
+   set, or (b) persisted `ProvidesRoots[source]`. Unmet → `UnsatisfiedRequires`,
+   candidate dropped.
+9. **Enact** (§4.1). `enact_candidate()` runs. For v4 candidates with
+   `ProvidesCommitment`: add to same-block enacted set, update
+   `ProvidesRoots[para_id]`.
+
+**Phase 4 — Availability & Finality**
+
+10. PoV is erasure-coded and distributed. Relay chain finality confirms the
+    candidate is canonical. `ProvidesRoots[source]` is now permanently available
+    for future receiver blocks.
+
 ---
 
 ## 2. Commitments Versioning Strategy
