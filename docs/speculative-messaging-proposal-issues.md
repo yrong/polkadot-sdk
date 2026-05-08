@@ -15,22 +15,26 @@ correcting several technical details.
 pub type OutgoingMessages<T>: DoubleMap<ParaId, u64, Bytes>; // (dest, leaf_index) → payload
 ```
 
-**POC design:** Payloads are kept off-chain. The runtime stores only MMR state
+**POC design:** Stores payload bytes on-chain for simplicity (`OutgoingMessages`
+storage map, parachain-local, not relay chain). The runtime also stores MMR state
 (`leaf_count`, `root`, `nodes` — hashes only). The relayer/provider reads payload
-bytes from finalized block events and constructs `MessageBatch` structs.
+bytes directly from storage via a runtime API — no event indexing needed.
 
 **Impact:** This is the core value proposition. In HRMP, message payloads are
 stored in relay chain state (`HrmpChannelContents`) — replicated to every relay
 chain validator and full node, growing with total cross-chain traffic. Storing
-them in parachain state via `OutgoingMessages` would move the burden from relay
-chain to parachain but wouldn't eliminate the persistent storage cost. The MMR
-only needs the 32-byte payload hash for proof verification — the actual bytes
-are already in the sender parachain's block execution trace (the sender produced
-them during runtime execution). Parachain block data is only stored by nodes
-following that parachain, not replicated to all relay chain nodes. The relayer
-reads payload bytes from finalized block events. What speculative messaging
-removes is the persistent on-chain *storage map* of message data — the bytes
-stay scoped to the parachain's own block data.
+them in parachain state via `OutgoingMessages` moves the burden from relay chain
+to parachain. The MMR only needs the 32-byte payload hash for proof verification
+— the payload bytes live in the sender parachain's own storage, which is only
+stored by nodes following that parachain, not replicated to all relay chain
+nodes. What speculative messaging removes is the relay chain's persistent
+*storage map* of message data.
+
+**POC simplification:** On-chain storage in `OutgoingMessages` is the simplest
+relayer path and keeps the POC focused on core messaging logic. A production
+implementation may move payloads off-chain (events, off-chain indexer, or
+similar) once a pruning strategy is defined, without changing the on-chain MMR
+or proof semantics.
 
 ## 2. LateBlockProof Location (Proposal §3.2)
 
@@ -82,10 +86,11 @@ a separate path (PoV) that matches their role as PVF-level inputs.
 
 **Proposal:** Matches against "currently backed/included" provides roots.
 
-**POC design:** Matches against same-block enacted provides roots or the latest
-persisted `ProvidesRoots` entry. A candidate that is merely backed but not yet
-enacted does not satisfy a dependency — its provides root hasn't been committed
-to relay state yet.
+**POC design:** Matches only against persisted `ProvidesRoots` entry from
+prior relay blocks. Same-block enacted matching is deliberately dropped as a
+simplification — the collator always reads from the relay parent's state, and
+the one-block delay in the rare concurrent-enactment case is acceptable. The
+same-block optimization can be added back later.
 
 ## 5. Collator: Proof Fetching vs Generation (Proposal §3.5 #3)
 
