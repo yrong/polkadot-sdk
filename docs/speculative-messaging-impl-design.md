@@ -705,6 +705,27 @@ pub struct MMRState {
     /// Nodes stored for proof generation (peaks + internal nodes).
     pub nodes: BTreeMap<u64, H256>,
 }
+
+/// Payload bytes for outgoing messages, keyed by destination and leaf position.
+/// Stored on-chain for the POC to keep the relayer simple — no event indexing
+/// or off-chain indexer needed. The relay chain is unaffected (this is
+/// parachain-local storage). A production implementation may move payloads
+/// off-chain with a pruning strategy; for the POC, bounded storage growth is
+/// acceptable.
+///
+/// Pruning: entries can be removed after a configurable retention window (e.g.,
+/// N blocks past the point where the destination has acknowledged consumption
+/// via ProvidesRoots advancement). The POC may start without automated pruning
+/// and add it when retention bounds are defined.
+#[pallet::storage]
+pub type OutgoingMessages<T: Config> = StorageDoubleMap<
+    _,
+    Twox64Concat,
+    ParaId,
+    Twox64Concat,
+    u64,
+    Vec<u8>,
+>;
 ```
 
 The important distinction: `OutgoingMMRs[destination].leaf_count` is the
@@ -1329,6 +1350,8 @@ the receiver to accept the resulting batches.
 pub trait SpeculativeOutboxApi {
     fn provides_root() -> Option<Hash>;
     fn destination_state(dest: ParaId) -> Option<(Hash, u64)>;
+    /// Read payload bytes from on-chain storage for a destination starting at
+    /// `from_position`. Returns up to `max_messages` entries.
     fn outbound_messages(dest: ParaId, from_position: u64, max_messages: u32) -> Vec<(u64, Vec<u8>)>;
     fn subtree_inclusion_proof(dest: ParaId, subtree_root: Hash) -> Option<Vec<Hash>>;
     /// Return an MMR extension proof proving that `old_subtree_root` at
@@ -1342,10 +1365,17 @@ pub trait SpeculativeOutboxApi {
 }
 ```
 
+**Payload bytes are read from on-chain storage.** The outbox pallet stores full
+payload bytes in `OutgoingMessages` (see §5.1). The provider calls
+`outbound_messages(dest, last_known_position, max)` to retrieve them — no event
+indexing or off-chain indexer needed. A production implementation may move
+payloads off-chain (events, off-chain indexer, or similar) once a pruning
+strategy is defined; for the POC, on-chain storage keeps the relayer simple.
+
 For each destination that received messages in a source block, the provider:
 reads `destination_state(dest)` for `(subtree_root, leaf_count)`, reads
 `subtree_inclusion_proof(dest, subtree_root)` for the Merkle proof, reads
-`outbound_messages(dest, last_known_position, max)` for ordered messages, reads
+`outbound_messages(dest, last_known_position, max)` for payload bytes, reads
 `provides_root()`, and assembles the `MessageBatch`.
 
 The provider retains batches in a bounded in-memory cache keyed by
