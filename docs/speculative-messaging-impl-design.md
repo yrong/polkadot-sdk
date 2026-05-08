@@ -77,10 +77,18 @@ through the existing path. A speculative outbox wrapper records the payloads int
 per-destination MMR/subtree state, and the sender's cumulative top-level
 `provides` root becomes derivable from the resulting runtime state. See section 5.1.
 
-**Step 2 — Source-side batch/proof retention.** After the sender block exists, a
-relayer/provider process retains a bounded recent history of: the sender
-`provides_root`, destination subtree roots, subtree inclusion proofs, and ordered
-messages with positions. See section 7.2.
+**Step 2 — Sender-side data is stored on-chain.** The sender chain stores
+outbound payload bytes in `OutgoingMessages` and MMR state in `OutgoingMMRs`.
+No additional work happens on the sender chain — the data persists in its
+runtime storage naturally as a result of block execution (step 1).
+
+An optional **provider** process (§7.2) monitors the sender chain, queries its
+runtime APIs (`provides_root`, `destination_state`, `outbound_messages`,
+`subtree_inclusion_proof`), and caches the results as `MessageBatch` structs.
+This caching layer is a convenience — it decouples the receiver collator from
+needing a direct RPC connection to the source chain. The receiver collator
+could query the source chain directly; the provider just amortizes work across
+multiple receivers and provides a simpler HTTP interface.
 
 **Step 3 — Receiver collator fetches and prechecks.** Before proposing its own
 block, the destination collator fetches recent batches from a provider and
@@ -126,9 +134,9 @@ How our design maps onto the existing parachain–relay-chain communication flow
 1. **Fetch off-chain data** (§7.4). Collator queries provider for `MessageBatch`es.
    Prechecks proofs and message continuity. If source root has advanced, also
    fetches and prechecks `LateBlockProof` (§6.2).
-2. **Assemble inherents** (§3.3). Collator creates `InherentData`: parachain-system
-   data + `SpeculativeIngress` (batches). Appends `LateBlockProof` bytes to PoV
-   after block data (§6.2).
+2. **Assemble inherents and PoV** (§3.3, §6.2). Collator creates `InherentData`:
+   parachain-system data + `SpeculativeIngress` (batches). Wraps block data and
+   `LateBlockProof`s in `ParachainBlockDataV4` and encodes as the PoV content.
 3. **Execute block** (§5.1, §5.2). Runtime executes. Outbox wrapper records
    outbound XCM into `OutgoingMMRs`. `ingest_verified_messages` verifies batches,
    updates `IncomingState`, dispatches XCM, records consumed sources.
@@ -143,10 +151,11 @@ How our design maps onto the existing parachain–relay-chain communication flow
 
 6. **PVF execution** (§6, §6.2). Each backing validator spins up Wasm sandbox,
    loads the parachain's Wasm blob, calls `validate_block` with the PoV. PVF
-   executes the block deterministically — same inherents, same
-   `ingest_verified_messages`, same outbox updates. After execution, reads
-   `LateBlockProof` from PoV trailing bytes, verifies each proof, transforms
-   requires. Returns `ValidationResultV4`.
+   decodes `ParachainBlockDataV4` from the PoV bytes (getting both block data and
+   `LateBlockProof`s in one call), executes the block deterministically —
+   same inherents, same `ingest_verified_messages`, same outbox updates. Verifies
+   each late block proof from `pov_v4.late_block_proofs`, transforms requires.
+   Returns `ValidationResultV4`.
 7. **Commitments reconstruction** (§6.1). Node-side validation reconstructs
    `CandidateCommitments` from `ValidationResultV4`, hashes, checks against the
    receipt's `commitments_hash`. Match → commitments are valid. Validators sign,
@@ -164,8 +173,8 @@ How our design maps onto the existing parachain–relay-chain communication flow
 **Phase 4 — Availability & Finality**
 
 10. PoV is erasure-coded and distributed. Relay chain finality confirms the
-    candidate is canonical. `ProvidesRoots[source]` is now permanently available
-    for future receiver blocks.
+    candidate is canonical. `ProvidesRoots[source]` is persisted and available
+    for future receiver blocks until the source produces a new provides root.
 
 ---
 
@@ -618,6 +627,16 @@ stable across multiple destination blocks, and each can match against the
 unchanged `ProvidesRoots[source]` without a proof. Faster destination production
 is not a problem; slower destination *inclusion* is.
 
+**What causes `ProvidesRoots[source]` to change.** Because the provides root is
+the top-level Merkle root over all per-destination subtree roots (see §5.1),
+it changes whenever the source produces outbound messages to **any** destination,
+not just this receiver. If the source sends messages to other parachains, the
+root advances even though this receiver has no new messages. In that case the
+receiver collator simply skips the source — no new batches to fetch, no proof
+needed. LateBlockProofs are only needed when there *are* new messages for this
+receiver *and* the root has advanced between the batch being built and the
+receiver's candidate reaching enactment.
+
 ### 4.3 New Error
 
 ```rust
@@ -648,6 +667,16 @@ It does not. The division of labor is:
 
 In short: all cryptographic work lives in the PVF; the relay chain only adds
 hash-equality checks on already-validated commitment fields.
+
+**Forward-looking: JAM 48KB refine→accumulate budget.** In the JAM protocol,
+the data flowing from refine (PVF) to accumulate (enactment) is capped at ~48KB
+per service per slot. Our design aligns naturally: the relay chain only handles
+a single `ProvidesCommitment.root` (32 bytes) per producer and a list of
+`RequiresCommitment` entries (~36 bytes each) per consumer. Full message
+payloads never cross the refine→accumulate boundary — they flow off-chain
+through the provider and are verified inside the PVF. This means the speculative
+messaging model is JAM-compatible without rearchitecting, unlike HRMP where
+payload bytes in relay chain state would compete for the 48KB budget.
 
 ---
 
@@ -1170,74 +1199,58 @@ the `provides_root` of the fetched batch. If they differ, the collator fetches a
 
 1. Uses `proof.new_provides_root` (not `batch.provides_root`) in the candidate
    commitments via the standard `get_requires_commitments()` path.
-2. Appends the serialized proof to the PoV after the block data, with a
-   well-known length-prefixed format.
+2. Wraps both block data and proofs in `ParachainBlockDataV4` and encodes
+   the full struct as the PoV content.
 
-**PoV format and construction.** The collator builds the PoV as normal (block
-data), then appends the proof section. In the current Cumulus codebase, the
-collator constructs the PoV during block proposal — `block_data` is the SCALE-
-encoded block. The integration point is after block construction and before
-candidate submission:
+**`ParachainBlockDataV4` wrapper type.** Instead of appending raw proof bytes after
+the SCALE-encoded block data and parsing them with a manual cursor, the POC defines
+a formal wrapper struct:
 
 ```rust
-// In the collator's proposal path (cumulus/client/consensus/aura/src/collator.rs):
-let block_data = build_block(...)?;  // existing PoV content
-
-// Append late block proof section
-let mut pov = block_data.encode();
-let num_proofs = late_block_proofs.len() as u32;
-pov.extend(&num_proofs.encode());
-for proof in &late_block_proofs {
-    let proof_bytes = proof.encode();
-    pov.extend(&(proof_bytes.len() as u32).encode());
-    pov.extend(&proof_bytes);
+/// Extended block data for v4 speculative-messaging candidates.
+#[derive(Encode, Decode)]
+pub struct ParachainBlockDataV4 {
+    pub inner: ParachainBlockData,
+    pub late_block_proofs: Vec<LateBlockProof>,
 }
-
-// Submit candidate with the extended PoV
 ```
 
-The PoV wire format is:
+The wire format is a single SCALE-encoded `ParachainBlockDataV4` — no manual
+length-prefixed sections, no cursor arithmetic. The collator constructs it directly:
 
+```rust
+// In the collator's proposal path:
+let block_data = build_block(...)?;  // existing PoV content
+let pov_v4 = ParachainBlockDataV4 {
+    inner: block_data,
+    late_block_proofs,
+};
+let pov_bytes = pov_v4.encode();
 ```
-[ block_data bytes ]
-[ u32: num_proofs ]
-[ for each proof: u32 length || LateBlockProof bytes ]
-```
 
-On the PVF side, `validate_block` receives the PoV via `ValidationParams.pov`.
-The existing block execution path reads `block_data` from the PoV as it does
-today. After execution, `read_late_block_proofs_from_pov` reads the trailing
-bytes, parses the proof section, and calls `verify_and_transform` for each proof
-(see the PVF verification pseudocode below). No PVF host changes needed — the
-PoV is already passed to the PVF as opaque bytes.
-
-The relay chain never sees the proofs and never verifies them. The entire
-pipeline is: collator appends proofs to PoV → PVF verifies and transforms
-requires → node-side validation reconstructs commitments from the
-transformed result → relay chain matches `expected_root` against
-`ProvidesRoots`. See §4.4 for what the relay chain does *not* do, and
-§6.1 for commitments reconstruction.
-
-**PVF verification.** During `validate_block`, after executing the block, the PVF
-reads the proof data from the PoV and verifies each proof:
+**PVF decode.** The `validate_block` entry point decodes `ParachainBlockDataV4`
+from the PoV bytes in one SCALE decode call. If the decode fails (wrong format,
+truncated data, etc.), the candidate is invalid — same error model as any other
+SCALE decode:
 
 ```rust
 fn validate_block(params: ValidationParams) -> Result<ValidationResultV4, ValidationError> {
-    // 1. Execute the block and collect standard validation outputs
-    let mut result = execute_block_and_collect_outputs(&params)?;
+    // Single decode: block data + late block proofs in one call.
+    let pov_v4 = ParachainBlockDataV4::decode(&mut &params.pov.block_data[..])
+        .map_err(|_| ValidationError::InvalidBlockData)?;
 
-    // 2. Read late block proofs from the PoV
-    let proofs = read_late_block_proofs_from_pov(&params.pov)?;
+    // 1. Execute the block with the inner block data
+    let mut result = execute_block(&pov_v4.inner)?;
 
-    // 3. Verify each proof and transform requires
+    // 2. Verify each late block proof and transform requires
     let mut transformed_requires = Vec::new();
-    for proof in &proofs {
+    for proof in &pov_v4.late_block_proofs {
         let transformed = verify_and_transform(&result.requires, proof)?;
         transformed_requires.push(transformed);
     }
     // Keep non-transformed requires for sources without proofs
     for req in &result.requires {
-        if !proofs.iter().any(|p| p.source == req.source) {
+        if !pov_v4.late_block_proofs.iter().any(|p| p.source == req.source) {
             transformed_requires.push(req.clone());
         }
     }
@@ -1245,7 +1258,76 @@ fn validate_block(params: ValidationParams) -> Result<ValidationResultV4, Valida
     result.requires = transformed_requires;
     Ok(result)
 }
+```
 
+No SCALE cursor tricks, no manual offset tracking, no `parse_late_block_proofs`
+function. The `ParachainBlockDataV4::decode` call either succeeds with both block
+data and proofs, or fails cleanly.
+
+**Version gating.** The collator and PVF must agree on the wire format. The
+descriptor version (`candidate.descriptor.version()`) distinguishes the two cases:
+
+- `V4` candidates: the PoV content is a SCALE-encoded `ParachainBlockDataV4`
+- Pre-`V4` candidates: the PoV content is a plain `ParachainBlockData` (unchanged)
+
+The collator branches on the candidate version when constructing the PoV:
+
+```rust
+if candidate_version >= V4 {
+    let pov_v4 = ParachainBlockDataV4 { inner: block_data, late_block_proofs };
+    pov.0 = pov_v4.encode();
+} else {
+    pov.0 = block_data.encode();
+}
+```
+
+The PVF similarly branches:
+
+```rust
+fn validate_block(params: ValidationParams) -> Result<..., ValidationError> {
+    // Version is communicated via the candidate descriptor (out of band of
+    // the PoV bytes). In practice the PVF runtime knows its own version
+    // from the runtime API version or descriptor header.
+    if is_v4_candidate() {
+        let pov = ParachainBlockDataV4::decode(&mut &params.pov.block_data[..])
+            .map_err(|_| ValidationError::InvalidBlockData)?;
+        let result = execute_block(&pov.inner)?;
+        // ... verify late_block_proofs from pov ...
+    } else {
+        let block_data = ParachainBlockData::decode(&mut &params.pov.block_data[..])
+            .map_err(|_| ValidationError::InvalidBlockData)?;
+        let result = execute_block(&block_data)?;
+        // ... no proof verification ...
+    }
+}
+```
+
+**Why the wrapper is better than the cursor.** The cursor approach had several
+problems:
+
+1. **Fragile decoding.** The `u32::decode(&mut &cursor[..])` pattern creates a new
+   borrowed slice each time instead of advancing the outer cursor. The correct
+   pattern requires `let mut sub = &cursor[..]; u32::decode(&mut sub)`, which is
+   easy to get wrong. A bug here silently produces garbage verification.
+2. **No compile-time structure.** The wire format exists only as a comment diagram
+   and the order of manual decode calls. `ParachainBlockDataV4` gives the compiler
+   a single struct to check, and SCALE derive handles the encoding/decoding.
+3. **Cleaner version gating.** With the wrapper, the version distinction is "use
+   this type or that type" rather than "decode this struct, then manually parse
+   trailing bytes of unknown format."
+
+No PVF host changes are needed — the PoV is already passed to the PVF as opaque
+bytes via `params.pov.block_data`. The only difference is what type we decode from
+those bytes.
+
+The relay chain never sees the proofs and never verifies them. The entire
+pipeline is: collator wraps proofs in `ParachainBlockDataV4` → PVF decodes and
+verifies proofs in one SCALE decode → transforms requires → node-side validation
+reconstructs commitments from the transformed result → relay chain matches
+`expected_root` against `ProvidesRoots`. See §4.4 for what the relay chain does
+*not* do, and §6.1 for commitments reconstruction.
+
+```rust
 fn verify_and_transform(
     block_requires: &[RequiresCommitment],
     proof: &LateBlockProof,
@@ -1308,7 +1390,8 @@ reserve a small allowance for these proofs (e.g., 50 KB).
 
 **Serving extension proofs.** The provider serves `LateBlockProof` data via the
 same HTTP endpoint (section 7.3), returning proofs alongside or instead of
-batches when the cursor root differs from the current root.
+batches when the source's provides_root has advanced beyond the receiver's
+last-seen root.
 
 ---
 
@@ -1329,9 +1412,9 @@ to HRMP.
 
 ### 7.2 Sender-Side: Batch Construction and Retention
 
-The sender runtime exposes APIs that the provider queries after block
-finalization. These are not consensus-critical but must return correct data for
-the receiver to accept the resulting batches.
+The sender chain's runtime stores all speculative messaging data on-chain as a
+result of normal block execution (§5.1). The sender runtime exposes APIs for
+reading this data:
 
 ```rust
 #[runtime_api]
@@ -1354,23 +1437,29 @@ pub trait SpeculativeOutboxApi {
 ```
 
 **Payload bytes are read from on-chain storage.** The outbox pallet stores full
-payload bytes in `OutgoingMessages` (see §5.1). The provider calls
-`outbound_messages(dest, last_known_position, max)` to retrieve them — no event
-indexing or off-chain indexer needed. A production implementation may move
-payloads off-chain (events, off-chain indexer, or similar) once a pruning
-strategy is defined; for the POC, on-chain storage keeps the relayer simple.
+payload bytes in `OutgoingMessages` (see §5.1). These runtime APIs can be
+queried by any RPC client that knows the source chain's endpoint.
 
-For each destination that received messages in a source block, the provider:
-reads `destination_state(dest)` for `(subtree_root, leaf_count)`, reads
-`subtree_inclusion_proof(dest, subtree_root)` for the Merkle proof, reads
-`outbound_messages(dest, last_known_position, max)` for payload bytes, reads
-`provides_root()`, and assembles the `MessageBatch`.
+**The provider as a convenience layer.** A separate provider process monitors the
+sender chain, queries these runtime APIs, and caches the results as pre-assembled
+`MessageBatch` structs. For each destination that received messages in a source
+block, the provider reads `destination_state(dest)` for `(subtree_root,
+leaf_count)`, reads `subtree_inclusion_proof(dest, subtree_root)` for the Merkle
+proof, reads `outbound_messages(dest, last_known_position, max)` for payload
+bytes, reads `provides_root()`, and assembles the `MessageBatch`.
 
 The provider retains batches in a bounded in-memory cache keyed by
 `(destination_para_id, provides_root)` with a retention window of the last N
 finalized source blocks (e.g., N = 64) or last T minutes (e.g., T = 10). The
 cache is purely in-memory for the POC — the source chain's runtime state is the
 canonical store.
+
+This caching layer is not required — the receiver collator could query the
+sender's runtime APIs directly via RPC (§7.4). The provider amortizes work
+across multiple receivers, provides a simpler HTTP interface (§7.3), and avoids
+requiring every receiver collator to maintain an RPC connection to every source
+chain. For the POC, one or more known providers per source is the simplest
+operational model.
 
 ### 7.3 Transport: HTTP API
 
@@ -1420,11 +1509,24 @@ seconds per provider) prevent hanging.
 
 **Precheck.** Each fetched batch goes through the collator-local precheck
 described in section 5.2: verify subtree inclusion proof, verify message
-continuity, reconstruct local subtree. If the batch's `provides_root` differs
-from `ProvidesRoots[source]`, the collator also fetches and prechecks a
-`LateBlockProof` (section 6.2) — verifying it locally and recording the
-transformed root for use in commitment assembly. Batches and proofs that fail
-precheck are discarded.
+continuity, reconstruct local subtree.
+
+The collator then compares the batch's `provides_root` against the current
+`ProvidesRoots[source]` by querying its relay chain node via RPC (the
+collator runs alongside a relay chain node and knows the storage key for the
+`speculative_messaging` pallet's `ProvidesRoots` map). This RPC read is a
+**best-effort precheck**, not a consensus path:
+
+- If `batch.provides_root == ProvidesRoots[source]`: the dependency is already
+  satisfied — no proof needed, candidate will pass enactment.
+- If they differ: the collator fetches and prechecks a `LateBlockProof`
+  (section 6.2), verifying it locally and recording the transformed root for
+  use in commitment assembly. The candidate will match against the current root
+  at enactment.
+- If the RPC read is stale or wrong: the candidate is rejected at enactment
+  with `UnsatisfiedRequires` — no state corruption, just a retry.
+
+Batches and proofs that fail precheck are discarded.
 
 **Selection.** Batches are ordered by source priority (configurable) then by age
 (oldest first). The collator selects greedily until block weight or size limits
@@ -1432,7 +1534,8 @@ are met. At most one distinct `provides_root` per source per block.
 
 **Injection.** Selected batches are encoded into `SpeculativeIngress` and
 injected into `InherentData` under `SPECULATIVE_INGRESS_IDENTIFIER`. Prechecked
-`LateBlockProof` data is appended to the PoV after block data.
+`LateBlockProof` data and the block data are wrapped in `ParachainBlockDataV4`
+for the PoV.
 
 **Resubmission.** After submitting the candidate, the collator watches the relay
 chain for a configurable window (e.g., 6 relay blocks). If the candidate is not
@@ -1684,10 +1787,11 @@ legacy path. Continue hash-checking against the candidate receipt.
 
 Add `LateBlockProof` and `MMRExtensionProof` types to `v10` primitives. Implement
 PoV-based proof verification: collator fetches and prechecks proofs, uses
-transformed root in candidate commitments, appends proofs to PoV. PVF reads
-proofs from PoV during `validate_block`, verifies, and transforms requires.
-Collator precheck and PVF verification use the same logic; mismatches cause
-commitments hash mismatch (candidate rejected).
+transformed root in candidate commitments, wraps proofs and block data in
+`ParachainBlockDataV4`. PVF decodes `ParachainBlockDataV4` from the PoV during
+`validate_block`, verifies proofs, and transforms requires. Collator precheck
+and PVF verification use the same logic; mismatches cause commitments hash
+mismatch (candidate rejected).
 
 ### 10.8 Step 8: Relay-Chain Runtime Enactment Rules
 
