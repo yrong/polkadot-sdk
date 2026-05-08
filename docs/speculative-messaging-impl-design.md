@@ -65,8 +65,7 @@ the existing parachain lifecycle instead of inventing a second execution path.
 
                                            6. Enactment / inclusion
                                               - Match requires against:
-                                                a) same-block enacted provides
-                                                b) latest persisted provides root
+                                                latest persisted provides root
                                               - Update ProvidesRoots only after actual enactment
 ```
 
@@ -112,9 +111,9 @@ PVF returns, candidate validation reconstructs commitments from the validation
 outputs and checks the hash against the candidate receipt. See section 6.1.
 
 **Step 9 — Relay-chain enactment checks dependency satisfaction.** At enactment
-time, the relay chain checks every `RequiresCommitment` against same-block
-enacted provides or the latest persisted provides root, then updates
-`ProvidesRoots[source]` on success. See section 4.2.
+time, the relay chain checks every `RequiresCommitment` against the latest
+persisted provides root, then updates `ProvidesRoots[source]` on success.
+See section 4.2.
 
 The detailed implementation order, including specific files and modules for each step, is in section 10.
 
@@ -157,12 +156,10 @@ How our design maps onto the existing parachain–relay-chain communication flow
 
 8. **Dependency check** (§4.2). Relay block author decides which pending
    candidates to include. For each v4 candidate, the relay chain checks every
-   `RequiresCommitment.expected_root` against: (a) same-block enacted provides
-   set, or (b) persisted `ProvidesRoots[source]`. Unmet → `UnsatisfiedRequires`,
-   candidate dropped.
+   `RequiresCommitment.expected_root` against persisted `ProvidesRoots[source]`.
+   Unmet → `UnsatisfiedRequires`, candidate dropped.
 9. **Enact** (§4.1). `enact_candidate()` runs. For v4 candidates with
-   `ProvidesCommitment`: add to same-block enacted set, update
-   `ProvidesRoots[para_id]`.
+   `ProvidesCommitment`: update `ProvidesRoots[para_id]`.
 
 **Phase 4 — Availability & Finality**
 
@@ -550,10 +547,24 @@ For speculative messaging:
 - persisted `ProvidesRoots` must be updated only when a candidate is actually enacted/included
 - requires/provides dependency satisfaction must be defined against roots that are actually included in relay-visible state
 
-So the minimal POC uses a two-stage relay-chain treatment:
+The relay-chain integration must distinguish **backing/pending-availability**
+from **actual inclusion/enactment**. In the current architecture,
+`inclusion::process_candidates()` handles newly backed candidates and moves them
+into `PendingAvailability`, while `inclusion::enact_candidate()` is the
+inclusion-time path that applies relay-visible messaging effects.
 
-1. `process_candidates()` remains the place where v4 candidates are admitted into pending availability alongside their `provides` / `requires` fields.
-2. The actual requires/provides satisfaction check is performed in the path that determines which pending candidates are enacted in the current relay block.
+For speculative messaging:
+
+- persisted `ProvidesRoots` must be updated only when a candidate is actually enacted/included
+- requires/provides dependency satisfaction is checked only against the relay parent's state
+  (i.e., roots persisted by prior relay blocks), not against candidates being enacted in
+  the current block
+
+This simplification avoids in-block candidate ordering tracking at the cost of at most
+one relay block of additional latency in the rare case where both the providing and
+consuming candidate land in the same relay block. The providing candidate is enacted in
+relay block N, its `ProvidesRoots` entry persists, and the consuming candidate succeeds
+when resubmitted in relay block N+1.
 
 ```rust
 // Stage 1: backing / pending-availability admission
@@ -562,26 +573,20 @@ pub(crate) fn process_candidates<GV>(...) -> Result<..., Error> {
         for (candidate, core_index) in backed_list {
             // ... existing candidate checks ...
             // Store the v4 commitments unchanged in PendingAvailability.
-            // No same-block requires satisfaction decision is finalized here.
+            // No requires satisfaction decision is finalized here.
         }
     }
 }
 
 // Stage 2: inclusion / enactment in the current relay block
 fn enact_pending_candidates_for_current_block(...) {
-    let mut enacted_provides_in_block: BTreeMap<ParaId, BTreeSet<Hash>> = BTreeMap::new();
-
     for candidate in candidates_being_enacted_now {
         if candidate.descriptor.version() >= V4 {
             for req in &candidate.commitments.requires {
-                let satisfied_same_block = enacted_provides_in_block
-                    .get(&req.source)
-                    .map_or(false, |roots| roots.contains(&req.expected_root));
-
-                let satisfied_persisted = SpeculativeMessaging::<T>::provides_root(&req.source)
+                let satisfied = SpeculativeMessaging::<T>::provides_root(&req.source)
                     .map_or(false, |root| root == req.expected_root);
 
-                ensure!(satisfied_same_block || satisfied_persisted, Error::<T>::UnsatisfiedRequires);
+                ensure!(satisfied, Error::<T>::UnsatisfiedRequires);
             }
         }
 
@@ -589,11 +594,6 @@ fn enact_pending_candidates_for_current_block(...) {
 
         if candidate.descriptor.version() >= V4 {
             if let Some(ref p) = candidate.commitments.provides {
-                enacted_provides_in_block
-                    .entry(candidate.para_id())
-                    .or_default()
-                    .insert(p.root);
-
                 SpeculativeMessaging::<T>::update_provides_root(candidate.para_id(), p.root);
             }
         }
@@ -606,40 +606,19 @@ inspect the already-validated `provides` / `requires` fields, check dependency
 satisfaction, and persist the newest provides root. This is a relay-runtime
 inclusion rule change, not a new protocol stage.
 
-The two matching paths exist because persisted `ProvidesRoots` is only updated
-on successful enactment — it lags behind the current block's in-progress
-enactments:
+**Simplification versus the original design.** The original high-level proposal
+included a same-block enacted matching path (checking against in-block candidate
+ordering). The POC deliberately drops this for simplicity: the collator always
+reads from the relay parent's state, which doesn't contain roots that will only
+be written later in the same block. The same-block optimization can be added
+later without breaking existing candidates — it only changes what the relay
+chain accepts, not how the collator builds candidates.
 
-- **Same-block enacted provides** cover the case where source and receiver
-  candidates are enacted together in the same relay block. The source's provides
-  root hasn't been persisted yet, so the receiver finds it in the in-memory
-  `enacted_provides_in_block` set.
-- **Latest persisted `ProvidesRoots`** covers the case where the source was
-  enacted in a prior relay block. Its root was persisted during that earlier
-  enactment and is available in storage.
-
-Both paths are necessary. Without same-block tracking, simultaneous enactment of
-dependent candidates would fail (the receiver can't find the source's root in
-storage). Without persisted roots, cross-block dependencies would fail (the
-in-memory set from a prior block is gone).
-
-**Relation to speculative delivery.** Same-block matching is a relay-chain-side
-optimization, not collator-side speculation. It does not depend on LLv2
-acknowledgement signatures, trust domains, or decoupled scheduling. The collator
-builds the block normally against whatever batches it has; the relay chain
-decides at enactment time whether the dependency can be satisfied — either from
-the in-memory same-block set or from persisted storage. This is distinct from
-the speculative (acknowledged) delivery mode, which requires the collator to
-optimistically include messages before seeing the source block's acknowledgement,
-an LLv2-gated feature deferred to §12. Same-block matching is valuable for the
-POC because it recovers a common case (closely-coupled chains producing at
-similar rates) at the cost of ~20 lines of `BTreeMap` tracking in the enactment
-path, with no new infrastructure.
-
-When the source root has advanced beyond what the receiver built against, Late
-Block Proofs (§6.2) transform the `RequiresCommitment` to reference the current
-root before the relay chain sees it. From the relay chain's perspective, the rule
-is always "latest persisted root OR same-block root" — the PVF handles the
+**Relation to late block proofs.** When the source root has advanced beyond what
+the receiver built against, Late Block Proofs (§6.2) transform the
+`RequiresCommitment` to reference the current root before the relay chain sees
+it. From the relay chain's perspective, the rule is always "the expected_root
+must match the latest persisted `ProvidesRoots[source]`" — the PVF handles the
 transformation.
 
 Note that this problem is asymmetric: LateBlockProofs are only needed when the
@@ -674,8 +653,8 @@ It does not. The division of labor is:
   needs the latest root for dependency matching.
 - **No new protocol stage.** The relay chain still backs candidates, admits them
   to pending availability, and enacts them. Speculative messaging adds one
-  inclusion-time check: `RequiresCommitment.expected_root` must match either a
-  same-block enacted provides root or the latest persisted root. That check is a
+  inclusion-time check: `RequiresCommitment.expected_root` must match the latest
+  persisted `ProvidesRoots[source]`. That check is a
   hash comparison, not a cryptographic verification.
 
 In short: all cryptographic work lives in the PVF; the relay chain only adds
@@ -1699,9 +1678,8 @@ commitments hash mismatch (candidate rejected).
 - `polkadot/runtime/parachains/src/inclusion/mod.rs`
 
 Add `ProvidesRoots` storage. Keep `process_candidates()` for backing admission.
-Extend the enactment path to track same-block enacted provides and check v4
-`RequiresCommitment` against same-block + persisted roots. Add
-`UnsatisfiedRequires` error.
+Extend the enactment path to check v4 `RequiresCommitment` against persisted
+roots only. Add `UnsatisfiedRequires` error.
 
 ### 10.9 Step 9: Off-Chain Networking
 
