@@ -545,17 +545,6 @@ inclusion-time path that applies relay-visible messaging effects.
 For speculative messaging:
 
 - persisted `ProvidesRoots` must be updated only when a candidate is actually enacted/included
-- requires/provides dependency satisfaction must be defined against roots that are actually included in relay-visible state
-
-The relay-chain integration must distinguish **backing/pending-availability**
-from **actual inclusion/enactment**. In the current architecture,
-`inclusion::process_candidates()` handles newly backed candidates and moves them
-into `PendingAvailability`, while `inclusion::enact_candidate()` is the
-inclusion-time path that applies relay-visible messaging effects.
-
-For speculative messaging:
-
-- persisted `ProvidesRoots` must be updated only when a candidate is actually enacted/included
 - requires/provides dependency satisfaction is checked only against the relay parent's state
   (i.e., roots persisted by prior relay blocks), not against candidates being enacted in
   the current block
@@ -1033,7 +1022,6 @@ for proof in &self.prechecked_late_block_proofs {
     }
 }
 requires.sort_by_key(|r| r.source);
-```
 ```
 
 ---
@@ -1562,7 +1550,7 @@ fallback/catch-up layer even after native collator transport is added.
 Phase 1 runs **alongside HRMP**. Both paths produce/consume messages. The receiver
 deduplicates: if the same message arrives via both HRMP and speculative
 messaging, the second dispatch attempt is ignored (replay protection by
-`mmr_leaf_index` or message hash).
+`(source, position)` or message hash).
 
 **Collator block building order:**
 1. Fetch pending messages via HRMP (from relay parent, as before)
@@ -1729,7 +1717,7 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 2. receiver runtime accepts valid `SpeculativeIngress` and rejects invalid proofs/ordering/mixed-root cases
 3. PVF returns matching v4 validation outputs (including transformed requires from late block proofs)
 4. node-side candidate validation reconstructs the correct v4 commitments hash
-5. relay-chain enactment accepts satisfied dependencies (both same-root and late-block-proof cases) and rejects unsatisfied ones
+5. relay-chain enactment accepts satisfied dependencies (batch root matches persisted ProvidesRoots, including late-block-proof cases) and rejects unsatisfied ones
 6. collator networking can fetch, precheck, and inject a recent batch end-to-end
 7. late block proof: receiver can consume messages from a source that has advanced past the root the receiver built against
 8. resubmission: collator detects candidate rejection, fetches fresh data, rebuilds, and delivers the message on a subsequent attempt
