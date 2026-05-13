@@ -26,9 +26,9 @@ use codec::{Decode, Encode};
 use polkadot_primitives::{
 	AppVerify, CandidateCommitments, CandidateDescriptorV2, CandidateHash, CandidateReceiptV2,
 	CollatorId, CollatorSignature, CommittedCandidateReceiptV2, CoreIndex, Hash, HashT, HeadData,
-	Id, Id as ParaId, InternalVersion, MutateDescriptorV2, PersistedValidationData, SessionIndex,
+	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex,
 	ValidationCode, ValidationCodeHash, ValidatorId,
-	v10::{self, CandidateCommitments as CandidateCommitmentsV10,
+	v10::{CandidateCommitments as CandidateCommitmentsV10,
 		CandidateDescriptorV4, CommittedCandidateReceiptV4, ProvidesCommitment,
 		RequiresCommitment},
 };

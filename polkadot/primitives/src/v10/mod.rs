@@ -24,15 +24,13 @@ use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use scale_info::TypeInfo;
 
-use sp_core::RuntimeDebug;
-
 // ── Re-export unchanged types from v9 ──
 
 pub use crate::v9::{
 	AccountId, AccountIndex, AccountPublic, Balance, BlakeTwo256, Block, BlockId, BlockNumber,
 	CandidateHash, ChainId, CollatorId, CollatorSignature, CoreIndex, DownwardMessage, Hash, HashT,
 	HeadData, Header, HorizontalMessages, HrmpChannelId, Id, Id as ParaId, InboundDownwardMessage,
-	InboundHrmpMessage, InternalVersion, Moment, Nonce, OutboundHrmpMessage, Remark,
+	InboundHrmpMessage, Moment, Nonce, OutboundHrmpMessage, Remark,
 	SessionIndex, Signature, Slot, UncheckedExtrinsic, UpwardMessage, UpwardMessages,
 	ValidationCode, ValidationCodeHash, ValidatorId, ValidatorSignature, LOWEST_PUBLIC_ID,
 };
@@ -49,7 +47,7 @@ pub const MAX_REQUIRES_PER_BLOCK: usize = 32;
 
 /// A commitment that a parachain provides a set of outbound messages.
 /// The root is the top-level Merkle root over all per-destination MMR roots.
-#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 #[cfg_attr(feature = "std", derive(Hash))]
 pub struct ProvidesCommitment {
 	/// Top-level Merkle root over all per-destination MMR roots.
@@ -57,7 +55,7 @@ pub struct ProvidesCommitment {
 }
 
 /// A commitment that a parachain requires messages from a source parachain.
-#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 #[cfg_attr(feature = "std", derive(Hash))]
 pub struct RequiresCommitment {
 	/// The source parachain whose provides root we expect.
@@ -147,7 +145,7 @@ pub struct MMRExtensionProof {
 
 /// Commitments made in a v10 candidate receipt.
 /// Extends v9 commitments with speculative messaging fields.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, RuntimeDebug)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
 #[cfg_attr(feature = "std", derive(Default, Hash))]
 pub struct CandidateCommitments<N = BlockNumber> {
 	/// Messages destined to be interpreted by the Relay chain itself.
@@ -179,7 +177,7 @@ impl CandidateCommitments {
 }
 
 /// The candidate descriptor version for speculative messaging.
-#[derive(PartialEq, Eq, Clone, TypeInfo, RuntimeDebug)]
+#[derive(PartialEq, Eq, Clone, TypeInfo, Debug)]
 pub enum CandidateDescriptorVersion {
 	/// Legacy v1 descriptor.
 	V1,
@@ -268,7 +266,7 @@ impl<H: Copy> CandidateDescriptorV4<H> {
 }
 
 /// A candidate receipt at version 4 (v10).
-#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, RuntimeDebug)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
 pub struct CandidateReceiptV4<H = Hash> {
 	/// The descriptor of the candidate.
 	pub descriptor: CandidateDescriptorV4<H>,
@@ -277,7 +275,7 @@ pub struct CandidateReceiptV4<H = Hash> {
 }
 
 /// A v10 candidate receipt with commitments directly included.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, RuntimeDebug)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
 pub struct CommittedCandidateReceiptV4<H = Hash> {
 	/// The descriptor of the candidate.
 	pub descriptor: CandidateDescriptorV4<H>,
