@@ -24,6 +24,10 @@
 // released version of the Polkadot runtime.
 pub mod v9;
 
+// The `v10` version contains speculative-messaging primitives alongside
+// all stable v9 types.
+pub mod v10;
+
 // The 'staging' version is special - it contains primitives which are
 // still in development. Once they are considered stable, they will be
 // moved to a new versioned module.
