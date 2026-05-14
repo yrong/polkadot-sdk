@@ -671,6 +671,7 @@ where
 				Some(relay_parent_data.clone()),
 				relay_proof_request,
 				collator_peer_id,
+				None, // TODO: Fetch speculative ingress off-chain
 			)
 			.await
 		{

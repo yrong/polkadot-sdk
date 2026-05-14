@@ -441,6 +441,7 @@ where
 						slot_claim.timestamp(),
 						relay_proof_request,
 						params.collator_peer_id,
+						None, // TODO: Fetch speculative ingress
 					)
 					.await
 				{

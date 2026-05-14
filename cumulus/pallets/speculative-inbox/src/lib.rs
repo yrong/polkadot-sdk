@@ -29,6 +29,9 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(feature = "std")]
+pub mod client;
+
 use codec::{Decode, Encode};
 use scale_info::TypeInfo;
 use sp_core::H256;

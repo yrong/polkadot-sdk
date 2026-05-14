@@ -249,7 +249,8 @@ where
 						claim.timestamp(),
 						Default::default(),
 						params.collator_peer_id,
-					)
+					None, // TODO: Fetch speculative ingress
+				)
 					.await
 			);
 

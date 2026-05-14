@@ -668,4 +668,36 @@ sp_api::decl_runtime_apis! {
 		/// The collator will include them in the relay chain proof that is passed alongside the parachain inherent into the runtime.
 		fn keys_to_prove() -> RelayProofRequest;
 	}
+
+	/// API for the speculative messaging outbox (sender side).
+	///
+	/// Called by the provider to query outbound message data.
+	pub trait SpeculativeOutboxApi {
+		/// Compute the cumulative provides root over all per-destination MMRs.
+		fn compute_provides_root()
+			-> Option<polkadot_primitives::v10::ProvidesCommitment>;
+		/// Get the subtree root and leaf count for a destination.
+		fn destination_state(dest: ParaId)
+			-> Option<(polkadot_primitives::Hash, u64)>;
+		/// Read payload bytes starting at `from_position`.
+		fn outbound_messages(
+			dest: ParaId,
+			from_position: u64,
+			max_messages: u32,
+		) -> Vec<(u64, Vec<u8>)>;
+		/// Generate a subtree inclusion proof for `(dest, subtree_root)` in the
+		/// top-level provides root. Returns (proof, num_destinations, leaf_index).
+		fn subtree_inclusion_proof(
+			dest: ParaId,
+			subtree_root: polkadot_primitives::Hash,
+		) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)>;
+	}
+
+	/// API for the speculative messaging inbox (receiver side).
+	///
+	/// Called by the collator after block execution to get the requires commitments.
+	pub trait SpeculativeInboxApi {
+		/// Get the requires commitments for this block.
+		fn requires_commitments() -> Vec<polkadot_primitives::v10::RequiresCommitment>;
+	}
 }
