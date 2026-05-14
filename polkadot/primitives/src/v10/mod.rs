@@ -66,14 +66,14 @@ pub struct RequiresCommitment {
 }
 
 /// Deterministic ingress payload carried in the parachain block body.
-#[derive(Clone, Encode, Decode, Debug)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct SpeculativeIngress {
 	/// Verified batches selected by the collator for this block.
 	pub batches: Vec<MessageBatch>,
 }
 
 /// A message batch sent off-chain between collators.
-#[derive(Clone, Encode, Decode, Debug)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct MessageBatch {
 	/// Source parachain.
 	pub source: ParaId,
@@ -88,12 +88,18 @@ pub struct MessageBatch {
 	/// Merkle proof that subtree_root is in provides_root.
 	/// Length: O(log D) where D = number of destinations.
 	pub subtree_inclusion_proof: Vec<Hash>,
+	/// Total number of destinations in the top-level Merkle tree
+	/// (needed for `binary_merkle_tree::verify_proof`).
+	pub number_of_destinations: u32,
+	/// The index of this destination's leaf in the top-level Merkle tree
+	/// (0-based, sorted by destination ParaId).
+	pub leaf_index: u32,
 	/// The messages with their positions in the sender's subtree MMR.
 	pub messages: Vec<OutgoingMessage>,
 }
 
 /// An individual outbound message with its MMR position.
-#[derive(Clone, Encode, Decode, Debug)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct OutgoingMessage {
 	/// Zero-based position in the source's per-destination MMR.
 	pub position: u64,
