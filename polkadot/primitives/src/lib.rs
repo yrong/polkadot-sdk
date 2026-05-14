@@ -48,8 +48,8 @@ pub use v9::{
 	AbridgedHrmpChannel, AccountId, AccountIndex, AccountPublic, ApprovalVote,
 	ApprovalVoteMultipleCandidates, ApprovalVotingParams, ApprovedPeerId, AssignmentId,
 	AsyncBackingParams, AuthorityDiscoveryId, AvailabilityBitfield, BackedCandidate, Balance,
-	BlakeTwo256, Block, BlockId, BlockNumber, CandidateCommitments, CandidateDescriptorV2,
-	CandidateDescriptorVersion, CandidateDescriptorVersionCheckError, CandidateEvent,
+	BlakeTwo256, Block, BlockId, BlockNumber, CandidateCommitments, CandidateDescriptorV2, CandidateDescriptorVersion,
+	CandidateDescriptorVersionCheckError, CandidateEvent,
 	CandidateHash, CandidateIndex, CandidateReceiptV2, CheckedDisputeStatementSet,
 	CheckedMultiDisputeStatementSet, ChunkIndex, ClaimQueueOffset, CollatorId, CollatorSignature,
 	CommittedCandidateReceiptError, CommittedCandidateReceiptV2, CompactStatement, ConsensusLog,
@@ -74,6 +74,12 @@ pub use v9::{
 	MAX_HEAD_DATA_SIZE, MAX_POV_SIZE, MIN_CODE_SIZE, ON_DEMAND_DEFAULT_QUEUE_MAX_SIZE,
 	ON_DEMAND_MAX_QUEUE_MAX_SIZE, PARACHAINS_INHERENT_IDENTIFIER, PARACHAIN_KEY_TYPE_ID,
 	RELAY_CHAIN_SLOT_DURATION_MILLIS, UMP_SEPARATOR,
+};
+
+pub use v10::{
+	CandidateCommitments as CandidateCommitmentsV10, CandidateDescriptorV4, CandidateReceiptV4,
+	CommittedCandidateReceiptV4, ProvidesCommitment, RequiresCommitment,
+	LateBlockProof,
 };
 
 #[cfg(feature = "test")]

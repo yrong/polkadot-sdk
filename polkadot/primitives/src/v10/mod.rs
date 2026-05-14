@@ -183,7 +183,7 @@ impl CandidateCommitments {
 }
 
 /// The candidate descriptor version for speculative messaging.
-#[derive(PartialEq, Eq, Clone, TypeInfo, Debug)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
 pub enum CandidateDescriptorVersion {
 	/// Legacy v1 descriptor.
 	V1,

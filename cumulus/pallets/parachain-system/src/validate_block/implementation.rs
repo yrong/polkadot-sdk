@@ -356,6 +356,14 @@ where
 			processed_downward_messages,
 			horizontal_messages,
 			hrmp_watermark,
+			provides_root: extension.as_ref().and_then(|e| match e {
+				polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { provides_root, .. } =>
+					*provides_root,
+			}),
+			requires: extension.as_ref().map_or(Vec::new(), |e| match e {
+				polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { requires, .. } =>
+					requires.clone(),
+			}),
 		},
 		polkadot_parachain_primitives::primitives::TrailingOption(extension),
 	)
