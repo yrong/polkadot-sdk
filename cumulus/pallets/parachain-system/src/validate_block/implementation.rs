@@ -80,7 +80,7 @@ pub fn validate_block<B: BlockT, E: ExecuteBlock<B>, PSC: crate::Config>(
 		relay_parent_number,
 		relay_parent_storage_root,
 	}: MemoryOptimizedValidationParams,
-) -> ValidationResult
+) -> (ValidationResult, polkadot_parachain_primitives::primitives::TrailingOption<polkadot_parachain_primitives::primitives::ValidationResultExtension>)
 where
 	B::Extrinsic: ExtrinsicCall,
 	<B::Extrinsic as ExtrinsicCall>::Call: IsSubType<crate::Call<PSC>>,
@@ -346,14 +346,19 @@ where
 
 	horizontal_messages.sort_by(|a, b| a.recipient.cmp(&b.recipient));
 
-	ValidationResult {
-		head_data: head_data.expect("HeadData not set"),
-		new_validation_code: new_validation_code.map(Into::into),
-		upward_messages,
-		processed_downward_messages,
-		horizontal_messages,
-		hrmp_watermark,
-	}
+	let extension = PSC::speculative_extension();
+
+	(
+		ValidationResult {
+			head_data: head_data.expect("HeadData not set"),
+			new_validation_code: new_validation_code.map(Into::into),
+			upward_messages,
+			processed_downward_messages,
+			horizontal_messages,
+			hrmp_watermark,
+		},
+		polkadot_parachain_primitives::primitives::TrailingOption(extension),
+	)
 }
 
 /// Validates the given [`PersistedValidationData`] against the data from the relay chain.

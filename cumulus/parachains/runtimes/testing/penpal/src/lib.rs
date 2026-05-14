@@ -614,6 +614,13 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 		UNINCLUDED_SEGMENT_CAPACITY,
 	>;
 	type RelayParentOffset = ConstU32<0>;
+
+	fn speculative_extension() -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
+		Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
+			provides_root: SpeculativeOutbox::compute_provides_root().map(|p| p.root),
+			requires: SpeculativeInbox::get_requires_commitments().into_iter().map(|r| (r.source, r.expected_root)).collect(),
+		})
+	}
 }
 
 impl parachain_info::Config for Runtime {}

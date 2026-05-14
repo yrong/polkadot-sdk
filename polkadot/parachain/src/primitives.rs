@@ -423,12 +423,25 @@ pub enum ValidationParamsExtension {
 		scheduling_parent: Hash,
 	},
 	// Future versions would add new variants:
-	// #[codec(index = 4)]
-	// V4 {
-	//     relay_parent: Hash,
-	//     scheduling_parent: Hash,
-	//     new_field: SomeType,
-	// },
+}
+
+/// Versioned extension appended to `ValidationResult` for speculative messaging.
+///
+/// Encoded as `TrailingOption<ValidationResultExtension>` after the
+/// `ValidationResult` bytes. For V4+ candidates the PVF appends a `V4` variant
+/// with provides/requires; for pre-V4 runtimes nothing is appended and the
+/// node-side decodes `TrailingOption(None)`.
+#[derive(Clone, Encode, Decode, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub enum ValidationResultExtension {
+	/// V4 extension — speculative messaging provides root and requires commitments.
+	#[codec(index = 4)]
+	V4 {
+		/// The provides root (top-level Merkle tree over per-destination MMR roots).
+		provides_root: Option<Hash>,
+		/// The requires commitments (source parachain → expected provides root).
+		requires: Vec<(Id, Hash)>,
+	},
 }
 
 /// A wrapper that decodes `T` if bytes remain after prior fields, or returns
