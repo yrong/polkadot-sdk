@@ -32,6 +32,9 @@
 #[cfg(feature = "std")]
 pub mod client;
 
+extern crate alloc;
+use alloc::{vec, vec::Vec};
+
 use codec::{Decode, Encode};
 use scale_info::TypeInfo;
 use sp_core::H256;
