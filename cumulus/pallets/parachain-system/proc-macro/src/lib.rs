@@ -126,7 +126,7 @@ pub fn register_validate_block(input: proc_macro::TokenStream) -> proc_macro::To
 						#crate_::validate_block::MemoryOptimizedValidationParams
 					>(args).expect("Invalid arguments to `validate_block`.");
 
-					let (res, extension) = #crate_::validate_block::implementation::validate_block::<
+					let res = #crate_::validate_block::implementation::validate_block::<
 						<#runtime as #crate_::validate_block::GetRuntimeBlockType>::RuntimeBlock,
 						#block_executor,
 						#runtime,
@@ -134,7 +134,6 @@ pub fn register_validate_block(input: proc_macro::TokenStream) -> proc_macro::To
 
 					#crate_::validate_block::polkadot_parachain_primitives::write_result(
 						&res,
-						extension,
 					)
 				}
 			}

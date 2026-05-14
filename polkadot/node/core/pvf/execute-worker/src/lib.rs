@@ -380,33 +380,7 @@ fn validate_using_artifact(
 	};
 
 	let mut result_descriptor =
-		match ValidationResult::decode(&mut &descriptor_bytes[..])
-			.or_else(|_| {
-				// Legacy wasm output without provides/requires fields.
-				let head_data = HeadData::decode(&mut &descriptor_bytes[..])
-					.map_err(|e| codec::Error::from("legacy head_data"))?;
-				let new_validation_code = Option::<ValidationCode>::decode(&mut &descriptor_bytes[..])
-					.map_err(|e| codec::Error::from("legacy new_validation_code"))?;
-				let upward_messages = UpwardMessages::decode(&mut &descriptor_bytes[..])
-					.map_err(|e| codec::Error::from("legacy upward_messages"))?;
-				let horizontal_messages = HorizontalMessages::decode(&mut &descriptor_bytes[..])
-					.map_err(|e| codec::Error::from("legacy horizontal_messages"))?;
-				let processed_downward_messages = u32::decode(&mut &descriptor_bytes[..])
-					.map_err(|e| codec::Error::from("legacy processed_downward_messages"))?;
-				let hrmp_watermark = RelayChainBlockNumber::decode(&mut &descriptor_bytes[..])
-					.map_err(|e| codec::Error::from("legacy hrmp_watermark"))?;
-				Ok::<ValidationResult, codec::Error>(ValidationResult {
-					provides_root: None,
-					requires: Vec::new(),
-					head_data,
-					new_validation_code,
-					upward_messages,
-					horizontal_messages,
-					processed_downward_messages,
-					hrmp_watermark,
-				})
-			})
-		{
+		match ValidationResult::decode(&mut &descriptor_bytes[..]) {
 			Err(err) => {
 				return JobResponse::format_invalid(
 					"validation result decoding failed",
