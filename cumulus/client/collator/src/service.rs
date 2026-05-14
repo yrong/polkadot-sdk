@@ -19,7 +19,10 @@
 //! operations used in parachain consensus/authoring.
 
 use cumulus_client_network::WaitToAnnounce;
-use cumulus_primitives_core::{CollationInfo, CollectCollationInfo, ParachainBlockData};
+use cumulus_primitives_core::{
+	CollationInfo, CollectCollationInfo, ParachainBlockData, SpeculativeInboxApi,
+	SpeculativeOutboxApi,
+};
 
 use polkadot_primitives::UMP_SEPARATOR;
 use sc_client_api::BlockBackend;
@@ -112,7 +115,9 @@ where
 	Block: BlockT,
 	BS: BlockBackend<Block>,
 	RA: ProvideRuntimeApi<Block>,
-	RA::Api: CollectCollationInfo<Block>,
+	RA::Api: CollectCollationInfo<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 {
 	fn split_at_separator(messages: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 		let mut parts = messages.splitn(2, |m: &Vec<u8>| m.is_empty());
@@ -254,11 +259,14 @@ where
 		let mut processed_downward_messages = 0;
 		let mut hrmp_watermark = None;
 		let mut head_data = None;
+		let mut provides = None;
+		let mut requires = Vec::new();
 
 		for block in &blocks {
+			let block_hash = block.hash();
 			// Create the parachain block data for the validators.
 			let (collation_info, _api_version) = self
-				.fetch_collation_info(block.hash(), block.header())
+				.fetch_collation_info(block_hash, block.header())
 				.map_err(|e| {
 					tracing::error!(
 						target: LOG_TARGET,
@@ -268,6 +276,14 @@ where
 				})
 				.ok()
 				.flatten()?;
+
+			let runtime_api = self.runtime_api.runtime_api();
+			if let Ok(p) = runtime_api.compute_provides_root(block_hash) {
+				provides = p;
+			}
+			if let Ok(r) = runtime_api.requires_commitments(block_hash) {
+				requires.extend(r);
+			}
 
 			// We are always using the `api_version` of the parent block. The `api_version` can only
 			// change with a runtime upgrade and this is when we want to observe the old
@@ -359,6 +375,8 @@ where
 			hrmp_watermark: hrmp_watermark?,
 			head_data: head_data?,
 			proof_of_validity: MaybeCompressedPoV::Compressed(pov),
+			provides,
+			requires,
 		};
 
 		Some((collation, block_data))
@@ -381,7 +399,9 @@ where
 	Block: BlockT,
 	BS: BlockBackend<Block>,
 	RA: ProvideRuntimeApi<Block>,
-	RA::Api: CollectCollationInfo<Block>,
+	RA::Api: CollectCollationInfo<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 {
 	fn check_block_status(&self, hash: Block::Hash, header: &Block::Header) -> bool {
 		CollatorService::check_block_status(self, hash, header)
