@@ -28,6 +28,9 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+use alloc::{vec, vec::Vec};
+
 use codec::{Decode, Encode};
 use scale_info::TypeInfo;
 use sp_core::H256;

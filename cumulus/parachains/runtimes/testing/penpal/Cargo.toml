@@ -75,6 +75,9 @@ cumulus-pallet-parachain-system = { workspace = true }
 cumulus-pallet-session-benchmarking = { workspace = true }
 cumulus-pallet-xcm = { workspace = true }
 cumulus-pallet-xcmp-queue = { workspace = true }
+cumulus-pallet-speculative-inbox = { workspace = true }
+cumulus-pallet-speculative-outbox = { workspace = true }
+
 cumulus-primitives-aura = { workspace = true }
 cumulus-primitives-core = { workspace = true }
 cumulus-primitives-utility = { workspace = true }
@@ -106,6 +109,9 @@ std = [
 	"cumulus-pallet-session-benchmarking/std",
 	"cumulus-pallet-xcm/std",
 	"cumulus-pallet-xcmp-queue/std",
+	"cumulus-pallet-speculative-inbox/std",
+	"cumulus-pallet-speculative-outbox/std",
+
 	"cumulus-primitives-aura/std",
 	"cumulus-primitives-core/std",
 	"cumulus-primitives-utility/std",
@@ -205,6 +211,9 @@ try-runtime = [
 	"cumulus-pallet-parachain-system/try-runtime",
 	"cumulus-pallet-xcm/try-runtime",
 	"cumulus-pallet-xcmp-queue/try-runtime",
+	"cumulus-pallet-speculative-inbox/try-runtime",
+	"cumulus-pallet-speculative-outbox/try-runtime",
+
 	"frame-executive/try-runtime",
 	"frame-support/try-runtime",
 	"frame-system/try-runtime",
