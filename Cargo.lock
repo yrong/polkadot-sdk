@@ -5256,6 +5256,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "cumulus-pallet-speculative-inbox"
+version = "0.1.0"
+dependencies = [
+ "binary-merkle-tree 13.0.0",
+ "cumulus-pallet-parachain-system",
+ "cumulus-primitives-core",
+ "frame-support",
+ "frame-system",
+ "log",
+ "pallet-balances",
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-parachain-primitives",
+ "polkadot-primitives",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-inherents 26.0.0",
+ "sp-mmr-primitives",
+ "sp-runtime 31.0.1",
+]
+
+[[package]]
+name = "cumulus-pallet-speculative-outbox"
+version = "0.1.0"
+dependencies = [
+ "binary-merkle-tree 13.0.0",
+ "cumulus-pallet-parachain-system",
+ "cumulus-primitives-core",
+ "frame-support",
+ "frame-system",
+ "log",
+ "pallet-balances",
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-parachain-primitives",
+ "polkadot-primitives",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-mmr-primitives",
+ "sp-runtime 31.0.1",
+ "sp-std 14.0.0",
+]
+
+[[package]]
 name = "cumulus-pallet-weight-reclaim"
 version = "1.0.0"
 dependencies = [
