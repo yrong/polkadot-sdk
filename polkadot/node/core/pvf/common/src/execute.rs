@@ -19,7 +19,7 @@ use codec::{Decode, Encode};
 use polkadot_node_primitives::PoV;
 use polkadot_parachain_primitives::primitives::ValidationResult;
 use polkadot_primitives::{
-	CandidateDescriptorVersion, CandidateReceiptV2 as CandidateReceipt, ExecutorParams, Hash,
+	CandidateDescriptorVersion, CandidateReceiptV2 as CandidateReceipt, ExecutorParams, Hash, LateBlockProof,
 	PersistedValidationData,
 };
 use std::{sync::Arc, time::Duration};
@@ -83,6 +83,7 @@ impl ValidationContext {
 			relay_parent: self.relay_parent(),
 			scheduling_parent: self.scheduling_parent(),
 			descriptor_version: self.descriptor_version(),
+			messaging_proofs: None,
 		}
 	}
 }
@@ -123,6 +124,8 @@ pub struct ExecuteRequest {
 	pub scheduling_parent: Hash,
 	/// The candidate descriptor version (determines ValidationParams format)
 	pub descriptor_version: CandidateDescriptorVersion,
+	/// Speculative messaging proofs for V4 candidates (Phase 1).
+	pub messaging_proofs: Option<Vec<LateBlockProof>>,
 }
 
 /// The response from the execution worker.
@@ -170,7 +173,7 @@ pub enum JobResponse {
 	Ok {
 		/// The result of parachain validation.
 		result_descriptor: ValidationResult,
-	},
+		},
 	/// A possibly transient runtime instantiation error happened during the execution; may be
 	/// retried with re-preparation
 	RuntimeConstruction(String),

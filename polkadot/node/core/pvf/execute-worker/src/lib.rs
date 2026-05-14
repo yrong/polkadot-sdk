@@ -56,9 +56,9 @@ use polkadot_node_core_pvf_common::{
 };
 use polkadot_node_primitives::{BlockData, POV_BOMB_LIMIT};
 use polkadot_parachain_primitives::primitives::{
-	TrailingOption, ValidationParamsExtension, ValidationResult,
+	HeadData, HorizontalMessages, RelayChainBlockNumber, TrailingOption, UpwardMessages, ValidationCode, ValidationParamsExtension, ValidationResult,
 };
-use polkadot_primitives::{CandidateDescriptorVersion, ExecutorParams};
+use polkadot_primitives::{CandidateDescriptorVersion, ExecutorParams, LateBlockProof};
 use std::{
 	io::{self, Read},
 	os::{
@@ -259,7 +259,8 @@ pub fn worker_entrypoint(
 				let extension: TrailingOption<ValidationParamsExtension> =
 					match request.descriptor_version {
 						CandidateDescriptorVersion::V3 => {
-							// V3 candidate - append extension with both parent hashes
+							// V3/V4 candidate - append extension with both parent hashes.
+							// TODO(speculative-messaging): Add V4-specific extension fields if needed.
 							TrailingOption(Some(ValidationParamsExtension::V3 {
 								relay_parent: request.relay_parent,
 								scheduling_parent: request.scheduling_parent,
@@ -286,6 +287,7 @@ pub fn worker_entrypoint(
 								&compiled_artifact_blob,
 								&executor_params,
 								&params,
+								request.messaging_proofs.clone(),
 								execution_timeout,
 								execute_thread_stack_size,
 								worker_info,
@@ -302,6 +304,7 @@ pub fn worker_entrypoint(
 								&compiled_artifact_blob,
 								&executor_params,
 								&params,
+								request.messaging_proofs.clone(),
 								execution_timeout,
 								execute_thread_stack_size,
 								worker_info,
@@ -317,6 +320,7 @@ pub fn worker_entrypoint(
 							&compiled_artifact_blob,
 							&executor_params,
 							&params,
+							request.messaging_proofs.clone(),
 							execution_timeout,
 							execute_thread_stack_size,
 							worker_info,
@@ -324,13 +328,13 @@ pub fn worker_entrypoint(
 							pov_size,
 						)?;
 					}
-				}
+				};
 
 				gum::trace!(
 					target: LOG_TARGET,
 					?worker_info,
 					"worker: sending result to host: {:?}",
-					result
+					&result
 				);
 				send_result(&mut stream, result, worker_info)?;
 			}
@@ -338,10 +342,29 @@ pub fn worker_entrypoint(
 	);
 }
 
+/// Applies speculative messaging proofs to the validation result.
+///
+/// This transforms `requires` commitments that reference older source roots into
+/// commitments that reference the current source roots, provided a valid proof is
+/// supplied in the PoV.
+fn apply_messaging_proofs(result: &mut ValidationResult, proofs: Vec<LateBlockProof>) {
+	for proof in proofs {
+		for req in result.requires.iter_mut() {
+			if req.0 == proof.source && req.1 == proof.old_provides_root {
+				// NOTE: In a production implementation, the Merkle proofs and MMR extension
+				// proofs would be cryptographically verified here before transformation.
+				// For the PoC, we perform the transformation if the source and old root match.
+				req.1 = proof.new_provides_root;
+			}
+		}
+	}
+}
+
 fn validate_using_artifact(
 	compiled_artifact_blob: &[u8],
 	executor_params: &ExecutorParams,
 	params: &[u8],
+	messaging_proofs: Option<Vec<LateBlockProof>>,
 ) -> JobResponse {
 	let descriptor_bytes = match unsafe {
 		// SAFETY: this should be safe since the compiled artifact passed here comes from the
@@ -356,15 +379,46 @@ fn validate_using_artifact(
 		Ok(d) => d,
 	};
 
-	let result_descriptor = match ValidationResult::decode(&mut &descriptor_bytes[..]) {
-		Err(err) => {
-			return JobResponse::format_invalid(
-				"validation result decoding failed",
-				&err.to_string(),
-			)
-		},
-		Ok(r) => r,
-	};
+	let mut result_descriptor =
+		match ValidationResult::decode(&mut &descriptor_bytes[..])
+			.or_else(|_| {
+				// Legacy wasm output without provides/requires fields.
+				let head_data = HeadData::decode(&mut &descriptor_bytes[..])
+					.map_err(|e| codec::Error::from("legacy head_data"))?;
+				let new_validation_code = Option::<ValidationCode>::decode(&mut &descriptor_bytes[..])
+					.map_err(|e| codec::Error::from("legacy new_validation_code"))?;
+				let upward_messages = UpwardMessages::decode(&mut &descriptor_bytes[..])
+					.map_err(|e| codec::Error::from("legacy upward_messages"))?;
+				let horizontal_messages = HorizontalMessages::decode(&mut &descriptor_bytes[..])
+					.map_err(|e| codec::Error::from("legacy horizontal_messages"))?;
+				let processed_downward_messages = u32::decode(&mut &descriptor_bytes[..])
+					.map_err(|e| codec::Error::from("legacy processed_downward_messages"))?;
+				let hrmp_watermark = RelayChainBlockNumber::decode(&mut &descriptor_bytes[..])
+					.map_err(|e| codec::Error::from("legacy hrmp_watermark"))?;
+				Ok::<ValidationResult, codec::Error>(ValidationResult {
+					provides_root: None,
+					requires: Vec::new(),
+					head_data,
+					new_validation_code,
+					upward_messages,
+					horizontal_messages,
+					processed_downward_messages,
+					hrmp_watermark,
+				})
+			})
+		{
+			Err(err) => {
+				return JobResponse::format_invalid(
+					"validation result decoding failed",
+					&err.to_string(),
+				)
+			},
+			Ok(r) => r,
+		};
+
+	if let Some(proofs) = messaging_proofs {
+		apply_messaging_proofs(&mut result_descriptor, proofs);
+	}
 
 	JobResponse::Ok { result_descriptor }
 }
@@ -377,6 +431,7 @@ fn handle_clone(
 	compiled_artifact_blob: &Arc<Vec<u8>>,
 	executor_params: &Arc<ExecutorParams>,
 	params: &Arc<Vec<u8>>,
+	messaging_proofs: Option<Vec<LateBlockProof>>,
 	execution_timeout: Duration,
 	execute_stack_size: usize,
 	worker_info: &WorkerInfo,
@@ -386,13 +441,15 @@ fn handle_clone(
 ) -> io::Result<Result<WorkerResponse, WorkerError>> {
 	use polkadot_node_core_pvf_common::worker::security;
 
+	let messaging_proofs_clone = messaging_proofs.clone();
+
 	// SAFETY: new process is spawned within a single threaded process. This invariant
 	// is enforced by tests. Stack size being specified to ensure child doesn't overflow
 	match unsafe {
 		security::clone::clone_on_worker(
 			worker_info,
 			have_unshare_newuser,
-			Box::new(|| {
+			Box::new(move || {
 				handle_child_process(
 					pipe_write_fd,
 					pipe_read_fd,
@@ -400,6 +457,7 @@ fn handle_clone(
 					Arc::clone(compiled_artifact_blob),
 					Arc::clone(executor_params),
 					Arc::clone(params),
+					messaging_proofs_clone,
 					execution_timeout,
 					execute_stack_size,
 				)
@@ -428,6 +486,7 @@ fn handle_fork(
 	compiled_artifact_blob: &Arc<Vec<u8>>,
 	executor_params: &Arc<ExecutorParams>,
 	params: &Arc<Vec<u8>>,
+	messaging_proofs: Option<Vec<LateBlockProof>>,
 	execution_timeout: Duration,
 	execute_worker_stack_size: usize,
 	worker_info: &WorkerInfo,
@@ -444,6 +503,7 @@ fn handle_fork(
 			Arc::clone(compiled_artifact_blob),
 			Arc::clone(executor_params),
 			Arc::clone(params),
+			messaging_proofs,
 			execution_timeout,
 			execute_worker_stack_size,
 		),
@@ -473,6 +533,7 @@ fn handle_child_process(
 	compiled_artifact_blob: Arc<Vec<u8>>,
 	executor_params: Arc<ExecutorParams>,
 	params: Arc<Vec<u8>>,
+	messaging_proofs: Option<Vec<LateBlockProof>>,
 	execution_timeout: Duration,
 	execute_thread_stack_size: usize,
 ) -> ! {
@@ -516,7 +577,14 @@ fn handle_child_process(
 
 	let execute_thread = thread::spawn_worker_thread_with_stack_size(
 		"execute thread",
-		move || validate_using_artifact(&compiled_artifact_blob, &executor_params, &params),
+		move || {
+			validate_using_artifact(
+				&compiled_artifact_blob,
+				&executor_params,
+				&params,
+				messaging_proofs,
+			)
+		},
 		Arc::clone(&condvar),
 		WaitOutcome::Finished,
 		execute_thread_stack_size,

@@ -422,7 +422,14 @@ pub enum ValidationParamsExtension {
 		/// The scheduling parent block hash (may differ from relay_parent in V3).
 		scheduling_parent: Hash,
 	},
-	// Future versions would add new variants:
+	/// V4 extension - contains relay_parent and scheduling_parent hashes.
+	#[codec(index = 4)]
+	V4 {
+		/// The relay parent block hash.
+		relay_parent: Hash,
+		/// The scheduling parent block hash.
+		scheduling_parent: Hash,
+	},
 }
 
 /// Versioned extension appended to `ValidationResult` for speculative messaging.
@@ -552,6 +559,10 @@ pub struct ValidationResult {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: RelayChainBlockNumber,
+	/// Speculative messaging: provides root (v10+). None for pre-v4.
+	pub provides_root: Option<Hash>,
+	/// Speculative messaging: requires commitments (v10+). Empty for pre-v4.
+	pub requires: Vec<(Id, Hash)>,
 }
 
 #[cfg(test)]
