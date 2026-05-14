@@ -85,11 +85,11 @@ members = [
 	"cumulus/pallets/parachain-system/proc-macro",
 	"cumulus/pallets/session-benchmarking",
 	"cumulus/pallets/solo-to-para",
+	"cumulus/pallets/speculative-inbox",
+	"cumulus/pallets/speculative-outbox",
 	"cumulus/pallets/weight-reclaim",
 	"cumulus/pallets/xcm",
 	"cumulus/pallets/xcmp-queue",
-	"cumulus/pallets/speculative-inbox",
-	"cumulus/pallets/speculative-outbox",
 	"cumulus/parachains/common",
 	"cumulus/parachains/common/types",
 	"cumulus/parachains/integration-tests/emulated/chains/parachains/assets/asset-hub-rococo",
@@ -776,11 +776,11 @@ cumulus-pallet-aura-ext = { path = "cumulus/pallets/aura-ext", default-features 
 cumulus-pallet-parachain-system = { path = "cumulus/pallets/parachain-system", default-features = false }
 cumulus-pallet-parachain-system-proc-macro = { path = "cumulus/pallets/parachain-system/proc-macro", default-features = false }
 cumulus-pallet-session-benchmarking = { path = "cumulus/pallets/session-benchmarking", default-features = false }
+cumulus-pallet-speculative-inbox = { path = "cumulus/pallets/speculative-inbox", default-features = false }
+cumulus-pallet-speculative-outbox = { path = "cumulus/pallets/speculative-outbox", default-features = false }
 cumulus-pallet-weight-reclaim = { path = "cumulus/pallets/weight-reclaim", default-features = false }
 cumulus-pallet-xcm = { path = "cumulus/pallets/xcm", default-features = false }
 cumulus-pallet-xcmp-queue = { path = "cumulus/pallets/xcmp-queue", default-features = false }
-cumulus-pallet-speculative-inbox = { path = "cumulus/pallets/speculative-inbox", default-features = false }
-cumulus-pallet-speculative-outbox = { path = "cumulus/pallets/speculative-outbox", default-features = false }
 cumulus-primitives-aura = { path = "cumulus/primitives/aura", default-features = false }
 cumulus-primitives-core = { path = "cumulus/primitives/core", default-features = false }
 cumulus-primitives-parachain-inherent = { path = "cumulus/primitives/parachain-inherent", default-features = false }
