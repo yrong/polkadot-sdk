@@ -80,7 +80,7 @@ pub fn validate_block<B: BlockT, E: ExecuteBlock<B>, PSC: crate::Config>(
 		relay_parent_number,
 		relay_parent_storage_root,
 	}: MemoryOptimizedValidationParams,
-) -> (ValidationResult, polkadot_parachain_primitives::primitives::TrailingOption<polkadot_parachain_primitives::primitives::ValidationResultExtension>)
+) -> ValidationResult
 where
 	B::Extrinsic: ExtrinsicCall,
 	<B::Extrinsic as ExtrinsicCall>::Call: IsSubType<crate::Call<PSC>>,
@@ -348,25 +348,22 @@ where
 
 	let extension = PSC::speculative_extension();
 
-	(
-		ValidationResult {
-			head_data: head_data.expect("HeadData not set"),
-			new_validation_code: new_validation_code.map(Into::into),
-			upward_messages,
-			processed_downward_messages,
-			horizontal_messages,
-			hrmp_watermark,
-			provides_root: extension.as_ref().and_then(|e| match e {
-				polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { provides_root, .. } =>
-					*provides_root,
-			}),
-			requires: extension.as_ref().map_or(Vec::new(), |e| match e {
-				polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { requires, .. } =>
-					requires.clone(),
-			}),
-		},
-		polkadot_parachain_primitives::primitives::TrailingOption(extension),
-	)
+	ValidationResult {
+		head_data: head_data.expect("HeadData not set"),
+		new_validation_code: new_validation_code.map(Into::into),
+		upward_messages,
+		processed_downward_messages,
+		horizontal_messages,
+		hrmp_watermark,
+		provides_root: extension.as_ref().and_then(|e| match e {
+			polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { provides_root, .. } =>
+				*provides_root,
+		}),
+		requires: extension.as_ref().map_or(Vec::new(), |e| match e {
+			polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { requires, .. } =>
+				requires.clone(),
+		}),
+	}
 }
 
 /// Validates the given [`PersistedValidationData`] against the data from the relay chain.

@@ -31,16 +31,7 @@ pub unsafe fn load_params(params: *const u8, len: usize) -> crate::primitives::V
 ///
 /// As described in the crate docs, this is a pointer to the appended length
 /// of the vector.
-///
-/// Encodes `(ValidationResult, TrailingOption<ValidationResultExtension>)`.
-/// The trailing extension is empty for pre-V4 runtimes and contains
-/// provides/requires for V4+ speculative messaging candidates.
 #[cfg(not(feature = "std"))]
-pub fn write_result(
-	result: &crate::primitives::ValidationResult,
-	extension: crate::primitives::TrailingOption<
-		crate::primitives::ValidationResultExtension,
-	>,
-) -> u64 {
-	sp_core::to_substrate_wasm_fn_return_value(&(result, extension))
+pub fn write_result(result: &crate::primitives::ValidationResult) -> u64 {
+	sp_core::to_substrate_wasm_fn_return_value(result)
 }
