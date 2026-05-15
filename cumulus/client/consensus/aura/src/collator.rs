@@ -62,7 +62,7 @@ use sp_trie::proof_size_extension::ProofSizeExt;
 use std::{error::Error, time::Duration};
 
 /// Parameters for instantiating a [`Collator`].
-pub struct Params<BI, CIDP, RClient, PF, CS> {
+pub struct Params<BI, CIDP, RClient, PF, CS, Client> {
 	/// A builder for inherent data builders.
 	pub create_inherent_data_providers: CIDP,
 	/// The block import handle.
@@ -80,6 +80,8 @@ pub struct Params<BI, CIDP, RClient, PF, CS> {
 	/// The collator service used for bundling proposals into collations and announcing
 	/// to the network.
 	pub collator_service: CS,
+	/// Off-chain sender chains to pull speculative message data from.
+	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Parameters for [`Collator::build_block_and_import`].
@@ -121,13 +123,13 @@ pub struct BuiltBlock<Block: BlockT> {
 
 impl<Block: BlockT> From<BuiltBlock<Block>> for ParachainCandidate<Block> {
 	fn from(built: BuiltBlock<Block>) -> Self {
-		Self { block: built.block, proof: built.proof }
+		Self { block: built.block, proof: built.proof, late_block_proofs: Vec::new() }
 	}
 }
 
 /// A utility struct for writing collation logic that makes use of Aura entirely
 /// or in part. See module docs for more details.
-pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS> {
+pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS, Client> {
 	create_inherent_data_providers: CIDP,
 	block_import: BI,
 	relay_client: RClient,
@@ -135,23 +137,27 @@ pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS> {
 	para_id: ParaId,
 	proposer: PF,
 	collator_service: CS,
+	speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 	_marker: std::marker::PhantomData<(Block, Box<dyn Fn(P) + Send + Sync + 'static>)>,
 }
 
-impl<Block, P, BI, CIDP, RClient, PF, CS> Collator<Block, P, BI, CIDP, RClient, PF, CS>
+impl<Block, P, BI, CIDP, RClient, PF, CS, Client> Collator<Block, P, BI, CIDP, RClient, PF, CS, Client>
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	RClient: RelayChainInterface,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
 	BI: BlockImport<Block> + ParachainBlockImportMarker + Send + Sync + 'static,
 	PF: Environment<Block>,
 	CS: CollatorServiceInterface<Block>,
+	Client: ProvideRuntimeApi<Block> + sc_client_api::UsageProvider<Block>,
+	Client::Api: cumulus_primitives_core::SpeculativeOutboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 	P: Pair,
 	P::Public: AppPublic + Member,
 	P::Signature: TryFrom<Vec<u8>> + Member + Codec,
 {
 	/// Instantiate a new instance of the `Aura` manager.
-	pub fn new(params: Params<BI, CIDP, RClient, PF, CS>) -> Self {
+	pub fn new(params: Params<BI, CIDP, RClient, PF, CS, Client>) -> Self {
 		Collator {
 			create_inherent_data_providers: params.create_inherent_data_providers,
 			block_import: params.block_import,
@@ -160,6 +166,7 @@ where
 			para_id: params.para_id,
 			proposer: params.proposer,
 			collator_service: params.collator_service,
+			speculative_sources: params.speculative_sources,
 			_marker: std::marker::PhantomData,
 		}
 	}
@@ -397,11 +404,29 @@ where
 			})
 			.await?;
 
-		let Some(candidate) = maybe_candidate else { return Ok(None) };
+		let Some(built) = maybe_candidate else { return Ok(None) };
 
-		let hash = candidate.block.header().hash();
+		let hash = built.block.header().hash();
+		let mut candidate = ParachainCandidate::from(built);
+
+		// Step 7: Late Block Proofs.
+		// If the block requires speculative roots that are already outdated on the
+		// relay chain, we must fetch late block proofs from the source parachains.
+		if let Ok(requires) = self.collator_service.para_client().runtime_api().requires_commitments(hash) {
+			for req in requires {
+				// 1. Check if req.expected_root is already outdated on the relay chain.
+				// For the PoC, we assume if we have a source client, we fetch a proof
+				// connecting the old root to the current root of that source.
+				if let Some((_, source_client)) = self.speculative_sources.sources.iter().find(|(id, _)| *id == req.source) {
+					if let Some(proof) = source_client.runtime_api().generate_late_block_proof(hash, req.source, req.expected_root).ok().flatten() {
+						candidate.late_block_proofs.push(proof);
+					}
+				}
+			}
+		}
+
 		if let Some((collation, block_data)) =
-			self.collator_service.build_collation(parent_header, hash, candidate.into())
+			self.collator_service.build_collation(parent_header, hash, candidate)
 		{
 			block_data.log_size_info();
 

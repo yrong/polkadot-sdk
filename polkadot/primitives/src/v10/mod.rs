@@ -182,6 +182,55 @@ impl CandidateCommitments {
 	}
 }
 
+impl From<crate::v9::CandidateCommitments> for CandidateCommitments {
+	fn from(c: crate::v9::CandidateCommitments) -> Self {
+		let speculative = c.speculative.into_inner();
+		Self {
+			head_data: c.head_data,
+			upward_messages: c.upward_messages,
+			horizontal_messages: c.horizontal_messages,
+			new_validation_code: c.new_validation_code,
+			processed_downward_messages: c.processed_downward_messages,
+			hrmp_watermark: c.hrmp_watermark,
+			provides: speculative
+				.as_ref()
+				.and_then(|s| s.provides.map(|root| ProvidesCommitment { root })),
+			requires: speculative.map_or(Vec::new(), |s| {
+				s.requires
+					.into_iter()
+					.map(|(source, expected_root)| RequiresCommitment { source, expected_root })
+					.collect()
+			}),
+		}
+	}
+}
+
+impl From<CandidateCommitments> for crate::v9::CandidateCommitments {
+	fn from(c: CandidateCommitments) -> Self {
+		let has_speculative = c.provides.is_some() || !c.requires.is_empty();
+		Self {
+			head_data: c.head_data,
+			upward_messages: c.upward_messages,
+			horizontal_messages: c.horizontal_messages,
+			new_validation_code: c.new_validation_code,
+			processed_downward_messages: c.processed_downward_messages,
+			hrmp_watermark: c.hrmp_watermark,
+			speculative: if has_speculative {
+				crate::v9::TrailingOption(Some(crate::v9::SpeculativeCommitments {
+					provides: c.provides.map(|p| p.root),
+					requires: c
+						.requires
+						.into_iter()
+						.map(|r| (r.source, r.expected_root))
+						.collect(),
+				}))
+			} else {
+				crate::v9::TrailingOption(None)
+			},
+		}
+	}
+}
+
 /// The candidate descriptor version for speculative messaging.
 #[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
 pub enum CandidateDescriptorVersion {

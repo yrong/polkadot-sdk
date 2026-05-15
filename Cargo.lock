@@ -5262,6 +5262,7 @@ version = "0.1.0"
 dependencies = [
  "binary-merkle-tree 13.0.0",
  "cumulus-pallet-parachain-system",
+ "cumulus-pallet-speculative-outbox",
  "cumulus-primitives-core",
  "frame-support",
  "frame-system",
@@ -5272,8 +5273,10 @@ dependencies = [
  "polkadot-parachain-primitives",
  "polkadot-primitives",
  "scale-info",
+ "sp-api 26.0.0",
  "sp-core 28.0.0",
  "sp-inherents 26.0.0",
+ "sp-io 30.0.0",
  "sp-mmr-primitives",
  "sp-runtime 31.0.1",
 ]

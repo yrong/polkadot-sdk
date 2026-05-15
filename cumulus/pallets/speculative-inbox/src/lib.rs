@@ -32,6 +32,12 @@
 #[cfg(feature = "std")]
 pub mod client;
 
+#[cfg(test)]
+mod mock;
+
+#[cfg(test)]
+mod integration_tests;
+
 extern crate alloc;
 use alloc::{vec, vec::Vec};
 
@@ -201,8 +207,13 @@ pub mod pallet {
 
 				// 3. Verify message continuity and reconstruct local subtree
 				for msg in &batch.messages {
+					let next_position = if state.local_subtree_leaves.is_empty() {
+						0
+					} else {
+						state.last_processed + 1
+					};
 					ensure!(
-						msg.position == state.last_processed + 1,
+						msg.position == next_position,
 						Error::<T>::NonConsecutiveMessage
 					);
 					let msg_hash = Keccak256::hash(&msg.payload);
@@ -279,6 +290,19 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
+	/// Next message position the collator should fetch from `source`.
+	pub fn next_expected_message_position(source: ParaId) -> u64 {
+		IncomingState::<T>::get(&source)
+			.map(|state| {
+				if state.local_subtree_leaves.is_empty() {
+					0
+				} else {
+					state.last_processed + 1
+				}
+			})
+			.unwrap_or(0)
+	}
+
 	/// Get the requires commitments for this block (sources consumed + their provides roots).
 	/// Called by the collator after block execution to populate `CandidateCommitments.requires`.
 	pub fn get_requires_commitments() -> Vec<RequiresCommitment> {

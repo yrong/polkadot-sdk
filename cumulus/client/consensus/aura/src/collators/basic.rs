@@ -87,6 +87,8 @@ pub struct Params<BI, CIDP, Client, RClient, Proposer, CS> {
 	/// Should be used when a chain migrates from a different consensus algorithm and was already
 	/// processing collation requests before initializing Aura.
 	pub collation_request_receiver: Option<Receiver<CollationRequest>>,
+	/// Off-chain sender chains to pull speculative message batches from.
+	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Run bare Aura consensus as a relay-chain-driven collator.
@@ -94,17 +96,21 @@ pub fn run<Block, P, BI, CIDP, Client, RClient, Proposer, CS>(
 	params: Params<BI, CIDP, Client, RClient, Proposer, CS>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT + Send,
+	Block: BlockT<Hash = polkadot_primitives::Hash> + Send,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
 		+ HeaderBackend<Block>
 		+ BlockBackend<Block>
 		+ CallApiAt<Block>
+		+ sc_client_api::UsageProvider<Block>
 		+ Send
 		+ Sync
 		+ 'static,
-	Client::Api: AuraApi<Block, P::Public> + CollectCollationInfo<Block>,
+	Client::Api: AuraApi<Block, P::Public>
+		+ CollectCollationInfo<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	RClient: RelayChainInterface + Send + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + Send + 'static,
 	CIDP::InherentDataProviders: Send,
@@ -138,9 +144,10 @@ where
 				para_id: params.para_id,
 				proposer: params.proposer,
 				collator_service: params.collator_service,
+				speculative_sources: params.speculative_sources,
 			};
 
-			collator_util::Collator::<Block, P, _, _, _, _, _>::new(params)
+			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
 		};
 
 		let mut last_processed_slot = 0;
@@ -240,6 +247,14 @@ where
 				continue;
 			}
 
+			let speculative_ingress = crate::collators::fetch_ingress_for_block(
+				&*params.para_client,
+				parent_hash,
+				params.para_id,
+				&params.speculative_sources,
+				validation_data.relay_parent_number,
+			);
+
 			let (parachain_inherent_data, other_inherent_data) = try_request!(
 				collator
 					.create_inherent_data(
@@ -249,8 +264,8 @@ where
 						claim.timestamp(),
 						Default::default(),
 						params.collator_peer_id,
-					None, // TODO: Fetch speculative ingress
-				)
+						Some(speculative_ingress),
+					)
 					.await
 			);
 

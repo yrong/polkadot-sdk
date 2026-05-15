@@ -223,6 +223,7 @@ fn start_consensus(
 		authoring_duration: Duration::from_millis(2000),
 		reinitialize: false,
 		max_pov_percentage: None,
+		speculative_sources: Default::default(),
 	};
 	let fut = aura::run::<Block, sp_consensus_aura::sr25519::AuthorityPair, _, _, _, _, _, _, _, _>(
 		params,

@@ -51,6 +51,7 @@ use polkadot_primitives::{
 	},
 	node_features::FeatureIndex,
 	transpose_claim_queue, AuthorityDiscoveryId, CandidateCommitments,
+	CandidateDescriptorVersion, SpeculativeCommitments, TrailingOption,
 	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
@@ -1305,21 +1306,24 @@ async fn validate_candidate(
 				gum::info!(target: LOG_TARGET, ?para_id, "Invalid candidate (para_head)");
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
-				let committed_candidate_receipt = CommittedCandidateReceipt {
-					descriptor: candidate_receipt.descriptor.clone(),
-					commitments: CandidateCommitments {
-						head_data: res.head_data,
-						upward_messages: res.upward_messages,
-						horizontal_messages: res.horizontal_messages,
-						new_validation_code: res.new_validation_code,
-						processed_downward_messages: res.processed_downward_messages,
-						hrmp_watermark: res.hrmp_watermark,
-					},
+				let speculative = TrailingOption(SpeculativeCommitments::from_pvf_parts(
+					res.provides_root,
+					res.requires,
+				));
+
+				let commitments_v9 = CandidateCommitments {
+					head_data: res.head_data,
+					upward_messages: res.upward_messages,
+					horizontal_messages: res.horizontal_messages,
+					new_validation_code: res.new_validation_code,
+					processed_downward_messages: res.processed_downward_messages,
+					hrmp_watermark: res.hrmp_watermark,
+					speculative,
 				};
 
-				if candidate_receipt.commitments_hash !=
-					committed_candidate_receipt.commitments.hash()
-				{
+				let commitments_hash = commitments_v9.hash();
+
+				if candidate_receipt.commitments_hash != commitments_hash {
 					gum::info!(
 						target: LOG_TARGET,
 						?para_id,
@@ -1331,7 +1335,7 @@ async fn validate_candidate(
 						target: LOG_TARGET,
 						?para_id,
 						?candidate_hash,
-						produced_commitments = ?committed_candidate_receipt.commitments,
+						produced_commitments = ?commitments_v9,
 						"Invalid candidate commitments"
 					);
 
@@ -1341,23 +1345,33 @@ async fn validate_candidate(
 				} else {
 					// Backing-only: validate UMP signals against the claim queue.
 					if let Some(claim_queue) = &pre.claim_queue {
-						if let Err(err) = committed_candidate_receipt
-							.parse_ump_signals(&transpose_claim_queue(claim_queue.0.clone()))
-						{
-							gum::warn!(
-								target: LOG_TARGET,
-								candidate_hash = ?candidate_receipt.hash(),
-								"Invalid UMP signals: {}",
-								err
-							);
-							return Ok(ValidationResult::Invalid(
-								InvalidCandidate::InvalidUMPSignals(err),
-							));
+						// UMP signals are only supported for V1-V3 descriptors via
+						// CommittedCandidateReceiptV2. Speculative messaging (V4)
+						// uses a different mechanism.
+						if candidate_receipt.descriptor.version() < CandidateDescriptorVersion::V4 {
+							let committed_candidate_receipt = CommittedCandidateReceipt {
+								descriptor: candidate_receipt.descriptor.clone(),
+								commitments: commitments_v9.clone(),
+							};
+
+							if let Err(err) = committed_candidate_receipt
+								.parse_ump_signals(&transpose_claim_queue(claim_queue.0.clone()))
+							{
+								gum::warn!(
+									target: LOG_TARGET,
+									candidate_hash = ?candidate_receipt.hash(),
+									"Invalid UMP signals: {}",
+									err
+								);
+								return Ok(ValidationResult::Invalid(
+									InvalidCandidate::InvalidUMPSignals(err),
+								));
+							}
 						}
 					}
 
 					Ok(ValidationResult::Valid(
-						committed_candidate_receipt.commitments,
+						commitments_v9.into(),
 						(*persisted_validation_data).clone(),
 					))
 				}

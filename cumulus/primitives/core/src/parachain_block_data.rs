@@ -191,6 +191,25 @@ impl<Block: BlockT> ParachainBlockData<Block> {
 	}
 }
 
+/// Extended block data for v4 speculative-messaging candidates.
+///
+/// Wraps the standard parachain block data and any late block proofs
+/// required for speculative messaging enactment.
+#[derive(codec::Encode, codec::Decode, Clone, PartialEq, Debug)]
+pub struct ParachainBlockDataV4<Block> {
+	/// Late block proofs for speculative messaging dependencies.
+	pub late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+	/// The standard parachain block data (blocks + storage proof).
+	pub inner: ParachainBlockData<Block>,
+}
+
+impl<Block> ParachainBlockDataV4<Block> {
+	/// Create a new instance of `ParachainBlockDataV4`.
+	pub fn new(inner: ParachainBlockData<Block>, late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>) -> Self {
+		Self { inner, late_block_proofs }
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

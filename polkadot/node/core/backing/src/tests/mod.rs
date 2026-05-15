@@ -309,7 +309,8 @@ async fn assert_validate_from_exhaustive(
 					new_validation_code: None,
 					processed_downward_messages: 0,
 					hrmp_watermark: 0,
-				},
+					speculative: TrailingOption(None),
+				}.into(),
 				result_validation_data,
 			)))
 			.unwrap();
@@ -661,7 +662,8 @@ async fn assert_validate_seconded_candidate(
 					new_validation_code: None,
 					processed_downward_messages: 0,
 					hrmp_watermark: 0,
-				},
+					speculative: TrailingOption(None),
+				}.into(),
 				assert_pvd.clone(),
 			)))
 			.unwrap();
@@ -3860,7 +3862,8 @@ fn concurrent_dependent_candidates() {
 								new_validation_code: None,
 								processed_downward_messages: 0,
 								hrmp_watermark: 0,
-							},
+								speculative: TrailingOption(None),
+							}.into(),
 							pvd.clone(),
 						)))
 						.unwrap();

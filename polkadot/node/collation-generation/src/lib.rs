@@ -98,13 +98,16 @@ use polkadot_node_subsystem::{
 	SubsystemContext, SubsystemError, SubsystemResult, SubsystemSender,
 };
 use polkadot_node_subsystem_util::{
-	request_claim_queue, request_persisted_validation_data, request_session_index_for_child,
-	request_validation_code_hash, request_validators, runtime::ClaimQueueSnapshot,
+	request_claim_queue, request_node_features, request_persisted_validation_data,
+	request_session_index_for_child, request_validation_code_hash, request_validators,
+	runtime::ClaimQueueSnapshot,
 };
 use polkadot_primitives::{
+	node_features::FeatureIndex,
 	transpose_claim_queue, CandidateCommitments, CandidateDescriptorV2,
 	CommittedCandidateReceiptV2, CoreIndex, Hash, Id as ParaId, OccupiedCoreAssumption,
-	PersistedValidationData, SessionIndex, TransposedClaimQueue, ValidationCodeHash,
+	PersistedValidationData, SessionIndex, SpeculativeCommitments, TrailingOption,
+	TransposedClaimQueue, ValidationCodeHash,
 };
 use schnellru::{ByLength, LruMap};
 use std::{collections::HashSet, sync::Arc};
@@ -615,6 +618,17 @@ async fn construct_and_distribute_receipt(
 
 	let erasure_root = erasure_root(n_validators, validation_data, pov.clone())?;
 
+	let has_speculative =
+		collation.provides.is_some() || !collation.requires.is_empty();
+	let speculative = TrailingOption(SpeculativeCommitments::from_pvf_parts(
+		collation.provides.map(|p| p.root),
+		collation
+			.requires
+			.iter()
+			.map(|r| (r.source, r.expected_root))
+			.collect(),
+	));
+
 	let commitments = CandidateCommitments {
 		upward_messages: collation.upward_messages,
 		horizontal_messages: collation.horizontal_messages,
@@ -622,11 +636,33 @@ async fn construct_and_distribute_receipt(
 		head_data: collation.head_data,
 		processed_downward_messages: collation.processed_downward_messages,
 		hrmp_watermark: collation.hrmp_watermark,
+		speculative,
 	};
 
+	let node_features =
+		request_node_features(relay_parent, session_index, sender).await.await??;
+	let speculative_enabled = FeatureIndex::SpeculativeMessaging.is_set(&node_features);
+	let v3_enabled = FeatureIndex::CandidateReceiptV3.is_set(&node_features);
+
 	let receipt = {
-		let descriptor = if let Some(sched_parent) = scheduling_parent {
-			// V3 descriptor with explicit scheduling_parent
+		let sched_parent = scheduling_parent.unwrap_or(relay_parent);
+		let use_v4 = speculative_enabled && has_speculative;
+
+		let descriptor = if use_v4 {
+			CandidateDescriptorV2::new_v4(
+				para_id,
+				relay_parent,
+				core_index,
+				session_index,
+				scheduling_session,
+				persisted_validation_data_hash,
+				pov_hash,
+				erasure_root,
+				commitments.head_data.hash(),
+				validation_code_hash,
+				sched_parent,
+			)
+		} else if scheduling_parent.is_some() && v3_enabled {
 			CandidateDescriptorV2::new_v3(
 				para_id,
 				relay_parent,
@@ -641,7 +677,6 @@ async fn construct_and_distribute_receipt(
 				sched_parent,
 			)
 		} else {
-			// V2 descriptor (scheduling_parent = zero)
 			CandidateDescriptorV2::new(
 				para_id,
 				relay_parent,
@@ -657,8 +692,10 @@ async fn construct_and_distribute_receipt(
 
 		let ccr = CommittedCandidateReceiptV2 { descriptor, commitments: commitments.clone() };
 
-		ccr.parse_ump_signals(&transposed_claim_queue)
-			.map_err(Error::CandidateReceiptCheck)?;
+		if !use_v4 {
+			ccr.parse_ump_signals(&transposed_claim_queue)
+				.map_err(Error::CandidateReceiptCheck)?;
+		}
 
 		ccr.to_plain()
 	};
