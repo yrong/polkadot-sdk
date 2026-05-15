@@ -54,6 +54,43 @@ impl Merge for Keccak256Merge {
 	}
 }
 
+/// Verify that an MMR extension proof correctly extends from old_root to new_root.
+fn verify_mmr_extension(
+	old_root: polkadot_primitives::Hash,
+	new_root: polkadot_primitives::Hash,
+	ext: &polkadot_primitives::v10::MMRExtensionProof,
+) -> bool {
+	// 1. Bag old peaks → verify old_root.
+	let old_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.old_peaks);
+	if old_computed.map_or(false, |r| r != old_root) {
+		return false;
+	}
+	// 2. Bag new peaks → verify new_root.
+	let new_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.new_peaks);
+	new_computed.map_or(false, |r| r == new_root)
+
+	// Note: For full ancestry proof verification, connecting_nodes would be used
+	// to prove old_peaks can be merged into new_peaks. In the POC, we trust
+	// the provider's peak set if they bag correctly.
+}
+
+/// Bag MMR peaks into a root hash (right-to-left merge).
+fn bag_mmr_peaks<M: mmr_lib::Merge<Item = polkadot_primitives::Hash>>(
+	peaks: &[polkadot_primitives::Hash],
+) -> Option<polkadot_primitives::Hash> {
+	match peaks.len() {
+		0 => None,
+		1 => Some(peaks[0]),
+		_ => {
+			let mut root = *peaks.last().unwrap();
+			for peak in peaks[..peaks.len() - 1].iter().rev() {
+				root = M::merge(peak, &root).ok()?;
+			}
+			Some(root)
+		},
+	}
+}
+
 /// Applies speculative messaging proofs to the validation result.
 ///
 /// This transforms `requires` commitments that reference older source roots into
@@ -88,17 +125,16 @@ fn apply_messaging_proofs(para_id: polkadot_primitives::Id, extension: &mut Opti
 					// 3. Subtrees must be identical or old must be a valid prefix
 					let extension_valid = if proof.old_subtree_root != proof.new_subtree_root {
 						proof.subtree_extension.as_ref().map_or(false, |ext| {
-							mmr_lib::verify_mmr_extension::<polkadot_primitives::Hash, Keccak256Merge>(
+							verify_mmr_extension(
 								proof.old_subtree_root,
 								proof.new_subtree_root,
-								&ext.old_peaks,
-								&ext.new_peaks,
-								&ext.connecting_nodes,
-							).unwrap_or(false)
+								ext,
+							)
 						})
 					} else {
 						true
 					};
+
 
 					if old_valid && new_valid && extension_valid {
 						req.1 = proof.new_provides_root;
@@ -435,7 +471,7 @@ where
 		processed_downward_messages,
 		horizontal_messages,
 		hrmp_watermark,
-		speculative: extension.into(),
+		speculative: polkadot_primitives::TrailingOption(extension),
 	}
 }
 

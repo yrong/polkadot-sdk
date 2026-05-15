@@ -39,7 +39,7 @@ mod mock;
 mod integration_tests;
 
 extern crate alloc;
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use codec::{Decode, Encode};
 use scale_info::TypeInfo;

@@ -37,6 +37,7 @@ use sp_core::H256;
 use sp_runtime::traits::{Hash as _, Keccak256};
 
 use frame_support::pallet_prelude::*;
+use frame_system::pallet_prelude::BlockNumberFor;
 
 use cumulus_primitives_core::{ParaId, XcmpMessageSource};
 use polkadot_primitives::v10::{ProvidesCommitment, MMRExtensionProof};
@@ -59,7 +60,10 @@ impl Merge for Keccak256Merge {
 /// MMR state for a single destination's subtree.
 #[derive(Clone, Encode, Decode, TypeInfo, Default)]
 pub struct MMRState {
+	/// MMR node count (returned by mmr.mmr_size()).
 	pub size: u64,
+	/// Number of leaves inserted so far.
+	pub leaf_count: u64,
 }
 
 pub use pallet::*;
@@ -74,8 +78,7 @@ pub mod pallet {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		type RuntimeEvent: From<Event<Self>>
-			+ IsType<<Self as frame_system::Config>::RuntimeEvent>;
+		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
 		/// The inner XCMP message source (typically `XcmpQueue`).
 		type InnerXcmpMessageSource: XcmpMessageSource;
@@ -144,7 +147,7 @@ pub mod pallet {
 			}
 
 			// Simple pruning: keep only the last 256 blocks of history.
-			let retention_window = 256u32.into();
+			let retention_window: BlockNumberFor<T> = 256u32.into();
 			if n > retention_window {
 				let prune_at = n - retention_window;
 				HistoricalProvidesRoots::<T>::remove(prune_at);
@@ -169,11 +172,11 @@ pub mod pallet {
 
 			for payload in payloads {
 				let pos = state.size; // This is actually the leaf index, but for payloads we use it as pos.
-				// Wait, mmr_lib uses node positions, not leaf indices.
 				// For OutgoingMessages, we'll use the leaf index.
-				let leaf_idx = mmr_lib::helper::pos_to_leaf_index(mmr.mmr_size());
+				let leaf_idx = state.leaf_count;
 				OutgoingMessages::<T>::insert(dest, leaf_idx, &payload);
 				mmr.push(Keccak256::hash(&payload)).expect("MMR push failed");
+				state.leaf_count += 1;
 			}
 
 			state.size = mmr.mmr_size();
@@ -252,7 +255,7 @@ impl<T: Config> Pallet<T> {
 		max_messages: u32,
 	) -> Vec<(u64, Vec<u8>)> {
 		let state = OutgoingMMRState::<T>::get(&dest);
-		let leaf_count = mmr_lib::helper::pos_to_leaf_index(state.size);
+		let leaf_count = state.leaf_count;
 		let end = leaf_count.min(from_position + max_messages as u64);
 
 		(from_position..end)
@@ -313,6 +316,7 @@ impl<T: Config> Pallet<T> {
 
 		// 3. Generate old subtree proof (inclusion in old_provides_root)
 		let mut old_roots: Vec<(ParaId, H256)> = HistoricalSubtreeState::<T>::iter_prefix(old_block_number)
+			.map(|(id, (root, _))| (id, root))
 			.collect();
 		old_roots.sort_by_key(|(id, _)| *id);
 		let old_leaf_idx = old_roots.iter().position(|(id, _)| *id == dest)?;
@@ -396,21 +400,43 @@ impl<T: Config> XcmpMessageSource for Pallet<T> {
 
 // ── Helpers ──
 
-/// Compute the MMR root from an ordered list of leaf hashes.
-///
-/// Identical to the receiver's `compute_mmr_root` in `pallet-speculative-inbox`.
-fn compute_mmr_root(leaves: &[H256]) -> H256 {
-	if leaves.is_empty() {
+/// Bag MMR peaks into a single root hash (right-to-left).
+fn bag_peaks<M: Merge<Item = H256>>(peaks: &[H256]) -> mmr_lib::Result<H256> {
+	match peaks.len() {
+		0 => Err(mmr_lib::Error::InconsistentStore),
+		1 => Ok(peaks[0]),
+		_ => {
+			let mut root = *peaks.last().unwrap();
+			for peak in peaks[..peaks.len() - 1].iter().rev() {
+				root = M::merge(peak, &root)?;
+			}
+			Ok(root)
+		},
+	}
+}
+
+/// Compute the MMR root for a destination by reading nodes from runtime storage.
+fn compute_mmr_root_from_storage<T: Config>(dest: ParaId, mmr_size: u64) -> H256 {
+	if mmr_size == 0 {
 		return H256::zero();
 	}
-	let store = mmr_lib::util::MemStore::<H256>::default();
-	let mut mmr =
-		mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
-	for leaf in leaves {
-		let _ = mmr.push(*leaf);
+	let peaks = mmr_lib::helper::get_peaks(mmr_size);
+	if peaks.is_empty() {
+		return H256::zero();
 	}
-	mmr.get_root().unwrap_or_default()
+	let peak_hashes: Vec<H256> = peaks
+		.iter()
+		.filter_map(|pos| MMRNodes::<T>::get(dest, *pos))
+		.collect();
+	if peak_hashes.is_empty() {
+		return H256::zero();
+	}
+	if peak_hashes.len() == 1 {
+		return peak_hashes[0];
+	}
+	bag_peaks::<Keccak256Merge>(&peak_hashes).unwrap_or_default()
 }
+
 
 #[cfg(test)]
 mod tests {
