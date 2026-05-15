@@ -85,7 +85,7 @@ where
 		.subtree_inclusion_proof(at, destination, subtree_root)
 		.ok()??;
 
-	let mut batch = MessageBatch {
+	let batch = MessageBatch {
 		source,
 		source_block,
 		source_relay_parent_number,

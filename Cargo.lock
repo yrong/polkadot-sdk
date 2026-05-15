@@ -5171,6 +5171,7 @@ version = "0.7.0"
 dependencies = [
  "array-bytes 6.2.2",
  "assert_matches",
+ "binary-merkle-tree 13.0.0",
  "bytes",
  "cumulus-pallet-parachain-system-proc-macro",
  "cumulus-primitives-core",
@@ -5192,6 +5193,7 @@ dependencies = [
  "log",
  "pallet-message-queue",
  "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
  "polkadot-parachain-primitives",
  "polkadot-primitives",
  "polkadot-runtime-parachains",

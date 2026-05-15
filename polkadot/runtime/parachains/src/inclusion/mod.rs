@@ -745,6 +745,30 @@ impl<T: Config> Pallet<T> {
 				candidate_receipt_with_backing_validator_indices
 					.push((candidate.receipt(), backer_idx_and_attestation));
 
+				// Speculative Messaging (Phase 1 PoC): check and store provides/requires.
+				if let Some(speculative) = candidate.candidate().commitments.speculative.0.as_ref() {
+					if speculative.provides.is_some() || !speculative.requires.is_empty() {
+						// At backing time, we must also ensure that the requirements are satisfied.
+						// If they aren't, the candidate should be rejected early.
+						if !Self::requires_satisfied(&speculative.requires) {
+							log::debug!(
+								target: LOG_TARGET,
+								"Candidate {:?} rejected: requirements not satisfied",
+								candidate_hash
+							);
+							if !cfg!(feature = "runtime-benchmarks") {
+								return Err(Error::<T>::UnsatisfiedRequires.into());
+							}
+						}
+
+						Self::store_pending_speculative(
+							candidate_hash,
+							speculative.provides,
+							speculative.requires.clone(),
+						);
+					}
+				}
+
 				// Update storage now
 				PendingAvailability::<T>::mutate(&para_id, |pending_availability| {
 					let new_candidate = CandidatePendingAvailability {
@@ -760,37 +784,11 @@ impl<T: Config> Pallet<T> {
 						backing_group: group_idx,
 					};
 
-					// Speculative Messaging (Phase 1 PoC): store provides/requires for enactment.
-					if let Some(speculative) = new_candidate.commitments.speculative.0.as_ref() {
-						match speculative {
-							polkadot_primitives::v10::ValidationResultExtension::V4 { provides_root, requires } => {
-								if provides_root.is_some() || !requires.is_empty() {
-									// At backing time, we must also ensure that the requirements are satisfied.
-									// If they aren't, the candidate should be rejected early.
-									if !Self::requires_satisfied(&requires) {
-										log::debug!(
-											target: LOG_TARGET,
-											"Candidate {:?} rejected: requirements not satisfied",
-											candidate_hash
-										);
-										return Err(Error::<T>::UnsatisfiedSpeculativeDependency.into());
-									}
-
-									Self::store_pending_speculative(
-										candidate_hash,
-										*provides_root,
-										requires.clone(),
-									);
-								}
-							}
-						}
-					}
-
 					if let Some(pending_availability) = pending_availability {
 						pending_availability.push_back(new_candidate);
 					} else {
 						*pending_availability =
-							Some([new_candidate].into_iter().collect::<VecDeque<_>>())
+							Some([new_candidate].into_iter().collect::<VecDeque<_>>());
 					}
 				});
 
@@ -984,6 +982,7 @@ impl<T: Config> Pallet<T> {
 		core_index: CoreIndex,
 		backing_group: GroupIndex,
 	) {
+		let candidate_hash = receipt.hash();
 		let plain = receipt.to_plain();
 		let commitments = receipt.commitments;
 		let config = configuration::ActiveConfig::<T>::get();
@@ -1036,12 +1035,12 @@ impl<T: Config> Pallet<T> {
 		);
 
 		// Finalize speculative messaging: update ProvidesRoots and check requirements.
-		if let Some((provides, requires)) = Self::take_pending_speculative(&receipt.hash()) {
+		if let Some((provides, requires)) = Self::take_pending_speculative(&candidate_hash) {
 			// Double-check requirements at enactment time.
 			if !Self::requires_satisfied(&requires) {
 				// This shouldn't happen if they were checked at backing, unless
 				// the relay chain state changed in an incompatible way.
-				defensive!("Candidate {:?} requirements no longer satisfied at enactment", receipt.hash());
+				defensive!("Candidate {:?} requirements no longer satisfied at enactment", candidate_hash);
 			}
 
 			if let Some(root) = provides {

@@ -287,7 +287,16 @@ where
 				requires.extend(r);
 			}
 
-			// We are always using the `api_version` of the parent block. The `api_version` can only
+			// Pre-transform the commitments using the late block proofs,
+			// just as the PVF will do during execution.
+			for proof in &late_block_proofs {
+				if let Some(req) = requires.iter_mut().find(|r| r.source == proof.source) {
+					req.expected_root = proof.new_provides_root;
+				}
+			}
+			requires.sort_by_key(|r| r.source);
+		}
+		// We are always using the `api_version` of the parent block. The `api_version` can only
 			// change with a runtime upgrade and this is when we want to observe the old
 			// `api_version`. Because this old `api_version` is the one used to validate this
 			// block. Otherwise, we already assume the `api_version` is higher than what the relay

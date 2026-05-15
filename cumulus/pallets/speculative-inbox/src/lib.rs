@@ -224,15 +224,11 @@ pub mod pallet {
 				}
 
 				// 4. Verify reconstructed MMR subtree root matches batch
-				let computed_root = mmr_lib::helper::get_root_from_peaks::<H256, Keccak256Merge>(
-					&state.mmr_peaks,
-					mmr_lib::helper::leaf_index_to_pos(state.mmr_size),
-				).unwrap_or_default();
+				let computed_root = bag_peaks::<Keccak256Merge>(&state.mmr_peaks);
 				ensure!(
 					computed_root == batch.subtree_root,
 					Error::<T>::SubtreeRootMismatch
 				);
-
 				// 5. Enforce one distinct top-level provides root per source per block
 				if state.last_processed > 0 {
 					ensure!(
@@ -339,8 +335,21 @@ fn encode_xcmp_batch<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
 
 /// Append a leaf to the MMR peaks incrementally.
 /// This ensures O(log N) storage and O(log N) update time.
-fn append_leaf_to_peaks<M: Merge>(
-	mut peaks: Vec<M::Item>,
+fn bag_peaks<M: Merge>(peaks: &[M::Item]) -> M::Item
+where
+	M::Item: Default + Clone,
+{
+	if peaks.is_empty() {
+		return Default::default();
+	}
+	let mut current = peaks.last().unwrap().clone();
+	for peak in peaks.iter().rev().skip(1) {
+		current = M::merge(peak, &current).unwrap_or(current);
+	}
+	current
+}
+
+fn append_leaf_to_peaks<M: Merge>(	mut peaks: Vec<M::Item>,
 	size: u64,
 	leaf: M::Item,
 ) -> Vec<M::Item> {
