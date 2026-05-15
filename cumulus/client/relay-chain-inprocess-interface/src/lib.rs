@@ -108,6 +108,14 @@ impl RelayChainInterface for RelayChainInProcessInterface {
 			.inbound_hrmp_channels_contents(relay_parent, para_id)?)
 	}
 
+	async fn provides_root(
+		&self,
+		para_id: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Option<Hash>> {
+		Ok(self.full_client.runtime_api().provides_root(relay_parent, para_id)?)
+	}
+
 	async fn header(&self, block_id: BlockId) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,

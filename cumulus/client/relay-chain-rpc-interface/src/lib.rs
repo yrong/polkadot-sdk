@@ -83,6 +83,16 @@ impl RelayChainInterface for RelayChainRpcInterface {
 			.await
 	}
 
+	async fn provides_root(
+		&self,
+		para_id: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Option<Hash>> {
+		let payload = para_id.encode();
+		let response = self.call_runtime_api("ParachainHost_provides_root", relay_parent, &payload).await?;
+		Ok(Decode::decode(&mut &response[..])?)
+	}
+
 	async fn header(&self, block_id: BlockId) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,

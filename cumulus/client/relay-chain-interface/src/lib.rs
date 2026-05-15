@@ -152,6 +152,13 @@ pub trait RelayChainInterface: Send + Sync {
 		relay_parent: PHash,
 	) -> RelayChainResult<BTreeMap<ParaId, Vec<InboundHrmpMessage>>>;
 
+	/// Fetch the latest provides root for a parachain we are interested in.
+	async fn provides_root(
+		&self,
+		para_id: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Option<Hash>>;
+
 	/// Yields the persisted validation data for the given `ParaId` along with an assumption that
 	/// should be used if the para currently occupies a core.
 	///
@@ -159,11 +166,11 @@ pub trait RelayChainInterface: Send + Sync {
 	/// and the para already occupies a core.
 	async fn persisted_validation_data(
 		&self,
-		block_id: PHash,
+		relay_parent: PHash,
 		para_id: ParaId,
-		_: OccupiedCoreAssumption,
+		occupied_core_assumption: OccupiedCoreAssumption,
 	) -> RelayChainResult<Option<PersistedValidationData>>;
-
+}
 	/// Get the receipt of the first candidate pending availability of this para_id. This returns
 	/// `Some` for any paras assigned to occupied cores in `availability_cores` and `None`
 	/// otherwise.
