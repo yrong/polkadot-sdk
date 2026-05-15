@@ -195,7 +195,7 @@ impl<Block: BlockT> ParachainBlockData<Block> {
 ///
 /// Wraps the standard parachain block data and any late block proofs
 /// required for speculative messaging enactment.
-#[derive(codec::Encode, codec::Decode, Clone, PartialEq, Debug)]
+#[derive(codec::Encode, codec::Decode, Clone)]
 pub struct ParachainBlockDataV4<Block> {
 	/// Late block proofs for speculative messaging dependencies.
 	pub late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,

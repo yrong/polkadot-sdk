@@ -157,7 +157,7 @@ pub trait RelayChainInterface: Send + Sync {
 		&self,
 		para_id: ParaId,
 		relay_parent: PHash,
-	) -> RelayChainResult<Option<Hash>>;
+	) -> RelayChainResult<Option<PHash>>;
 
 	/// Yields the persisted validation data for the given `ParaId` along with an assumption that
 	/// should be used if the para currently occupies a core.
@@ -170,7 +170,7 @@ pub trait RelayChainInterface: Send + Sync {
 		para_id: ParaId,
 		occupied_core_assumption: OccupiedCoreAssumption,
 	) -> RelayChainResult<Option<PersistedValidationData>>;
-}
+
 	/// Get the receipt of the first candidate pending availability of this para_id. This returns
 	/// `Some` for any paras assigned to occupied cores in `availability_cores` and `None`
 	/// otherwise.
@@ -287,6 +287,14 @@ where
 		relay_parent: PHash,
 	) -> RelayChainResult<BTreeMap<ParaId, Vec<InboundHrmpMessage>>> {
 		(**self).retrieve_all_inbound_hrmp_channel_contents(para_id, relay_parent).await
+	}
+
+	async fn provides_root(
+		&self,
+		para_id: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Option<PHash>> {
+		(**self).provides_root(para_id, relay_parent).await
 	}
 
 	async fn persisted_validation_data(

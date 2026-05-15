@@ -477,8 +477,8 @@ pub enum ValidationResultExtension {
 /// - The PVF receives this as the entire input (no wrapper struct)
 ///
 /// If you're considering using this elsewhere, you probably want `Option<T>` instead.
-#[derive(Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "std", derive(Debug, Hash))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "std", derive(Hash))]
 pub struct TrailingOption<T>(pub Option<T>);
 
 impl<T: Decode> Decode for TrailingOption<T> {

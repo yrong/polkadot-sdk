@@ -84,7 +84,6 @@ impl ValidationContext {
 			relay_parent: self.relay_parent(),
 			scheduling_parent: self.scheduling_parent(),
 			descriptor_version: self.descriptor_version(),
-			messaging_proofs: None,
 		}
 	}
 }
@@ -127,8 +126,6 @@ pub struct ExecuteRequest {
 	pub scheduling_parent: Hash,
 	/// The candidate descriptor version (determines ValidationParams format)
 	pub descriptor_version: CandidateDescriptorVersion,
-	/// Speculative messaging proofs for V4 candidates (Phase 1).
-	pub messaging_proofs: Option<Vec<LateBlockProof>>,
 }
 
 /// The response from the execution worker.

@@ -109,7 +109,7 @@ pub struct OutgoingMessage {
 
 /// Included in the receiver candidate's PoV when the block was built against
 /// an older source root than what's persisted in ProvidesRoots.
-#[derive(Clone, Encode, Decode, Debug)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct LateBlockProof {
 	/// The source parachain this proof covers.
 	pub source: ParaId,
@@ -143,7 +143,7 @@ pub struct LateBlockProof {
 
 /// Proves that an MMR root R_old is an ancestor of R_new, i.e. the MMR was
 /// only appended to, not mutated.
-#[derive(Clone, Encode, Decode, Debug)]
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct MMRExtensionProof {
 	/// The peaks of the old MMR.
 	pub old_peaks: Vec<Hash>,

@@ -27,10 +27,6 @@ polkadot-node-core-pvf-common = { workspace = true, default-features = true }
 polkadot-node-primitives = { workspace = true, default-features = true }
 polkadot-parachain-primitives = { workspace = true, default-features = true }
 polkadot-primitives = { workspace = true, default-features = true }
-cumulus-primitives-core = { workspace = true, default-features = true }
-binary-merkle-tree = { workspace = true }
-mmr-lib = { workspace = true }
-sp-runtime = { workspace = true }
 
 sp-maybe-compressed-blob = { workspace = true, default-features = true }
 

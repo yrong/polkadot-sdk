@@ -56,9 +56,9 @@ use polkadot_node_core_pvf_common::{
 };
 use polkadot_node_primitives::{BlockData, POV_BOMB_LIMIT};
 use polkadot_parachain_primitives::primitives::{
-	HeadData, HorizontalMessages, RelayChainBlockNumber, TrailingOption, UpwardMessages, ValidationCode, ValidationParamsExtension, ValidationResult,
+	TrailingOption, ValidationParamsExtension, ValidationResult,
 };
-use polkadot_primitives::{CandidateDescriptorVersion, ExecutorParams, LateBlockProof};
+use polkadot_primitives::{CandidateDescriptorVersion, ExecutorParams};
 use std::{
 	io::{self, Read},
 	os::{
@@ -242,23 +242,9 @@ pub fn worker_entrypoint(
 
 				let pov_size = raw_block_data.len() as u32;
 
-				let mut messaging_proofs = request.messaging_proofs.clone();
-				let mut block_data_bytes = raw_block_data.to_vec();
-
-				// Step 7: PVF decodes ParachainBlockDataV4 from the PoV.
-				// For V4 candidates, the PoV starts with SCALE-encoded messaging proofs,
-				// followed by the actual parachain block data.
-				if request.descriptor_version == CandidateDescriptorVersion::V4 {
-					let mut input = &raw_block_data[..];
-					if let Ok(proofs) = Vec::<LateBlockProof>::decode(&mut input) {
-						messaging_proofs = Some(proofs);
-						block_data_bytes = input.to_vec();
-					}
-				}
-
 				let params = ValidationParams {
 					parent_head: pvd.parent_head.clone(),
-					block_data: BlockData(block_data_bytes),
+					block_data: BlockData(raw_block_data.to_vec()),
 					relay_parent_number: pvd.relay_parent_number,
 					relay_parent_storage_root: pvd.relay_parent_storage_root,
 				};
@@ -272,10 +258,15 @@ pub fn worker_entrypoint(
 				// 3. The PVF will decode ValidationParams + optional extension as the entire input
 				let extension: TrailingOption<ValidationParamsExtension> =
 					match request.descriptor_version {
-						CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 => {
-							// V3/V4 candidate - append extension with both parent hashes.
-							// TODO(speculative-messaging): Add V4-specific extension fields if needed.
+						CandidateDescriptorVersion::V3 => {
+							// V3 candidate - append extension with both parent hashes
 							TrailingOption(Some(ValidationParamsExtension::V3 {
+								relay_parent: request.relay_parent,
+								scheduling_parent: request.scheduling_parent,
+							}))
+						},
+						CandidateDescriptorVersion::V4 => {
+							TrailingOption(Some(ValidationParamsExtension::V4 {
 								relay_parent: request.relay_parent,
 								scheduling_parent: request.scheduling_parent,
 							}))
@@ -301,7 +292,6 @@ pub fn worker_entrypoint(
 								&compiled_artifact_blob,
 								&executor_params,
 								&params,
-								messaging_proofs,
 								execution_timeout,
 								execute_thread_stack_size,
 								worker_info,
@@ -318,7 +308,6 @@ pub fn worker_entrypoint(
 								&compiled_artifact_blob,
 								&executor_params,
 								&params,
-								messaging_proofs,
 								execution_timeout,
 								execute_thread_stack_size,
 								worker_info,
@@ -334,7 +323,6 @@ pub fn worker_entrypoint(
 							&compiled_artifact_blob,
 							&executor_params,
 							&params,
-							messaging_proofs,
 							execution_timeout,
 							execute_thread_stack_size,
 							worker_info,
@@ -342,13 +330,13 @@ pub fn worker_entrypoint(
 							pov_size,
 						)?;
 					}
-				};
+				}
 
 				gum::trace!(
 					target: LOG_TARGET,
 					?worker_info,
 					"worker: sending result to host: {:?}",
-					&result
+					result
 				);
 				send_result(&mut stream, result, worker_info)?;
 			}
@@ -356,68 +344,10 @@ pub fn worker_entrypoint(
 	);
 }
 
-use sp_runtime::traits::{Hash as _, Keccak256};
-use mmr_lib::Merge;
-
-/// Keccak256 merge for MMR node construction.
-struct Keccak256Merge;
-impl Merge for Keccak256Merge {
-	type Item = polkadot_primitives::Hash;
-	fn merge(lhs: &Self::Item, rhs: &Self::Item) -> Result<Self::Item, mmr_lib::Error> {
-		let mut concat = [0u8; 64];
-		concat[..32].copy_from_slice(lhs.as_ref());
-		concat[32..].copy_from_slice(rhs.as_ref());
-		Ok(Keccak256::hash(&concat))
-	}
-}
-
-/// Applies speculative messaging proofs to the validation result.
-///
-/// This transforms `requires` commitments that reference older source roots into
-/// commitments that reference the current source roots, provided a valid proof is
-/// supplied in the PoV.
-fn apply_messaging_proofs(para_id: polkadot_primitives::Id, result: &mut ValidationResult, proofs: Vec<LateBlockProof>) {
-	if let Some(ValidationResultExtension::V4 { ref mut requires, .. }) = result.speculative.0 {
-		for proof in proofs {
-			for req in requires.iter_mut() {
-				if req.0 == proof.source && req.1 == proof.old_provides_root {
-					// 1. Verify old subtree root was in old provides root.
-					// Leaf is keccak256(encode((para_id, subtree_root)))
-					let old_leaf = Keccak256::hash(&(para_id, proof.old_subtree_root).encode());
-					let old_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
-						&proof.old_provides_root,
-						proof.old_subtree_proof.iter().copied(),
-						proof.number_of_destinations,
-						proof.leaf_index,
-						&old_leaf,
-					);
-					
-					// 2. Verify new subtree root is in new provides root.
-					let new_leaf = Keccak256::hash(&(para_id, proof.new_subtree_root).encode());
-					let new_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
-						&proof.new_provides_root,
-						proof.new_subtree_proof.iter().copied(),
-						proof.number_of_destinations,
-						proof.leaf_index,
-						&new_leaf,
-					);
-
-					if old_valid && new_valid {
-						// NOTE: prefix extension verification skipped for minimal POC.
-						req.1 = proof.new_provides_root;
-					}
-				}
-			}
-		}
-	}
-}
-
 fn validate_using_artifact(
-	para_id: polkadot_primitives::Id,
 	compiled_artifact_blob: &[u8],
 	executor_params: &ExecutorParams,
 	params: &[u8],
-	messaging_proofs: Option<Vec<LateBlockProof>>,
 ) -> JobResponse {
 	let descriptor_bytes = match unsafe {
 		// SAFETY: this should be safe since the compiled artifact passed here comes from the
@@ -432,20 +362,15 @@ fn validate_using_artifact(
 		Ok(d) => d,
 	};
 
-	let mut result_descriptor =
-		match ValidationResult::decode(&mut &descriptor_bytes[..]) {
-			Err(err) => {
-				return JobResponse::format_invalid(
-					"validation result decoding failed",
-					&err.to_string(),
-				)
-			},
-			Ok(r) => r,
-		};
-
-	if let Some(proofs) = messaging_proofs {
-		apply_messaging_proofs(para_id, &mut result_descriptor, proofs);
-	}
+	let result_descriptor = match ValidationResult::decode(&mut &descriptor_bytes[..]) {
+		Err(err) => {
+			return JobResponse::format_invalid(
+				"validation result decoding failed",
+				&err.to_string(),
+			)
+		},
+		Ok(r) => r,
+	};
 
 	JobResponse::Ok { result_descriptor }
 }
@@ -458,8 +383,6 @@ fn handle_clone(
 	compiled_artifact_blob: &Arc<Vec<u8>>,
 	executor_params: &Arc<ExecutorParams>,
 	params: &Arc<Vec<u8>>,
-	para_id: polkadot_primitives::Id,
-	messaging_proofs: Option<Vec<LateBlockProof>>,
 	execution_timeout: Duration,
 	execute_stack_size: usize,
 	worker_info: &WorkerInfo,
@@ -469,15 +392,13 @@ fn handle_clone(
 ) -> io::Result<Result<WorkerResponse, WorkerError>> {
 	use polkadot_node_core_pvf_common::worker::security;
 
-	let messaging_proofs_clone = messaging_proofs.clone();
-
 	// SAFETY: new process is spawned within a single threaded process. This invariant
 	// is enforced by tests. Stack size being specified to ensure child doesn't overflow
 	match unsafe {
 		security::clone::clone_on_worker(
 			worker_info,
 			have_unshare_newuser,
-			Box::new(move || {
+			Box::new(|| {
 				handle_child_process(
 					pipe_write_fd,
 					pipe_read_fd,
@@ -485,156 +406,6 @@ fn handle_clone(
 					Arc::clone(compiled_artifact_blob),
 					Arc::clone(executor_params),
 					Arc::clone(params),
-					para_id,
-					messaging_proofs_clone,
-					execution_timeout,
-					execute_stack_size,
-					worker_info,
-					usage_before,
-					pov_size,
-				)
-			}),
-			execute_stack_size,
-		)
-	} {
-		Ok(WaitStatus::Exited(_pid, exit_status)) => {
-			gum::trace!(
-				target: LOG_TARGET,
-				?worker_info,
-				"worker: clone: child process exited with status: {}",
-				exit_status
-			);
-			Ok(Ok(WorkerResponse {
-				job_response: JobResponse::internal_error("execute", "child process exited"),
-				duration: Duration::from_millis(0),
-				pov_size: 0,
-			}))
-		},
-		Ok(s) => {
-			gum::trace!(
-				target: LOG_TARGET,
-				?worker_info,
-				"worker: clone: child process wait status: {:?}",
-				s
-			);
-			Ok(Ok(WorkerResponse {
-				job_response: JobResponse::internal_error("execute", "child process wait status"),
-				duration: Duration::from_millis(0),
-				pov_size: 0,
-			}))
-		},
-		Err(err) => {
-			gum::error!(
-				target: LOG_TARGET,
-				?worker_info,
-				"worker: clone: failed to wait for child process: {}",
-				err
-			);
-			Ok(Err(WorkerError::InternalError("failed to wait for child process".to_string())))
-		},
-	}
-}
-
-fn handle_child_process(
-	pipe_write_fd: i32,
-	pipe_read_fd: i32,
-	stream_fd: i32,
-	compiled_artifact_blob: Arc<Vec<u8>>,
-	executor_params: Arc<ExecutorParams>,
-	params: Arc<Vec<u8>>,
-	para_id: polkadot_primitives::Id,
-	messaging_proofs: Option<Vec<LateBlockProof>>,
-	execution_timeout: Duration,
-	execute_stack_size: usize,
-	worker_info: &WorkerInfo,
-	usage_before: Usage,
-	pov_size: u32,
-) -> i32 {
-	let mut stream = unsafe { UnixStream::from_raw_fd(stream_fd) };
-	let result = validate_using_artifact(
-		para_id,
-		&compiled_artifact_blob,
-		&executor_params,
-		&params,
-		messaging_proofs,
-	);
-	let duration = Duration::from_millis(0); // TODO: CPU time tracking
-	let response = WorkerResponse { job_response: result, duration, pov_size };
-	if let Err(err) = send_result(&mut stream, Ok(response), worker_info) {
-		gum::error!(
-			target: LOG_TARGET,
-			?worker_info,
-			"worker: child: failed to send result to host: {}",
-			err
-		);
-		return 1;
-	}
-	0
-}
-
-#[cfg(not(target_os = "linux"))]
-fn handle_fork(
-	pipe_write_fd: i32,
-	pipe_read_fd: i32,
-	stream_fd: i32,
-	compiled_artifact_blob: &Arc<Vec<u8>>,
-	executor_params: &Arc<ExecutorParams>,
-	params: &Arc<Vec<u8>>,
-	para_id: polkadot_primitives::Id,
-	messaging_proofs: Option<Vec<LateBlockProof>>,
-	execution_timeout: Duration,
-	execute_stack_size: usize,
-	worker_info: &WorkerInfo,
-	usage_before: Usage,
-	pov_size: u32,
-) -> io::Result<Result<WorkerResponse, WorkerError>> {
-	let result = validate_using_artifact(
-		para_id,
-		compiled_artifact_blob,
-		executor_params,
-		params,
-		messaging_proofs,
-	);
-	let duration = Duration::from_millis(0); // TODO: CPU time tracking
-	let response = WorkerResponse { job_response: result, duration, pov_size };
-	Ok(Ok(response))
-}
-
-#[cfg(target_os = "linux")]
-fn handle_clone(
-	pipe_write_fd: i32,
-	pipe_read_fd: i32,
-	stream_fd: i32,
-	compiled_artifact_blob: &Arc<Vec<u8>>,
-	executor_params: &Arc<ExecutorParams>,
-	params: &Arc<Vec<u8>>,
-	messaging_proofs: Option<Vec<LateBlockProof>>,
-	execution_timeout: Duration,
-	execute_stack_size: usize,
-	worker_info: &WorkerInfo,
-	have_unshare_newuser: bool,
-	usage_before: Usage,
-	pov_size: u32,
-) -> io::Result<Result<WorkerResponse, WorkerError>> {
-	use polkadot_node_core_pvf_common::worker::security;
-
-	let messaging_proofs_clone = messaging_proofs.clone();
-
-	// SAFETY: new process is spawned within a single threaded process. This invariant
-	// is enforced by tests. Stack size being specified to ensure child doesn't overflow
-	match unsafe {
-		security::clone::clone_on_worker(
-			worker_info,
-			have_unshare_newuser,
-			Box::new(move || {
-				handle_child_process(
-					pipe_write_fd,
-					pipe_read_fd,
-					stream_fd,
-					Arc::clone(compiled_artifact_blob),
-					Arc::clone(executor_params),
-					Arc::clone(params),
-					messaging_proofs_clone,
 					execution_timeout,
 					execute_stack_size,
 				)
@@ -663,7 +434,6 @@ fn handle_fork(
 	compiled_artifact_blob: &Arc<Vec<u8>>,
 	executor_params: &Arc<ExecutorParams>,
 	params: &Arc<Vec<u8>>,
-	messaging_proofs: Option<Vec<LateBlockProof>>,
 	execution_timeout: Duration,
 	execute_worker_stack_size: usize,
 	worker_info: &WorkerInfo,
@@ -680,7 +450,6 @@ fn handle_fork(
 			Arc::clone(compiled_artifact_blob),
 			Arc::clone(executor_params),
 			Arc::clone(params),
-			messaging_proofs,
 			execution_timeout,
 			execute_worker_stack_size,
 		),
@@ -710,7 +479,6 @@ fn handle_child_process(
 	compiled_artifact_blob: Arc<Vec<u8>>,
 	executor_params: Arc<ExecutorParams>,
 	params: Arc<Vec<u8>>,
-	messaging_proofs: Option<Vec<LateBlockProof>>,
 	execution_timeout: Duration,
 	execute_thread_stack_size: usize,
 ) -> ! {
@@ -754,14 +522,7 @@ fn handle_child_process(
 
 	let execute_thread = thread::spawn_worker_thread_with_stack_size(
 		"execute thread",
-		move || {
-			validate_using_artifact(
-				&compiled_artifact_blob,
-				&executor_params,
-				&params,
-				messaging_proofs,
-			)
-		},
+		move || validate_using_artifact(&compiled_artifact_blob, &executor_params, &params),
 		Arc::clone(&condvar),
 		WaitOutcome::Finished,
 		execute_thread_stack_size,

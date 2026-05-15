@@ -35,10 +35,79 @@ use sp_externalities::{set_and_run_with_externalities, Externalities};
 use sp_io::{hashing::blake2_128, KillStorageResult};
 use sp_runtime::traits::{
 	Block as BlockT, ExtrinsicCall, Hash as HashT, HashingFor, Header as HeaderT, LazyBlock,
+	Keccak256,
 };
 use sp_state_machine::OverlayedChanges;
 use sp_trie::{HashDBT, ProofSizeProvider, EMPTY_PREFIX};
 use trie_recorder::{SeenNodes, SizeOnlyRecorderProvider};
+use mmr_lib::Merge;
+
+/// Keccak256 merge for MMR node construction.
+struct Keccak256Merge;
+impl Merge for Keccak256Merge {
+	type Item = polkadot_primitives::Hash;
+	fn merge(lhs: &Self::Item, rhs: &Self::Item) -> Result<Self::Item, mmr_lib::Error> {
+		let mut concat = [0u8; 64];
+		concat[..32].copy_from_slice(lhs.as_ref());
+		concat[32..].copy_from_slice(rhs.as_ref());
+		Ok(Keccak256::hash(&concat))
+	}
+}
+
+/// Applies speculative messaging proofs to the validation result.
+///
+/// This transforms `requires` commitments that reference older source roots into
+/// commitments that reference the current source roots, provided a valid proof is
+/// supplied in the PoV.
+fn apply_messaging_proofs(para_id: polkadot_primitives::Id, extension: &mut Option<polkadot_parachain_primitives::primitives::ValidationResultExtension>, proofs: Vec<polkadot_primitives::v10::LateBlockProof>) {
+	if let Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { ref mut requires, .. }) = extension {
+		for proof in proofs {
+			for req in requires.iter_mut() {
+				if req.0 == proof.source && req.1 == proof.old_provides_root {
+					// 1. Verify old subtree root was in old provides root.
+					// Leaf is keccak256(encode((para_id, subtree_root)))
+					let old_leaf = Keccak256::hash(&(para_id, proof.old_subtree_root).encode());
+					let old_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
+						&proof.old_provides_root,
+						proof.old_subtree_proof.iter().copied(),
+						proof.number_of_destinations,
+						proof.leaf_index,
+						&old_leaf,
+					);
+					
+					// 2. Verify new subtree root is in new provides root.
+					let new_leaf = Keccak256::hash(&(para_id, proof.new_subtree_root).encode());
+					let new_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
+						&proof.new_provides_root,
+						proof.new_subtree_proof.iter().copied(),
+						proof.number_of_destinations,
+						proof.leaf_index,
+						&new_leaf,
+					);
+
+					// 3. Subtrees must be identical or old must be a valid prefix
+					let extension_valid = if proof.old_subtree_root != proof.new_subtree_root {
+						proof.subtree_extension.as_ref().map_or(false, |ext| {
+							mmr_lib::verify_mmr_extension::<polkadot_primitives::Hash, Keccak256Merge>(
+								proof.old_subtree_root,
+								proof.new_subtree_root,
+								&ext.old_peaks,
+								&ext.new_peaks,
+								&ext.connecting_nodes,
+							).unwrap_or(false)
+						})
+					} else {
+						true
+					};
+
+					if old_valid && new_valid && extension_valid {
+						req.1 = proof.new_provides_root;
+					}
+				}
+			}
+		}
+	}
+}
 
 type Ext<'a, Block, Backend> = sp_state_machine::Ext<'a, HashingFor<Block>, Backend>;
 
@@ -130,8 +199,16 @@ where
 		sp_io::transaction_index::host_renew.replace_implementation(host_transaction_index_renew),
 	);
 
-	let block_data = codec::decode_from_bytes::<ParachainBlockData<B::LazyBlock>>(block_data)
-		.expect("Invalid parachain block data");
+	let (block_data, messaging_proofs) = if let Ok(pov_v4) =
+		codec::decode_from_bytes::<cumulus_primitives_core::ParachainBlockDataV4<B::LazyBlock>>(
+			block_data.clone(),
+		) {
+		(pov_v4.inner, Some(pov_v4.late_block_proofs))
+	} else {
+		let pov = codec::decode_from_bytes::<ParachainBlockData<B::LazyBlock>>(block_data)
+			.expect("Invalid parachain block data");
+		(pov, None)
+	};
 
 	// Initialize hashmaps randomness.
 	sp_trie::add_extra_randomness(build_seed_from_head_data::<B>(
@@ -346,7 +423,10 @@ where
 
 	horizontal_messages.sort_by(|a, b| a.recipient.cmp(&b.recipient));
 
-	let extension = PSC::speculative_extension();
+	let mut extension = PSC::speculative_extension();
+	if let Some(proofs) = messaging_proofs {
+		apply_messaging_proofs(PSC::SelfParaId::get(), &mut extension, proofs);
+	}
 
 	ValidationResult {
 		head_data: head_data.expect("HeadData not set"),
