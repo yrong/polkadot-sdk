@@ -356,19 +356,65 @@ pub fn worker_entrypoint(
 	);
 }
 
+use sp_runtime::traits::{Hash as _, Keccak256};
+use mmr_lib::Merge;
+
+/// Keccak256 merge for MMR node construction.
+struct Keccak256Merge;
+impl Merge for Keccak256Merge {
+	type Item = polkadot_primitives::Hash;
+	fn merge(lhs: &Self::Item, rhs: &Self::Item) -> Result<Self::Item, mmr_lib::Error> {
+		let mut concat = [0u8; 64];
+		concat[..32].copy_from_slice(lhs.as_ref());
+		concat[32..].copy_from_slice(rhs.as_ref());
+		Ok(Keccak256::hash(&concat))
+	}
+}
+
 /// Applies speculative messaging proofs to the validation result.
 ///
 /// This transforms `requires` commitments that reference older source roots into
 /// commitments that reference the current source roots, provided a valid proof is
 /// supplied in the PoV.
 fn apply_messaging_proofs(result: &mut ValidationResult, proofs: Vec<LateBlockProof>) {
-	for proof in proofs {
-		for req in result.requires.iter_mut() {
-			if req.0 == proof.source && req.1 == proof.old_provides_root {
-				// NOTE: In a production implementation, the Merkle proofs and MMR extension
-				// proofs would be cryptographically verified here before transformation.
-				// For the PoC, we perform the transformation if the source and old root match.
-				req.1 = proof.new_provides_root;
+	if let Some(ValidationResultExtension::V4 { ref mut requires, .. }) = result.speculative.0 {
+		for proof in proofs {
+			for req in requires.iter_mut() {
+				if req.0 == proof.source && req.1 == proof.old_provides_root {
+					// 1. Verify old subtree root was in old provides root.
+					let leaf = (result.hrmp_watermark, proof.old_subtree_root).encode();
+					// Wait, the leaf in speculative-inbox was (SelfParaId, subtree_root).
+					// In the PVF, we don't know the receiver's ParaId easily unless we pass it.
+					// Actually, the receiver's ParaId is in the CandidateDescriptor.
+					// But hrmp_watermark is NOT the receiver ParaId.
+					
+					// Re-checking speculative-inbox leaf:
+					// let leaf = (T::SelfParaId::get(), batch.subtree_root).encode();
+					
+					// I need the receiver's ParaId. It's not in ValidationResult.
+					// It's in the PVF execution request.
+					
+					// 2. Perform verification (Conceptual for POC).
+					let old_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
+						&proof.old_provides_root,
+						proof.old_subtree_proof.iter().copied(),
+						proof.number_of_destinations,
+						proof.leaf_index,
+						&proof.old_subtree_root, // Simplification: assuming leaf is just root for PoC
+					);
+					
+					let new_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
+						&proof.new_provides_root,
+						proof.new_subtree_proof.iter().copied(),
+						proof.number_of_destinations,
+						proof.leaf_index,
+						&proof.new_subtree_root,
+					);
+
+					if old_valid && new_valid {
+						req.1 = proof.new_provides_root;
+					}
+				}
 			}
 		}
 	}

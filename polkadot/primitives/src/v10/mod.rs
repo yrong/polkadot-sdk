@@ -114,6 +114,12 @@ pub struct LateBlockProof {
 	/// The source parachain this proof covers.
 	pub source: ParaId,
 
+	/// The total number of destinations in the source's provides root.
+	/// Required to verify the binary Merkle proof.
+	pub number_of_destinations: u32,
+	/// The index of the receiver's subtree in the source's top-level tree.
+	pub leaf_index: u32,
+
 	/// The provides root the receiver block was built against (the old root
 	/// from the batch).
 	pub old_provides_root: Hash,
