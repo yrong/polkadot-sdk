@@ -762,12 +762,27 @@ impl<T: Config> Pallet<T> {
 
 					// Speculative Messaging (Phase 1 PoC): store provides/requires for enactment.
 					if let Some(speculative) = new_candidate.commitments.speculative.0.as_ref() {
-						if speculative.provides.is_some() || !speculative.requires.is_empty() {
-							Self::store_pending_speculative(
-								candidate_hash,
-								speculative.provides,
-								speculative.requires.clone(),
-							);
+						match speculative {
+							polkadot_primitives::v10::ValidationResultExtension::V4 { provides_root, requires } => {
+								if provides_root.is_some() || !requires.is_empty() {
+									// At backing time, we must also ensure that the requirements are satisfied.
+									// If they aren't, the candidate should be rejected early.
+									if !Self::requires_satisfied(&requires) {
+										log::debug!(
+											target: LOG_TARGET,
+											"Candidate {:?} rejected: requirements not satisfied",
+											candidate_hash
+										);
+										return Err(Error::<T>::UnsatisfiedSpeculativeDependency.into());
+									}
+
+									Self::store_pending_speculative(
+										candidate_hash,
+										*provides_root,
+										requires.clone(),
+									);
+								}
+							}
 						}
 					}
 
@@ -1019,6 +1034,20 @@ impl<T: Config> Pallet<T> {
 			receipt.descriptor.para_id(),
 			commitments.horizontal_messages,
 		);
+
+		// Finalize speculative messaging: update ProvidesRoots and check requirements.
+		if let Some((provides, requires)) = Self::take_pending_speculative(&receipt.hash()) {
+			// Double-check requirements at enactment time.
+			if !Self::requires_satisfied(&requires) {
+				// This shouldn't happen if they were checked at backing, unless
+				// the relay chain state changed in an incompatible way.
+				defensive!("Candidate {:?} requirements no longer satisfied at enactment", receipt.hash());
+			}
+
+			if let Some(root) = provides {
+				Self::update_provides_root(receipt.descriptor.para_id(), root);
+			}
+		}
 
 		Self::deposit_event(Event::<T>::CandidateIncluded(
 			plain,

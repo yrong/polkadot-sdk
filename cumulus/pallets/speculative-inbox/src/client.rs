@@ -85,7 +85,7 @@ where
 		.subtree_inclusion_proof(at, destination, subtree_root)
 		.ok()??;
 
-	Some(MessageBatch {
+	let mut batch = MessageBatch {
 		source,
 		source_block,
 		source_relay_parent_number,
@@ -98,7 +98,13 @@ where
 			.into_iter()
 			.map(|(position, payload)| OutgoingMessage { position, payload })
 			.collect(),
-	})
+	};
+
+	// TODO(speculative-messaging): Check expected_provides_root from relay chain.
+	// If it differs, call api.generate_late_block_proof(at, destination, expected_provides_root)
+	// and attach it to the ingress metadata.
+
+	Some(batch)
 }
 
 /// Fetch batches from one or more sender chains and assemble ingress.
