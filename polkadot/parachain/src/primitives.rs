@@ -477,8 +477,8 @@ pub enum ValidationResultExtension {
 /// - The PVF receives this as the entire input (no wrapper struct)
 ///
 /// If you're considering using this elsewhere, you probably want `Option<T>` instead.
-#[derive(Clone)]
-#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug, Hash))]
 pub struct TrailingOption<T>(pub Option<T>);
 
 impl<T: Decode> Decode for TrailingOption<T> {
@@ -507,6 +507,22 @@ impl<T> TrailingOption<T> {
 		self.0
 	}
 }
+
+impl<T> Default for TrailingOption<T> {
+	fn default() -> Self {
+		TrailingOption(None)
+	}
+}
+
+impl<T: scale_info::TypeInfo + 'static> scale_info::TypeInfo for TrailingOption<T> {
+	type Identity = Self;
+
+	fn type_info() -> scale_info::Type {
+		<Option<T>>::type_info()
+	}
+}
+
+impl<T: codec::DecodeWithMemTracking> codec::DecodeWithMemTracking for TrailingOption<T> {}
 
 /// Validation parameters for evaluating the parachain validity function.
 // TODO: balance downloads (https://github.com/paritytech/polkadot/issues/220)

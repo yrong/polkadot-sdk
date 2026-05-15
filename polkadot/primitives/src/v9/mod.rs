@@ -63,8 +63,8 @@ pub use polkadot_core_primitives::v2::{
 
 // Export some polkadot-parachain primitives
 pub use polkadot_parachain_primitives::primitives::{
-	HeadData, HorizontalMessages, HrmpChannelId, Id, Id as ParaId, UpwardMessage, UpwardMessages,
-	ValidationCode, ValidationCodeHash, LOWEST_PUBLIC_ID,
+	HeadData, HorizontalMessages, HrmpChannelId, Id, Id as ParaId, TrailingOption, UpwardMessage,
+	UpwardMessages, ValidationCode, ValidationCodeHash, LOWEST_PUBLIC_ID,
 };
 
 /// Signed data.
@@ -563,6 +563,33 @@ pub struct CandidateCommitments<N = BlockNumber> {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: N,
+	/// Speculative messaging data (v10+).
+	/// Wrapped in `TrailingOption` to preserve hash compatibility for legacy candidates.
+	pub speculative: TrailingOption<SpeculativeCommitments>,
+}
+
+/// Speculative messaging commitments (v10+).
+#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
+#[cfg_attr(feature = "std", derive(Default, Hash))]
+pub struct SpeculativeCommitments {
+	/// The provides root (top-level Merkle tree over per-destination MMR roots).
+	pub provides: Option<Hash>,
+	/// The requires commitments (source parachain -> expected provides root).
+	pub requires: Vec<(Id, Hash)>,
+}
+
+impl SpeculativeCommitments {
+	/// Build speculative commitments from PVF outputs, if any.
+	pub fn from_pvf_parts(
+		provides_root: Option<Hash>,
+		requires: Vec<(Id, Hash)>,
+	) -> Option<Self> {
+		if provides_root.is_some() || !requires.is_empty() {
+			Some(Self { provides: provides_root, requires })
+		} else {
+			None
+		}
+	}
 }
 
 impl CandidateCommitments {
@@ -1742,10 +1769,12 @@ pub mod node_features {
 		CandidateReceiptV2 = 3,
 		/// Enables support for scheduling information in the Candidate Descriptor.
 		CandidateReceiptV3 = 4,
+		/// Enables speculative messaging (phase 1 PoC).
+		SpeculativeMessaging = 5,
 		/// First unassigned feature bit.
 		/// Every time a new feature flag is assigned it should take this value.
 		/// and this should be incremented.
-		FirstUnassigned = 5,
+		FirstUnassigned = 6,
 	}
 
 	impl FeatureIndex {
@@ -1850,6 +1879,8 @@ pub enum CandidateDescriptorVersion {
 	V2,
 	/// Candidate with scheduling info.
 	V3,
+	/// Speculative-messaging-capable v4 descriptor.
+	V4,
 	/// An unknown/not yet supported version.
 	///
 	/// Such a candidate must be dropped by the runtime and rejected by backers.
@@ -1860,10 +1891,12 @@ pub enum CandidateDescriptorVersion {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CandidateDescriptorVersionCheckError {
 	/// Old-style and new-style version detection disagree, and this is not the
-	/// expected V3 disagreement (old rules → V1, new rules → V3) with V3 enabled.
+	/// expected V3/V4 disagreement (old rules → V1, new rules → V3/V4) with V3/V4 enabled.
 	Inconsistency,
 	/// The descriptor is V3 but the V3 feature is not enabled.
 	V3NotEnabled,
+	/// The descriptor is V4 but the speculative messaging feature is not enabled.
+	V4NotEnabled,
 }
 
 // Manual Display impl required because this type is used in `no_std` runtime
@@ -1875,6 +1908,9 @@ impl core::fmt::Display for CandidateDescriptorVersionCheckError {
 				write!(f, "Descriptor version detection inconsistency (old vs new rules disagree)")
 			},
 			Self::V3NotEnabled => write!(f, "V3 candidate descriptor but V3 feature not enabled"),
+			Self::V4NotEnabled => {
+				write!(f, "V4 candidate descriptor but speculative messaging feature not enabled")
+			},
 		}
 	}
 }
@@ -2031,19 +2067,30 @@ impl<H: AsRef<[u8]>> CandidateDescriptorV2<H> {
 	pub fn check_version_acceptance(
 		&self,
 		v3_enabled: bool,
+		speculative_enabled: bool,
 	) -> Result<(), CandidateDescriptorVersionCheckError> {
 		let version = self.version();
 
 		// Version consistency: old and new detection must agree, unless this is the
-		// expected V3 disagreement (old rules → V1, new rules → V3) with V3 enabled.
+		// expected V3/V4 disagreement (old rules → V1, new rules → V3/V4) with V3/V4 enabled.
 		let is_expected_v3_disagreement = version == CandidateDescriptorVersion::V3 && v3_enabled;
-		if !self.check_version_consistency() && !is_expected_v3_disagreement {
+		let is_expected_v4_disagreement =
+			version == CandidateDescriptorVersion::V4 && speculative_enabled;
+		if !self.check_version_consistency() &&
+			!is_expected_v3_disagreement &&
+			!is_expected_v4_disagreement
+		{
 			return Err(CandidateDescriptorVersionCheckError::Inconsistency);
 		}
 
 		// V3 gating: reject V3 candidates before the feature is enabled.
 		if version == CandidateDescriptorVersion::V3 && !v3_enabled {
 			return Err(CandidateDescriptorVersionCheckError::V3NotEnabled);
+		}
+
+		// V4 gating: reject V4 candidates before the feature is enabled.
+		if version == CandidateDescriptorVersion::V4 && !speculative_enabled {
+			return Err(CandidateDescriptorVersionCheckError::V4NotEnabled);
 		}
 
 		Ok(())
@@ -2087,6 +2134,7 @@ impl<H> CandidateDescriptorV2<H> {
 		match self.version {
 			0 => CandidateDescriptorVersion::V2,
 			1 => CandidateDescriptorVersion::V3,
+			2 => CandidateDescriptorVersion::V4,
 			_ => CandidateDescriptorVersion::Unknown,
 		}
 	}
@@ -2195,7 +2243,8 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 		match self.version() {
 			CandidateDescriptorVersion::V1 => self.relay_parent,
 			CandidateDescriptorVersion::V2 => self.relay_parent,
-			CandidateDescriptorVersion::V3 => self.scheduling_parent,
+			CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 =>
+				self.scheduling_parent,
 			CandidateDescriptorVersion::Unknown => self.relay_parent,
 		}
 	}
@@ -2210,7 +2259,7 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 		match self.version() {
 			CandidateDescriptorVersion::V1 => None,
 			CandidateDescriptorVersion::V2 => Some(self.session_index),
-			CandidateDescriptorVersion::V3 => {
+			CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 => {
 				Some(self.session_index.saturating_add(self.scheduling_session_offset as _))
 			},
 			CandidateDescriptorVersion::Unknown => None,
@@ -2269,7 +2318,7 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 		match self.version_for_candidate_validation(v3_ever_seen) {
 			CandidateDescriptorVersion::V1 => None,
 			CandidateDescriptorVersion::V2 => Some(self.session_index),
-			CandidateDescriptorVersion::V3 => {
+			CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 => {
 				Some(self.session_index.saturating_add(self.scheduling_session_offset as _))
 			},
 			CandidateDescriptorVersion::Unknown => None,
@@ -2285,7 +2334,8 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 	) -> Option<SessionIndex> {
 		match self.version_for_candidate_validation(v3_ever_seen) {
 			CandidateDescriptorVersion::V1 | CandidateDescriptorVersion::Unknown => None,
-			CandidateDescriptorVersion::V2 | CandidateDescriptorVersion::V3 => {
+			CandidateDescriptorVersion::V2 | CandidateDescriptorVersion::V3 |
+			CandidateDescriptorVersion::V4 => {
 				Some(self.session_index)
 			},
 		}
@@ -2324,6 +2374,20 @@ where
 				.finish(),
 			CandidateDescriptorVersion::V3 => f
 				.debug_struct("CandidateDescriptorV3")
+				.field("para_id", &self.para_id)
+				.field("relay_parent", &self.relay_parent)
+				.field("scheduling_parent", &self.scheduling_parent)
+				.field("core_index", &self.core_index)
+				.field("session_index", &self.session_index)
+				.field("scheduling_session_offset", &self.scheduling_session_offset)
+				.field("persisted_validation_data_hash", &self.persisted_validation_data_hash)
+				.field("pov_hash", &self.pov_hash)
+				.field("erasure_root", &self.erasure_root)
+				.field("para_head", &self.para_head)
+				.field("validation_code_hash", &self.validation_code_hash)
+				.finish(),
+			CandidateDescriptorVersion::V4 => f
+				.debug_struct("CandidateDescriptorV4")
 				.field("para_id", &self.para_id)
 				.field("relay_parent", &self.relay_parent)
 				.field("core_index", &self.core_index)
@@ -2382,6 +2446,45 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 	/// V3 descriptors are identified by `version == 1` and have a non-zero scheduling_parent
 	/// field, which indicates the relay chain block that was used for scheduling (may differ
 	/// from relay_parent). V3 descriptors require UMP signals to be present.
+	/// Constructor for V4 candidate descriptor (speculative messaging).
+	///
+	/// V4 descriptors are identified by `version == 2`. They use the same scheduling-parent
+	/// layout as V3 but do not require UMP signals; speculative commitments are carried in
+	/// `CandidateCommitments::speculative` instead.
+	pub fn new_v4(
+		para_id: Id,
+		relay_parent: H,
+		core_index: CoreIndex,
+		session_index: SessionIndex,
+		scheduling_session_index: SessionIndex,
+		persisted_validation_data_hash: Hash,
+		pov_hash: Hash,
+		erasure_root: Hash,
+		para_head: Hash,
+		validation_code_hash: ValidationCodeHash,
+		scheduling_parent: H,
+	) -> Self {
+		Self {
+			para_id,
+			relay_parent,
+			version: 2,
+			core_index: core_index.0 as u16,
+			session_index,
+			scheduling_session_offset: scheduling_session_index
+				.saturating_sub(session_index)
+				.try_into()
+				.expect("scheduling session offset should fit in u8"),
+			reserved1: [0; 24],
+			persisted_validation_data_hash,
+			pov_hash,
+			erasure_root,
+			scheduling_parent,
+			reserved2: [0; 32],
+			para_head,
+			validation_code_hash,
+		}
+	}
+
 	pub fn new_v3(
 		para_id: Id,
 		relay_parent: H,
@@ -3369,8 +3472,8 @@ pub mod tests {
 		assert_eq!(desc.version_old_rules(), CandidateDescriptorVersion::V1);
 		assert!(desc.check_version_consistency());
 
-		assert!(desc.check_version_acceptance(false).is_ok());
-		assert!(desc.check_version_acceptance(true).is_ok());
+		assert!(desc.check_version_acceptance(false, false).is_ok());
+		assert!(desc.check_version_acceptance(true, false).is_ok());
 	}
 
 	#[test]
@@ -3382,8 +3485,8 @@ pub mod tests {
 		assert_eq!(desc.version_old_rules(), CandidateDescriptorVersion::V2);
 		assert!(desc.check_version_consistency());
 
-		assert!(desc.check_version_acceptance(false).is_ok());
-		assert!(desc.check_version_acceptance(true).is_ok());
+		assert!(desc.check_version_acceptance(false, false).is_ok());
+		assert!(desc.check_version_acceptance(true, false).is_ok());
 	}
 
 	#[test]
@@ -3395,7 +3498,7 @@ pub mod tests {
 		assert_eq!(desc.version_old_rules(), CandidateDescriptorVersion::V1);
 		assert!(!desc.check_version_consistency());
 
-		assert!(desc.check_version_acceptance(true).is_ok());
+		assert!(desc.check_version_acceptance(true, false).is_ok());
 	}
 
 	#[test]
@@ -3407,7 +3510,7 @@ pub mod tests {
 
 		assert_eq!(desc.version(), CandidateDescriptorVersion::V3);
 		assert_eq!(
-			desc.check_version_acceptance(false),
+			desc.check_version_acceptance(false, false),
 			Err(CandidateDescriptorVersionCheckError::Inconsistency)
 		);
 	}
@@ -3425,11 +3528,11 @@ pub mod tests {
 
 		// Rejected regardless of v3_enabled.
 		assert_eq!(
-			desc.check_version_acceptance(false),
+			desc.check_version_acceptance(false, false),
 			Err(CandidateDescriptorVersionCheckError::Inconsistency)
 		);
 		assert_eq!(
-			desc.check_version_acceptance(true),
+			desc.check_version_acceptance(true, false),
 			Err(CandidateDescriptorVersionCheckError::Inconsistency)
 		);
 	}
@@ -3444,7 +3547,7 @@ pub mod tests {
 		assert_eq!(desc.version_old_rules(), CandidateDescriptorVersion::V1);
 		assert!(!desc.check_version_consistency());
 		// Accepted when V3 is enabled.
-		assert!(desc.check_version_acceptance(true).is_ok());
+		assert!(desc.check_version_acceptance(true, false).is_ok());
 	}
 
 	#[test]
@@ -3492,11 +3595,11 @@ pub mod tests {
 		assert!(!desc.check_version_consistency());
 
 		assert_eq!(
-			desc.check_version_acceptance(false),
+			desc.check_version_acceptance(false, false),
 			Err(CandidateDescriptorVersionCheckError::Inconsistency)
 		);
 		assert_eq!(
-			desc.check_version_acceptance(true),
+			desc.check_version_acceptance(true, false),
 			Err(CandidateDescriptorVersionCheckError::Inconsistency)
 		);
 	}

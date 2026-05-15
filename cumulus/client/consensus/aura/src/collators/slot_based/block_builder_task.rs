@@ -119,6 +119,8 @@ pub struct BuilderTaskParams<
 	/// The maximum percentage of the maximum PoV size that the collator can use.
 	/// It will be removed once https://github.com/paritytech/polkadot-sdk/issues/6020 is fixed.
 	pub max_pov_percentage: Option<u32>,
+	/// Off-chain sender chains to pull speculative message batches from.
+	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Run block-builder.
@@ -126,7 +128,7 @@ pub fn run_block_builder<Block, P, BI, CIDP, Client, Backend, RelayClient, CHP, 
 	params: BuilderTaskParams<Block, BI, CIDP, Client, Backend, RelayClient, CHP, Proposer, CS>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ UsageProvider<Block>
 		+ BlockOf
@@ -141,7 +143,9 @@ where
 		+ AuraUnincludedSegmentApi<Block>
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
-		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>,
+		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RelayClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -172,6 +176,7 @@ where
 			para_backend,
 			slot_offset,
 			max_pov_percentage,
+			speculative_sources,
 		} = params;
 
 		let mut slot_timer = SlotTimer::new_with_offset(slot_offset, relay_chain_slot_duration);
@@ -467,6 +472,7 @@ where
 					relay_slot,
 					para_slot: para_slot.slot,
 					para_client: &*para_client,
+					speculative_sources: &speculative_sources,
 				})
 				.await
 				{
@@ -526,6 +532,7 @@ struct BuildCollationParams<
 	relay_slot: cumulus_primitives_aura::Slot,
 	para_slot: cumulus_primitives_aura::Slot,
 	para_client: &'a Client,
+	speculative_sources: &'a crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Build a collation for one core.
@@ -568,9 +575,11 @@ async fn build_collation_for_core<
 		relay_slot,
 		para_slot,
 		para_client,
+		speculative_sources,
 	}: BuildCollationParams<'_, Block, P, RelayClient, BI, CIDP, Proposer, CS, CHP, Client>,
 ) -> Result<Option<Block::Header>, ()>
 where
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	RelayClient: RelayChainInterface + 'static,
 	P: Pair,
 	P::Public: AppPublic + Member + Codec,
@@ -581,10 +590,12 @@ where
 	Proposer: Environment<Block> + Send + Sync + 'static,
 	CS: CollatorServiceInterface<Block> + Send + Sync + 'static,
 	CHP: consensus_common::ValidationCodeHashProvider<Block::Hash> + Send + Sync + 'static,
-	Client: ProvideRuntimeApi<Block>,
+	Client: ProvideRuntimeApi<Block> + UsageProvider<Block>,
 	Client::Api: AuraUnincludedSegmentApi<Block>
 		+ ApiExt<Block>
-		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>,
+		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 {
 	let core_start = Instant::now();
 
@@ -662,6 +673,14 @@ where
 		let relay_proof_request =
 			crate::collators::get_relay_proof_request::<Block, Client>(para_client, parent_hash);
 
+		let speculative_ingress = crate::collators::fetch_ingress_for_block(
+			para_client,
+			parent_hash,
+			para_id,
+			speculative_sources,
+			validation_data.relay_parent_number,
+		);
+
 		let (parachain_inherent_data, other_inherent_data) = match collator
 			.create_inherent_data_with_rp_offset(
 				relay_parent_hash,
@@ -671,7 +690,7 @@ where
 				Some(relay_parent_data.clone()),
 				relay_proof_request,
 				collator_peer_id,
-				None, // TODO: Fetch speculative ingress off-chain
+				Some(speculative_ingress),
 			)
 			.await
 		{

@@ -743,6 +743,7 @@ where
 			spawner: task_manager.spawn_essential_handle(),
 			export_pov: node_extra_args.export_pov,
 			max_pov_percentage: node_extra_args.max_pov_percentage,
+			speculative_sources: Default::default(),
 		};
 
 		let wait_client = client.clone();
@@ -894,6 +895,7 @@ where
 				authoring_duration: Duration::from_millis(2000),
 				reinitialize: false,
 				max_pov_percentage: node_extra_args.max_pov_percentage,
+				speculative_sources: Default::default(),
 			},
 		};
 

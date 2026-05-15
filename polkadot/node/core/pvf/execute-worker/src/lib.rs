@@ -242,9 +242,23 @@ pub fn worker_entrypoint(
 
 				let pov_size = raw_block_data.len() as u32;
 
+				let mut messaging_proofs = request.messaging_proofs.clone();
+				let mut block_data_bytes = raw_block_data.to_vec();
+
+				// Step 7: PVF decodes ParachainBlockDataV4 from the PoV.
+				// For V4 candidates, the PoV starts with SCALE-encoded messaging proofs,
+				// followed by the actual parachain block data.
+				if request.descriptor_version == CandidateDescriptorVersion::V4 {
+					let mut input = &raw_block_data[..];
+					if let Ok(proofs) = Vec::<LateBlockProof>::decode(&mut input) {
+						messaging_proofs = Some(proofs);
+						block_data_bytes = input.to_vec();
+					}
+				}
+
 				let params = ValidationParams {
 					parent_head: pvd.parent_head.clone(),
-					block_data: BlockData(raw_block_data.to_vec()),
+					block_data: BlockData(block_data_bytes),
 					relay_parent_number: pvd.relay_parent_number,
 					relay_parent_storage_root: pvd.relay_parent_storage_root,
 				};
@@ -258,7 +272,7 @@ pub fn worker_entrypoint(
 				// 3. The PVF will decode ValidationParams + optional extension as the entire input
 				let extension: TrailingOption<ValidationParamsExtension> =
 					match request.descriptor_version {
-						CandidateDescriptorVersion::V3 => {
+						CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 => {
 							// V3/V4 candidate - append extension with both parent hashes.
 							// TODO(speculative-messaging): Add V4-specific extension fields if needed.
 							TrailingOption(Some(ValidationParamsExtension::V3 {
@@ -287,7 +301,7 @@ pub fn worker_entrypoint(
 								&compiled_artifact_blob,
 								&executor_params,
 								&params,
-								request.messaging_proofs.clone(),
+								messaging_proofs,
 								execution_timeout,
 								execute_thread_stack_size,
 								worker_info,
@@ -304,7 +318,7 @@ pub fn worker_entrypoint(
 								&compiled_artifact_blob,
 								&executor_params,
 								&params,
-								request.messaging_proofs.clone(),
+								messaging_proofs,
 								execution_timeout,
 								execute_thread_stack_size,
 								worker_info,
@@ -320,7 +334,7 @@ pub fn worker_entrypoint(
 							&compiled_artifact_blob,
 							&executor_params,
 							&params,
-							request.messaging_proofs.clone(),
+							messaging_proofs,
 							execution_timeout,
 							execute_thread_stack_size,
 							worker_info,

@@ -109,6 +109,8 @@ pub struct Params<BI, CIDP, Client, Backend, RClient, CHP, ProposerFactory, CS> 
 	/// The maximum percentage of the maximum PoV size that the collator can use.
 	/// It will be removed once <https://github.com/paritytech/polkadot-sdk/issues/6020> is fixed.
 	pub max_pov_percentage: Option<u32>,
+	/// Off-chain sender chains to pull speculative message batches from.
+	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Get the current parachain slot from a given block hash.
@@ -160,19 +162,22 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS>(
 	params: Params<BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
 		+ HeaderBackend<Block>
 		+ BlockBackend<Block>
+		+ sc_client_api::UsageProvider<Block>
 		+ Send
 		+ Sync
 		+ 'static,
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -214,19 +219,22 @@ pub fn run_with_export<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Propos
 	>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
 		+ HeaderBackend<Block>
 		+ BlockBackend<Block>
+		+ sc_client_api::UsageProvider<Block>
 		+ Send
 		+ Sync
 		+ 'static,
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -272,9 +280,10 @@ where
 				para_id: params.para_id,
 				proposer: params.proposer,
 				collator_service: params.collator_service,
+				speculative_sources: params.speculative_sources,
 			};
 
-			collator_util::Collator::<Block, P, _, _, _, _, _>::new(params)
+			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
 		};
 
 		let mut connection_helper = BackingGroupConnectionHelper::new(
@@ -433,6 +442,14 @@ where
 				let relay_proof_request =
 					super::get_relay_proof_request(&*params.para_client, parent_hash);
 
+				let speculative_ingress = crate::collators::fetch_ingress_for_block(
+					&*params.para_client,
+					parent_hash,
+					params.para_id,
+					&params.speculative_sources,
+					validation_data.relay_parent_number,
+				);
+
 				let (parachain_inherent_data, other_inherent_data) = match collator
 					.create_inherent_data(
 						relay_parent,
@@ -441,7 +458,7 @@ where
 						slot_claim.timestamp(),
 						relay_proof_request,
 						params.collator_peer_id,
-						None, // TODO: Fetch speculative ingress
+						Some(speculative_ingress),
 					)
 					.await
 				{

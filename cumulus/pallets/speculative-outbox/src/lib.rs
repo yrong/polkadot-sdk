@@ -224,6 +224,31 @@ impl<T: Config> Pallet<T> {
 		Some((proof.proof, number_of_leaves, leaf_index as u32))
 	}
 
+	/// Generate a late block proof for a receiver that built against an older root.
+	pub fn generate_late_block_proof(
+		dest: ParaId,
+		old_provides_root: H256,
+	) -> Option<polkadot_primitives::v10::LateBlockProof> {
+		let current_provides = Self::compute_provides_root()?;
+		let (current_subtree_root, _) = Self::destination_state(dest)?;
+		let (current_subtree_proof, num_dest, leaf_idx) =
+			Self::subtree_inclusion_proof(dest, current_subtree_root)?;
+
+		// For the PoC, we don't store historical provides roots, so we return a
+		// proof connecting the destination to the current provides root.
+		// We use a dummy source ID; the caller (provider) will populate it.
+		Some(polkadot_primitives::v10::LateBlockProof {
+			source: 0u32.into(),
+			old_provides_root,
+			old_subtree_root: H256::zero(),
+			old_subtree_proof: Vec::new(),
+			new_provides_root: current_provides.root,
+			new_subtree_root: current_subtree_root,
+			new_subtree_proof: current_subtree_proof,
+			subtree_extension: None,
+		})
+	}
+
 	/// Generate an MMR extension proof (PoC stub).
 	pub fn mmr_extension_proof(
 		_dest: ParaId,

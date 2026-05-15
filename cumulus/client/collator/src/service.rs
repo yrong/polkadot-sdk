@@ -20,8 +20,8 @@
 
 use cumulus_client_network::WaitToAnnounce;
 use cumulus_primitives_core::{
-	CollationInfo, CollectCollationInfo, ParachainBlockData, SpeculativeInboxApi,
-	SpeculativeOutboxApi,
+	CollationInfo, CollectCollationInfo, ParachainBlockData, ParachainBlockDataV4,
+	SpeculativeInboxApi, SpeculativeOutboxApi,
 };
 
 use polkadot_primitives::UMP_SEPARATOR;
@@ -71,6 +71,7 @@ pub trait ServiceInterface<Block: BlockT> {
 		parent_header: &Block::Header,
 		blocks: Vec<Block>,
 		proof: StorageProof,
+		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)>;
 
 	/// Inform networking systems that the block should be announced after a signal has
@@ -241,6 +242,7 @@ where
 		parent_header: &Block::Header,
 		blocks: Vec<Block>,
 		proof: StorageProof,
+		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		let compact_proof =
 			match proof.into_compact_proof::<HashingFor<Block>>(*parent_header.state_root()) {
@@ -323,19 +325,21 @@ where
 		let block_data = ParachainBlockData::<Block>::new(blocks, compact_proof);
 
 		let pov = polkadot_node_primitives::maybe_compress_pov(PoV {
-			block_data: BlockData(if api_version >= 3 {
+			block_data: BlockData(if !late_block_proofs.is_empty() {
+				ParachainBlockDataV4::new(block_data.clone(), late_block_proofs).encode()
+			} else if api_version >= 3 {
 				block_data.encode()
 			} else {
-				let block_data = block_data.as_v0();
+				let block_data_v0 = block_data.as_v0();
 
-				if block_data.is_none() {
+				if block_data_v0.is_none() {
 					tracing::error!(
 						target: LOG_TARGET,
 						"Trying to submit a collation with multiple blocks is not supported by the current runtime."
 					);
 				}
 
-				block_data?.encode()
+				block_data_v0?.encode()
 			}),
 		});
 
@@ -418,6 +422,7 @@ where
 			parent_header,
 			vec![candidate.block],
 			candidate.proof,
+			candidate.late_block_proofs,
 		)
 	}
 
@@ -437,7 +442,8 @@ where
 		parent_header: &<Block as BlockT>::Header,
 		blocks: Vec<Block>,
 		proof: StorageProof,
+		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
-		CollatorService::build_multi_block_collation(self, parent_header, blocks, proof)
+		CollatorService::build_multi_block_collation(self, parent_header, blocks, proof, late_block_proofs)
 	}
 }

@@ -33,7 +33,7 @@ pub const REF_TIME_PER_CORE_IN_SECS: u64 = 2;
 
 pub mod parachain_block_data;
 
-pub use parachain_block_data::ParachainBlockData;
+pub use parachain_block_data::{ParachainBlockData, ParachainBlockDataV4};
 pub use polkadot_core_primitives::InboundDownwardMessage;
 pub use polkadot_parachain_primitives::primitives::{
 	DmpMessageHandler, Id as ParaId, IsSystem, UpwardMessage, ValidationParams, XcmpMessageFormat,
@@ -691,6 +691,12 @@ sp_api::decl_runtime_apis! {
 			dest: ParaId,
 			subtree_root: polkadot_primitives::Hash,
 		) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)>;
+
+		/// Generate a late block proof for a receiver that built against an older root.
+		fn generate_late_block_proof(
+			dest: ParaId,
+			old_provides_root: polkadot_primitives::Hash,
+		) -> Option<polkadot_primitives::v10::LateBlockProof>;
 	}
 
 	/// API for the speculative messaging inbox (receiver side).
@@ -699,5 +705,8 @@ sp_api::decl_runtime_apis! {
 	pub trait SpeculativeInboxApi {
 		/// Get the requires commitments for this block.
 		fn requires_commitments() -> Vec<polkadot_primitives::v10::RequiresCommitment>;
+
+		/// Next expected message position from `source` for speculative ingress fetch.
+		fn next_expected_message_position(source: ParaId) -> u64;
 	}
 }

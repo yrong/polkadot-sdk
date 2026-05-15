@@ -4542,6 +4542,7 @@ mod sanitizers {
 						BTreeSet::new(),
 						scheduled,
 						false,
+						false,
 					),
 					expected_backed_candidates_with_core,
 				);
@@ -4566,6 +4567,7 @@ mod sanitizers {
 						BTreeSet::new(),
 						scheduled,
 						v2_descriptor,
+						false,
 					),
 					expected_backed_candidates_with_core,
 				);
@@ -4587,6 +4589,7 @@ mod sanitizers {
 						&shared::AllowedSchedulingParents::<Test>::get(),
 						BTreeSet::new(),
 						scheduled,
+						false,
 						false,
 					),
 					expected_backed_candidates_with_core
@@ -4617,6 +4620,7 @@ mod sanitizers {
 						&shared::AllowedSchedulingParents::<Test>::get(),
 						BTreeSet::new(),
 						scheduled,
+						false,
 						false,
 					),
 					expected_backed_candidates_with_core
@@ -4657,6 +4661,7 @@ mod sanitizers {
 					&shared::AllowedSchedulingParents::<Test>::get(),
 					BTreeSet::new(),
 					scheduled,
+					false,
 					false,
 				);
 
@@ -4724,6 +4729,7 @@ mod sanitizers {
 					BTreeSet::new(),
 					scheduled,
 					false,
+					false,
 				);
 
 				assert_eq!(res.len(), 1);
@@ -4755,6 +4761,7 @@ mod sanitizers {
 					BTreeSet::new(),
 					scheduled,
 					v2_descriptor,
+					false,
 				);
 
 				assert!(sanitized_backed_candidates.is_empty());
@@ -4786,6 +4793,7 @@ mod sanitizers {
 					&shared::AllowedSchedulingParents::<Test>::get(),
 					set,
 					scheduled,
+					false,
 					false,
 				);
 
@@ -4826,6 +4834,7 @@ mod sanitizers {
 					invalid_set,
 					scheduled,
 					v2_descriptor,
+					false,
 				);
 
 				// We'll be left with candidates from paraid 2 and 4.
@@ -4862,6 +4871,7 @@ mod sanitizers {
 					invalid_set,
 					scheduled,
 					v2_descriptor,
+					false,
 				);
 
 				// Only the second candidate of paraid 1 should be removed.

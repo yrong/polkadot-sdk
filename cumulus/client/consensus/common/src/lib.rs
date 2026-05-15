@@ -67,6 +67,8 @@ pub struct ParachainCandidate<B> {
 	pub block: B,
 	/// The proof that was recorded while building the block.
 	pub proof: sp_trie::StorageProof,
+	/// Late block proofs for speculative messaging requirements (v10+).
+	pub late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
 }
 
 /// Parachain specific block import.

@@ -372,7 +372,10 @@ pub mod pallet {
 		_,
 		Twox64Concat,
 		polkadot_primitives::CandidateHash,
-		(polkadot_primitives::Hash, Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>),
+		(
+			Option<polkadot_primitives::Hash>,
+			Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
+		),
 	>;
 
 	#[pallet::call]
@@ -584,16 +587,10 @@ impl<T: Config> Pallet<T> {
 									Self::peek_pending_speculative(
 										&candidate.hash,
 									) {
-									for (source, expected_root) in requires {
-										if Self::provides_root(
-											&source,
-										) != Some(expected_root)
-										{
-											// Requirement not satisfied. We cannot enact this
-											// candidate or any of its descendants in this block.
-											can_enact = false;
-											break
-										}
+									if !Self::requires_satisfied(&requires) {
+										// Requirement not satisfied. We cannot enact this
+										// candidate or any of its descendants in this block.
+										can_enact = false;
 									}
 								}
 							}
@@ -611,15 +608,13 @@ impl<T: Config> Pallet<T> {
 						for candidate in evicted_candidates {
 							freed_cores.push((candidate.core, candidate.hash));
 
-							// Speculative messaging: update provides root.
+							// Speculative messaging: update provides root (senders only).
 							if let Some((provides_root, _)) =
-								Self::take_pending_speculative(
-									&candidate.hash,
-								) {
-								Self::update_provides_root(
-									paraid,
-									provides_root,
-								);
+								Self::take_pending_speculative(&candidate.hash)
+							{
+								if let Some(root) = provides_root {
+									Self::update_provides_root(paraid, root);
+								}
 							}
 
 							let receipt = CommittedCandidateReceipt {
@@ -653,7 +648,7 @@ impl<T: Config> Pallet<T> {
 
 				// Also clean up any speculative data for cores that timed out or were disputed.
 				for (_, candidate_hash) in &freed_cores {
-				Self::take_pending_speculative(candidate_hash);
+					Self::cleanup_speculative(candidate_hash);
 				}
 
 				// For relay chain blocks, we're (ab)using the proof size
@@ -764,6 +759,17 @@ impl<T: Config> Pallet<T> {
 						backed_in_number: now,
 						backing_group: group_idx,
 					};
+
+					// Speculative Messaging (Phase 1 PoC): store provides/requires for enactment.
+					if let Some(speculative) = new_candidate.commitments.speculative.0.as_ref() {
+						if speculative.provides.is_some() || !speculative.requires.is_empty() {
+							Self::store_pending_speculative(
+								candidate_hash,
+								speculative.provides,
+								speculative.requires.clone(),
+							);
+						}
+					}
 
 					if let Some(pending_availability) = pending_availability {
 						pending_availability.push_back(new_candidate);
@@ -905,6 +911,15 @@ impl<T: Config> Pallet<T> {
 		ProvidesRoots::<T>::get(para_id)
 	}
 
+	/// Returns true when every requirement matches the persisted provides root.
+	pub(crate) fn requires_satisfied(
+		requires: &[(polkadot_primitives::Id, polkadot_primitives::Hash)],
+	) -> bool {
+		requires.iter().all(|(source, expected_root)| {
+			Self::provides_root(source) == Some(*expected_root)
+		})
+	}
+
 	/// Update the provides root after a candidate is enacted.
 	pub(crate) fn update_provides_root(
 		para_id: polkadot_primitives::Id,
@@ -917,7 +932,7 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn peek_pending_speculative(
 		candidate_hash: &polkadot_primitives::CandidateHash,
 	) -> Option<(
-		polkadot_primitives::Hash,
+		Option<polkadot_primitives::Hash>,
 		Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
 	)> {
 		PendingSpeculativeData::<T>::get(candidate_hash)
@@ -927,10 +942,24 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn take_pending_speculative(
 		candidate_hash: &polkadot_primitives::CandidateHash,
 	) -> Option<(
-		polkadot_primitives::Hash,
+		Option<polkadot_primitives::Hash>,
 		Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
 	)> {
 		PendingSpeculativeData::<T>::take(candidate_hash)
+	}
+
+	/// Store speculative data for a candidate entering `PendingAvailability`.
+	pub(crate) fn store_pending_speculative(
+		candidate_hash: polkadot_primitives::CandidateHash,
+		provides_root: Option<polkadot_primitives::Hash>,
+		requires: Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
+	) {
+		PendingSpeculativeData::<T>::insert(candidate_hash, (provides_root, requires));
+	}
+
+	/// Cleanup speculative data for a candidate that was dropped.
+	pub(crate) fn cleanup_speculative(candidate_hash: &polkadot_primitives::CandidateHash) {
+		PendingSpeculativeData::<T>::remove(candidate_hash);
 	}
 	fn enact_candidate(
 		relay_parent_number: BlockNumberFor<T>,
@@ -1164,6 +1193,10 @@ impl<T: Config> Pallet<T> {
 			for (index, candidate) in pending_candidates.iter().enumerate() {
 				if pred(candidate) {
 					earliest_dropped_idx = Some(index);
+					// Cleanup speculative messaging data for all dropped candidates.
+					for dropped in pending_candidates.iter().skip(index) {
+						Self::cleanup_speculative(&dropped.hash);
+					}
 					// Since we're looping the candidates in dependency order, we've found the
 					// earliest failed index for this paraid.
 					break;

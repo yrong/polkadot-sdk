@@ -107,8 +107,8 @@ use polkadot_node_subsystem_util::{
 };
 use polkadot_parachain_primitives::primitives::IsSystem;
 use polkadot_primitives::{
-	node_features::FeatureIndex, BackedCandidate, CandidateCommitments, CandidateHash,
-	CandidateReceiptV2 as CandidateReceipt,
+	node_features::FeatureIndex, BackedCandidate, CandidateCommitments, CandidateCommitmentsV10,
+	CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex,
 	GroupRotationInfo, Hash, Id as ParaId, IndexedVec, NodeFeatures, PersistedValidationData,
 	SessionIndex, SigningContext, ValidationCode, ValidatorId, ValidatorIndex, ValidatorSignature,
@@ -423,6 +423,9 @@ struct State {
 	/// and dispute validation use active leaves instead, so they always transition
 	/// *before* backing does — the safe direction.
 	v3_ever_seen: bool,
+	/// Monotonic flag for speculative messaging: set to `true` once a **finalized**
+	/// block is observed whose session has the `SpeculativeMessaging` node feature.
+	speculative_ever_seen: bool,
 }
 
 impl State {
@@ -438,6 +441,7 @@ impl State {
 			background_validation_tx,
 			keystore,
 			v3_ever_seen: false,
+			speculative_ever_seen: false,
 		}
 	}
 }
@@ -756,7 +760,7 @@ async fn request_candidate_validation(
 
 struct BackgroundValidationOutputs {
 	candidate: CandidateReceipt,
-	commitments: CandidateCommitments,
+	commitments: CandidateCommitmentsV10,
 	persisted_validation_data: PersistedValidationData,
 }
 
@@ -1067,6 +1071,16 @@ async fn check_v3_on_finalized<Context>(
 		 enabling V3 candidate support",
 		);
 		state.v3_ever_seen = true;
+	}
+
+	if FeatureIndex::SpeculativeMessaging.is_set(&node_features) {
+		gum::info!(
+			target: LOG_TARGET,
+			?session_index,
+			"SpeculativeMessaging node feature detected in finalized block, \
+		 enabling V4 candidate support",
+		);
+		state.speculative_ever_seen = true;
 	}
 
 	Ok(())
@@ -1407,7 +1421,7 @@ async fn handle_validated_candidate_command<Context>(
 
 						let receipt = CommittedCandidateReceipt {
 							descriptor: candidate.descriptor.clone(),
-							commitments,
+							commitments: commitments.into(),
 						};
 
 						let hypothetical_candidate = HypotheticalCandidate::Complete {
@@ -1891,7 +1905,7 @@ async fn maybe_validate_and_import<Context>(
 
 	// Version consistency + V3 gating for Seconded statements (shared logic).
 	if let StatementWithPVD::Seconded(receipt, _) = statement.payload() {
-		if let Err(reason) = receipt.descriptor.check_version_acceptance(state.v3_ever_seen) {
+		if let Err(reason) = receipt.descriptor.check_version_acceptance(state.v3_ever_seen, state.speculative_ever_seen) {
 			gum::debug!(
 				target: LOG_TARGET,
 				?scheduling_parent,
@@ -2060,7 +2074,7 @@ async fn handle_second_message<Context>(
 	}
 
 	// Version consistency + V3 gating (shared logic from primitives).
-	if let Err(reason) = candidate.descriptor().check_version_acceptance(state.v3_ever_seen) {
+	if let Err(reason) = candidate.descriptor().check_version_acceptance(state.v3_ever_seen, state.speculative_ever_seen) {
 		gum::debug!(
 			target: LOG_TARGET,
 			?candidate_hash,

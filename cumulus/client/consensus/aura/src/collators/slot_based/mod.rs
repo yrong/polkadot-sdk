@@ -153,13 +153,15 @@ pub struct Params<Block, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, 
 	/// The maximum percentage of the maximum PoV size that the collator can use.
 	/// It will be removed once <https://github.com/paritytech/polkadot-sdk/issues/6020> is fixed.
 	pub max_pov_percentage: Option<u32>,
+	/// Off-chain sender chains to pull speculative message batches from.
+	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Run aura-based block building and collation task.
 pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spawner>(
 	params: Params<Block, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spawner>,
 ) where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
@@ -175,7 +177,9 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spaw
 		+ RelayParentOffsetApi<Block>
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -209,6 +213,7 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spaw
 		export_pov,
 		relay_chain_slot_duration,
 		max_pov_percentage,
+		speculative_sources,
 	} = params;
 
 	// Initialize proof size recording cleanup
@@ -244,6 +249,7 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spaw
 		relay_chain_slot_duration,
 		slot_offset,
 		max_pov_percentage,
+		speculative_sources,
 	};
 
 	let block_builder_fut =
