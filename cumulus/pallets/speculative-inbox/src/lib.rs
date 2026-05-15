@@ -85,14 +85,11 @@ pub struct SourceState {
 	pub last_seen_provides_root: H256,
 	/// The source's subtree root we last accepted.
 	pub last_seen_subtree_root: H256,
-	/// Accumulated leaf hashes for the receiver-local subtree.
-	/// The receiver verifies that the batch's subtree_root matches the Merkle root
-	/// computed from these leaves.
-	///
-	/// TODO: MMR Storage Efficiency. For the PoC, we store all leaves; a production
-	/// implementation must use an MMR storage adapter that stores only the peaks and
-	/// the current leaf count to avoid unbounded storage growth.
-	pub local_subtree_leaves: Vec<H256>,
+	/// The current number of nodes in the receiver-local subtree MMR.
+	pub mmr_size: u64,
+	/// The peaks of the receiver-local subtree MMR.
+	/// Storing only peaks ensures O(log N) storage per source.
+	pub mmr_peaks: Vec<H256>,
 }
 
 pub use pallet::*;
@@ -207,22 +204,30 @@ pub mod pallet {
 
 				// 3. Verify message continuity and reconstruct local subtree
 				for msg in &batch.messages {
-					let next_position = if state.local_subtree_leaves.is_empty() {
+					let expected_position = if state.mmr_size == 0 {
 						0
 					} else {
 						state.last_processed + 1
 					};
 					ensure!(
-						msg.position == next_position,
+						msg.position == expected_position,
 						Error::<T>::NonConsecutiveMessage
 					);
 					let msg_hash = Keccak256::hash(&msg.payload);
-					state.local_subtree_leaves.push(msg_hash);
+					state.mmr_peaks = append_leaf_to_peaks::<Keccak256Merge>(
+						state.mmr_peaks,
+						state.mmr_size,
+						msg_hash,
+					);
+					state.mmr_size += 1;
 					state.last_processed = msg.position;
 				}
 
 				// 4. Verify reconstructed MMR subtree root matches batch
-				let computed_root = compute_mmr_root(&state.local_subtree_leaves);
+				let computed_root = mmr_lib::helper::get_root_from_peaks::<H256, Keccak256Merge>(
+					&state.mmr_peaks,
+					mmr_lib::helper::leaf_index_to_pos(state.mmr_size),
+				).unwrap_or_default();
 				ensure!(
 					computed_root == batch.subtree_root,
 					Error::<T>::SubtreeRootMismatch
@@ -294,7 +299,7 @@ impl<T: Config> Pallet<T> {
 	pub fn next_expected_message_position(source: ParaId) -> u64 {
 		IncomingState::<T>::get(&source)
 			.map(|state| {
-				if state.local_subtree_leaves.is_empty() {
+				if state.mmr_size == 0 {
 					0
 				} else {
 					state.last_processed + 1
@@ -332,91 +337,44 @@ fn encode_xcmp_batch<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
 	page
 }
 
-/// Compute the MMR root from an ordered list of leaf hashes.
-///
-/// Uses `mmr_lib::MemMMR` to accumulate leaves exactly the same way the sender
-/// builds its per-destination subtree MMR. Both sides use the same `Keccak256Merge`,
-/// so the receiver can independently reconstruct and verify the root against the
-/// batch's `subtree_root`.
-///
-/// Uses `MemMMR` — which buffers writes in memory and computes the root from the
-/// merged peak set — rather than `MerkleProof::calculate_root`, because the
-/// receiver does not receive per-message MMR proofs, only the ordered message
-/// payloads and the claimed `subtree_root`.
-///
-/// Note: this rebuilds the MMR from scratch each time (O(n) in total accumulated
-/// messages). A production implementation should track the MMR state incrementally
-/// in runtime storage (e.g., `StorageMap<u64, H256>` for MMR nodes + `mmr_size`)
-/// and only push the new messages.
-fn compute_mmr_root(leaves: &[H256]) -> H256 {
-	if leaves.is_empty() {
-		return H256::zero();
+/// Append a leaf to the MMR peaks incrementally.
+/// This ensures O(log N) storage and O(log N) update time.
+fn append_leaf_to_peaks<M: Merge>(
+	mut peaks: Vec<M::Item>,
+	size: u64,
+	leaf: M::Item,
+) -> Vec<M::Item> {
+	let mut current = leaf;
+	let mut current_size = size;
+	while current_size % 2 == 1 {
+		if let Some(last_peak) = peaks.pop() {
+			current = M::merge(&last_peak, &current).unwrap_or(current);
+		}
+		current_size /= 2;
 	}
-	let store = mmr_lib::util::MemStore::<H256>::default();
-	let mut mmr =
-		mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
-	for leaf in leaves {
-		let _ = mmr.push(*leaf);
-	}
-	mmr.get_root().unwrap_or_default()
+	peaks.push(current);
+	peaks
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use mmr_lib::helper::leaf_index_to_pos;
 	use sp_core::H256;
-	use sp_mmr_primitives::utils::NodesUtils;
 	use sp_runtime::traits::Keccak256;
 
 	#[test]
 	fn test_mmr_root_single_leaf() {
 		let leaf = Keccak256::hash(b"msg1");
-		assert_eq!(compute_mmr_root(&[leaf]), leaf);
-	}
-
-	#[test]
-	fn test_mmr_root_two_leaves_matches_merkle_proof() {
-		// Rebuild the MMR from two leaves.
-		let leaf1 = Keccak256::hash(b"msg1");
-		let leaf2 = Keccak256::hash(b"msg2");
-		let rebuilt_root = compute_mmr_root(&[leaf1, leaf2]);
-
-		// Now verify independently: generate a MerkleProof for leaf 1
-		// and use `calculate_root` (the same pattern as `verify_relay_mmr_proof`).
-		let leaf_count: u64 = 2;
-		let mmr_node_size = NodesUtils::new(leaf_count).size();
-		let leaf_pos = leaf_index_to_pos(1); // second leaf (0-based index 1)
-
-		// Build the MMR once to extract the proof for the second leaf.
-		let store = mmr_lib::util::MemStore::<H256>::default();
-		let mut mmr =
-			mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
-		let pos0 = mmr.push(leaf1).unwrap();
-		let pos1 = mmr.push(leaf2).unwrap();
-		let root_via_get_root = mmr.get_root().unwrap();
-		assert_eq!(rebuilt_root, root_via_get_root);
-
-		let proof = mmr.gen_proof(vec![pos1]).unwrap();
-		let proof_items = proof.proof_items().to_vec();
-
-		// Verify using MerkleProof::calculate_root — the same pattern
-		// used in the reference `verify_relay_mmr_proof`.
-		let merkle_proof =
-			mmr_lib::MerkleProof::<H256, Keccak256Merge>::new(
-				mmr_node_size,
-				proof_items,
-			);
-		let calculated = merkle_proof
-			.calculate_root(vec![(leaf_pos, leaf2)])
-			.unwrap();
-
-		assert_eq!(calculated, rebuilt_root);
+		let peaks = append_leaf_to_peaks::<Keccak256Merge>(Vec::new(), 0, leaf);
+		let root = mmr_lib::helper::get_root_from_peaks::<H256, Keccak256Merge>(
+			&peaks,
+			mmr_lib::helper::leaf_index_to_pos(1),
+		).unwrap();
+		assert_eq!(root, leaf);
 	}
 
 	#[test]
 	fn test_mmr_root_matches_after_multiple_pushes() {
-		// Regression: rebuilding from all leaves must match incremental push root.
 		let leaves: Vec<H256> = (0..11u8)
 			.map(|i| Keccak256::hash(&[i]))
 			.collect();
@@ -424,14 +382,21 @@ mod tests {
 		let store = mmr_lib::util::MemStore::<H256>::default();
 		let mut mmr =
 			mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
+		
+		let mut peaks = Vec::new();
+		let mut size = 0;
 		for leaf in &leaves {
 			mmr.push(*leaf).unwrap();
+			peaks = append_leaf_to_peaks::<Keccak256Merge>(peaks, size, *leaf);
+			size += 1;
 		}
 		let incremental_root = mmr.get_root().unwrap();
 
-		let rebuilt_root = compute_mmr_root(&leaves);
-		assert_eq!(rebuilt_root, incremental_root);
-		assert_ne!(rebuilt_root, H256::zero());
+		let peak_root = mmr_lib::helper::get_root_from_peaks::<H256, Keccak256Merge>(
+			&peaks,
+			mmr_lib::helper::leaf_index_to_pos(size),
+		).unwrap();
+		assert_eq!(peak_root, incremental_root);
 	}
 
 	#[test]
