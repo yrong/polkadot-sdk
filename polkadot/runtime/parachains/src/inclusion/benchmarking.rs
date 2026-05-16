@@ -80,7 +80,7 @@ fn create_candidate_commitments<T: crate::hrmp::pallet::Config>(
 		head_data,
 		processed_downward_messages: 0,
 		hrmp_watermark: 10,
-		speculative: None,
+		provides: None, requires: vec![],
 	}
 }
 

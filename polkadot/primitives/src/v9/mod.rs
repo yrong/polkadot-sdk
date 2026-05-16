@@ -546,6 +546,26 @@ impl<H: Encode, N: Encode> PersistedValidationData<H, N> {
 	}
 }
 
+/// A commitment that a parachain provides a set of outbound speculative messages.
+/// The root is the top-level Merkle root over all per-destination MMR roots.
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
+#[cfg_attr(feature = "std", derive(Hash))]
+pub struct ProvidesCommitment {
+	/// Top-level Merkle root over all per-destination MMR roots.
+	pub root: Hash,
+}
+
+/// A commitment that a parachain requires messages from a source parachain.
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
+#[cfg_attr(feature = "std", derive(Hash))]
+pub struct RequiresCommitment {
+	/// The source parachain whose provides root we expect.
+	pub source: Id,
+	/// The provides root we built against (the source chain's top-level root at the
+	/// block from which we received messages).
+	pub expected_root: Hash,
+}
+
 /// Commitments made in a `CandidateReceipt`. Many of these are outputs of validation.
 #[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
 #[cfg_attr(feature = "std", derive(Default, Hash))]
@@ -563,35 +583,10 @@ pub struct CandidateCommitments<N = BlockNumber> {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: N,
-	/// Speculative messaging data (v10+).
-	/// Uses standard `Option` so that `CandidateCommitments` can be safely embedded in
-	/// other SCALE structs (e.g. `CandidatePendingAvailability`). `TrailingOption` would
-	/// greedily consume bytes belonging to subsequent fields.
-	pub speculative: Option<SpeculativeCommitments>,
-}
-
-/// Speculative messaging commitments (v10+).
-#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
-#[cfg_attr(feature = "std", derive(Default, Hash))]
-pub struct SpeculativeCommitments {
-	/// The provides root (top-level Merkle tree over per-destination MMR roots).
-	pub provides: Option<Hash>,
-	/// The requires commitments (source parachain -> expected provides root).
-	pub requires: Vec<(Id, Hash)>,
-}
-
-impl SpeculativeCommitments {
-	/// Build speculative commitments from PVF outputs, if any.
-	pub fn from_pvf_parts(
-		provides_root: Option<Hash>,
-		requires: Vec<(Id, Hash)>,
-	) -> Option<Self> {
-		if provides_root.is_some() || !requires.is_empty() {
-			Some(Self { provides: provides_root, requires })
-		} else {
-			None
-		}
-	}
+	/// The provides commitment for speculative messaging (None if no outbox state exists).
+	pub provides: Option<ProvidesCommitment>,
+	/// The requires commitments for speculative messaging, sorted by source ParaId.
+	pub requires: Vec<RequiresCommitment>,
 }
 
 impl CandidateCommitments {

@@ -30,9 +30,10 @@ pub use crate::v9::{
 	AccountId, AccountIndex, AccountPublic, Balance, BlakeTwo256, Block, BlockId, BlockNumber,
 	CandidateHash, ChainId, CollatorId, CollatorSignature, CoreIndex, DownwardMessage, Hash, HashT,
 	HeadData, Header, HorizontalMessages, HrmpChannelId, Id, Id as ParaId, InboundDownwardMessage,
-	InboundHrmpMessage, Moment, Nonce, OutboundHrmpMessage, Remark,
-	SessionIndex, Signature, Slot, UncheckedExtrinsic, UpwardMessage, UpwardMessages,
-	ValidationCode, ValidationCodeHash, ValidatorId, ValidatorSignature, LOWEST_PUBLIC_ID,
+	InboundHrmpMessage, Moment, Nonce, OutboundHrmpMessage, ProvidesCommitment, Remark,
+	RequiresCommitment, SessionIndex, Signature, Slot, UncheckedExtrinsic, UpwardMessage,
+	UpwardMessages, ValidationCode, ValidationCodeHash, ValidatorId, ValidatorSignature,
+	LOWEST_PUBLIC_ID,
 };
 
 // ── Speculative Messaging Types (v10 additions) ──
@@ -44,26 +45,6 @@ pub const SPECULATIVE_API_VERSION: u32 = 10;
 /// Maximum number of source parachains a receiver can consume from in one block.
 /// This bounds the size of `requires` in candidate commitments.
 pub const MAX_REQUIRES_PER_BLOCK: usize = 32;
-
-/// A commitment that a parachain provides a set of outbound messages.
-/// The root is the top-level Merkle root over all per-destination MMR roots.
-#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
-#[cfg_attr(feature = "std", derive(Hash))]
-pub struct ProvidesCommitment {
-	/// Top-level Merkle root over all per-destination MMR roots.
-	pub root: Hash,
-}
-
-/// A commitment that a parachain requires messages from a source parachain.
-#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
-#[cfg_attr(feature = "std", derive(Hash))]
-pub struct RequiresCommitment {
-	/// The source parachain whose provides root we expect.
-	pub source: ParaId,
-	/// The provides root we built against (the source chain's top-level root at the
-	/// block from which we received messages).
-	pub expected_root: Hash,
-}
 
 /// Deterministic ingress payload carried in the parachain block body.
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
@@ -156,86 +137,8 @@ pub struct MMRExtensionProof {
 // ── Extended Candidate Types for v10 ──
 
 /// Commitments made in a v10 candidate receipt.
-/// Extends v9 commitments with speculative messaging fields.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]
-#[cfg_attr(feature = "std", derive(Default, Hash))]
-pub struct CandidateCommitments<N = BlockNumber> {
-	/// Messages destined to be interpreted by the Relay chain itself.
-	pub upward_messages: UpwardMessages,
-	/// Horizontal messages sent by the parachain (HRMP, legacy).
-	pub horizontal_messages: HorizontalMessages,
-	/// New validation code.
-	pub new_validation_code: Option<ValidationCode>,
-	/// The head-data produced as a result of execution.
-	pub head_data: HeadData,
-	/// The number of messages processed from the DMQ.
-	pub processed_downward_messages: u32,
-	/// The mark which specifies the block number up to which all inbound HRMP messages are
-	/// processed.
-	pub hrmp_watermark: N,
-
-	// ── Speculative messaging fields ──
-	/// The provides commitment (None if no outbox state exists yet).
-	pub provides: Option<ProvidesCommitment>,
-	/// The requires commitments, sorted by source: ParaId, at most one per source.
-	pub requires: Vec<RequiresCommitment>,
-}
-
-impl CandidateCommitments {
-	/// Compute the blake2-256 hash of the commitments.
-	pub fn hash(&self) -> Hash {
-		BlakeTwo256::hash_of(self)
-	}
-}
-
-impl From<crate::v9::CandidateCommitments> for CandidateCommitments {
-	fn from(c: crate::v9::CandidateCommitments) -> Self {
-		let speculative = c.speculative;
-		Self {
-			head_data: c.head_data,
-			upward_messages: c.upward_messages,
-			horizontal_messages: c.horizontal_messages,
-			new_validation_code: c.new_validation_code,
-			processed_downward_messages: c.processed_downward_messages,
-			hrmp_watermark: c.hrmp_watermark,
-			provides: speculative
-				.as_ref()
-				.and_then(|s| s.provides.map(|root| ProvidesCommitment { root })),
-			requires: speculative.map_or(Vec::new(), |s| {
-				s.requires
-					.into_iter()
-					.map(|(source, expected_root)| RequiresCommitment { source, expected_root })
-					.collect()
-			}),
-		}
-	}
-}
-
-impl From<CandidateCommitments> for crate::v9::CandidateCommitments {
-	fn from(c: CandidateCommitments) -> Self {
-		let has_speculative = c.provides.is_some() || !c.requires.is_empty();
-		Self {
-			head_data: c.head_data,
-			upward_messages: c.upward_messages,
-			horizontal_messages: c.horizontal_messages,
-			new_validation_code: c.new_validation_code,
-			processed_downward_messages: c.processed_downward_messages,
-			hrmp_watermark: c.hrmp_watermark,
-			speculative: if has_speculative {
-				Some(crate::v9::SpeculativeCommitments {
-					provides: c.provides.map(|p| p.root),
-					requires: c
-						.requires
-						.into_iter()
-						.map(|r| (r.source, r.expected_root))
-						.collect(),
-				})
-			} else {
-				None
-			},
-		}
-	}
-}
+/// Re-uses v9 `CandidateCommitments` directly since v9 now has the speculative fields.
+pub use crate::v9::CandidateCommitments;
 
 /// The candidate descriptor version for speculative messaging.
 #[derive(PartialEq, Eq, Clone, Encode, Decode, DecodeWithMemTracking, TypeInfo, Debug)]

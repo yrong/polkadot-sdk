@@ -106,7 +106,7 @@ use polkadot_primitives::{
 	node_features::FeatureIndex,
 	transpose_claim_queue, CandidateCommitments, CandidateDescriptorV2,
 	CommittedCandidateReceiptV2, CoreIndex, Hash, Id as ParaId, OccupiedCoreAssumption,
-	PersistedValidationData, SessionIndex, SpeculativeCommitments,
+	PersistedValidationData, ProvidesCommitment, RequiresCommitment, SessionIndex,
 	TransposedClaimQueue, ValidationCodeHash,
 };
 use schnellru::{ByLength, LruMap};
@@ -618,15 +618,13 @@ async fn construct_and_distribute_receipt(
 
 	let erasure_root = erasure_root(n_validators, validation_data, pov.clone())?;
 
-	let speculative = SpeculativeCommitments::from_pvf_parts(
-		collation.provides.map(|p| p.root),
-		collation
-			.requires
-			.iter()
-			.map(|r| (r.source, r.expected_root))
-			.collect(),
-	);
-	let has_speculative = speculative.is_some();
+	let provides = collation.provides.map(|p| ProvidesCommitment { root: p.root });
+	let requires: Vec<RequiresCommitment> = collation
+		.requires
+		.into_iter()
+		.map(|r| RequiresCommitment { source: r.source, expected_root: r.expected_root })
+		.collect();
+	let has_speculative = provides.is_some() || !requires.is_empty();
 
 	let commitments = CandidateCommitments {
 		upward_messages: collation.upward_messages,
@@ -635,7 +633,8 @@ async fn construct_and_distribute_receipt(
 		head_data: collation.head_data,
 		processed_downward_messages: collation.processed_downward_messages,
 		hrmp_watermark: collation.hrmp_watermark,
-		speculative,
+		provides,
+		requires,
 	};
 
 	let node_features =
