@@ -287,7 +287,7 @@ impl<T: Config> Pallet<T> {
 		};
 
 		Some(polkadot_primitives::v10::LateBlockProof {
-			source: 0u32.into(), // Caller fills in the source para id.
+			source: dest,
 			number_of_destinations: num_dest,
 			leaf_index: leaf_idx,
 			old_provides_root,

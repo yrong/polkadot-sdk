@@ -196,12 +196,20 @@ should be read as **the next concrete speculative-capable descriptor/receipt
 version** — the important point is the **version-gated coexistence model**, not
 the literal version numeral.
 
-**Settled decision — new concrete version family.** Introduce a new
-descriptor/receipt version rather than evolving the existing V2 struct.
-Overloading the V2 reserved bytes with speculative fields risks
-backward-compatibility bugs where a non-speculative node parsing a speculative
-candidate silently misinterprets fields. Legacy candidates continue on the
-unchanged v9 path; v4 candidates use v10 types.
+**Implementation approach — version byte on existing V2 struct.** The POC reuses
+the existing `CandidateDescriptorV2` struct rather than introducing a new
+`CandidateDescriptorV4` type. The constructor `CandidateDescriptorV2::new_v4()`
+writes version byte `2` (the next available value in the reserved version field
+inside V2's layout), making `descriptor.version()` return
+`CandidateDescriptorVersion::V4`. Speculative field population is gated on
+`FeatureIndex::SpeculativeMessaging` being set in node features, checked in
+`collation-generation` and `candidate-validation`.
+
+This avoids updating every site that pattern-matches on descriptor versions and
+keeps the diff minimal. The version-byte mechanism inside `CandidateDescriptorV2`
+already handles multi-version coexistence via `descriptor.version()`. In
+production, a separate struct would provide better type safety; for the POC the
+version-byte approach is sufficient.
 
 Concretely, the intended behavior:
 
@@ -228,25 +236,9 @@ that touches commitments is version-aware:
 
 ```rust
 // In v10/mod.rs:
-pub struct CandidateDescriptorV4<N = BlockNumber> {
-    pub para_id: ParaId,
-    pub relay_parent: Hash,
-    // Phase 1 speculative messaging does not require LLv2 fields. If the
-    // implementation wants to stay strictly decoupled from LLv2, these can be
-    // omitted from the initial V4. If the team intentionally wants one shared
-    // descriptor upgrade path, they can be included as optional fields:
-    pub scheduling_parent: Option<Hash>,
-    pub scheduling_session_index: Option<SessionIndex>,
-    pub collator: CollatorId,
-    pub persisted_validation_data_hash: Hash,
-    pub pov_hash: Hash,
-    pub erasure_root: Hash,
-    pub para_head: Hash,
-    pub validation_code_hash: ValidationCodeHash,
-    pub signature: CollatorSignature,
-    pub core_index: CoreIndex,
-    pub session_index: SessionIndex,
-}
+// Note: the POC does NOT introduce a new CandidateDescriptorV4 struct. Instead,
+// CandidateDescriptorV2::new_v4() sets version byte 2, making version() return
+// CandidateDescriptorVersion::V4. The struct layout is unchanged.
 
 pub struct CandidateCommitments<N = BlockNumber> {
     pub upward_messages: UpwardMessages,
@@ -342,6 +334,13 @@ pub struct MessageBatch {
     /// Merkle proof that subtree_root is in provides_root.
     /// Length: O(log D) where D = number of destinations.
     pub subtree_inclusion_proof: Vec<Hash>,
+    /// Total number of destinations in the top-level Merkle tree.
+    /// Required by `binary_merkle_tree::verify_proof` as an explicit parameter.
+    pub number_of_destinations: u32,
+    /// The 0-based index of the receiver's leaf in the top-level Merkle tree
+    /// (leaves sorted by destination ParaId).
+    /// Required by `binary_merkle_tree::verify_proof` as an explicit parameter.
+    pub leaf_index: u32,
     /// The messages with their positions in the sender's subtree MMR.
     pub messages: Vec<OutgoingMessage>,
 }
@@ -485,6 +484,13 @@ pub struct LateBlockProof {
     /// The source parachain this proof covers.
     pub source: ParaId,
 
+    /// The total number of destinations in the source's provides root.
+    /// Required by `binary_merkle_tree::verify_proof`.
+    pub number_of_destinations: u32,
+    /// The 0-based index of the receiver's subtree in the source's top-level tree.
+    /// Required by `binary_merkle_tree::verify_proof`.
+    pub leaf_index: u32,
+
     /// The provides root the receiver block was built against (the old root
     /// from the batch). This is the root that would appear in
     /// RequiresCommitment.expected_root without the proof.
@@ -529,10 +535,20 @@ verification semantics of `sp-mmr-primitives`.
 
 ## 4. Relay Chain Runtime Changes
 
-### 4.1 New Module: `speculative_messaging.rs`
+### 4.1 Speculative Messaging Storage and Helpers
+
+**POC implementation note:** The POC inlines all speculative relay-chain logic
+(`ProvidesRoots` storage and helpers) directly into
+`polkadot/runtime/parachains/src/inclusion/mod.rs`, grouped under clearly labelled
+`// ── Phase 1 Speculative Messaging (POC) ──` comment sections. This avoids
+the boilerplate of registering a new pallet for what are effectively a handful of
+storage items and helper functions that are tightly coupled to `process_candidates`
+and `enact_candidate`. A production implementation would extract these into a
+separate `speculative_messaging.rs` module for independent testability.
 
 ```
-polkadot/runtime/parachains/src/speculative_messaging.rs  ← NEW FILE
+// POC: inlined into polkadot/runtime/parachains/src/inclusion/mod.rs
+// Production target: polkadot/runtime/parachains/src/speculative_messaging.rs
 ```
 
 ```rust
@@ -584,31 +600,32 @@ pub(crate) fn process_candidates<GV>(...) -> Result<..., Error> {
     for (para_id, backed_list) in candidates.iter() {
         for (candidate, core_index) in backed_list {
             // ... existing candidate checks ...
-            // Store the v4 commitments unchanged in PendingAvailability.
-            // No requires satisfaction decision is finalized here.
+            // Store commitments (including provides/requires) unchanged in
+            // CandidatePendingAvailability. No requires satisfaction check here.
+            // PendingAvailability already stores full CandidateCommitments,
+            // so no separate speculative storage map is needed.
         }
     }
 }
 
-// Stage 2: inclusion / enactment in the current relay block
-fn enact_pending_candidates_for_current_block(...) {
-    for candidate in candidates_being_enacted_now {
-        if candidate.descriptor.version() >= V4 {
-            for req in &candidate.commitments.requires {
-                let satisfied = SpeculativeMessaging::<T>::provides_root(&req.source)
-                    .map_or(false, |root| root == req.expected_root);
+// Stage 2: availability check — gate enactment on requires satisfaction
+// (called from update_pending_availability_and_get_freed_cores)
+if candidate.availability_votes.count_ones() >= threshold {
+    let can_enact = /* predecessor check ... */
+        && requires_satisfied(&candidate.commitments.requires);
+    // If requires not satisfied, skip enactment for this candidate and
+    // all its descendants in this relay block.
+}
 
-                ensure!(satisfied, Error::<T>::UnsatisfiedRequires);
-            }
-        }
-
-        Self::enact_candidate(...);
-
-        if candidate.descriptor.version() >= V4 {
-            if let Some(ref p) = candidate.commitments.provides {
-                SpeculativeMessaging::<T>::update_provides_root(candidate.para_id(), p.root);
-            }
-        }
+// Stage 3: inclusion / enactment
+fn enact_candidate(receipt: CommittedCandidateReceipt, ...) {
+    // Read provides/requires directly from the commitments stored in
+    // CandidatePendingAvailability — no separate storage lookup needed.
+    if !requires_satisfied(&commitments.requires) {
+        defensive!("requirements no longer satisfied at enactment");
+    }
+    if let Some(ref p) = commitments.provides {
+        update_provides_root(receipt.descriptor.para_id(), p.root);
     }
 }
 ```
@@ -731,17 +748,16 @@ pub type OutgoingMMRs<T: Config> = StorageMap<
 
 #[derive(Clone, Encode, Decode, TypeInfo, Default)]
 pub struct MMRState {
-    /// Leaf count for THIS destination's subtree MMR.
+    /// Number of leaves inserted so far into this destination's subtree MMR.
     pub leaf_count: u64,
-    pub root: H256,
-    /// Nodes stored for proof generation (peaks + internal nodes).
-    pub nodes: BTreeMap<u64, H256>,
+    /// MMR peaks — O(log n) hashes sufficient to reconstruct the subtree root
+    /// and to build append-only extension proofs.
+    /// The full internal node set is NOT stored on-chain. Per-message inclusion
+    /// proofs (proving a single leaf without the full batch) require the full
+    /// node set; for Phase 1 these are generated off-chain by the provider
+    /// process which rebuilds the MMR from `outbound_messages()` payload bytes.
+    pub peaks: Vec<H256>,
 }
-
-/// A storage adapter is required to integrate `sp-mmr-primitives::MMR` into the
-/// `MMRState` struct, as the standard implementation is storage-backed.
-/// For the POC, `MMRState` must implement an in-memory or runtime-storage
-/// adapter that satisfies the `mmr_lib::MMRStore` traits.
 
 /// Payload bytes for outgoing messages, keyed by destination and leaf position.
 /// Stored on-chain for the POC to keep the relayer simple — no event indexing
@@ -807,18 +823,24 @@ state after executing this block, not merely "the delta produced by this block."
 ```rust
 pub fn compute_provides_root() -> Option<ProvidesCommitment> {
     let mut roots: Vec<(ParaId, H256)> = OutgoingMMRs::<T>::iter()
-        .map(|(dest, state)| (dest, state.root))
+        .filter(|(_, state)| state.leaf_count > 0)
+        .map(|(dest, state)| {
+            let root = bag_peaks(&state.peaks).unwrap_or_default();
+            (dest, root)
+        })
         .collect();
 
     if roots.is_empty() {
-        return None;  // no speculative outbox state exists yet
+        return None;
     }
 
     roots.sort_by_key(|(id, _)| *id);
-    let leaves: Vec<H256> = roots.into_iter().map(|(dest, root)| {
-        H256::from(sp_io::hashing::keccak_256(&(dest, root).encode()))
-    }).collect();
-    Some(ProvidesCommitment { root: compute_merkle_root(&leaves) })
+    let leaves: Vec<Vec<u8>> = roots.iter()
+        .map(|(dest, root)| (dest, root).encode())
+        .collect();
+    Some(ProvidesCommitment {
+        root: binary_merkle_tree::merkle_root::<Keccak256, _>(leaves),
+    })
 }
 ```
 
@@ -838,21 +860,15 @@ pub struct SourceState {
     /// The source's top-level provides root for the latest batch we accepted.
     /// Used in the `MultipleRootsPerSourceInOneBlock` check.
     pub last_seen_provides_root: H256,
-    /// The source's subtree root we last accepted. The original design carried
-    /// a TODO asking why this was needed. In the current POC, subtree
-    /// continuity is already enforced by `last_processed + 1` (message
-    /// position) + `local_subtree.root == batch.subtree_root` (root
-    /// reconstruction). This field is a snapshot of the last verification
-    /// result, useful for diagnostics and forward-looking: in LateBlockProof
-    /// verification the PVF compares `proof.old_subtree_root` against the last
-    /// accepted root.
+    /// The source's subtree root we last accepted.
+    /// Used for diagnostics and LateBlockProof verification (the PVF compares
+    /// `proof.old_subtree_root` against this value).
     pub last_seen_subtree_root: H256,
-    /// Local copy of the subtree MMR (only messages sent to us). Not present
-    /// in the original design. The receiver independently reconstructs the
-    /// per-destination subtree from ingested messages and verifies its root
-    /// matches the batch's `subtree_root`. Without this, the receiver would
-    /// trust the batch's subtree root claim without being able to verify it.
-    pub local_subtree: MMRState,
+    /// Leaf count of the receiver's local subtree MMR.
+    pub mmr_size: u64,
+    /// Peaks of the receiver's local subtree MMR — O(log n) hashes sufficient
+    /// to reconstruct the root without storing all internal nodes.
+    pub mmr_peaks: Vec<H256>,
 }
 
 /// Per-block sources actually consumed during THIS block.
@@ -951,7 +967,10 @@ impl<T: Config> Pallet<T> {
 
             let mut state = IncomingState::<T>::get(&batch.source).unwrap_or_default();
             for msg in &batch.messages {
-                ensure!(msg.position == state.last_processed + 1, Error::<T>::NonConsecutiveMessage);
+                // Guard against position-0 edge case: when mmr_size == 0 the
+                // first-ever message must be at position 0, not last_processed + 1.
+                let expected_position = if state.mmr_size == 0 { 0 } else { state.last_processed + 1 };
+                ensure!(msg.position == expected_position, Error::<T>::NonConsecutiveMessage);
                 let msg_hash = sp_io::hashing::keccak_256(&msg.payload);
                 state.local_subtree.insert_leaf(msg_hash);
                 state.last_processed = msg.position;
@@ -1353,6 +1372,15 @@ verifies proofs in one SCALE decode → transforms requires → node-side valida
 reconstructs commitments from the transformed result → relay chain matches
 `expected_root` against `ProvidesRoots`. See §4.4 for what the relay chain does
 *not* do, and §6.1 for commitments reconstruction.
+
+**Runtime performs no late-block-proof verification.** All four steps of
+`verify_and_transform` (old subtree Merkle proof, new subtree Merkle proof, MMR
+extension proof, root transformation) happen exclusively inside the PVF's
+`apply_messaging_proofs`. The relay-chain runtime (`ingest_verified_messages`)
+never sees `LateBlockProof` data and performs no verification of it. Adding a
+`proof.old_subtree_root == state.last_seen_subtree_root` equality check to the
+runtime would be a possible future defense-in-depth improvement but is not
+required for correctness — the PVF is the consensus-critical path.
 
 ```rust
 fn verify_and_transform(
@@ -1918,6 +1946,18 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 - Formalize PoV / validation ABI extensions.
 - Tighten proof size and storage growth guarantees.
 - Expand adversarial testing and security review scope.
+- **Validate `connecting_nodes` in `verify_mmr_extension`** — both the PVF
+  (`validate_block/implementation.rs`) and inbox pallet verify that old and new
+  peak sets bag to their claimed roots, but do not walk `connecting_nodes` to
+  prove the old MMR is a valid prefix of the new. The POC accepts this gap
+  (acknowledged in code comments); it must be closed before production.
+- **Outbox leaf granularity** — `XcmpMessageSource::take_outbound_messages`
+  records each XCMP page (not individual XCM messages) as a single MMR leaf.
+  Sender and receiver must hash the same unit; verify this is consistent before
+  expanding to per-message proof generation.
+- **`block_number_for_provides_root` linear scan** — `HistoricalProvidesRoots`
+  is scanned linearly (O(N) in the retention window) to look up a block number
+  by root hash. A reverse index `(H256 → BlockNumber)` would make this O(1).
 
 ### Optional Future Directions
 - Super-chain / intra-block messaging.

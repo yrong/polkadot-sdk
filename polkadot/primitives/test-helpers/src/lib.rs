@@ -28,9 +28,7 @@ use polkadot_primitives::{
 	CollatorId, CollatorSignature, CommittedCandidateReceiptV2, CoreIndex, Hash, HashT, HeadData,
 	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex,
 	ValidationCode, ValidationCodeHash, ValidatorId,
-	v10::{CandidateCommitments as CandidateCommitmentsV10,
-		CandidateDescriptorV4, CommittedCandidateReceiptV4, ProvidesCommitment,
-		RequiresCommitment},
+	v10::{CandidateCommitments as CandidateCommitmentsV10, ProvidesCommitment, RequiresCommitment},
 };
 pub use rand;
 use scale_info::TypeInfo;
@@ -747,77 +745,6 @@ pub fn dummy_provides_commitment() -> ProvidesCommitment {
 /// Create a dummy requires commitment.
 pub fn dummy_requires_commitment(source: ParaId, expected_root: Hash) -> RequiresCommitment {
 	RequiresCommitment { source, expected_root }
-}
-
-/// Create a v4 candidate descriptor with filler data.
-pub fn dummy_candidate_descriptor_v4<H: AsRef<[u8]> + Copy>(
-	relay_parent: H,
-) -> CandidateDescriptorV4<H> {
-	let collator = sp_keyring::Sr25519Keyring::Ferdie;
-	let payload = collator_signature_payload(
-		&relay_parent,
-		&1u32.into(),
-		&Hash::zero(),
-		&Hash::zero(),
-		&dummy_validation_code().hash(),
-	);
-	let signature = collator.sign(&payload).into();
-
-	CandidateDescriptorV4 {
-		para_id: 1u32.into(),
-		relay_parent,
-		scheduling_parent: None,
-		scheduling_session_index: None,
-		collator: collator.public().into(),
-		persisted_validation_data_hash: Hash::zero(),
-		pov_hash: Hash::zero(),
-		erasure_root: Hash::zero(),
-		para_head: Hash::zero(),
-		validation_code_hash: dummy_validation_code().hash(),
-		signature,
-		core_index: CoreIndex(1),
-		session_index: 1,
-	}
-}
-
-/// Create a v4 committed candidate receipt with filler data.
-pub fn dummy_committed_candidate_receipt_v4<H: AsRef<[u8]> + Copy>(
-	relay_parent: H,
-) -> CommittedCandidateReceiptV4<H> {
-	CommittedCandidateReceiptV4 {
-		descriptor: dummy_candidate_descriptor_v4(relay_parent),
-		commitments: dummy_candidate_commitments_v10(dummy_head_data()),
-	}
-}
-
-/// Create a meaningless v4 candidate, returning its receipt and PVD.
-pub fn make_candidate_v4(
-	relay_parent_hash: Hash,
-	relay_parent_number: u32,
-	para_id: ParaId,
-	parent_head: HeadData,
-	head_data: HeadData,
-	validation_code_hash: ValidationCodeHash,
-) -> (CommittedCandidateReceiptV4, PersistedValidationData) {
-	let pvd = dummy_pvd(parent_head, relay_parent_number);
-	let commitments = CandidateCommitmentsV10 {
-		head_data,
-		horizontal_messages: Default::default(),
-		upward_messages: Default::default(),
-		new_validation_code: None,
-		processed_downward_messages: 0,
-		hrmp_watermark: relay_parent_number,
-		provides: None,
-		requires: vec![],
-	};
-
-	let mut descriptor = dummy_candidate_descriptor_v4(relay_parent_hash);
-	descriptor.para_id = para_id;
-	descriptor.persisted_validation_data_hash = pvd.hash();
-	descriptor.validation_code_hash = validation_code_hash;
-	let candidate = CommittedCandidateReceiptV4 { descriptor, commitments };
-
-	(candidate, pvd)
 }
 
 /// After manually modifying the candidate descriptor, resign with a defined collator key.
