@@ -285,4 +285,6 @@ struct CollatorMessage<Block: BlockT> {
 	pub core_index: CoreIndex,
 	/// The persisted validation data for this collation.
 	pub validation_data: PersistedValidationData,
+	/// Late block proofs for speculative messaging dependencies (v10+).
+	pub late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
 }

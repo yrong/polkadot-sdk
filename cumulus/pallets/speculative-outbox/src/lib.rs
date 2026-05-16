@@ -344,6 +344,13 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
+	/// Find the block number that produced the given provides root.
+	pub fn block_number_for_provides_root(root: H256) -> Option<BlockNumberFor<T>> {
+		HistoricalProvidesRoots::<T>::iter()
+			.find(|(_, r)| r == &root)
+			.map(|(n, _)| n)
+	}
+
 	/// Generate an MMR extension proof.
 	pub fn mmr_extension_proof(
 		dest: ParaId,

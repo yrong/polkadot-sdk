@@ -252,6 +252,8 @@ where
 				parent_hash,
 				params.para_id,
 				&params.speculative_sources,
+				*request.relay_parent(),
+				&params.relay_client,
 				validation_data.relay_parent_number,
 			);
 

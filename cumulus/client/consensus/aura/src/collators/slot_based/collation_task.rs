@@ -127,10 +127,11 @@ async fn handle_collation_message<Block: BlockT, RClient: RelayChainInterface + 
 		relay_parent,
 		core_index,
 		validation_data,
+		late_block_proofs,
 	} = message;
 
 	let (collation, block_data) =
-		match collator_service.build_multi_block_collation(&parent_header, blocks, proof) {
+		match collator_service.build_multi_block_collation(&parent_header, blocks, proof, late_block_proofs) {
 			Some(collation) => collation,
 			None => {
 				tracing::warn!(target: LOG_TARGET, ?core_index, "Unable to build collation.");

@@ -21,7 +21,7 @@ use polkadot_node_subsystem_util::inclusion_emulator::{
 };
 use polkadot_primitives::{
 	BlockNumber, CandidateCommitments, CandidateDescriptorV2, CoreIndex, HeadData, Id as ParaId,
-	MutateDescriptorV2,
+	MutateDescriptorV2, TrailingOption,
 };
 use polkadot_primitives_test_helpers as test_helpers;
 use polkadot_primitives_test_helpers::CandidateDescriptor;
@@ -169,6 +169,7 @@ impl CandidateBuilder {
 				head_data: self.para_head,
 				processed_downward_messages: 1,
 				hrmp_watermark: self.hrmp_watermark,
+				speculative: TrailingOption(None),
 			},
 		};
 

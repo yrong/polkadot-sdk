@@ -64,6 +64,7 @@ pub fn build_message_batch<Block, Client>(
 	source_block: Hash,
 	source_relay_parent_number: BlockNumber,
 	from_position: u64,
+	expected_provides_root: Hash,
 	max_messages: u32,
 ) -> Option<MessageBatch>
 where
@@ -85,6 +86,11 @@ where
 		.subtree_inclusion_proof(at, destination, subtree_root)
 		.ok()??;
 
+	let mut late_block_proof = None;
+	if expected_provides_root != Hash::zero() && expected_provides_root != provides.root {
+		late_block_proof = api.generate_late_block_proof(at, destination, expected_provides_root).ok().flatten();
+	}
+
 	let batch = MessageBatch {
 		source,
 		source_block,
@@ -98,18 +104,15 @@ where
 			.into_iter()
 			.map(|(position, payload)| OutgoingMessage { position, payload })
 			.collect(),
+		late_block_proof,
 	};
-
-	// TODO(speculative-messaging): Check expected_provides_root from relay chain.
-	// If it differs, call api.generate_late_block_proof(at, destination, expected_provides_root)
-	// and attach it to the ingress metadata.
 
 	Some(batch)
 }
 
 /// Fetch batches from one or more sender chains and assemble ingress.
 ///
-/// Each entry is `(source_para_id, sender_client, sender_block_hash, relay_parent_number, from_position)`.
+/// Each entry is `(source_para_id, sender_client, sender_block_hash, relay_parent_number, from_position, expected_provides_root)`.
 /// Failures for individual sources are skipped (collator continues without that source).
 pub fn fetch_speculative_ingress<Block, Client>(
 	sources: &[(
@@ -118,6 +121,7 @@ pub fn fetch_speculative_ingress<Block, Client>(
 		<Block as BlockT>::Hash,
 		BlockNumber,
 		u64,
+		Hash,
 	)],
 	destination: ParaId,
 	max_messages_per_source: u32,
@@ -128,7 +132,7 @@ where
 	Client::Api: SpeculativeOutboxApi<Block>,
 {
 	let mut batches = Vec::new();
-	for (source, client, at, relay_parent_number, from_position) in sources {
+	for (source, client, at, relay_parent_number, from_position, expected_provides_root) in sources {
 		let source_block = *at;
 		if let Some(batch) = build_message_batch::<Block, Client>(
 			client,
@@ -138,6 +142,7 @@ where
 			source_block,
 			*relay_parent_number,
 			*from_position,
+			*expected_provides_root,
 			max_messages_per_source,
 		) {
 			batches.push(batch);

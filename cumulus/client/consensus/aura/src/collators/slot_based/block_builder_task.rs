@@ -678,6 +678,8 @@ where
 			parent_hash,
 			para_id,
 			speculative_sources,
+			relay_parent_hash,
+			relay_client,
 			validation_data.relay_parent_number,
 		);
 
@@ -835,6 +837,59 @@ where
 
 	let proof = StorageProof::merge(proofs);
 
+	let mut late_block_proofs = Vec::new();
+
+	// 1. Extract proofs from fetched batches.
+	for batch in &speculative_ingress.batches {
+		if let Some(proof) = &batch.late_block_proof {
+			late_block_proofs.push(proof.clone());
+		}
+	}
+
+	// 2. Check for missing proofs (e.g. root advanced but no new messages).
+	for block in &blocks {
+		let hash = block.hash();
+		if let Ok(requires) = para_client.runtime_api().requires_commitments(hash) {
+			for req in requires {
+				// If we don't have a proof for this requirement yet, check if one is needed.
+				if !late_block_proofs
+					.iter()
+					.any(|p| p.source == req.source && p.old_provides_root == req.expected_root)
+				{
+					if let Ok(Some(relay_provides_root)) = futures::executor::block_on(
+						relay_client.provides_root(relay_parent_hash, req.source),
+					) {
+						if relay_provides_root != Hash::default() &&
+							req.expected_root != relay_provides_root
+						{
+							if let Some((_, source_client)) =
+								speculative_sources.sources.iter().find(|(id, _)| *id == req.source)
+							{
+								let source_best = source_client.as_ref().usage_info().chain.best_hash;
+								if let Ok(Some(at_relay)) = source_client
+									.as_ref()
+									.runtime_api()
+									.block_hash_for_provides_root(source_best, relay_provides_root)
+								{
+									if let Ok(Some(proof)) = source_client
+										.as_ref()
+										.runtime_api()
+										.generate_late_block_proof(
+											at_relay,
+											req.source,
+											req.expected_root,
+										) {
+										late_block_proofs.push(proof);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	tracing::trace!(
 		target: LOG_TARGET,
 		?core_index,
@@ -851,6 +906,7 @@ where
 		validation_code_hash,
 		core_index,
 		validation_data,
+		late_block_proofs,
 	}) {
 		tracing::error!(target: crate::LOG_TARGET, ?err, "Unable to send block to collation task.");
 		Err(())
