@@ -361,6 +361,22 @@ pub mod pallet {
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
+	// ── Phase 1 Speculative Messaging (POC) ─────────────────────────────────────
+	//
+	// These storage items implement the relay-chain side of inclusion-based
+	// speculative messaging (design doc: docs/speculative-messaging-impl-design.md).
+	//
+	// ProvidesRoots  — one hash per parachain, updated at enactment. The relay
+	//                  chain only ever stores the latest provides root; old roots
+	//                  are overwritten. No history is kept.
+	//
+	// PendingSpeculativeData — bridges backing and enactment. Speculative fields
+	//                  (provides root, requires list) are extracted from commitments
+	//                  at backing time and stored here, keyed by candidate hash.
+	//                  enact_candidate reads and removes the entry. Timed-out or
+	//                  disputed candidates are cleaned up by free_failed_cores.
+	// ─────────────────────────────────────────────────────────────────────────────
+
 	/// Latest provides root per parachain for speculative messaging (Phase 1).
 	#[pallet::storage]
 	pub(crate) type ProvidesRoots<T: Config> =
@@ -895,6 +911,8 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+
+	// ── Phase 1 Speculative Messaging helpers ────────────────────────────────────
 
 	/// Read the latest provides root for a parachain.
 	pub(crate) fn provides_root(
