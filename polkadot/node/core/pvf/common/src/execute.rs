@@ -19,7 +19,7 @@ use codec::{Decode, Encode};
 use polkadot_node_primitives::PoV;
 use polkadot_parachain_primitives::primitives::ValidationResult;
 use polkadot_primitives::{
-	CandidateDescriptorVersion, CandidateReceiptV2 as CandidateReceipt, ExecutorParams, Hash, LateBlockProof,
+	CandidateDescriptorVersion, CandidateReceiptV2 as CandidateReceipt, ExecutorParams, Hash,
 	PersistedValidationData,
 };
 use std::{sync::Arc, time::Duration};
@@ -76,7 +76,6 @@ impl ValidationContext {
 	/// Consumes self since the context is no longer needed after sending to the worker.
 	pub fn into_execute_request(self, artifact_checksum: ArtifactChecksum) -> ExecuteRequest {
 		ExecuteRequest {
-			para_id: self.candidate_receipt.descriptor.para_id(),
 			pvd: (*self.pvd).clone(),
 			pov: (*self.pov).clone(),
 			execution_timeout: self.exec_timeout,
@@ -110,8 +109,6 @@ pub struct Handshake {
 /// that the worker doesn't need.
 #[derive(Encode, Decode)]
 pub struct ExecuteRequest {
-	/// The ID of the para being validated.
-	pub para_id: polkadot_primitives::Id,
 	/// Persisted validation data
 	pub pvd: PersistedValidationData,
 	/// Proof-of-validity
@@ -173,7 +170,7 @@ pub enum JobResponse {
 	Ok {
 		/// The result of parachain validation.
 		result_descriptor: ValidationResult,
-		},
+	},
 	/// A possibly transient runtime instantiation error happened during the execution; may be
 	/// retried with re-preparation
 	RuntimeConstruction(String),
