@@ -364,11 +364,18 @@ fn encode_xcmp_batch<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
 }
 
 /// Verify that an MMR root R_old is an ancestor of R_new using an extension proof.
+///
+/// Note: connecting_nodes are not yet used — this is a POC simplification.
+/// Full ancestry verification (proving old_peaks are a valid prefix of new_peaks)
+/// requires walking connecting_nodes and should be added before production use.
 fn verify_mmr_extension(
 	old_root: H256,
 	new_root: H256,
 	ext: &polkadot_primitives::v10::MMRExtensionProof,
 ) -> bool {
+	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() {
+		return false;
+	}
 	let old_computed = bag_peaks::<Keccak256Merge>(&ext.old_peaks);
 	if old_computed != old_root {
 		return false;
@@ -377,8 +384,8 @@ fn verify_mmr_extension(
 	new_computed == new_root
 }
 
-/// Append a leaf to the MMR peaks incrementally.
-/// This ensures O(log N) storage and O(log N) update time.
+/// Bag MMR peaks into a single root hash using mmr_lib's canonical merge order:
+/// merge(right_peak, next_left_peak) from right to left.
 fn bag_peaks<M: Merge>(peaks: &[M::Item]) -> M::Item
 where
 	M::Item: Default + Clone,
@@ -387,8 +394,8 @@ where
 		return Default::default();
 	}
 	let mut current = peaks.last().unwrap().clone();
-	for peak in peaks.iter().rev().skip(1) {
-		current = M::merge(peak, &current).unwrap_or(current);
+	for peak in peaks[..peaks.len() - 1].iter().rev() {
+		current = M::merge(&current, peak).unwrap_or(current);
 	}
 	current
 }
@@ -419,10 +426,7 @@ mod tests {
 	fn test_mmr_root_single_leaf() {
 		let leaf = Keccak256::hash(b"msg1");
 		let peaks = append_leaf_to_peaks::<Keccak256Merge>(Vec::new(), 0, leaf);
-		let root = mmr_lib::helper::get_root_from_peaks::<H256, Keccak256Merge>(
-			&peaks,
-			mmr_lib::helper::leaf_index_to_pos(1),
-		).unwrap();
+		let root = bag_peaks::<Keccak256Merge>(&peaks);
 		assert_eq!(root, leaf);
 	}
 
@@ -435,7 +439,7 @@ mod tests {
 		let store = mmr_lib::util::MemStore::<H256>::default();
 		let mut mmr =
 			mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
-		
+
 		let mut peaks = Vec::new();
 		let mut size = 0;
 		for leaf in &leaves {
@@ -445,10 +449,7 @@ mod tests {
 		}
 		let incremental_root = mmr.get_root().unwrap();
 
-		let peak_root = mmr_lib::helper::get_root_from_peaks::<H256, Keccak256Merge>(
-			&peaks,
-			mmr_lib::helper::leaf_index_to_pos(size),
-		).unwrap();
+		let peak_root = bag_peaks::<Keccak256Merge>(&peaks);
 		assert_eq!(peak_root, incremental_root);
 	}
 

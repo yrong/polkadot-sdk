@@ -32,7 +32,7 @@ use polkadot_node_subsystem::{
 	messages::{AvailabilityRecoveryMessage, RuntimeApiRequest},
 	RecoveryError, TimeoutExt,
 };
-use polkadot_primitives::{CandidateEvent, TrailingOption};
+use polkadot_primitives::{CandidateEvent};
 use rstest::rstest;
 use sc_client_api::{
 	BlockImportNotification, ClientInfo, CompactProof, FinalityNotification, FinalityNotifications,
@@ -564,7 +564,7 @@ fn make_candidate_chain(candidate_number_range: Range<u32>) -> Vec<CommittedCand
 				horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
-				speculative: TrailingOption(None),
+				speculative: None,
 			},
 		});
 	}

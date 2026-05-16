@@ -608,15 +608,6 @@ impl<T: Config> Pallet<T> {
 						for candidate in evicted_candidates {
 							freed_cores.push((candidate.core, candidate.hash));
 
-							// Speculative messaging: update provides root (senders only).
-							if let Some((provides_root, _)) =
-								Self::take_pending_speculative(&candidate.hash)
-							{
-								if let Some(root) = provides_root {
-									Self::update_provides_root(paraid, root);
-								}
-							}
-
 							let receipt = CommittedCandidateReceipt {
 								descriptor: candidate.descriptor,
 								commitments: candidate.commitments,
@@ -644,11 +635,6 @@ impl<T: Config> Pallet<T> {
 					}
 				}
 				});
-				}
-
-				// Also clean up any speculative data for cores that timed out or were disputed.
-				for (_, candidate_hash) in &freed_cores {
-					Self::cleanup_speculative(candidate_hash);
 				}
 
 				// For relay chain blocks, we're (ab)using the proof size
@@ -745,22 +731,10 @@ impl<T: Config> Pallet<T> {
 				candidate_receipt_with_backing_validator_indices
 					.push((candidate.receipt(), backer_idx_and_attestation));
 
-				// Speculative Messaging (Phase 1 PoC): check and store provides/requires.
-				if let Some(speculative) = candidate.candidate().commitments.speculative.0.as_ref() {
+				// Speculative Messaging (Phase 1 PoC): store provides/requires for enactment.
+				// Per §4.2, satisfaction is only enforced at enactment time, not here.
+				if let Some(speculative) = candidate.candidate().commitments.speculative.as_ref() {
 					if speculative.provides.is_some() || !speculative.requires.is_empty() {
-						// At backing time, we must also ensure that the requirements are satisfied.
-						// If they aren't, the candidate should be rejected early.
-						if !Self::requires_satisfied(&speculative.requires) {
-							log::debug!(
-								target: LOG_TARGET,
-								"Candidate {:?} rejected: requirements not satisfied",
-								candidate_hash
-							);
-							if !cfg!(feature = "runtime-benchmarks") {
-								return Err(Error::<T>::UnsatisfiedRequires.into());
-							}
-						}
-
 						Self::store_pending_speculative(
 							candidate_hash,
 							speculative.provides,

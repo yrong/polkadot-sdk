@@ -35,7 +35,7 @@ use polkadot_overseer::ActivatedLeaf;
 use polkadot_primitives::{
 	CandidateDescriptorV2, CandidateDescriptorVersion, ClaimQueueOffset,
 	CommittedCandidateReceiptError, CoreIndex, CoreSelector, GroupIndex, HeadData, Id as ParaId,
-	MutateDescriptorV2, NodeFeatures, OccupiedCoreAssumption, SessionInfo, TrailingOption,
+	MutateDescriptorV2, NodeFeatures, OccupiedCoreAssumption, SessionInfo,
 	UMPSignal, UpwardMessage, ValidatorId, DEFAULT_SCHEDULING_LOOKAHEAD, UMP_SEPARATOR,
 };
 use polkadot_primitives_test_helpers::{
@@ -556,7 +556,7 @@ fn candidate_validation_ok_is_ok(#[case] v2_descriptor: bool) {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
@@ -647,7 +647,7 @@ fn invalid_session_or_ump_signals() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 
 	let mut candidate_receipt =
@@ -982,7 +982,7 @@ fn v3_ump_signal_enforcement() {
 			new_validation_code: validation_result.new_validation_code.clone(),
 			processed_downward_messages: validation_result.processed_downward_messages,
 			hrmp_watermark: validation_result.hrmp_watermark,
-			speculative: TrailingOption(None),
+			speculative: None,
 		};		let candidate_receipt = CandidateReceipt {
 			descriptor: descriptor.clone(),
 			commitments_hash: commitments.hash(),
@@ -1145,7 +1145,7 @@ fn candidate_validation_one_ambiguous_error_is_valid() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
@@ -1482,7 +1482,7 @@ fn compressed_code_works() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
@@ -2735,7 +2735,7 @@ fn pre_validation_scheduling_session_check() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
 
@@ -3048,7 +3048,7 @@ fn pre_validation_relay_parent_session_check() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
 
@@ -3216,7 +3216,7 @@ fn pre_validation_relay_parent_session_check_v3_ancestor_query() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: TrailingOption(None),
+		speculative: None,
 	};
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
 

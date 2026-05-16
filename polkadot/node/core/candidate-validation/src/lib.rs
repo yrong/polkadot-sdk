@@ -53,7 +53,7 @@ use polkadot_primitives::{
 	},
 	node_features::FeatureIndex,
 	transpose_claim_queue, AuthorityDiscoveryId, CandidateCommitments,
-	CandidateDescriptorVersion, SpeculativeCommitments, TrailingOption,
+	CandidateDescriptorVersion, SpeculativeCommitments,
 	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
@@ -1313,10 +1313,10 @@ async fn validate_candidate(
 						(provides_root, requires),
 					None => (None, Vec::new()),
 				};
-				let speculative = TrailingOption(SpeculativeCommitments::from_pvf_parts(
+				let speculative = SpeculativeCommitments::from_pvf_parts(
 					provides_root,
 					requires,
-				));
+				);
 
 				let commitments_v9 = CandidateCommitments {
 					head_data: res.head_data,

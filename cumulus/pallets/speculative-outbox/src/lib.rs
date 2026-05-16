@@ -179,6 +179,7 @@ pub mod pallet {
 				state.leaf_count += 1;
 			}
 
+			mmr.commit().expect("MMR commit failed");
 			state.size = mmr.mmr_size();
 			OutgoingMMRState::<T>::insert(dest, state);
 
@@ -415,7 +416,7 @@ fn bag_peaks<M: Merge<Item = H256>>(peaks: &[H256]) -> mmr_lib::Result<H256> {
 		_ => {
 			let mut root = *peaks.last().unwrap();
 			for peak in peaks[..peaks.len() - 1].iter().rev() {
-				root = M::merge(peak, &root)?;
+				root = M::merge(&root, peak)?;
 			}
 			Ok(root)
 		},
@@ -450,6 +451,15 @@ mod tests {
 	use super::*;
 	use mmr_lib::helper::leaf_index_to_pos;
 	use sp_mmr_primitives::utils::NodesUtils;
+
+	fn compute_mmr_root(leaves: &[H256]) -> H256 {
+		let store = mmr_lib::util::MemStore::<H256>::default();
+		let mut mmr = mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
+		for leaf in leaves {
+			mmr.push(*leaf).unwrap();
+		}
+		mmr.get_root().unwrap_or_default()
+	}
 
 	#[test]
 	fn test_mmr_root_matches_inbox_pattern() {

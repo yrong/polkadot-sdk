@@ -30,7 +30,7 @@ use polkadot_node_subsystem_test_helpers::mock::new_leaf;
 use polkadot_primitives::{
 	node_features, BlockNumber, CandidateDescriptorV2, CandidateDescriptorVersion, CollatorId,
 	CollatorSignature, CoreState, GroupRotationInfo, HeadData, Header, MutateDescriptorV2,
-	OccupiedCore, PersistedValidationData, ScheduledCore, SessionIndex, TrailingOption,
+	OccupiedCore, PersistedValidationData, ScheduledCore, SessionIndex,
 	LEGACY_MIN_BACKING_VOTES,
 };
 use polkadot_primitives_test_helpers::{
@@ -256,7 +256,7 @@ impl TestCandidateBuilder {
 				new_validation_code: None,
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
-				speculative: TrailingOption(None),
+				speculative: None,
 			},
 		}
 	}
@@ -311,7 +311,7 @@ async fn assert_validate_from_exhaustive(
 					new_validation_code: None,
 					processed_downward_messages: 0,
 					hrmp_watermark: 0,
-					speculative: TrailingOption(None),
+					speculative: None,
 				}.into(),
 				result_validation_data,
 			)))
@@ -664,7 +664,7 @@ async fn assert_validate_seconded_candidate(
 					new_validation_code: None,
 					processed_downward_messages: 0,
 					hrmp_watermark: 0,
-					speculative: TrailingOption(None),
+					speculative: None,
 				}.into(),
 				assert_pvd.clone(),
 			)))
@@ -3864,7 +3864,7 @@ fn concurrent_dependent_candidates() {
 								new_validation_code: None,
 								processed_downward_messages: 0,
 								hrmp_watermark: 0,
-								speculative: TrailingOption(None),
+								speculative: None,
 							}.into(),
 							pvd.clone(),
 						)))
@@ -4111,7 +4111,7 @@ fn v3_capable_validator_backs_v1_descriptor() {
 				new_validation_code: None,
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
-				speculative: TrailingOption(None),
+				speculative: None,
 			},
 		};
 

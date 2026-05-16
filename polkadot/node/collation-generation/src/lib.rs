@@ -106,7 +106,7 @@ use polkadot_primitives::{
 	node_features::FeatureIndex,
 	transpose_claim_queue, CandidateCommitments, CandidateDescriptorV2,
 	CommittedCandidateReceiptV2, CoreIndex, Hash, Id as ParaId, OccupiedCoreAssumption,
-	PersistedValidationData, SessionIndex, SpeculativeCommitments, TrailingOption,
+	PersistedValidationData, SessionIndex, SpeculativeCommitments,
 	TransposedClaimQueue, ValidationCodeHash,
 };
 use schnellru::{ByLength, LruMap};
@@ -618,16 +618,15 @@ async fn construct_and_distribute_receipt(
 
 	let erasure_root = erasure_root(n_validators, validation_data, pov.clone())?;
 
-	let has_speculative =
-		collation.provides.is_some() || !collation.requires.is_empty();
-	let speculative = TrailingOption(SpeculativeCommitments::from_pvf_parts(
+	let speculative = SpeculativeCommitments::from_pvf_parts(
 		collation.provides.map(|p| p.root),
 		collation
 			.requires
 			.iter()
 			.map(|r| (r.source, r.expected_root))
 			.collect(),
-	));
+	);
+	let has_speculative = speculative.is_some();
 
 	let commitments = CandidateCommitments {
 		upward_messages: collation.upward_messages,
