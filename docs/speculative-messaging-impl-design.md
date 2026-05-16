@@ -1946,11 +1946,6 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 - Formalize PoV / validation ABI extensions.
 - Tighten proof size and storage growth guarantees.
 - Expand adversarial testing and security review scope.
-- **Validate `connecting_nodes` in `verify_mmr_extension`** — both the PVF
-  (`validate_block/implementation.rs`) and inbox pallet verify that old and new
-  peak sets bag to their claimed roots, but do not walk `connecting_nodes` to
-  prove the old MMR is a valid prefix of the new. The POC accepts this gap
-  (acknowledged in code comments); it must be closed before production.
 - **Outbox leaf granularity** — `XcmpMessageSource::take_outbound_messages`
   records each XCMP page (not individual XCM messages) as a single MMR leaf.
   Sender and receiver must hash the same unit; verify this is consistent before

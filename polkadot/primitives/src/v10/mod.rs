@@ -128,9 +128,12 @@ pub struct LateBlockProof {
 pub struct MMRExtensionProof {
 	/// The peaks of the old MMR.
 	pub old_peaks: Vec<Hash>,
+	/// Number of leaves in the old MMR. Required to replay appends correctly.
+	pub old_leaf_count: u64,
 	/// The peaks of the new (larger) MMR.
 	pub new_peaks: Vec<Hash>,
-	/// Nodes connecting old peaks to new peaks to prove prefix relationship.
+	/// Leaf hashes of messages appended between old and new state (in order).
+	/// Replaying these appends starting from old_peaks must reproduce new_peaks.
 	pub connecting_nodes: Vec<Hash>,
 }
 

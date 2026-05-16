@@ -56,24 +56,32 @@ impl Merge for Keccak256Merge {
 
 /// Verify that an MMR extension proof correctly extends from old_root to new_root.
 ///
-/// Checks that the supplied peak sets each bag to their claimed roots.
-/// Note: connecting_nodes are not yet used — this is a POC simplification.
-/// Full ancestry verification (proving old_peaks are a valid prefix of new_peaks)
-/// requires walking connecting_nodes and should be added before production use.
+/// Replays the leaf appends in `ext.connecting_nodes` starting from `ext.old_peaks`
+/// at `ext.old_leaf_count`. The resulting peaks must bag to `new_root`.
 fn verify_mmr_extension(
 	old_root: polkadot_primitives::Hash,
 	new_root: polkadot_primitives::Hash,
 	ext: &polkadot_primitives::v10::MMRExtensionProof,
 ) -> bool {
-	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() {
+	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() || ext.connecting_nodes.is_empty() {
 		return false;
 	}
-	// Bag old peaks → must equal old_root.
+	// Verify old peaks bag to old_root.
 	let old_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.old_peaks);
 	if old_computed != Some(old_root) {
 		return false;
 	}
-	// Bag new peaks → must equal new_root.
+	// Replay each leaf append and confirm we arrive at ext.new_peaks.
+	let mut peaks = ext.old_peaks.clone();
+	let mut size = ext.old_leaf_count;
+	for &leaf_hash in &ext.connecting_nodes {
+		peaks = append_mmr_leaf::<Keccak256Merge>(peaks, size, leaf_hash);
+		size += 1;
+	}
+	if peaks != ext.new_peaks {
+		return false;
+	}
+	// Verify new peaks bag to new_root.
 	let new_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.new_peaks);
 	new_computed == Some(new_root)
 }
@@ -95,7 +103,26 @@ fn bag_mmr_peaks<M: mmr_lib::Merge<Item = polkadot_primitives::Hash>>(
 	}
 }
 
-/// Applies speculative messaging proofs to the validation result.
+/// Append a leaf hash to peaks, merging as required.
+/// `size` is the number of leaves already in the MMR (0-based).
+fn append_mmr_leaf<M: mmr_lib::Merge<Item = polkadot_primitives::Hash>>(
+	mut peaks: Vec<polkadot_primitives::Hash>,
+	size: u64,
+	leaf: polkadot_primitives::Hash,
+) -> Vec<polkadot_primitives::Hash> {
+	let mut current = leaf;
+	let mut current_size = size;
+	while current_size % 2 == 1 {
+		if let Some(last_peak) = peaks.pop() {
+			current = M::merge(&last_peak, &current).unwrap_or(current);
+		}
+		current_size /= 2;
+	}
+	peaks.push(current);
+	peaks
+}
+
+
 ///
 /// This transforms `requires` commitments that reference older source roots into
 /// commitments that reference the current source roots, provided a valid proof is

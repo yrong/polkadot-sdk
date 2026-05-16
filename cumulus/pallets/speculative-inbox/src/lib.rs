@@ -341,23 +341,31 @@ fn encode_xcmp_batch<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
 
 /// Verify that an MMR root R_old is an ancestor of R_new using an extension proof.
 ///
-/// Note: connecting_nodes are not yet used — this is a POC simplification.
-/// Full ancestry verification (proving old_peaks are a valid prefix of new_peaks)
-/// requires walking connecting_nodes and should be added before production use.
+/// Replays the leaf appends in `ext.connecting_nodes` starting from `ext.old_peaks`
+/// at `ext.old_leaf_count`. The resulting peaks must match `ext.new_peaks` and bag to `new_root`.
 fn verify_mmr_extension(
 	old_root: H256,
 	new_root: H256,
 	ext: &polkadot_primitives::v10::MMRExtensionProof,
 ) -> bool {
-	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() {
+	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() || ext.connecting_nodes.is_empty() {
 		return false;
 	}
 	let old_computed = bag_peaks::<Keccak256Merge>(&ext.old_peaks);
 	if old_computed != old_root {
 		return false;
 	}
-	let new_computed = bag_peaks::<Keccak256Merge>(&ext.new_peaks);
-	new_computed == new_root
+	// Replay each leaf append and confirm we arrive at ext.new_peaks.
+	let mut peaks = ext.old_peaks.clone();
+	let mut size = ext.old_leaf_count;
+	for &leaf_hash in &ext.connecting_nodes {
+		peaks = append_leaf_to_peaks::<Keccak256Merge>(peaks, size, leaf_hash);
+		size += 1;
+	}
+	if peaks != ext.new_peaks {
+		return false;
+	}
+	bag_peaks::<Keccak256Merge>(&ext.new_peaks) == new_root
 }
 
 /// Bag MMR peaks into a single root hash using mmr_lib's canonical merge order:
