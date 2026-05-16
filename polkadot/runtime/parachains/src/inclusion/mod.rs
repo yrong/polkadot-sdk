@@ -48,8 +48,8 @@ use polkadot_primitives::{
 	BackedCandidate, CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
 	CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex, HeadData,
-	Id as ParaId, SignedAvailabilityBitfields, SigningContext, UpwardMessage, ValidatorId,
-	ValidatorIndex, ValidityAttestation,
+	Id as ParaId, RequiresCommitment, SignedAvailabilityBitfields, SigningContext, UpwardMessage,
+	ValidatorId, ValidatorIndex, ValidityAttestation,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{traits::One, DispatchError, SaturatedConversion, Saturating};
@@ -369,30 +369,12 @@ pub mod pallet {
 	// ProvidesRoots  — one hash per parachain, updated at enactment. The relay
 	//                  chain only ever stores the latest provides root; old roots
 	//                  are overwritten. No history is kept.
-	//
-	// PendingSpeculativeData — bridges backing and enactment. Speculative fields
-	//                  (provides root, requires list) are extracted from commitments
-	//                  at backing time and stored here, keyed by candidate hash.
-	//                  enact_candidate reads and removes the entry. Timed-out or
-	//                  disputed candidates are cleaned up by free_failed_cores.
 	// ─────────────────────────────────────────────────────────────────────────────
 
 	/// Latest provides root per parachain for speculative messaging (Phase 1).
 	#[pallet::storage]
 	pub(crate) type ProvidesRoots<T: Config> =
 		StorageMap<_, Twox64Concat, polkadot_primitives::Id, polkadot_primitives::Hash>;
-
-	/// Speculative messaging data for candidates in `PendingAvailability`.
-	#[pallet::storage]
-	pub(crate) type PendingSpeculativeData<T: Config> = StorageMap<
-		_,
-		Twox64Concat,
-		polkadot_primitives::CandidateHash,
-		(
-			Option<polkadot_primitives::Hash>,
-			Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
-		),
-	>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
@@ -599,15 +581,10 @@ impl<T: Config> Pallet<T> {
 
 							// Speculative messaging: check requirements if the candidate is v4.
 							if can_enact {
-								if let Some((_, requires)) =
-									Self::peek_pending_speculative(
-										&candidate.hash,
-									) {
-									if !Self::requires_satisfied(&requires) {
-										// Requirement not satisfied. We cannot enact this
-										// candidate or any of its descendants in this block.
-										can_enact = false;
-									}
+								if !Self::requires_satisfied(&candidate.commitments.requires) {
+									// Requirement not satisfied. We cannot enact this
+									// candidate or any of its descendants in this block.
+									can_enact = false;
 								}
 							}
 
@@ -746,23 +723,6 @@ impl<T: Config> Pallet<T> {
 				latest_head_data = candidate.candidate().commitments.head_data.clone();
 				candidate_receipt_with_backing_validator_indices
 					.push((candidate.receipt(), backer_idx_and_attestation));
-
-				// Speculative Messaging (Phase 1 PoC): store provides/requires for enactment.
-				// Per §4.2, satisfaction is only enforced at enactment time, not here.
-				{
-					let commitments = &candidate.candidate().commitments;
-					if commitments.provides.is_some() || !commitments.requires.is_empty() {
-						Self::store_pending_speculative(
-							candidate_hash,
-							commitments.provides.as_ref().map(|p| p.root),
-							commitments
-								.requires
-								.iter()
-								.map(|r| (r.source, r.expected_root))
-								.collect(),
-						);
-					}
-				}
 
 				// Update storage now
 				PendingAvailability::<T>::mutate(&para_id, |pending_availability| {
@@ -922,12 +882,10 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Returns true when every requirement matches the persisted provides root.
-	pub(crate) fn requires_satisfied(
-		requires: &[(polkadot_primitives::Id, polkadot_primitives::Hash)],
-	) -> bool {
-		requires.iter().all(|(source, expected_root)| {
-			Self::provides_root(source) == Some(*expected_root)
-		})
+	pub(crate) fn requires_satisfied(requires: &[RequiresCommitment]) -> bool {
+		requires
+			.iter()
+			.all(|r| Self::provides_root(&r.source) == Some(r.expected_root))
 	}
 
 	/// Update the provides root after a candidate is enacted.
@@ -938,39 +896,6 @@ impl<T: Config> Pallet<T> {
 		ProvidesRoots::<T>::insert(para_id, root);
 	}
 
-	/// Peek at speculative data for a candidate without removing it.
-	pub(crate) fn peek_pending_speculative(
-		candidate_hash: &polkadot_primitives::CandidateHash,
-	) -> Option<(
-		Option<polkadot_primitives::Hash>,
-		Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
-	)> {
-		PendingSpeculativeData::<T>::get(candidate_hash)
-	}
-
-	/// Take speculative data for a candidate being enacted.
-	pub(crate) fn take_pending_speculative(
-		candidate_hash: &polkadot_primitives::CandidateHash,
-	) -> Option<(
-		Option<polkadot_primitives::Hash>,
-		Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
-	)> {
-		PendingSpeculativeData::<T>::take(candidate_hash)
-	}
-
-	/// Store speculative data for a candidate entering `PendingAvailability`.
-	pub(crate) fn store_pending_speculative(
-		candidate_hash: polkadot_primitives::CandidateHash,
-		provides_root: Option<polkadot_primitives::Hash>,
-		requires: Vec<(polkadot_primitives::Id, polkadot_primitives::Hash)>,
-	) {
-		PendingSpeculativeData::<T>::insert(candidate_hash, (provides_root, requires));
-	}
-
-	/// Cleanup speculative data for a candidate that was dropped.
-	pub(crate) fn cleanup_speculative(candidate_hash: &polkadot_primitives::CandidateHash) {
-		PendingSpeculativeData::<T>::remove(candidate_hash);
-	}
 	fn enact_candidate(
 		relay_parent_number: BlockNumberFor<T>,
 		receipt: CommittedCandidateReceipt<T::Hash>,
@@ -1031,18 +956,12 @@ impl<T: Config> Pallet<T> {
 			commitments.horizontal_messages,
 		);
 
-		// Finalize speculative messaging: update ProvidesRoots and check requirements.
-		if let Some((provides, requires)) = Self::take_pending_speculative(&candidate_hash) {
-			// Double-check requirements at enactment time.
-			if !Self::requires_satisfied(&requires) {
-				// This shouldn't happen if they were checked at backing, unless
-				// the relay chain state changed in an incompatible way.
-				defensive!("Candidate {:?} requirements no longer satisfied at enactment", candidate_hash);
-			}
-
-			if let Some(root) = provides {
-				Self::update_provides_root(receipt.descriptor.para_id(), root);
-			}
+		// Finalize speculative messaging: check requirements and update ProvidesRoots.
+		if !Self::requires_satisfied(&commitments.requires) {
+			defensive!("Candidate {:?} requirements no longer satisfied at enactment", candidate_hash);
+		}
+		if let Some(ref p) = commitments.provides {
+			Self::update_provides_root(receipt.descriptor.para_id(), p.root);
 		}
 
 		Self::deposit_event(Event::<T>::CandidateIncluded(
@@ -1218,10 +1137,6 @@ impl<T: Config> Pallet<T> {
 			for (index, candidate) in pending_candidates.iter().enumerate() {
 				if pred(candidate) {
 					earliest_dropped_idx = Some(index);
-					// Cleanup speculative messaging data for all dropped candidates.
-					for dropped in pending_candidates.iter().skip(index) {
-						Self::cleanup_speculative(&dropped.hash);
-					}
 					// Since we're looping the candidates in dependency order, we've found the
 					// earliest failed index for this paraid.
 					break;

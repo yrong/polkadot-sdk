@@ -3216,7 +3216,10 @@ fn speculative_requires_satisfied_when_persisted_root_matches() {
 		let source = ParaId::from(1000u32);
 		let root = Hash::from_low_u64_be(42);
 		ParaInclusion::update_provides_root(source, root);
-		assert!(ParaInclusion::requires_satisfied(&[(source, root)]));
+		assert!(ParaInclusion::requires_satisfied(&[RequiresCommitment {
+			source,
+			expected_root: root,
+		}]));
 	});
 }
 
@@ -3225,10 +3228,10 @@ fn speculative_requires_unsatisfied_when_persisted_root_differs() {
 	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
 		let source = ParaId::from(1000u32);
 		ParaInclusion::update_provides_root(source, Hash::from_low_u64_be(1));
-		assert!(!ParaInclusion::requires_satisfied(&[(
+		assert!(!ParaInclusion::requires_satisfied(&[RequiresCommitment {
 			source,
-			Hash::from_low_u64_be(2),
-		)]));
+			expected_root: Hash::from_low_u64_be(2),
+		}]));
 	});
 }
 
@@ -3236,9 +3239,9 @@ fn speculative_requires_unsatisfied_when_persisted_root_differs() {
 fn speculative_requires_unsatisfied_when_source_has_no_persisted_root() {
 	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
 		let source = ParaId::from(2000u32);
-		assert!(!ParaInclusion::requires_satisfied(&[(
+		assert!(!ParaInclusion::requires_satisfied(&[RequiresCommitment {
 			source,
-			Hash::from_low_u64_be(99),
-		)]));
+			expected_root: Hash::from_low_u64_be(99),
+		}]));
 	});
 }
