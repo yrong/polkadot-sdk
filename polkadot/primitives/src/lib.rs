@@ -77,11 +77,7 @@ pub use v9::{
 	TrailingOption,
 };
 
-pub use v10::{
-	CandidateDescriptorV4, CandidateReceiptV4,
-	CommittedCandidateReceiptV4,
-	LateBlockProof,
-};
+pub use v10::LateBlockProof;
 
 /// Alias for `CandidateCommitments` used by v10 callers.
 /// Since v9 `CandidateCommitments` now includes the speculative fields,
