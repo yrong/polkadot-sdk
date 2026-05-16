@@ -55,23 +55,27 @@ impl Merge for Keccak256Merge {
 }
 
 /// Verify that an MMR extension proof correctly extends from old_root to new_root.
+///
+/// Checks that the supplied peak sets each bag to their claimed roots.
+/// Note: connecting_nodes are not yet used — this is a POC simplification.
+/// Full ancestry verification (proving old_peaks are a valid prefix of new_peaks)
+/// requires walking connecting_nodes and should be added before production use.
 fn verify_mmr_extension(
 	old_root: polkadot_primitives::Hash,
 	new_root: polkadot_primitives::Hash,
 	ext: &polkadot_primitives::v10::MMRExtensionProof,
 ) -> bool {
-	// 1. Bag old peaks → verify old_root.
-	let old_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.old_peaks);
-	if old_computed.map_or(false, |r| r != old_root) {
+	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() {
 		return false;
 	}
-	// 2. Bag new peaks → verify new_root.
+	// Bag old peaks → must equal old_root.
+	let old_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.old_peaks);
+	if old_computed != Some(old_root) {
+		return false;
+	}
+	// Bag new peaks → must equal new_root.
 	let new_computed = bag_mmr_peaks::<Keccak256Merge>(&ext.new_peaks);
-	new_computed.map_or(false, |r| r == new_root)
-
-	// Note: For full ancestry proof verification, connecting_nodes would be used
-	// to prove old_peaks can be merged into new_peaks. In the POC, we trust
-	// the provider's peak set if they bag correctly.
+	new_computed == Some(new_root)
 }
 
 /// Bag MMR peaks into a root hash (right-to-left merge).
@@ -84,7 +88,7 @@ fn bag_mmr_peaks<M: mmr_lib::Merge<Item = polkadot_primitives::Hash>>(
 		_ => {
 			let mut root = *peaks.last().unwrap();
 			for peak in peaks[..peaks.len() - 1].iter().rev() {
-				root = M::merge(peak, &root).ok()?;
+				root = M::merge(&root, peak).ok()?;
 			}
 			Some(root)
 		},
@@ -102,8 +106,8 @@ fn apply_messaging_proofs(para_id: polkadot_primitives::Id, extension: &mut Opti
 			for req in requires.iter_mut() {
 				if req.0 == proof.source && req.1 == proof.old_provides_root {
 					// 1. Verify old subtree root was in old provides root.
-					// Leaf is keccak256(encode((para_id, subtree_root)))
-					let old_leaf = Keccak256::hash(&(para_id, proof.old_subtree_root).encode());
+					// Leaf is SCALE(destination_para_id, subtree_root) — verify_proof hashes it.
+					let old_leaf = (para_id, proof.old_subtree_root).encode();
 					let old_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 						&proof.old_provides_root,
 						proof.old_subtree_proof.iter().copied(),
@@ -111,9 +115,9 @@ fn apply_messaging_proofs(para_id: polkadot_primitives::Id, extension: &mut Opti
 						proof.leaf_index,
 						&old_leaf,
 					);
-					
+
 					// 2. Verify new subtree root is in new provides root.
-					let new_leaf = Keccak256::hash(&(para_id, proof.new_subtree_root).encode());
+					let new_leaf = (para_id, proof.new_subtree_root).encode();
 					let new_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 						&proof.new_provides_root,
 						proof.new_subtree_proof.iter().copied(),

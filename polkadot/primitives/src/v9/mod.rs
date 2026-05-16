@@ -564,8 +564,10 @@ pub struct CandidateCommitments<N = BlockNumber> {
 	/// processed.
 	pub hrmp_watermark: N,
 	/// Speculative messaging data (v10+).
-	/// Wrapped in `TrailingOption` to preserve hash compatibility for legacy candidates.
-	pub speculative: TrailingOption<SpeculativeCommitments>,
+	/// Uses standard `Option` so that `CandidateCommitments` can be safely embedded in
+	/// other SCALE structs (e.g. `CandidatePendingAvailability`). `TrailingOption` would
+	/// greedily consume bytes belonging to subsequent fields.
+	pub speculative: Option<SpeculativeCommitments>,
 }
 
 /// Speculative messaging commitments (v10+).

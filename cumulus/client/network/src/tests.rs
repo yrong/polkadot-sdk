@@ -30,7 +30,7 @@ use polkadot_primitives::{
 	BlockNumber, CandidateCommitments, CandidateDescriptorV2, CandidateEvent, CollatorPair,
 	CommittedCandidateReceiptV2, CoreState, Hash as PHash, HeadData, InboundDownwardMessage,
 	InboundHrmpMessage, OccupiedCoreAssumption, PersistedValidationData, SessionIndex,
-	SigningContext, TrailingOption, ValidationCodeHash, ValidatorId,
+	SigningContext, ValidationCodeHash, ValidatorId,
 };
 use polkadot_primitives_test_helpers::{CandidateDescriptor, CommittedCandidateReceipt};
 use polkadot_test_client::{
@@ -82,7 +82,7 @@ fn dummy_candidate() -> CommittedCandidateReceiptV2 {
 			head_data: HeadData(Vec::new()),
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			speculative: TrailingOption(None),
+			speculative: None,
 		},
 	}
 }

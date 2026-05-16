@@ -192,7 +192,7 @@ impl CandidateCommitments {
 
 impl From<crate::v9::CandidateCommitments> for CandidateCommitments {
 	fn from(c: crate::v9::CandidateCommitments) -> Self {
-		let speculative = c.speculative.into_inner();
+		let speculative = c.speculative;
 		Self {
 			head_data: c.head_data,
 			upward_messages: c.upward_messages,
@@ -224,16 +224,16 @@ impl From<CandidateCommitments> for crate::v9::CandidateCommitments {
 			processed_downward_messages: c.processed_downward_messages,
 			hrmp_watermark: c.hrmp_watermark,
 			speculative: if has_speculative {
-				crate::v9::TrailingOption(Some(crate::v9::SpeculativeCommitments {
+				Some(crate::v9::SpeculativeCommitments {
 					provides: c.provides.map(|p| p.root),
 					requires: c
 						.requires
 						.into_iter()
 						.map(|r| (r.source, r.expected_root))
 						.collect(),
-				}))
+				})
 			} else {
-				crate::v9::TrailingOption(None)
+				None
 			},
 		}
 	}
