@@ -100,8 +100,8 @@ pub mod pallet {
 	pub type HistoricalProvidesRoots<T: Config> =
 		StorageMap<_, Twox64Concat, BlockNumberFor<T>, H256>;
 
-	/// Historical subtree roots and peaks per destination.
-	/// Stores (root, peaks) so extension proofs can be built without a full node store.
+	/// Historical subtree roots, peaks, and leaf counts per destination.
+	/// Stores (root, peaks, leaf_count) so extension proofs can be built without a full node store.
 	#[pallet::storage]
 	pub type HistoricalSubtreeState<T: Config> = StorageDoubleMap<
 		_,
@@ -109,7 +109,7 @@ pub mod pallet {
 		BlockNumberFor<T>,
 		Twox64Concat,
 		ParaId,
-		(H256, Vec<H256>),
+		(H256, Vec<H256>, u64),
 	>;
 
 	/// Payload bytes for outgoing messages.
@@ -132,7 +132,7 @@ pub mod pallet {
 				// Record current subtree state for all active destinations.
 				for (dest, state) in OutgoingMMRState::<T>::iter() {
 					let root = bag_peaks::<Keccak256Merge>(&state.peaks).unwrap_or_default();
-					HistoricalSubtreeState::<T>::insert(n, dest, (root, state.peaks));
+					HistoricalSubtreeState::<T>::insert(n, dest, (root, state.peaks, state.leaf_count));
 				}
 			}
 
@@ -251,8 +251,8 @@ impl<T: Config> Pallet<T> {
 		let (old_block_number, _) =
 			HistoricalProvidesRoots::<T>::iter().find(|(_, root)| root == &old_provides_root)?;
 
-		// 2. Get historical subtree state (root + peaks stored at that block).
-		let (old_subtree_root, old_peaks) =
+		// 2. Get historical subtree state (root + peaks + leaf_count stored at that block).
+		let (old_subtree_root, old_peaks, old_leaf_count) =
 			HistoricalSubtreeState::<T>::get(old_block_number, dest)?;
 
 		let current_provides = Self::compute_provides_root()?;
@@ -263,7 +263,7 @@ impl<T: Config> Pallet<T> {
 		// 3. Build old subtree Merkle proof from historical provides root.
 		let mut old_roots: Vec<(ParaId, H256)> =
 			HistoricalSubtreeState::<T>::iter_prefix(old_block_number)
-				.map(|(id, (root, _))| (id, root))
+				.map(|(id, (root, _, _))| (id, root))
 				.collect();
 		old_roots.sort_by_key(|(id, _)| *id);
 		let old_leaf_idx = old_roots.iter().position(|(id, _)| *id == dest)?;
@@ -276,11 +276,17 @@ impl<T: Config> Pallet<T> {
 
 		// 4. Build MMR extension proof if the subtree has grown.
 		let current_state = OutgoingMMRState::<T>::get(&dest);
-		let subtree_extension = if current_state.leaf_count > old_peaks.len() as u64 {
+		let subtree_extension = if current_state.leaf_count > old_leaf_count {
+			// Collect leaf hashes for all messages appended since old_leaf_count.
+			let connecting_nodes: Vec<H256> = (old_leaf_count..current_state.leaf_count)
+				.filter_map(|pos| OutgoingMessages::<T>::get(dest, pos))
+				.map(|payload| Keccak256::hash(&payload))
+				.collect();
 			Some(MMRExtensionProof {
 				old_peaks: old_peaks.clone(),
+				old_leaf_count,
 				new_peaks: current_state.peaks.clone(),
-				connecting_nodes: Vec::new(),
+				connecting_nodes,
 			})
 		} else {
 			None
@@ -322,6 +328,7 @@ impl<T: Config> Pallet<T> {
 		}
 		Some(MMRExtensionProof {
 			old_peaks: Vec::new(), // Caller must supply old peaks from history.
+			old_leaf_count: 0,     // Caller must supply old leaf count from history.
 			new_peaks: current_state.peaks,
 			connecting_nodes: Vec::new(),
 		})
