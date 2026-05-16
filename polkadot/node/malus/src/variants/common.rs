@@ -25,7 +25,7 @@ use polkadot_node_primitives::{InvalidCandidate, ValidationResult};
 
 use polkadot_primitives::{
 	CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
-	CandidateReceiptV2 as CandidateReceipt, PersistedValidationData, PvfExecKind,
+	CandidateReceiptV2 as CandidateReceipt, PersistedValidationData, PvfExecKind, TrailingOption,
 };
 
 use futures::channel::oneshot;
@@ -189,6 +189,7 @@ pub fn create_fake_candidate_commitments(
 		head_data,
 		processed_downward_messages: 0,
 		hrmp_watermark: persisted_validation_data.relay_parent_number,
+		speculative: TrailingOption(None),
 	}
 }
 

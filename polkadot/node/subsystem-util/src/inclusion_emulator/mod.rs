@@ -82,7 +82,7 @@
 /// in practice at most once every few weeks.
 use polkadot_primitives::{
 	async_backing::Constraints as PrimitiveConstraints, skip_ump_signals, BlockNumber,
-	CandidateCommitments, Hash, HeadData, Id as ParaId, PersistedValidationData,
+	CandidateCommitments, Hash, HeadData, Id as ParaId, PersistedValidationData, TrailingOption,
 	UpgradeRestriction, ValidationCodeHash,
 };
 use std::{collections::HashMap, sync::Arc};
@@ -1182,6 +1182,7 @@ mod tests {
 				head_data: HeadData::from(vec![1, 2, 3, 4, 5]),
 				processed_downward_messages: 0,
 				hrmp_watermark: relay_parent.number,
+				speculative: TrailingOption(None),
 			},
 			persisted_validation_data: PersistedValidationData {
 				parent_head: constraints.required_parent.clone(),

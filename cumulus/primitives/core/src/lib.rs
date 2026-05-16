@@ -697,6 +697,11 @@ sp_api::decl_runtime_apis! {
 			dest: ParaId,
 			old_provides_root: polkadot_primitives::Hash,
 		) -> Option<polkadot_primitives::v10::LateBlockProof>;
+
+		/// Find the best block hash that has the given provides root.
+		fn block_hash_for_provides_root(
+			provides_root: polkadot_primitives::Hash,
+		) -> Option<polkadot_primitives::Hash>;
 	}
 
 	/// API for the speculative messaging inbox (receiver side).
@@ -708,5 +713,8 @@ sp_api::decl_runtime_apis! {
 
 		/// Next expected message position from `source` for speculative ingress fetch.
 		fn next_expected_message_position(source: ParaId) -> u64;
+
+		/// Last seen provides root from `source`.
+		fn last_seen_provides_root(source: ParaId) -> polkadot_primitives::Hash;
 	}
 }

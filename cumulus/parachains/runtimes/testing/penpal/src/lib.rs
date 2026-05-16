@@ -1227,14 +1227,20 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 			proof.source = ParachainInfo::parachain_id();
 			Some(proof)
 		}
-	}
-
+		fn block_hash_for_provides_root(provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
+			let number = SpeculativeOutbox::block_number_for_provides_root(provides_root)?;
+			Some(frame_system::Pallet::<Runtime>::block_hash(number))
+		}
+		}
 	impl cumulus_primitives_core::SpeculativeInboxApi<Block> for Runtime {
 		fn requires_commitments() -> Vec<polkadot_primitives::v10::RequiresCommitment> {
 			SpeculativeInbox::get_requires_commitments()
 		}
 		fn next_expected_message_position(source: ParaId) -> u64 {
 			SpeculativeInbox::next_expected_message_position(source)
+		}
+		fn last_seen_provides_root(source: ParaId) -> polkadot_primitives::Hash {
+			SpeculativeInbox::last_seen_provides_root(source)
 		}
 	}
 );
