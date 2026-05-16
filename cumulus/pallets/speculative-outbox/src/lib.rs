@@ -18,9 +18,9 @@
 //!
 //! Sender-side pallet for the inclusion-based speculative messaging PoC.
 //!
-//! Maintains per-destination MMRs accumulating all outbound messages, stores
-//! payload bytes on-chain, and exposes runtime APIs for providers to query
-//! `MessageBatch`es.
+//! Maintains per-destination MMRs accumulating all outbound messages using a
+//! peaks-only representation (O(log n) storage), stores payload bytes on-chain,
+//! and exposes runtime APIs for providers to query `MessageBatch`es.
 //!
 //! Implements `XcmpMessageSource` by wrapping the inner source (typically
 //! `XcmpQueue`), recording outbound messages in the speculative MMR while
@@ -57,13 +57,13 @@ impl Merge for Keccak256Merge {
 	}
 }
 
-/// MMR state for a single destination's subtree.
+/// MMR state for a single destination's subtree (peaks-only representation).
 #[derive(Clone, Encode, Decode, TypeInfo, Default)]
 pub struct MMRState {
-	/// MMR node count (returned by mmr.mmr_size()).
-	pub size: u64,
-	/// Number of leaves inserted so far.
+	/// Number of leaves inserted so far (used as `size` in append_leaf_to_peaks).
 	pub leaf_count: u64,
+	/// MMR peaks — O(log n) hashes sufficient to reconstruct the subtree root.
+	pub peaks: Vec<H256>,
 }
 
 pub use pallet::*;
@@ -90,28 +90,18 @@ pub mod pallet {
 		MessagesRecorded { destination: ParaId, count: u32 },
 	}
 
-	/// Per-destination MMR state (current size).
+	/// Per-destination MMR state (leaf count + peaks).
 	#[pallet::storage]
 	pub type OutgoingMMRState<T: Config> =
 		StorageMap<_, Twox64Concat, ParaId, MMRState, ValueQuery>;
-
-	/// MMR nodes for per-destination subtrees.
-	#[pallet::storage]
-	pub type MMRNodes<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		ParaId,
-		Twox64Concat,
-		u64,
-		H256,
-	>;
 
 	/// Historical provides roots for late block proof generation.
 	#[pallet::storage]
 	pub type HistoricalProvidesRoots<T: Config> =
 		StorageMap<_, Twox64Concat, BlockNumberFor<T>, H256>;
 
-	/// Historical subtree roots and sizes per destination.
+	/// Historical subtree roots and peaks per destination.
+	/// Stores (root, peaks) so extension proofs can be built without a full node store.
 	#[pallet::storage]
 	pub type HistoricalSubtreeState<T: Config> = StorageDoubleMap<
 		_,
@@ -119,7 +109,7 @@ pub mod pallet {
 		BlockNumberFor<T>,
 		Twox64Concat,
 		ParaId,
-		(H256, u64),
+		(H256, Vec<H256>),
 	>;
 
 	/// Payload bytes for outgoing messages.
@@ -138,11 +128,11 @@ pub mod pallet {
 		fn on_finalize(n: BlockNumberFor<T>) {
 			if let Some(provides) = Self::compute_provides_root() {
 				HistoricalProvidesRoots::<T>::insert(n, provides.root);
-				
+
 				// Record current subtree state for all active destinations.
 				for (dest, state) in OutgoingMMRState::<T>::iter() {
-					let root = compute_mmr_root_from_storage::<T>(dest, state.size);
-					HistoricalSubtreeState::<T>::insert(n, dest, (root, state.size));
+					let root = bag_peaks::<Keccak256Merge>(&state.peaks).unwrap_or_default();
+					HistoricalSubtreeState::<T>::insert(n, dest, (root, state.peaks));
 				}
 			}
 
@@ -158,63 +148,21 @@ pub mod pallet {
 
 	impl<T: Config> Pallet<T> {
 		/// Record outbound messages in the speculative MMR.
-		pub fn record_outbound_messages(
-			dest: ParaId,
-			payloads: Vec<Vec<u8>>,
-		) {
+		pub fn record_outbound_messages(dest: ParaId, payloads: Vec<Vec<u8>>) {
 			let count = payloads.len() as u32;
 			let mut state = OutgoingMMRState::<T>::get(&dest);
-			
-			let mut mmr = mmr_lib::MMR::<H256, Keccak256Merge, _>::new(
-				state.size,
-				DestMMRStore::<T>::new(dest),
-			);
 
 			for payload in payloads {
-				let pos = state.size; // This is actually the leaf index, but for payloads we use it as pos.
-				// For OutgoingMessages, we'll use the leaf index.
-				let leaf_idx = state.leaf_count;
-				OutgoingMessages::<T>::insert(dest, leaf_idx, &payload);
-				mmr.push(Keccak256::hash(&payload)).expect("MMR push failed");
+				OutgoingMessages::<T>::insert(dest, state.leaf_count, &payload);
+				let leaf_hash = Keccak256::hash(&payload);
+				state.peaks =
+					append_leaf_to_peaks::<Keccak256Merge>(state.peaks, state.leaf_count, leaf_hash);
 				state.leaf_count += 1;
 			}
 
-			mmr.commit().expect("MMR commit failed");
-			state.size = mmr.mmr_size();
 			OutgoingMMRState::<T>::insert(dest, state);
-
-			Self::deposit_event(Event::MessagesRecorded {
-				destination: dest,
-				count,
-			});
+			Self::deposit_event(Event::MessagesRecorded { destination: dest, count });
 		}
-	}
-}
-
-/// Helper to wrap runtime storage as an mmr_lib store.
-struct DestMMRStore<T>(ParaId, core::marker::PhantomData<T>);
-impl<T> DestMMRStore<T> {
-	fn new(dest: ParaId) -> Self {
-		Self(dest, core::marker::PhantomData)
-	}
-}
-
-impl<T: Config> mmr_lib::MMRStoreReadOps<H256> for DestMMRStore<T> {
-	fn get_elem(&self, pos: u64) -> mmr_lib::Result<Option<H256>> {
-		Ok(MMRNodes::<T>::get(self.0, pos))
-	}
-}
-
-impl<T: Config> mmr_lib::MMRStoreWriteOps<H256> for DestMMRStore<T> {
-	fn append(&mut self, _pos: u64, elems: Vec<H256>) -> mmr_lib::Result<()> {
-		// Note: _pos is the starting position of elems in the MMR.
-		// mmr_lib handles the position mapping.
-		let mut current_pos = _pos;
-		for elem in elems {
-			MMRNodes::<T>::insert(self.0, current_pos, elem);
-			current_pos += 1;
-		}
-		Ok(())
 	}
 }
 
@@ -222,7 +170,11 @@ impl<T: Config> Pallet<T> {
 	/// Compute the cumulative provides root over all per-destination MMRs.
 	pub fn compute_provides_root() -> Option<ProvidesCommitment> {
 		let mut roots: Vec<(ParaId, H256)> = OutgoingMMRState::<T>::iter()
-			.map(|(dest, state)| (dest, compute_mmr_root_from_storage::<T>(dest, state.size)))
+			.filter(|(_, state)| state.leaf_count > 0)
+			.map(|(dest, state)| {
+				let root = bag_peaks::<Keccak256Merge>(&state.peaks).unwrap_or_default();
+				(dest, root)
+			})
 			.collect();
 
 		if roots.is_empty() {
@@ -230,10 +182,8 @@ impl<T: Config> Pallet<T> {
 		}
 
 		roots.sort_by_key(|(id, _)| *id);
-		let leaves: Vec<Vec<u8>> = roots
-			.iter()
-			.map(|(dest, root)| (dest, root).encode())
-			.collect();
+		let leaves: Vec<Vec<u8>> =
+			roots.iter().map(|(dest, root)| (dest, root).encode()).collect();
 
 		Some(ProvidesCommitment {
 			root: binary_merkle_tree::merkle_root::<Keccak256, _>(leaves),
@@ -243,10 +193,11 @@ impl<T: Config> Pallet<T> {
 	/// Get the MMR subtree root and leaf count for a destination.
 	pub fn destination_state(dest: ParaId) -> Option<(H256, u64)> {
 		let state = OutgoingMMRState::<T>::get(&dest);
-		if state.size == 0 {
+		if state.leaf_count == 0 {
 			return None;
 		}
-		Some((compute_mmr_root_from_storage::<T>(dest, state.size), state.size))
+		let root = bag_peaks::<Keccak256Merge>(&state.peaks).unwrap_or_default();
+		Some((root, state.leaf_count))
 	}
 
 	/// Read payload bytes for a destination starting at `from_position`.
@@ -255,15 +206,10 @@ impl<T: Config> Pallet<T> {
 		from_position: u64,
 		max_messages: u32,
 	) -> Vec<(u64, Vec<u8>)> {
-		let state = OutgoingMMRState::<T>::get(&dest);
-		let leaf_count = state.leaf_count;
+		let leaf_count = OutgoingMMRState::<T>::get(&dest).leaf_count;
 		let end = leaf_count.min(from_position + max_messages as u64);
-
 		(from_position..end)
-			.filter_map(|pos| {
-				OutgoingMessages::<T>::get(dest, pos)
-					.map(|payload| (pos, payload))
-			})
+			.filter_map(|pos| OutgoingMessages::<T>::get(dest, pos).map(|p| (pos, p)))
 			.collect()
 	}
 
@@ -274,7 +220,11 @@ impl<T: Config> Pallet<T> {
 		_subtree_root: H256,
 	) -> Option<(Vec<H256>, u32, u32)> {
 		let mut roots: Vec<(ParaId, H256)> = OutgoingMMRState::<T>::iter()
-			.map(|(d, state)| (d, compute_mmr_root_from_storage::<T>(d, state.size)))
+			.filter(|(_, state)| state.leaf_count > 0)
+			.map(|(d, state)| {
+				let root = bag_peaks::<Keccak256Merge>(&state.peaks).unwrap_or_default();
+				(d, root)
+			})
 			.collect();
 
 		if roots.is_empty() {
@@ -283,17 +233,11 @@ impl<T: Config> Pallet<T> {
 
 		roots.sort_by_key(|(id, _)| *id);
 		let leaf_index = roots.iter().position(|(d, _)| *d == dest)?;
-
-		let leaves: Vec<Vec<u8>> = roots
-			.iter()
-			.map(|(d, r)| (d, r).encode())
-			.collect();
-
+		let leaves: Vec<Vec<u8>> =
+			roots.iter().map(|(d, r)| (d, r).encode()).collect();
 		let number_of_leaves = leaves.len() as u32;
-		let proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(
-			leaves,
-			leaf_index as u32,
-		);
+		let proof =
+			binary_merkle_tree::merkle_proof::<Keccak256, _, _>(leaves, leaf_index as u32);
 
 		Some((proof.proof, number_of_leaves, leaf_index as u32))
 	}
@@ -303,36 +247,47 @@ impl<T: Config> Pallet<T> {
 		dest: ParaId,
 		old_provides_root: H256,
 	) -> Option<polkadot_primitives::v10::LateBlockProof> {
-		// 1. Find block number for old_provides_root
-		let (old_block_number, _) = HistoricalProvidesRoots::<T>::iter()
-			.find(|(_, root)| root == &old_provides_root)?;
-			
-		// 2. Get historical subtree state
-		let (old_subtree_root, old_subtree_size) = HistoricalSubtreeState::<T>::get(old_block_number, dest)?;
+		// 1. Find the block number that produced old_provides_root.
+		let (old_block_number, _) =
+			HistoricalProvidesRoots::<T>::iter().find(|(_, root)| root == &old_provides_root)?;
+
+		// 2. Get historical subtree state (root + peaks stored at that block).
+		let (old_subtree_root, old_peaks) =
+			HistoricalSubtreeState::<T>::get(old_block_number, dest)?;
 
 		let current_provides = Self::compute_provides_root()?;
-		let (current_subtree_root, current_subtree_size) = Self::destination_state(dest)?;
+		let (current_subtree_root, _) = Self::destination_state(dest)?;
 		let (current_subtree_proof, num_dest, leaf_idx) =
 			Self::subtree_inclusion_proof(dest, current_subtree_root)?;
 
-		// 3. Generate old subtree proof (inclusion in old_provides_root)
-		let mut old_roots: Vec<(ParaId, H256)> = HistoricalSubtreeState::<T>::iter_prefix(old_block_number)
-			.map(|(id, (root, _))| (id, root))
-			.collect();
+		// 3. Build old subtree Merkle proof from historical provides root.
+		let mut old_roots: Vec<(ParaId, H256)> =
+			HistoricalSubtreeState::<T>::iter_prefix(old_block_number)
+				.map(|(id, (root, _))| (id, root))
+				.collect();
 		old_roots.sort_by_key(|(id, _)| *id);
 		let old_leaf_idx = old_roots.iter().position(|(id, _)| *id == dest)?;
-		let old_leaves: Vec<Vec<u8>> = old_roots.iter().map(|(d, r)| (d, r).encode()).collect();
-		let old_proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(old_leaves, old_leaf_idx as u32);
+		let old_leaves: Vec<Vec<u8>> =
+			old_roots.iter().map(|(d, r)| (d, r).encode()).collect();
+		let old_proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(
+			old_leaves,
+			old_leaf_idx as u32,
+		);
 
-		// 4. Generate MMR extension proof if size increased
-		let subtree_extension = if current_subtree_size > old_subtree_size {
-			Self::mmr_extension_proof(dest, old_subtree_root, old_subtree_size)
+		// 4. Build MMR extension proof if the subtree has grown.
+		let current_state = OutgoingMMRState::<T>::get(&dest);
+		let subtree_extension = if current_state.leaf_count > old_peaks.len() as u64 {
+			Some(MMRExtensionProof {
+				old_peaks: old_peaks.clone(),
+				new_peaks: current_state.peaks.clone(),
+				connecting_nodes: Vec::new(),
+			})
 		} else {
 			None
 		};
 
 		Some(polkadot_primitives::v10::LateBlockProof {
-			source: 0u32.into(), // Caller will fill
+			source: 0u32.into(), // Caller fills in the source para id.
 			number_of_destinations: num_dest,
 			leaf_index: leaf_idx,
 			old_provides_root,
@@ -352,37 +307,22 @@ impl<T: Config> Pallet<T> {
 			.map(|(n, _)| n)
 	}
 
-	/// Generate an MMR extension proof.
+	/// Generate an MMR extension proof from stored peaks.
 	pub fn mmr_extension_proof(
 		dest: ParaId,
 		_old_subtree_root: H256,
-		old_subtree_size: u64,
+		_old_subtree_size: u64,
 	) -> Option<MMRExtensionProof> {
-		let current_size = OutgoingMMRState::<T>::get(&dest).size;
-		if current_size <= old_subtree_size {
+		// With peaks-only storage, the caller already has old_peaks from
+		// HistoricalSubtreeState. This entry point is retained for API
+		// compatibility; generate_late_block_proof builds the proof directly.
+		let current_state = OutgoingMMRState::<T>::get(&dest);
+		if current_state.leaf_count == 0 {
 			return None;
 		}
-
-		// Use mmr-lib's helper to get peaks.
-		let old_peaks = mmr_lib::helper::get_peaks(old_subtree_size);
-		let mut old_peak_hashes = Vec::new();
-		for pos in old_peaks {
-			if let Some(hash) = MMRNodes::<T>::get(dest, pos) {
-				old_peak_hashes.push(hash);
-			}
-		}
-
-		let current_peaks = mmr_lib::helper::get_peaks(current_size);
-		let mut current_peak_hashes = Vec::new();
-		for pos in current_peaks {
-			if let Some(hash) = MMRNodes::<T>::get(dest, pos) {
-				current_peak_hashes.push(hash);
-			}
-		}
-
 		Some(MMRExtensionProof {
-			old_peaks: old_peak_hashes,
-			new_peaks: current_peak_hashes,
+			old_peaks: Vec::new(), // Caller must supply old peaks from history.
+			new_peaks: current_state.peaks,
 			connecting_nodes: Vec::new(),
 		})
 	}
@@ -393,22 +333,19 @@ impl<T: Config> XcmpMessageSource for Pallet<T> {
 		maximum_channels: usize,
 		excluded_recipients: &[ParaId],
 	) -> Vec<(ParaId, Vec<u8>)> {
-		let messages = T::InnerXcmpMessageSource::take_outbound_messages(
-			maximum_channels,
-			excluded_recipients,
-		);
-
+		let messages =
+			T::InnerXcmpMessageSource::take_outbound_messages(maximum_channels, excluded_recipients);
 		for (dest, data) in &messages {
 			Pallet::<T>::record_outbound_messages(*dest, vec![data.clone()]);
 		}
-
 		messages
 	}
 }
 
 // ── Helpers ──
 
-/// Bag MMR peaks into a single root hash (right-to-left).
+/// Bag MMR peaks into a single root hash using the canonical merge order:
+/// merge(right_accumulator, left_peak) from right to left.
 fn bag_peaks<M: Merge<Item = H256>>(peaks: &[H256]) -> mmr_lib::Result<H256> {
 	match peaks.len() {
 		0 => Err(mmr_lib::Error::InconsistentStore),
@@ -423,43 +360,28 @@ fn bag_peaks<M: Merge<Item = H256>>(peaks: &[H256]) -> mmr_lib::Result<H256> {
 	}
 }
 
-/// Compute the MMR root for a destination by reading nodes from runtime storage.
-fn compute_mmr_root_from_storage<T: Config>(dest: ParaId, mmr_size: u64) -> H256 {
-	if mmr_size == 0 {
-		return H256::zero();
+/// Append a leaf hash to the peaks list, merging peaks as required.
+/// `size` is the number of leaves already in the MMR (0-based leaf count).
+fn append_leaf_to_peaks<M: Merge<Item = H256>>(
+	mut peaks: Vec<H256>,
+	size: u64,
+	leaf: H256,
+) -> Vec<H256> {
+	let mut current = leaf;
+	let mut current_size = size;
+	while current_size % 2 == 1 {
+		if let Some(last_peak) = peaks.pop() {
+			current = M::merge(&last_peak, &current).unwrap_or(current);
+		}
+		current_size /= 2;
 	}
-	let peaks = mmr_lib::helper::get_peaks(mmr_size);
-	if peaks.is_empty() {
-		return H256::zero();
-	}
-	let peak_hashes: Vec<H256> = peaks
-		.iter()
-		.filter_map(|pos| MMRNodes::<T>::get(dest, *pos))
-		.collect();
-	if peak_hashes.is_empty() {
-		return H256::zero();
-	}
-	if peak_hashes.len() == 1 {
-		return peak_hashes[0];
-	}
-	bag_peaks::<Keccak256Merge>(&peak_hashes).unwrap_or_default()
+	peaks.push(current);
+	peaks
 }
-
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use mmr_lib::helper::leaf_index_to_pos;
-	use sp_mmr_primitives::utils::NodesUtils;
-
-	fn compute_mmr_root(leaves: &[H256]) -> H256 {
-		let store = mmr_lib::util::MemStore::<H256>::default();
-		let mut mmr = mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
-		for leaf in leaves {
-			mmr.push(*leaf).unwrap();
-		}
-		mmr.get_root().unwrap_or_default()
-	}
 
 	#[test]
 	fn test_mmr_root_matches_inbox_pattern() {
@@ -467,35 +389,26 @@ mod tests {
 		let leaf2 = Keccak256::hash(b"msg2");
 		let leaf3 = Keccak256::hash(b"msg3");
 
-		let root = compute_mmr_root(&[leaf1, leaf2, leaf3]);
-		assert_ne!(root, H256::zero());
+		// Build using peaks-only approach (same as inbox).
+		let mut peaks = Vec::new();
+		for (i, leaf) in [leaf1, leaf2, leaf3].iter().enumerate() {
+			peaks = append_leaf_to_peaks::<Keccak256Merge>(peaks, i as u64, *leaf);
+		}
+		let peaks_root = bag_peaks::<Keccak256Merge>(&peaks).unwrap();
 
-		// Verify against MerkleProof::calculate_root (same as inbox).
-		let leaf_count: u64 = 3;
-		let mmr_node_size = NodesUtils::new(leaf_count).size();
-		let leaf_pos = leaf_index_to_pos(2);
-
+		// Reference: mmr_lib in-memory MMR.
 		let store = mmr_lib::util::MemStore::<H256>::default();
-		let mut mmr =
-			mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
+		let mut mmr = mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
 		mmr.push(leaf1).unwrap();
 		mmr.push(leaf2).unwrap();
-		let pos2 = mmr.push(leaf3).unwrap();
-		let proof = mmr.gen_proof(vec![pos2]).unwrap();
+		mmr.push(leaf3).unwrap();
+		let mmr_root = mmr.get_root().unwrap();
 
-		let mp = mmr_lib::MerkleProof::<H256, Keccak256Merge>::new(
-			mmr_node_size,
-			proof.proof_items().to_vec(),
-		);
-		let calculated =
-			mp.calculate_root(vec![(leaf_pos, leaf3)]).unwrap();
-
-		assert_eq!(calculated, root);
+		assert_eq!(peaks_root, mmr_root);
 	}
 
 	#[test]
 	fn test_top_level_proof_generation_verification_roundtrip() {
-		// Provider-generated proof → receiver verification
 		let dest_a: ParaId = 1000u32.into();
 		let dest_b: ParaId = 2000u32.into();
 		let subtree_a = Keccak256::hash(b"msgs_to_a");
@@ -506,9 +419,7 @@ mod tests {
 		let leaves: Vec<Vec<u8>> =
 			pairs.iter().map(|(d, r)| (d, r).encode()).collect();
 		let number_of_leaves = leaves.len() as u32;
-
-		let provides_root =
-			binary_merkle_tree::merkle_root::<Keccak256, _>(&leaves);
+		let provides_root = binary_merkle_tree::merkle_root::<Keccak256, _>(&leaves);
 
 		let leaf_index = pairs.iter().position(|(d, _)| *d == dest_a).unwrap();
 		let proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(
@@ -516,7 +427,6 @@ mod tests {
 			leaf_index as u32,
 		);
 
-		// Receiver-side verification (same as pallet-speculative-inbox)
 		let leaf_data = (dest_a, subtree_a).encode();
 		assert!(binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 			&provides_root,
