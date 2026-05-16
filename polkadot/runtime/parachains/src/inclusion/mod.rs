@@ -733,12 +733,17 @@ impl<T: Config> Pallet<T> {
 
 				// Speculative Messaging (Phase 1 PoC): store provides/requires for enactment.
 				// Per §4.2, satisfaction is only enforced at enactment time, not here.
-				if let Some(speculative) = candidate.candidate().commitments.speculative.as_ref() {
-					if speculative.provides.is_some() || !speculative.requires.is_empty() {
+				{
+					let commitments = &candidate.candidate().commitments;
+					if commitments.provides.is_some() || !commitments.requires.is_empty() {
 						Self::store_pending_speculative(
 							candidate_hash,
-							speculative.provides,
-							speculative.requires.clone(),
+							commitments.provides.as_ref().map(|p| p.root),
+							commitments
+								.requires
+								.iter()
+								.map(|r| (r.source, r.expected_root))
+								.collect(),
 						);
 					}
 				}

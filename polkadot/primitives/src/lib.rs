@@ -73,14 +73,20 @@ pub use v9::{
 	DEFAULT_SCHEDULING_LOOKAHEAD, LEGACY_MIN_BACKING_VOTES, LOWEST_PUBLIC_ID, MAX_CODE_SIZE,
 	MAX_HEAD_DATA_SIZE, MAX_POV_SIZE, MIN_CODE_SIZE, ON_DEMAND_DEFAULT_QUEUE_MAX_SIZE,
 	ON_DEMAND_MAX_QUEUE_MAX_SIZE, PARACHAINS_INHERENT_IDENTIFIER, PARACHAIN_KEY_TYPE_ID,
-	RELAY_CHAIN_SLOT_DURATION_MILLIS, 	UMP_SEPARATOR, SpeculativeCommitments, TrailingOption,
+	RELAY_CHAIN_SLOT_DURATION_MILLIS, UMP_SEPARATOR, ProvidesCommitment, RequiresCommitment,
+	TrailingOption,
 };
 
 pub use v10::{
-	CandidateCommitments as CandidateCommitmentsV10, CandidateDescriptorV4, CandidateReceiptV4,
-	CommittedCandidateReceiptV4, ProvidesCommitment, RequiresCommitment,
+	CandidateDescriptorV4, CandidateReceiptV4,
+	CommittedCandidateReceiptV4,
 	LateBlockProof,
 };
+
+/// Alias for `CandidateCommitments` used by v10 callers.
+/// Since v9 `CandidateCommitments` now includes the speculative fields,
+/// v10 no longer needs a separate type.
+pub use v9::CandidateCommitments as CandidateCommitmentsV10;
 
 #[cfg(feature = "test")]
 pub use v9::{AppVerify, MutateDescriptorV2};

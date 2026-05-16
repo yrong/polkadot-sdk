@@ -536,7 +536,7 @@ fn candidate_validation_ok_is_ok(#[case] v2_descriptor: bool) {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 
 	if v2_descriptor {
@@ -556,7 +556,7 @@ fn candidate_validation_ok_is_ok(#[case] v2_descriptor: bool) {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
@@ -632,7 +632,7 @@ fn invalid_session_or_ump_signals() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 
 	validation_result.upward_messages.force_push(UMP_SEPARATOR);
@@ -647,7 +647,7 @@ fn invalid_session_or_ump_signals() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 
 	let mut candidate_receipt =
@@ -944,7 +944,7 @@ fn v3_ump_signal_enforcement() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 	result_with_signals.upward_messages.force_push(UMP_SEPARATOR);
 	result_with_signals
@@ -959,7 +959,7 @@ fn v3_ump_signal_enforcement() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 
 	let mut cq = BTreeMap::new();
@@ -982,7 +982,7 @@ fn v3_ump_signal_enforcement() {
 			new_validation_code: validation_result.new_validation_code.clone(),
 			processed_downward_messages: validation_result.processed_downward_messages,
 			hrmp_watermark: validation_result.hrmp_watermark,
-			speculative: None,
+			provides: None, requires: vec![],
 		};		let candidate_receipt = CandidateReceipt {
 			descriptor: descriptor.clone(),
 			commitments_hash: commitments.hash(),
@@ -1135,7 +1135,7 @@ fn candidate_validation_one_ambiguous_error_is_valid() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 
 	let commitments = CandidateCommitments {
@@ -1145,7 +1145,7 @@ fn candidate_validation_one_ambiguous_error_is_valid() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
@@ -1417,7 +1417,7 @@ fn candidate_validation_commitment_hash_mismatch_is_invalid() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 12345,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 
 	let result = executor::block_on(validate_candidate(
@@ -1472,7 +1472,7 @@ fn compressed_code_works() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 
 	let commitments = CandidateCommitments {
@@ -1482,7 +1482,7 @@ fn compressed_code_works() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
@@ -2726,7 +2726,7 @@ fn pre_validation_scheduling_session_check() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 	let commitments = CandidateCommitments {
 		head_data: validation_result.head_data.clone(),
@@ -2735,7 +2735,7 @@ fn pre_validation_scheduling_session_check() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
 
@@ -2843,7 +2843,7 @@ fn pre_validation_v3_scheduling_offset_mismatch() {
 			horizontal_messages: Default::default(),
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			speculative: Default::default(),
+			provides: None, requires: vec![],
 		}));
 	let (response_tx, response_rx) = oneshot::channel();
 
@@ -3039,7 +3039,7 @@ fn pre_validation_relay_parent_session_check() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 	let commitments = CandidateCommitments {
 		head_data: validation_result.head_data.clone(),
@@ -3048,7 +3048,7 @@ fn pre_validation_relay_parent_session_check() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
 
@@ -3207,7 +3207,7 @@ fn pre_validation_relay_parent_session_check_v3_ancestor_query() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: Default::default(),
+		provides: None, requires: vec![],
 	};
 	let commitments = CandidateCommitments {
 		head_data: validation_result.head_data.clone(),
@@ -3216,7 +3216,7 @@ fn pre_validation_relay_parent_session_check_v3_ancestor_query() {
 		new_validation_code: validation_result.new_validation_code.clone(),
 		processed_downward_messages: validation_result.processed_downward_messages,
 		hrmp_watermark: validation_result.hrmp_watermark,
-		speculative: None,
+		provides: None, requires: vec![],
 	};
 	let candidate_receipt = CandidateReceipt { descriptor, commitments_hash: commitments.hash() };
 

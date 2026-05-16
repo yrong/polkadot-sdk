@@ -53,7 +53,7 @@ use polkadot_primitives::{
 	},
 	node_features::FeatureIndex,
 	transpose_claim_queue, AuthorityDiscoveryId, CandidateCommitments,
-	CandidateDescriptorVersion, SpeculativeCommitments,
+	CandidateDescriptorVersion, ProvidesCommitment, RequiresCommitment,
 	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
@@ -1308,15 +1308,16 @@ async fn validate_candidate(
 				gum::info!(target: LOG_TARGET, ?para_id, "Invalid candidate (para_head)");
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
-				let (provides_root, requires) = match res.speculative.0 {
-					Some(ValidationResultExtension::V4 { provides_root, requires }) =>
-						(provides_root, requires),
+				let (provides, requires) = match res.speculative.0 {
+					Some(ValidationResultExtension::V4 { provides_root, requires }) => (
+						provides_root.map(|root| ProvidesCommitment { root }),
+						requires
+							.into_iter()
+							.map(|(source, expected_root)| RequiresCommitment { source, expected_root })
+							.collect(),
+					),
 					None => (None, Vec::new()),
 				};
-				let speculative = SpeculativeCommitments::from_pvf_parts(
-					provides_root,
-					requires,
-				);
 
 				let commitments_v9 = CandidateCommitments {
 					head_data: res.head_data,
@@ -1325,7 +1326,8 @@ async fn validate_candidate(
 					new_validation_code: res.new_validation_code,
 					processed_downward_messages: res.processed_downward_messages,
 					hrmp_watermark: res.hrmp_watermark,
-					speculative,
+					provides,
+					requires,
 				};
 
 				let commitments_hash = commitments_v9.hash();
