@@ -839,14 +839,7 @@ where
 
 	let mut late_block_proofs = Vec::new();
 
-	// 1. Extract proofs from fetched batches.
-	for batch in &speculative_ingress.batches {
-		if let Some(proof) = &batch.late_block_proof {
-			late_block_proofs.push(proof.clone());
-		}
-	}
-
-	// 2. Check for missing proofs (e.g. root advanced but no new messages).
+	// Check for missing proofs (e.g. root advanced but no new messages).
 	for block in &blocks {
 		let hash = block.hash();
 		if let Ok(requires) = para_client.runtime_api().requires_commitments(hash) {

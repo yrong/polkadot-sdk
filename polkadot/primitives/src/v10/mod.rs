@@ -96,8 +96,6 @@ pub struct MessageBatch {
 	pub leaf_index: u32,
 	/// The messages with their positions in the sender's subtree MMR.
 	pub messages: Vec<OutgoingMessage>,
-	/// Optional proof required if the receiver built against an older root.
-	pub late_block_proof: Option<LateBlockProof>,
 }
 
 /// An individual outbound message with its MMR position.
