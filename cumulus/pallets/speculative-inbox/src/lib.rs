@@ -201,30 +201,6 @@ pub mod pallet {
 				// 2. Load or init per-source state
 				let mut state = IncomingState::<T>::get(&batch.source).unwrap_or_default();
 
-				// 2.1 Handle Late Block Proof if root has advanced
-				if let Some(proof) = batch.late_block_proof {
-					ensure!(proof.source == batch.source, Error::<T>::InvalidSubtreeProof);
-					ensure!(
-						proof.old_provides_root == state.last_seen_provides_root
-							|| state.last_seen_provides_root == H256::zero(),
-						Error::<T>::InvalidSubtreeProof
-					);
-					ensure!(proof.new_provides_root == batch.provides_root, Error::<T>::InvalidSubtreeProof);
-
-					// Verify extension if subtree has changed
-					if let Some(ext) = proof.subtree_extension {
-						let valid = verify_mmr_extension(
-							proof.old_subtree_root,
-							proof.new_subtree_root,
-							&ext,
-						);
-						ensure!(valid, Error::<T>::InvalidSubtreeProof);
-					}
-					// Note: Binary Merkle proofs for subtree roots in provides roots are
-					// implicitly verified by the fact that batch.subtree_root matches
-					// proof.new_subtree_root and batch.subtree_inclusion_proof is verified in step 1.
-				}
-
 				// 3. Verify message continuity and reconstruct local subtree
 				for msg in &batch.messages {
 					let expected_position = if state.mmr_size == 0 {

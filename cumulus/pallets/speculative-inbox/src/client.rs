@@ -86,11 +86,6 @@ where
 		.subtree_inclusion_proof(at, destination, subtree_root)
 		.ok()??;
 
-	let mut late_block_proof = None;
-	if expected_provides_root != Hash::zero() && expected_provides_root != provides.root {
-		late_block_proof = api.generate_late_block_proof(at, destination, expected_provides_root).ok().flatten();
-	}
-
 	let batch = MessageBatch {
 		source,
 		source_block,
@@ -104,7 +99,6 @@ where
 			.into_iter()
 			.map(|(position, payload)| OutgoingMessage { position, payload })
 			.collect(),
-		late_block_proof,
 	};
 
 	Some(batch)

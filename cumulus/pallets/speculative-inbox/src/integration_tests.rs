@@ -49,7 +49,6 @@ fn build_valid_batch(
 				payload,
 			})
 			.collect(),
-		late_block_proof: None,
 	}
 }
 
@@ -139,7 +138,6 @@ fn ingest_second_batch_requires_consecutive_positions() {
 				position: 1,
 				payload: b"two".to_vec(),
 			}],
-			late_block_proof: None,
 		};
 
 		assert_ok!(SpeculativeInbox::<Test>::ingest_verified_messages(
