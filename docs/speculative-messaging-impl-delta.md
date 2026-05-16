@@ -119,63 +119,48 @@ production organization.
 
 ---
 
-## 5. `OutgoingMMRs` / `MMRState` storage structure differs
+## 5. `OutgoingMMRs` / `MMRState` — peaks-only storage matches inbox approach
 
 **Design section:** §5.1
 
-**Design:**
-```rust
-pub struct MMRState {
-    pub leaf_count: u64,
-    pub root: H256,
-    pub nodes: BTreeMap<u64, H256>,
-}
-
-#[pallet::storage]
-pub type OutgoingMMRs<T: Config> = StorageMap<_, Twox64Concat, ParaId, MMRState>;
-```
-(root and nodes stored inline in one map entry)
+**Design:** Shows `MMRState { leaf_count, root, nodes: BTreeMap<u64, H256> }` with
+root and all nodes stored inline.
 
 **Implementation** (`cumulus/pallets/speculative-outbox/src/lib.rs`):
 ```rust
 pub struct MMRState {
-    pub size: u64,        // MMR node count (mmr.mmr_size()), not leaf count alone
     pub leaf_count: u64,
+    pub peaks: Vec<H256>,  // O(log n) — same approach as inbox
 }
-
-#[pallet::storage]
-pub type OutgoingMMRState<T: Config> = StorageMap<_, Twox64Concat, ParaId, MMRState>;
-
-#[pallet::storage]
-pub type MMRNodes<T: Config> = StorageDoubleMap<_, Twox64Concat, ParaId, Twox64Concat, u64, H256>;
 ```
-The root is not stored — it is computed on demand from peak positions via
-`compute_mmr_root_from_storage(dest, state.size)`. Nodes are in a separate
-storage map, not inline in `MMRState`.
 
-**Why:** FRAME storage maps have size constraints that make large inline
-`BTreeMap` values impractical. A separate `StorageDoubleMap` is the idiomatic
-approach. Computing the root on demand avoids a stale-root risk and is cheap
-given that only O(log n) peak hashes need to be read.
+Both outbox and inbox use identical peaks-only storage with the same
+`append_leaf_to_peaks` + `bag_peaks` helpers. `HistoricalSubtreeState` stores
+`(root, peaks)` instead of `(root, size)` so extension proofs can be built
+without a separate node store. `MMRNodes`, `DestMMRStore`, and the
+`mmr_lib::MMR::push`/`commit` path are removed entirely.
 
-**Recommendation:** Update §5.1 to describe the two-map layout and explain why
-the root is computed on-demand rather than stored.
+**Tradeoff:** Per-message MMR inclusion proofs (proving a single leaf is in the
+subtree root without the full batch) require the full internal node set. The
+current design never needs them — the receiver reconstructs the entire subtree
+from all messages and checks the root. When selective or relaxed delivery is
+added, the right solution is off-chain node storage in the provider process,
+which already maintains a local cache of batch data. The provider rebuilds the
+full MMR from `outbound_messages()` and serves per-message proofs from its local
+store; no on-chain storage changes are needed.
+
+**Status:** Resolved — see commit `22cd03d3f3d`.
+
+**Recommendation:** Update §5.1 to document the peaks-only layout and add a note
+on per-message proof generation as a provider-side extension.
 
 ---
 
-## 6. `SourceState.local_subtree` replaced with peaks-only fields
+## 6. `SourceState` — peaks-only fields match design intent
 
 **Design section:** §5.2
 
-**Design:**
-```rust
-pub struct SourceState {
-    pub last_processed: u64,
-    pub last_seen_provides_root: H256,
-    pub last_seen_subtree_root: H256,
-    pub local_subtree: MMRState,  // full MMRState struct
-}
-```
+**Design:** Shows `SourceState` containing `local_subtree: MMRState` (full struct).
 
 **Implementation** (`cumulus/pallets/speculative-inbox/src/lib.rs`):
 ```rust
@@ -183,19 +168,19 @@ pub struct SourceState {
     pub last_processed: u64,
     pub last_seen_provides_root: H256,
     pub last_seen_subtree_root: H256,
-    pub mmr_size: u64,           // leaf count (not the mmr_lib node count)
-    pub mmr_peaks: Vec<H256>,    // peaks only — no full node set
+    pub mmr_size: u64,        // leaf count
+    pub mmr_peaks: Vec<H256>, // O(log n) peaks
 }
 ```
 
-**Why:** The receiver only needs to reconstruct the subtree root from new
-messages batch-by-batch. Storing only the peaks (O(log n) entries) is
-sufficient — the full node set is never needed again after the root is
-verified. This avoids growing on-chain storage proportionally with message
-count.
+The outbox uses the identical peaks-only representation (`MMRState { leaf_count,
+peaks }`), so both sides are consistent. `mmr_size` counts leaves, not mmr_lib's
+internal node count.
 
-**Recommendation:** Update §5.2 to document the peaks-only approach and clarify
-that `mmr_size` here counts leaves (not mmr_lib's internal node count).
+**Status:** Resolved — consistent with item 5.
+
+**Recommendation:** Update §5.2 to document the peaks-only fields and clarify
+that `mmr_size` / `leaf_count` counts leaves.
 
 ---
 
@@ -321,8 +306,8 @@ existing descriptor version byte, not a new struct family, and describe the
 | 2 | §6.2 | Late block proofs exclusively in PoV | Resolved | No action needed |
 | 3 | §2, §6.1 | `CandidateCommitments` has direct fields matching design | Resolved | No action needed |
 | 4 | §4.1 | No separate `speculative_messaging.rs`; inlined into `inclusion` | Open | Update design |
-| 5 | §5.1 | `OutgoingMMRs` split into two storage maps; root computed on-demand | Open | Update design |
-| 6 | §5.2 | `SourceState.local_subtree` replaced by peaks-only `mmr_size`/`mmr_peaks` | Open | Update design |
+| 5 | §5.1 | Peaks-only outbox storage; `MMRNodes` removed | Resolved | Update design |
+| 6 | §5.2 | Peaks-only inbox storage; consistent with item 5 | Resolved | Update design |
 | 7 | §4.2 | `PendingSpeculativeData` storage item not described | Open | Update design |
 | 8 | §5.2 | Position-0 first-message bug in design pseudocode | Open | Fix design |
 | 9 | §6.2 | Old subtree Merkle proof verified in PVF only, not runtime | Open | Update design |
