@@ -43,7 +43,9 @@ use polkadot_node_subsystem_util::{
 	runtime::{fetch_scheduling_lookahead, ClaimQueueSnapshot},
 };
 use polkadot_overseer::{ActivatedLeaf, ActiveLeavesUpdate};
-use polkadot_parachain_primitives::primitives::ValidationResult as WasmValidationResult;
+use polkadot_parachain_primitives::primitives::{
+	ValidationResult as WasmValidationResult, ValidationResultExtension,
+};
 use polkadot_primitives::{
 	executor_params::{
 		DEFAULT_APPROVAL_EXECUTION_TIMEOUT, DEFAULT_BACKING_EXECUTION_TIMEOUT,
@@ -1306,9 +1308,14 @@ async fn validate_candidate(
 				gum::info!(target: LOG_TARGET, ?para_id, "Invalid candidate (para_head)");
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
+				let (provides_root, requires) = match res.speculative.0 {
+					Some(ValidationResultExtension::V4 { provides_root, requires }) =>
+						(provides_root, requires),
+					None => (None, Vec::new()),
+				};
 				let speculative = TrailingOption(SpeculativeCommitments::from_pvf_parts(
-					res.provides_root,
-					res.requires,
+					provides_root,
+					requires,
 				));
 
 				let commitments_v9 = CandidateCommitments {
