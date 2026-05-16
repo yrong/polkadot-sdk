@@ -184,33 +184,32 @@ that `mmr_size` / `leaf_count` counts leaves.
 
 ---
 
-## 7. `PendingSpeculativeData` relay-chain storage not in design
+## 7. `PendingSpeculativeData` — removed, commitments read directly
 
 **Design section:** §4.2
 
-**Design:** Describes the two-phase backing/enactment model but does not define
-any intermediate storage item to hold speculative data between the two phases.
+**Design:** Describes the two-phase backing/enactment model. Does not define any
+intermediate storage item — the implies reading from the candidate's commitments
+directly at enactment time.
 
-**Implementation** (`polkadot/runtime/parachains/src/inclusion/mod.rs`):
-```rust
-#[pallet::storage]
-pub(crate) type PendingSpeculativeData<T: Config> = StorageMap<
-    _,
-    Twox64Concat,
-    CandidateHash,
-    (Option<Hash>, Vec<(Id, Hash)>),  // (provides_root, requires)
->;
-```
-Written when a candidate enters `PendingAvailability` in `process_candidates`;
-consumed (taken) by `enact_candidate` when the candidate is enacted.
+**Earlier implementation:** Had a `PendingSpeculativeData: StorageMap<CandidateHash, ...>`
+that extracted speculative fields at backing time and stored them separately.
 
-**Why:** Without this storage item, `enact_candidate` has no access to the
-speculative fields because `CandidatePendingAvailability` does not re-derive
-them from the commitments — they are consumed at backing time and need to
-survive until enactment.
+**Current implementation:** `PendingSpeculativeData` has been removed.
+`CandidatePendingAvailability` already stores the full `CandidateCommitments`
+including `provides` and `requires` fields, so the separate map was redundant.
+It was introduced when the `SpeculativeCommitments` wrapper used compact
+`(Id, Hash)` tuples that were awkward to access; after that wrapper was removed
+(item 3), reading directly from commitments became natural.
 
-**Recommendation:** Add `PendingSpeculativeData` to §4.1 (storage items) and
-update §4.2 to describe the write-at-backing / read-at-enactment lifecycle.
+- Availability check reads `candidate.commitments.requires` directly.
+- `enact_candidate` reads `commitments.provides` / `commitments.requires` directly.
+- `free_failed_cores` needs no cleanup loop — no separate storage to clear.
+
+**Status:** Resolved — see commit `cc1266e84b0`.
+
+**Recommendation:** Update §4.2 to remove the `PendingSpeculativeData` mention
+and describe the direct-commitments access pattern.
 
 ---
 
@@ -308,7 +307,7 @@ existing descriptor version byte, not a new struct family, and describe the
 | 4 | §4.1 | No separate `speculative_messaging.rs`; inlined into `inclusion` | Open | Update design |
 | 5 | §5.1 | Peaks-only outbox storage; `MMRNodes` removed | Resolved | Update design |
 | 6 | §5.2 | Peaks-only inbox storage; consistent with item 5 | Resolved | Update design |
-| 7 | §4.2 | `PendingSpeculativeData` storage item not described | Open | Update design |
+| 7 | §4.2 | `PendingSpeculativeData` removed; commitments read directly | Resolved | Update design |
 | 8 | §5.2 | Position-0 first-message bug in design pseudocode | Open | Fix design |
 | 9 | §6.2 | Old subtree Merkle proof verified in PVF only, not runtime | Open | Update design |
 | 10 | §2 | Version gating uses feature flag + version byte, not new struct family | Open | Update design |
