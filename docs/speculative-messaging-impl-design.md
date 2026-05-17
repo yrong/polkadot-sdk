@@ -154,10 +154,12 @@ How our design maps onto the existing parachain–relay-chain communication flow
    decodes `ParachainBlockDataV4` from the PoV bytes (getting both block data and
    `LateBlockProof`s in one call), executes the block deterministically —
    same inherents, same `ingest_verified_messages`, same outbox updates. Verifies
-   each late block proof from `pov_v4.late_block_proofs`, transforms requires.
-   Returns `ValidationResultV4`.
-7. **Commitments reconstruction** (§6.1). Node-side validation reconstructs
-   `CandidateCommitments` from `ValidationResultV4`, hashes, checks against the
+   each late block proof via `apply_messaging_proofs`, transforms requires in
+   `ValidationResultExtension::V4`. Returns `ValidationResult` with populated
+   `speculative` field.
+7. **Commitments reconstruction** (§6.1). Node-side validation extracts
+   `ValidationResultExtension::V4` from `result.speculative.0`, reconstructs
+   `CandidateCommitments` from the outputs, hashes, checks against the
    receipt's `commitments_hash`. Match → commitments are valid. Validators sign,
    candidate enters `PendingAvailability`.
 
@@ -1103,83 +1105,99 @@ requires.sort_by_key(|r| r.source);
 
 ## 6. PVF Validation Entry Point
 
-Phase 1 requires a **small validation ABI extension**. The current parachain
-validation ABI returns a `ValidationResult` containing only legacy fields.
-Speculative messaging adds:
+Phase 1 requires a **small validation ABI extension**. Rather than introducing a
+new `ValidationResultV4` struct, the POC extends the existing `ValidationResult`
+with a `speculative: TrailingOption<ValidationResultExtension>` trailing field.
+`TrailingOption` provides backward compatibility: old decoders that don't know
+about the extension simply see zero remaining bytes and return `None`, while new
+decoders decode the speculative fields. This avoids updating every code path that
+constructs or matches on `ValidationResult`.
 
-- `provides: Option<ProvidesCommitment>`
-- `requires: Vec<RequiresCommitment>`
-
-The wasm entrypoint returns **one upgraded validation-result struct**.
-Non-speculative candidates on upgraded runtimes return `provides: None` and
-`requires: vec![]`. Version-gating happens on the node side — candidate
-validation branches on descriptor version to know whether to expect populated
-speculative fields. The relay-chain runtime API (`check_validation_outputs`)
-must evolve to accept the extended type from the start, ignoring optional
-speculative fields for pre-speculative candidates.
-
-**Current-codebase embedding:**
-
-1. In `polkadot/parachain/src/primitives.rs`, introduce an extended validation result shape.
-2. In `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`, after block execution, read speculative outputs (`provides`, `requires`) from runtime state and include them in the returned validation result.
-3. In `polkadot/parachain/src/wasm_api.rs`, return that extended result from the wasm entrypoint.
-4. In `polkadot/node/core/candidate-validation`, decode the extended result and reconstruct `v10::CandidateCommitments` for v4 candidates.
-5. Keep older descriptor versions on the legacy path.
-6. Update relay-chain runtime-API entrypoints that still accept the legacy unversioned `CandidateCommitments` (`ParachainHost::check_validation_outputs` and `check_validation_outputs_for_runtime_api(...)`).
+The extension enum:
 
 ```rust
-/// Extended wasm validation result for v4 speculative-messaging candidates.
-pub struct ValidationResultV4 {
+/// Versioned extension appended to `ValidationResult` for speculative messaging.
+/// Encoded as `TrailingOption<ValidationResultExtension>` — the trailing field
+/// of `ValidationResult`. Old decoders see zero bytes and return None.
+pub enum ValidationResultExtension {
+    /// V4: speculative messaging provides root and requires commitments.
+    V4 {
+        provides_root: Option<Hash>,           // top-level MMR root (sender side)
+        requires: Vec<(ParaId, Hash)>,         // (source, expected_root) pairs (receiver side)
+    },
+}
+
+pub struct ValidationResult {
     pub head_data: HeadData,
     pub new_validation_code: Option<ValidationCode>,
     pub upward_messages: UpwardMessages,
     pub horizontal_messages: HorizontalMessages,
     pub processed_downward_messages: u32,
     pub hrmp_watermark: RelayChainBlockNumber,
-    pub provides: Option<ProvidesCommitment>,
-    pub requires: Vec<RequiresCommitment>,
+    /// Speculative messaging extension (v10+). Must be the LAST field.
+    /// TrailingOption<T> greedily consumes all remaining bytes on decode.
+    pub speculative: TrailingOption<ValidationResultExtension>,
+}
+```
+
+Non-speculative candidates use `speculative: TrailingOption(None)`. Version-gating
+happens on the node side — candidate validation branches on descriptor version to
+decide whether to read speculative fields from the extension. The relay-chain
+runtime API (`check_validation_outputs`) continues to accept the existing type,
+ignoring the trailing extension for pre-speculative candidates.
+
+**Current-codebase embedding:**
+
+1. In `polkadot/parachain/src/primitives.rs`: `ValidationResultExtension` and `TrailingOption` defined; `speculative` field added as last field of `ValidationResult`.
+2. In `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`: after block execution, call `PSC::speculative_extension()` to read `ValidationResultExtension::V4` from runtime state; pass to `apply_messaging_proofs`; set `speculative` field in the returned `ValidationResult`.
+3. In `polkadot/parachain/src/wasm_api.rs`: no separate entrypoint needed — `validate_block` returns `ValidationResult` with the speculative extension populated.
+4. In `polkadot/node/core/candidate-validation`: decode `speculative` field; extract `provides_root`/`requires` from `ValidationResultExtension::V4`; reconstruct `v10::CandidateCommitments` for v4 candidates.
+5. Keep older descriptor versions on the legacy path (extension is `None`).
+
+```rust
+// In validate_block/implementation.rs — after executing all blocks:
+let mut extension = PSC::speculative_extension();
+if let Some(proofs) = messaging_proofs {
+    apply_messaging_proofs(PSC::SelfParaId::get(), &mut extension, proofs);
 }
 
-fn validate_block(params: ValidationParams) -> Result<ValidationResultV4, ValidationError> {
-    let result = execute_block_and_collect_outputs(&params)?;
-    Ok(ValidationResultV4 {
-        head_data: result.head_data,
-        new_validation_code: result.new_validation_code,
-        upward_messages: result.upward_messages,
-        horizontal_messages: result.horizontal_messages,
-        processed_downward_messages: result.processed_downward_messages,
-        hrmp_watermark: result.hrmp_watermark,
-        provides: result.provides,
-        requires: result.requires,
-    })
+ValidationResult {
+    head_data: head_data.expect("HeadData not set"),
+    new_validation_code: new_validation_code.map(Into::into),
+    upward_messages,
+    processed_downward_messages,
+    horizontal_messages,
+    hrmp_watermark,
+    speculative: TrailingOption(extension),
 }
 ```
 
 The wasm PVF does **not** read candidate commitments as an input. It executes the
-block, derives the full validation outputs, and returns them. The node-side
-candidate-validation pipeline then reconstructs `CandidateCommitments` from those
-returned outputs and checks the commitments hash.
+block, derives the full validation outputs via the speculative extension, and returns
+them in `ValidationResult`. The node-side candidate-validation pipeline then
+reconstructs `CandidateCommitments` from those outputs and checks the commitments
+hash.
 
-The pseudocode above shows the basic path. The full implementation (section 6.2)
-additionally reads `LateBlockProof` data from the PoV after block execution,
-verifies each proof, and transforms the `requires` in the returned validation
-result.
+The full implementation (section 6.2) additionally reads `LateBlockProof` data from
+the PoV after block execution, verifies each proof via `apply_messaging_proofs`, and
+transforms the `requires` entries in the extension before the result is returned.
 
 ### 6.1 Candidate Commitments Reconstruction
 
-After the PVF returns a `ValidationResultV4`, the node-side candidate validation
-subsystem reconstructs `CandidateCommitments` from the returned outputs, hashes
-them, and checks the hash against the candidate receipt's `commitments_hash`.
-This is a **hash comparison only** — it ensures the PVF produced the same
-commitments the collator claimed. If the PVF produced different `provides` or
-`requires` (e.g., the collator lied, or a LateBlockProof verification failed
+After the PVF returns a `ValidationResult`, the node-side candidate validation
+subsystem extracts speculative fields from `result.speculative.0` (a
+`ValidationResultExtension::V4`), reconstructs `CandidateCommitments` from the
+returned outputs, hashes them, and checks the hash against the candidate receipt's
+`commitments_hash`. This is a **hash comparison only** — it ensures the PVF produced
+the same commitments the collator claimed. If the PVF produced different `provides`
+or `requires` (e.g., the collator lied, or a LateBlockProof verification failed
 upstream inside the PVF), the hash won't match and the candidate is rejected.
 
 LateBlockProof verification itself happens earlier, inside `validate_block`
-(§6.2) — the PVF reads proofs from the PoV, verifies them, transforms requires,
-and returns the result. The hash check here is the downstream safety net that
-catches any mismatch between the PVF's output and what the collator put in the
-receipt.
+(§6.2) — the PVF reads proofs from the PoV, verifies them via `apply_messaging_proofs`,
+transforms requires in the extension, and returns the result. The hash check here is
+the downstream safety net that catches any mismatch between the PVF's output and what
+the collator put in the receipt.
 
 Once validated, these commitments flow to the relay chain (§4.2) where
 `requires` / `provides` matching happens. The relay chain trusts the commitments
@@ -1914,7 +1932,7 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `get_requires_commitments`. 11/11 tests pass. |
 | 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
 | 10.4 | Collator-side inherent injection & commitment assembly | 🔶 | `SpeculativeIngress` inherent plumbing in place; `ParachainBlockDataV4` wrapping works. `provides`/`requires` now read from runtime via `SpeculativeOutboxApi`/`SpeculativeInboxApi` after block execution in `block_builder_task.rs` and passed through `CollatorMessage` to `build_multi_block_collation`. Collator-side LBP collection removed (see §12 Production Hardening). Single-block path (`build_collation`) still passes `None`/empty. |
-| 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4`, `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
+| 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4` via `TrailingOption<ValidationResultExtension>` (not a separate `ValidationResultV4` struct — backward-compatible trailing field on existing `ValidationResult`). `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
 | 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
