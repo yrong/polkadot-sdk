@@ -90,7 +90,9 @@ impl RelayChainInterface for RelayChainRpcInterface {
 		relay_parent: RelayHash,
 	) -> RelayChainResult<Option<RelayHash>> {
 		let payload = para_id.encode();
-		let response = self.call_runtime_api("ParachainHost_provides_root", relay_parent, &payload).await?;
+		let response = self
+			.call_runtime_api("ParachainHost_provides_root", relay_parent, &payload)
+			.await?;
 		Ok(Decode::decode(&mut &response[..])?)
 	}
 

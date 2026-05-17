@@ -29,18 +29,18 @@ use frame_support::{
 	traits::{ExecuteBlock, Get, IsSubType},
 	BoundedVec,
 };
+use mmr_lib::Merge;
 use polkadot_parachain_primitives::primitives::{HeadData, ValidationResult};
 use sp_core::storage::{well_known_keys, ChildInfo, StateVersion};
 use sp_externalities::{set_and_run_with_externalities, Externalities};
 use sp_io::{hashing::blake2_128, KillStorageResult};
 use sp_runtime::traits::{
-	Block as BlockT, ExtrinsicCall, Hash as HashT, HashingFor, Header as HeaderT, LazyBlock,
-	Keccak256,
+	Block as BlockT, ExtrinsicCall, Hash as HashT, HashingFor, Header as HeaderT, Keccak256,
+	LazyBlock,
 };
 use sp_state_machine::OverlayedChanges;
 use sp_trie::{HashDBT, ProofSizeProvider, EMPTY_PREFIX};
 use trie_recorder::{SeenNodes, SizeOnlyRecorderProvider};
-use mmr_lib::Merge;
 
 /// Keccak256 merge for MMR node construction.
 struct Keccak256Merge;
@@ -122,13 +122,19 @@ fn append_mmr_leaf<M: mmr_lib::Merge<Item = polkadot_primitives::Hash>>(
 	peaks
 }
 
-
-///
 /// This transforms `requires` commitments that reference older source roots into
 /// commitments that reference the current source roots, provided a valid proof is
 /// supplied in the PoV.
-fn apply_messaging_proofs(para_id: polkadot_primitives::Id, extension: &mut Option<polkadot_parachain_primitives::primitives::ValidationResultExtension>, proofs: Vec<polkadot_primitives::v10::LateBlockProof>) {
-	if let Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 { ref mut requires, .. }) = extension {
+fn apply_messaging_proofs(
+	para_id: polkadot_primitives::Id,
+	extension: &mut Option<polkadot_parachain_primitives::primitives::ValidationResultExtension>,
+	proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+) {
+	if let Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
+		ref mut requires,
+		..
+	}) = extension
+	{
 		for proof in proofs {
 			for req in requires.iter_mut() {
 				if req.0 == proof.source && req.1 == proof.old_provides_root {
@@ -165,7 +171,6 @@ fn apply_messaging_proofs(para_id: polkadot_primitives::Id, extension: &mut Opti
 					} else {
 						true
 					};
-
 
 					if old_valid && new_valid && extension_valid {
 						req.1 = proof.new_provides_root;
@@ -266,10 +271,10 @@ where
 		sp_io::transaction_index::host_renew.replace_implementation(host_transaction_index_renew),
 	);
 
-	let (block_data, messaging_proofs) = if let Ok(pov_v4) =
-		codec::decode_from_bytes::<cumulus_primitives_core::ParachainBlockDataV4<B::LazyBlock>>(
-			block_data.clone(),
-		) {
+	let (block_data, messaging_proofs) = if let Ok(pov_v4) = codec::decode_from_bytes::<
+		cumulus_primitives_core::ParachainBlockDataV4<B::LazyBlock>,
+	>(block_data.clone())
+	{
 		(pov_v4.inner, Some(pov_v4.late_block_proofs))
 	} else {
 		let pov = codec::decode_from_bytes::<ParachainBlockData<B::LazyBlock>>(block_data)
@@ -790,8 +795,8 @@ fn host_transaction_index_renew(_extrinsic: u32, _context_hash: [u8; 32]) {
 mod tests {
 	use super::*;
 	use codec::Encode;
-	use polkadot_primitives::v10::{LateBlockProof, MMRExtensionProof};
 	use polkadot_parachain_primitives::primitives::ValidationResultExtension;
+	use polkadot_primitives::v10::{LateBlockProof, MMRExtensionProof};
 	use sp_runtime::traits::Hash as _;
 
 	fn build_peaks(leaf_hashes: &[polkadot_primitives::Hash]) -> Vec<polkadot_primitives::Hash> {
@@ -934,8 +939,7 @@ mod tests {
 	#[test]
 	fn apply_messaging_proofs_does_not_transform_on_invalid_extension() {
 		let para_id: polkadot_primitives::Id = 1000u32.into();
-		let (old_provides_root, _, mut proof) =
-			build_proof_for_test(para_id, b"msg1", b"msg2");
+		let (old_provides_root, _, mut proof) = build_proof_for_test(para_id, b"msg1", b"msg2");
 
 		if let Some(ref mut ext) = proof.subtree_extension {
 			ext.connecting_nodes[0] = keccak(b"tampered");

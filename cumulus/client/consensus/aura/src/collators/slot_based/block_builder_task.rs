@@ -670,7 +670,8 @@ where
 		let relay_proof_request =
 			crate::collators::get_relay_proof_request::<Block, Client>(para_client, parent_hash);
 
-		let speculative_ingress = cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
+		let speculative_ingress =
+			cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
 
 		let (parachain_inherent_data, other_inherent_data) = match collator
 			.create_inherent_data_with_rp_offset(

@@ -103,11 +103,10 @@ use polkadot_node_subsystem_util::{
 	runtime::ClaimQueueSnapshot,
 };
 use polkadot_primitives::{
-	node_features::FeatureIndex,
-	transpose_claim_queue, CandidateCommitments, CandidateDescriptorV2,
-	CommittedCandidateReceiptV2, CoreIndex, Hash, Id as ParaId, OccupiedCoreAssumption,
-	PersistedValidationData, ProvidesCommitment, RequiresCommitment, SessionIndex,
-	TransposedClaimQueue, ValidationCodeHash,
+	node_features::FeatureIndex, transpose_claim_queue, CandidateCommitments,
+	CandidateDescriptorV2, CommittedCandidateReceiptV2, CoreIndex, Hash, Id as ParaId,
+	OccupiedCoreAssumption, PersistedValidationData, ProvidesCommitment, RequiresCommitment,
+	SessionIndex, TransposedClaimQueue, ValidationCodeHash,
 };
 use schnellru::{ByLength, LruMap};
 use std::{collections::HashSet, sync::Arc};
@@ -637,8 +636,7 @@ async fn construct_and_distribute_receipt(
 		requires,
 	};
 
-	let node_features =
-		request_node_features(relay_parent, session_index, sender).await.await??;
+	let node_features = request_node_features(relay_parent, session_index, sender).await.await??;
 	let speculative_enabled = FeatureIndex::SpeculativeMessaging.is_set(&node_features);
 	let v3_enabled = FeatureIndex::CandidateReceiptV3.is_set(&node_features);
 

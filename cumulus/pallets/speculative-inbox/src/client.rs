@@ -75,16 +75,13 @@ where
 	let api = client.runtime_api();
 	let provides = api.compute_provides_root(at).ok()??;
 	let (subtree_root, _) = api.destination_state(at, destination).ok()??;
-	let messages = api
-		.outbound_messages(at, destination, from_position, max_messages)
-		.ok()?;
+	let messages = api.outbound_messages(at, destination, from_position, max_messages).ok()?;
 	if messages.is_empty() {
 		return None;
 	}
 
-	let (proof, number_of_destinations, leaf_index) = api
-		.subtree_inclusion_proof(at, destination, subtree_root)
-		.ok()??;
+	let (proof, number_of_destinations, leaf_index) =
+		api.subtree_inclusion_proof(at, destination, subtree_root).ok()??;
 
 	let batch = MessageBatch {
 		source,
@@ -106,17 +103,11 @@ where
 
 /// Fetch batches from one or more sender chains and assemble ingress.
 ///
-/// Each entry is `(source_para_id, sender_client, sender_block_hash, relay_parent_number, from_position, expected_provides_root)`.
-/// Failures for individual sources are skipped (collator continues without that source).
+/// Each entry is `(source_para_id, sender_client, sender_block_hash, relay_parent_number,
+/// from_position, expected_provides_root)`. Failures for individual sources are skipped (collator
+/// continues without that source).
 pub fn fetch_speculative_ingress<Block, Client>(
-	sources: &[(
-		ParaId,
-		&Client,
-		<Block as BlockT>::Hash,
-		BlockNumber,
-		u64,
-		Hash,
-	)],
+	sources: &[(ParaId, &Client, <Block as BlockT>::Hash, BlockNumber, u64, Hash)],
 	destination: ParaId,
 	max_messages_per_source: u32,
 ) -> SpeculativeIngress
@@ -126,7 +117,8 @@ where
 	Client::Api: SpeculativeOutboxApi<Block>,
 {
 	let mut batches = Vec::new();
-	for (source, client, at, relay_parent_number, from_position, expected_provides_root) in sources {
+	for (source, client, at, relay_parent_number, from_position, expected_provides_root) in sources
+	{
 		let source_block = *at;
 		if let Some(batch) = build_message_batch::<Block, Client>(
 			client,

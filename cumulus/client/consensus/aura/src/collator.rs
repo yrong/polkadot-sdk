@@ -141,7 +141,8 @@ pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS, Client> {
 	_marker: std::marker::PhantomData<(Block, Box<dyn Fn(P) + Send + Sync + 'static>)>,
 }
 
-impl<Block, P, BI, CIDP, RClient, PF, CS, Client> Collator<Block, P, BI, CIDP, RClient, PF, CS, Client>
+impl<Block, P, BI, CIDP, RClient, PF, CS, Client>
+	Collator<Block, P, BI, CIDP, RClient, PF, CS, Client>
 where
 	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	RClient: RelayChainInterface,

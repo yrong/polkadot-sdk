@@ -40,7 +40,7 @@ use frame_support::pallet_prelude::*;
 use frame_system::pallet_prelude::BlockNumberFor;
 
 use cumulus_primitives_core::{ParaId, XcmpMessageSource};
-use polkadot_primitives::v10::{ProvidesCommitment, MMRExtensionProof};
+use polkadot_primitives::v10::{MMRExtensionProof, ProvidesCommitment};
 
 use mmr_lib::{Merge, Result as MmrResult};
 
@@ -114,14 +114,8 @@ pub mod pallet {
 
 	/// Payload bytes for outgoing messages.
 	#[pallet::storage]
-	pub type OutgoingMessages<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		ParaId,
-		Twox64Concat,
-		u64,
-		Vec<u8>,
-	>;
+	pub type OutgoingMessages<T: Config> =
+		StorageDoubleMap<_, Twox64Concat, ParaId, Twox64Concat, u64, Vec<u8>>;
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
@@ -132,7 +126,11 @@ pub mod pallet {
 				// Record current subtree state for all active destinations.
 				for (dest, state) in OutgoingMMRState::<T>::iter() {
 					let root = bag_peaks::<Keccak256Merge>(&state.peaks).unwrap_or_default();
-					HistoricalSubtreeState::<T>::insert(n, dest, (root, state.peaks, state.leaf_count));
+					HistoricalSubtreeState::<T>::insert(
+						n,
+						dest,
+						(root, state.peaks, state.leaf_count),
+					);
 				}
 			}
 
@@ -155,8 +153,11 @@ pub mod pallet {
 			for payload in payloads {
 				OutgoingMessages::<T>::insert(dest, state.leaf_count, &payload);
 				let leaf_hash = Keccak256::hash(&payload);
-				state.peaks =
-					append_leaf_to_peaks::<Keccak256Merge>(state.peaks, state.leaf_count, leaf_hash);
+				state.peaks = append_leaf_to_peaks::<Keccak256Merge>(
+					state.peaks,
+					state.leaf_count,
+					leaf_hash,
+				);
 				state.leaf_count += 1;
 			}
 
@@ -182,12 +183,9 @@ impl<T: Config> Pallet<T> {
 		}
 
 		roots.sort_by_key(|(id, _)| *id);
-		let leaves: Vec<Vec<u8>> =
-			roots.iter().map(|(dest, root)| (dest, root).encode()).collect();
+		let leaves: Vec<Vec<u8>> = roots.iter().map(|(dest, root)| (dest, root).encode()).collect();
 
-		Some(ProvidesCommitment {
-			root: binary_merkle_tree::merkle_root::<Keccak256, _>(leaves),
-		})
+		Some(ProvidesCommitment { root: binary_merkle_tree::merkle_root::<Keccak256, _>(leaves) })
 	}
 
 	/// Get the MMR subtree root and leaf count for a destination.
@@ -233,11 +231,9 @@ impl<T: Config> Pallet<T> {
 
 		roots.sort_by_key(|(id, _)| *id);
 		let leaf_index = roots.iter().position(|(d, _)| *d == dest)?;
-		let leaves: Vec<Vec<u8>> =
-			roots.iter().map(|(d, r)| (d, r).encode()).collect();
+		let leaves: Vec<Vec<u8>> = roots.iter().map(|(d, r)| (d, r).encode()).collect();
 		let number_of_leaves = leaves.len() as u32;
-		let proof =
-			binary_merkle_tree::merkle_proof::<Keccak256, _, _>(leaves, leaf_index as u32);
+		let proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(leaves, leaf_index as u32);
 
 		Some((proof.proof, number_of_leaves, leaf_index as u32))
 	}
@@ -267,12 +263,9 @@ impl<T: Config> Pallet<T> {
 				.collect();
 		old_roots.sort_by_key(|(id, _)| *id);
 		let old_leaf_idx = old_roots.iter().position(|(id, _)| *id == dest)?;
-		let old_leaves: Vec<Vec<u8>> =
-			old_roots.iter().map(|(d, r)| (d, r).encode()).collect();
-		let old_proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(
-			old_leaves,
-			old_leaf_idx as u32,
-		);
+		let old_leaves: Vec<Vec<u8>> = old_roots.iter().map(|(d, r)| (d, r).encode()).collect();
+		let old_proof =
+			binary_merkle_tree::merkle_proof::<Keccak256, _, _>(old_leaves, old_leaf_idx as u32);
 
 		// 4. Build MMR extension proof if the subtree has grown.
 		let current_state = OutgoingMMRState::<T>::get(&dest);
@@ -308,9 +301,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Find the block number that produced the given provides root.
 	pub fn block_number_for_provides_root(root: H256) -> Option<BlockNumberFor<T>> {
-		HistoricalProvidesRoots::<T>::iter()
-			.find(|(_, r)| r == &root)
-			.map(|(n, _)| n)
+		HistoricalProvidesRoots::<T>::iter().find(|(_, r)| r == &root).map(|(n, _)| n)
 	}
 
 	/// Generate an MMR extension proof from stored peaks.
@@ -340,8 +331,10 @@ impl<T: Config> XcmpMessageSource for Pallet<T> {
 		maximum_channels: usize,
 		excluded_recipients: &[ParaId],
 	) -> Vec<(ParaId, Vec<u8>)> {
-		let messages =
-			T::InnerXcmpMessageSource::take_outbound_messages(maximum_channels, excluded_recipients);
+		let messages = T::InnerXcmpMessageSource::take_outbound_messages(
+			maximum_channels,
+			excluded_recipients,
+		);
 		for (dest, data) in &messages {
 			Pallet::<T>::record_outbound_messages(*dest, vec![data.clone()]);
 		}
@@ -423,16 +416,12 @@ mod tests {
 
 		let mut pairs = vec![(dest_a, subtree_a), (dest_b, subtree_b)];
 		pairs.sort_by_key(|(id, _)| *id);
-		let leaves: Vec<Vec<u8>> =
-			pairs.iter().map(|(d, r)| (d, r).encode()).collect();
+		let leaves: Vec<Vec<u8>> = pairs.iter().map(|(d, r)| (d, r).encode()).collect();
 		let number_of_leaves = leaves.len() as u32;
 		let provides_root = binary_merkle_tree::merkle_root::<Keccak256, _>(&leaves);
 
 		let leaf_index = pairs.iter().position(|(d, _)| *d == dest_a).unwrap();
-		let proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(
-			leaves,
-			leaf_index as u32,
-		);
+		let proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(leaves, leaf_index as u32);
 
 		let leaf_data = (dest_a, subtree_a).encode();
 		assert!(binary_merkle_tree::verify_proof::<Keccak256, _, _>(

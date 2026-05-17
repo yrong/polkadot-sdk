@@ -606,7 +606,8 @@ impl Collator {
 						head_data: collation.head_data,
 						processed_downward_messages: collation.processed_downward_messages,
 						hrmp_watermark: collation.hrmp_watermark,
-						provides: None, requires: vec![],
+						provides: None,
+						requires: vec![],
 					};
 
 					// Submit the same collation to all assigned cores.

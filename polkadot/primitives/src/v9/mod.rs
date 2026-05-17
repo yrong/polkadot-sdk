@@ -2240,8 +2240,9 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 		match self.version() {
 			CandidateDescriptorVersion::V1 => self.relay_parent,
 			CandidateDescriptorVersion::V2 => self.relay_parent,
-			CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 =>
-				self.scheduling_parent,
+			CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 => {
+				self.scheduling_parent
+			},
 			CandidateDescriptorVersion::Unknown => self.relay_parent,
 		}
 	}
@@ -2331,10 +2332,9 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 	) -> Option<SessionIndex> {
 		match self.version_for_candidate_validation(v3_ever_seen) {
 			CandidateDescriptorVersion::V1 | CandidateDescriptorVersion::Unknown => None,
-			CandidateDescriptorVersion::V2 | CandidateDescriptorVersion::V3 |
-			CandidateDescriptorVersion::V4 => {
-				Some(self.session_index)
-			},
+			CandidateDescriptorVersion::V2 |
+			CandidateDescriptorVersion::V3 |
+			CandidateDescriptorVersion::V4 => Some(self.session_index),
 		}
 	}
 }

@@ -627,10 +627,10 @@ impl<T: Config> Pallet<T> {
 						}
 					}
 				}
-				});
-				}
+			});
+		}
 
-				// For relay chain blocks, we're (ab)using the proof size
+		// For relay chain blocks, we're (ab)using the proof size
 		// to limit the raw transaction size of `ParaInherent` and
 		// there's no state proof (aka PoV) associated with it.
 		// Since we already accounted for bitfields size, we should
@@ -871,7 +871,6 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-
 	// ── Phase 1 Speculative Messaging helpers ────────────────────────────────────
 
 	/// Read the latest provides root for a parachain.
@@ -883,9 +882,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Returns true when every requirement matches the persisted provides root.
 	pub(crate) fn requires_satisfied(requires: &[RequiresCommitment]) -> bool {
-		requires
-			.iter()
-			.all(|r| Self::provides_root(&r.source) == Some(r.expected_root))
+		requires.iter().all(|r| Self::provides_root(&r.source) == Some(r.expected_root))
 	}
 
 	/// Update the provides root after a candidate is enacted.
@@ -958,7 +955,10 @@ impl<T: Config> Pallet<T> {
 
 		// Finalize speculative messaging: check requirements and update ProvidesRoots.
 		if !Self::requires_satisfied(&commitments.requires) {
-			defensive!("Candidate {:?} requirements no longer satisfied at enactment", candidate_hash);
+			defensive!(
+				"Candidate {:?} requirements no longer satisfied at enactment",
+				candidate_hash
+			);
 		}
 		if let Some(ref p) = commitments.provides {
 			Self::update_provides_root(receipt.descriptor.para_id(), p.root);

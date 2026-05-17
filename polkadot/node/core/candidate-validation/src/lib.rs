@@ -53,12 +53,11 @@ use polkadot_primitives::{
 	},
 	node_features::FeatureIndex,
 	transpose_claim_queue, AuthorityDiscoveryId, CandidateCommitments,
-	CandidateDescriptorVersion, ProvidesCommitment, RequiresCommitment,
-	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
+	CandidateDescriptorV2 as CandidateDescriptor, CandidateDescriptorVersion, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
-	PersistedValidationData, PvfExecKind as RuntimePvfExecKind, PvfPrepKind, SessionIndex,
-	ValidationCode, ValidationCodeHash, ValidatorId,
+	PersistedValidationData, ProvidesCommitment, PvfExecKind as RuntimePvfExecKind, PvfPrepKind,
+	RequiresCommitment, SessionIndex, ValidationCode, ValidationCodeHash, ValidatorId,
 };
 use sp_application_crypto::{AppCrypto, ByteArray};
 use sp_keystore::KeystorePtr;
@@ -1313,7 +1312,10 @@ async fn validate_candidate(
 						provides_root.map(|root| ProvidesCommitment { root }),
 						requires
 							.into_iter()
-							.map(|(source, expected_root)| RequiresCommitment { source, expected_root })
+							.map(|(source, expected_root)| RequiresCommitment {
+								source,
+								expected_root,
+							})
 							.collect(),
 					),
 					None => (None, Vec::new()),
