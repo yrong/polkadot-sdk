@@ -572,7 +572,11 @@ where
 		+ pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>
 		+ substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>
 		+ TargetBlockRate<Block>
-		+ GetParachainInfo<Block>,
+		+ GetParachainInfo<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
@@ -605,6 +609,8 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
 	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId> + TargetBlockRate<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
@@ -659,7 +665,12 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 	> for StartSlotBasedAuraConsensus<Block, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
-	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId> + TargetBlockRate<Block>,
+	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>
+		+ TargetBlockRate<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
