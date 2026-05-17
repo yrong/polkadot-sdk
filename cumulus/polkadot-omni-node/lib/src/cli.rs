@@ -28,6 +28,7 @@ use crate::{
 };
 use chain_spec_builder::ChainSpecBuilder;
 use clap::{Command, CommandFactory, FromArgMatches, ValueEnum};
+use polkadot_primitives::Id as ParaId;
 use sc_chain_spec::ChainSpec;
 use sc_cli::{
 	CliConfiguration, DefaultConfigurationValues, ImportParams, KeystoreParams, NetworkParams,
@@ -212,6 +213,14 @@ pub struct Cli<Config: CliConfig> {
 	#[arg(long)]
 	pub export_pov_to_path: Option<PathBuf>,
 
+	/// Speculative messaging sender to connect to.
+	///
+	/// Specify as `<PARA_ID>=<WS_URL>`, e.g. `--speculative-sender 1000=ws://127.0.0.1:9944`.
+	/// May be repeated for multiple sender chains.
+	/// Requires `--authoring slot-based`.
+	#[arg(long, value_name = "PARA_ID=WS_URL")]
+	pub speculative_sender: Vec<String>,
+
 	/// Relay chain arguments
 	#[arg(raw = true)]
 	pub relay_chain_args: Vec<String>,
@@ -299,6 +308,15 @@ impl Display for AuthoringPolicy {
 
 impl<Config: CliConfig> Cli<Config> {
 	pub(crate) fn node_extra_args(&self) -> NodeExtraArgs {
+		let speculative_sources_config = self
+			.speculative_sender
+			.iter()
+			.filter_map(|s| {
+				let (id_str, url) = s.split_once('=')?;
+				let para_id: u32 = id_str.parse().ok()?;
+				Some((ParaId::from(para_id), url.to_string()))
+			})
+			.collect();
 		NodeExtraArgs {
 			authoring_policy: self
 				.experimental_use_slot_based
@@ -316,6 +334,7 @@ impl<Config: CliConfig> Cli<Config> {
 				},
 			),
 			storage_monitor: self.storage_monitor.clone(),
+			speculative_sources_config,
 		}
 	}
 

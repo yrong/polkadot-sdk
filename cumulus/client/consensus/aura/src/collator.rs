@@ -62,7 +62,7 @@ use sp_trie::proof_size_extension::ProofSizeExt;
 use std::{error::Error, time::Duration};
 
 /// Parameters for instantiating a [`Collator`].
-pub struct Params<BI, CIDP, RClient, PF, CS, Client> {
+pub struct Params<BI, CIDP, RClient, PF, CS> {
 	/// A builder for inherent data builders.
 	pub create_inherent_data_providers: CIDP,
 	/// The block import handle.
@@ -80,8 +80,6 @@ pub struct Params<BI, CIDP, RClient, PF, CS, Client> {
 	/// The collator service used for bundling proposals into collations and announcing
 	/// to the network.
 	pub collator_service: CS,
-	/// Off-chain sender chains to pull speculative message data from.
-	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 }
 
 /// Parameters for [`Collator::build_block_and_import`].
@@ -129,7 +127,7 @@ impl<Block: BlockT> From<BuiltBlock<Block>> for ParachainCandidate<Block> {
 
 /// A utility struct for writing collation logic that makes use of Aura entirely
 /// or in part. See module docs for more details.
-pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS, Client> {
+pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS> {
 	create_inherent_data_providers: CIDP,
 	block_import: BI,
 	relay_client: RClient,
@@ -137,12 +135,11 @@ pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS, Client> {
 	para_id: ParaId,
 	proposer: PF,
 	collator_service: CS,
-	speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
 	_marker: std::marker::PhantomData<(Block, Box<dyn Fn(P) + Send + Sync + 'static>)>,
 }
 
-impl<Block, P, BI, CIDP, RClient, PF, CS, Client>
-	Collator<Block, P, BI, CIDP, RClient, PF, CS, Client>
+impl<Block, P, BI, CIDP, RClient, PF, CS>
+	Collator<Block, P, BI, CIDP, RClient, PF, CS>
 where
 	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	RClient: RelayChainInterface,
@@ -150,13 +147,12 @@ where
 	BI: BlockImport<Block> + ParachainBlockImportMarker + Send + Sync + 'static,
 	PF: Environment<Block>,
 	CS: CollatorServiceInterface<Block>,
-	Client: ProvideRuntimeApi<Block> + sc_client_api::UsageProvider<Block>,
 	P: Pair,
 	P::Public: AppPublic + Member,
 	P::Signature: TryFrom<Vec<u8>> + Member + Codec,
 {
 	/// Instantiate a new instance of the `Aura` manager.
-	pub fn new(params: Params<BI, CIDP, RClient, PF, CS, Client>) -> Self {
+	pub fn new(params: Params<BI, CIDP, RClient, PF, CS>) -> Self {
 		Collator {
 			create_inherent_data_providers: params.create_inherent_data_providers,
 			block_import: params.block_import,
@@ -165,7 +161,6 @@ where
 			para_id: params.para_id,
 			proposer: params.proposer,
 			collator_service: params.collator_service,
-			speculative_sources: params.speculative_sources,
 			_marker: std::marker::PhantomData,
 		}
 	}

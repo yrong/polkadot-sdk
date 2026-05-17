@@ -110,7 +110,7 @@ pub struct Params<BI, CIDP, Client, Backend, RClient, CHP, ProposerFactory, CS> 
 	/// It will be removed once <https://github.com/paritytech/polkadot-sdk/issues/6020> is fixed.
 	pub max_pov_percentage: Option<u32>,
 	/// Off-chain sender chains to pull speculative message batches from.
-	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
+	pub speculative_sources: crate::collators::SpeculativeMessageSources,
 }
 
 /// Get the current parachain slot from a given block hash.
@@ -276,10 +276,9 @@ where
 				para_id: params.para_id,
 				proposer: params.proposer,
 				collator_service: params.collator_service,
-				speculative_sources: params.speculative_sources.clone(),
 			};
 
-			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
+			collator_util::Collator::<Block, P, _, _, _, _, _>::new(params)
 		};
 
 		let mut connection_helper = BackingGroupConnectionHelper::new(

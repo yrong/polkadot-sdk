@@ -88,7 +88,7 @@ pub struct Params<BI, CIDP, Client, RClient, Proposer, CS> {
 	/// processing collation requests before initializing Aura.
 	pub collation_request_receiver: Option<Receiver<CollationRequest>>,
 	/// Off-chain sender chains to pull speculative message batches from.
-	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
+	pub speculative_sources: crate::collators::SpeculativeMessageSources,
 }
 
 /// Run bare Aura consensus as a relay-chain-driven collator.
@@ -141,10 +141,9 @@ where
 				para_id: params.para_id,
 				proposer: params.proposer,
 				collator_service: params.collator_service,
-				speculative_sources: params.speculative_sources.clone(),
 			};
 
-			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
+			collator_util::Collator::<Block, P, _, _, _, _, _>::new(params)
 		};
 
 		let mut last_processed_slot = 0;

@@ -78,8 +78,8 @@ pub trait NodeRuntimeApi<Block: BlockT>:
 	+ GetParachainInfo<Block>
 	+ TransactionStorageApi<Block>
 	+ RelayParentOffsetApi<Block>
-	+ SpeculativeOutboxApi<Block>
 	+ SpeculativeInboxApi<Block>
+	+ SpeculativeOutboxApi<Block>
 	+ Sized
 {
 }
@@ -95,8 +95,8 @@ impl<T, Block: BlockT> NodeRuntimeApi<Block> for T where
 		+ CollectCollationInfo<Block>
 		+ GetParachainInfo<Block>
 		+ TransactionStorageApi<Block>
-		+ SpeculativeOutboxApi<Block>
 		+ SpeculativeInboxApi<Block>
+		+ SpeculativeOutboxApi<Block>
 {
 }
 
@@ -137,4 +137,9 @@ pub struct NodeExtraArgs {
 
 	/// Parameters for storage monitoring.
 	pub storage_monitor: sc_storage_monitor::StorageMonitorParams,
+
+	/// Speculative messaging sender connections: `(sender_para_id, ws_rpc_url)`.
+	/// Each entry will be connected to via `RpcOutboxClient` at collator startup.
+	/// Empty by default (no speculative ingress).
+	pub speculative_sources_config: Vec<(polkadot_primitives::Id, String)>,
 }
