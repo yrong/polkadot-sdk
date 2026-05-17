@@ -154,7 +154,7 @@ pub struct Params<Block, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, 
 	/// It will be removed once <https://github.com/paritytech/polkadot-sdk/issues/6020> is fixed.
 	pub max_pov_percentage: Option<u32>,
 	/// Off-chain sender chains to pull speculative message batches from.
-	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
+	pub speculative_sources: crate::collators::SpeculativeMessageSources,
 }
 
 /// Run aura-based block building and collation task.
@@ -178,8 +178,8 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spaw
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
 		+ KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,

@@ -121,7 +121,7 @@ pub struct BuilderTaskParams<
 	/// It will be removed once https://github.com/paritytech/polkadot-sdk/issues/6020 is fixed.
 	pub max_pov_percentage: Option<u32>,
 	/// Off-chain sender chains to pull speculative message batches from.
-	pub speculative_sources: crate::collators::SpeculativeMessageSources<Client>,
+	pub speculative_sources: crate::collators::SpeculativeMessageSources,
 }
 
 /// Run block-builder.
@@ -145,8 +145,8 @@ where
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
 		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RelayClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -192,10 +192,9 @@ where
 				para_id,
 				proposer,
 				collator_service,
-				speculative_sources: speculative_sources.clone(),
 			};
 
-			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
+			collator_util::Collator::<Block, P, _, _, _, _, _>::new(params)
 		};
 
 		let mut best_notifications = match relay_client.new_best_notification_stream().await {
@@ -518,7 +517,7 @@ struct BuildCollationParams<
 	code_hash_provider: &'a CHP,
 	slot_claim: &'a SlotClaim<P::Public>,
 	collator_sender: &'a sc_utils::mpsc::TracingUnboundedSender<CollatorMessage<Block>>,
-	collator: &'a mut Collator<Block, P, BI, CIDP, RelayClient, Proposer, CS, Client>,
+	collator: &'a mut Collator<Block, P, BI, CIDP, RelayClient, Proposer, CS>,
 	allowed_pov_size: usize,
 	core_info: CoreInfo,
 	core_index: CoreIndex,
@@ -534,7 +533,7 @@ struct BuildCollationParams<
 	relay_slot: cumulus_primitives_aura::Slot,
 	para_slot: cumulus_primitives_aura::Slot,
 	para_client: &'a Client,
-	speculative_sources: &'a crate::collators::SpeculativeMessageSources<Client>,
+	speculative_sources: &'a crate::collators::SpeculativeMessageSources,
 }
 
 /// Build a collation for one core.
@@ -596,8 +595,8 @@ where
 	Client::Api: AuraUnincludedSegmentApi<Block>
 		+ ApiExt<Block>
 		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 {
 	let core_start = Instant::now();
 
@@ -849,11 +848,13 @@ where
 	// Read speculative messaging provides/requires from the last built block's runtime state.
 	let (provides, requires) = blocks
 		.last()
-		.map(|last_block| {
+		.map(|last_block: &Block| {
 			let h = last_block.hash();
 			let api = para_client.runtime_api();
-			let provides = api.compute_provides_root(h).unwrap_or(None);
-			let requires = api.requires_commitments(h).unwrap_or_default();
+			let provides: Option<polkadot_primitives::v10::ProvidesCommitment> =
+				api.compute_provides_root(h).unwrap_or(None);
+			let requires: Vec<polkadot_primitives::v10::RequiresCommitment> =
+				api.requires_commitments(h).unwrap_or_default();
 			(provides, requires)
 		})
 		.unwrap_or_default();

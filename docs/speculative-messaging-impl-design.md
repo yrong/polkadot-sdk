@@ -1472,29 +1472,51 @@ last-seen root.
 
 ### 7.1 Model
 
-**POC implementation: direct client approach.** The receiver collator holds
-in-process references to sender chain clients (`Arc<SenderClient>`), configured
-statically via `SpeculativeMessageSources`. Before each block proposal, the collator
-queries the sender chain's `SpeculativeOutboxApi` runtime APIs directly (no
-separate process, no HTTP). This works on zombienet where both parachains run
-in the same process tree.
+**POC implementation: `OutboxQuery` trait abstraction.** The receiver collator
+holds a list of type-erased sender-chain query handles via `SpeculativeMessageSources`:
 
-The design doc originally described an HTTP relayer/provider model — one or more
-provider processes watching source chain blocks and serving `MessageBatch` data
-over HTTP. That model is deferred to production hardening (§12) as a
-convenience optimization for multi-host deployments.
+```rust
+pub struct SpeculativeMessageSources {
+    pub sources: Vec<(ParaId, Arc<dyn OutboxQuery>)>,
+    pub max_messages_per_source: u32,
+}
+```
 
-The direct client path is implemented in:
+`OutboxQuery` is an `async_trait` that abstracts over two concrete implementations:
+
+- **`DirectOutboxClient<Block, Client>`** — holds an `Arc<Client>` and calls
+  `SpeculativeOutboxApi` runtime APIs directly, in-process. Suitable for zombienet
+  setups where both sender and receiver parachains share a single process tree.
+  Constructed via `DirectOutboxClient::new(arc_client)`, which returns
+  `Arc<dyn OutboxQuery>`.
+
+- **`RpcOutboxClient`** — connects to a remote node via JSON-RPC WebSocket
+  (`jsonrpsee` ws-client). All outbox queries are translated to `state_call` RPC
+  requests, e.g. `state_call("SpeculativeOutboxApi_compute_provides_root", ...)`.
+  Supports two separate penpal binaries (sender and receiver running as independent
+  OS processes). Constructed via `RpcOutboxClient::connect(url).await`.
+
+This abstraction lives in:
+- `cumulus/client/consensus/aura/src/collators/outbox_client.rs` — `OutboxQuery`
+  trait, `DirectOutboxClient`, `RpcOutboxClient`, `build_message_batch_from_query`.
 - `cumulus/client/consensus/aura/src/collators/speculative_ingress.rs` —
-  `fetch_ingress_for_block()`: async, queries relay chain for the current provides
-  root, queries sender's `SpeculativeOutboxApi`, assembles `MessageBatch`es.
+  `SpeculativeMessageSources` (now generic-free) and `fetch_ingress_for_block()`
+  (fully async): queries relay chain for the current provides root, queries each
+  configured sender via `OutboxQuery`, assembles `MessageBatch`es.
 - `cumulus/pallets/speculative-inbox/src/client.rs` — `build_message_batch()`
-  and `fetch_speculative_ingress()`: lower-level batch construction helpers.
+  lower-level batch construction helpers (receiver reads IncomingState from its
+  own runtime API).
+
+The design doc originally described an HTTP relayer/provider model. That model is
+deferred to production hardening (§12). The `OutboxQuery` trait is the correct
+abstraction layer for both: a future HTTP provider client would be a third
+`OutboxQuery` implementation without touching any of the collator logic.
 
 The transport is a data-fetch path, not a consensus path. Consensus depends only
 on `SpeculativeIngress` being embedded in the block body and re-verified
-deterministically during PVF execution. If no sender client is configured, the
-collator simply produces empty ingress and falls back to HRMP.
+deterministically during PVF execution. If no sender client is configured
+(`SpeculativeMessageSources::disabled()`), the collator produces empty ingress
+and falls back to HRMP.
 
 ### 7.2 Sender-Side: Batch Construction and Retention
 
@@ -1944,12 +1966,12 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | 10.1 | Primitives & version gating | ✅ | `v10` types, `MMRExtensionProof.old_leaf_count`, `CandidateDescriptorV2::new_v4()` version-byte approach. V4 struct family removed. |
 | 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `get_requires_commitments`. 11/11 tests pass. |
 | 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
-| 10.4 | Collator-side inherent injection & commitment assembly | 🔶 | Slot-based path complete: `provides`/`requires` read from runtime via `SpeculativeOutboxApi`/`SpeculativeInboxApi` after block execution, flowed through `CollatorMessage` to `build_multi_block_collation`. `ParachainBlockDataV4` wrapping works. Remaining gap: single-block path (`build_collation` in basic/lookahead collators) still passes `None`/empty. Collator-side LBP collection deferred (see §12). |
+| 10.4 | Collator-side inherent injection & commitment assembly | 🔶 | Slot-based path complete: `provides`/`requires` read from runtime via `SpeculativeInboxApi` after block execution in `build_collation_for_core`, flowed through `CollatorMessage` to `build_multi_block_collation` in `service.rs`. `ParachainBlockDataV4` wrapping works. Remaining gap: single-block path (`build_collation` in basic/lookahead collators) still passes `None`/empty. Collator-side LBP pre-fetch deferred (see §12). |
 | 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4` via `TrailingOption<ValidationResultExtension>` (not a separate `ValidationResultV4` struct — backward-compatible trailing field on existing `ValidationResult`). `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
 | 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
-| 10.9 | Off-chain networking | 🔶 | Direct client approach wired: `fetch_ingress_for_block` (async) in `speculative_ingress.rs` queries sender's `SpeculativeOutboxApi` directly. Wired into `build_collation_for_core` via `SpeculativeMessageSources`. HTTP provider (§7.3) deferred to production. Node setup to configure `SpeculativeMessageSources` in penpal/test nodes is a follow-up. |
+| 10.9 | Off-chain networking | ✅ | `OutboxQuery` async trait with `RpcOutboxClient` (JSON-RPC WebSocket). `SpeculativeMessageSources` is generic-free. `fetch_ingress_for_block` is fully async. `--speculative-sender <PARA_ID>=<WS_URL>` CLI arg added to omni-node. At startup the node async-connects to each configured sender and populates `SpeculativeMessageSources`; connection failures are logged and skipped gracefully. Both slot-based and lookahead/basic collator paths wired. |
 | 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–5 ✅. Milestones 6–8 require node setup wiring and zombienet config (follow-up). |
 
 ---
@@ -1996,6 +2018,15 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 - Formalize PoV / validation ABI extensions.
 - Tighten proof size and storage growth guarantees.
 - Expand adversarial testing and security review scope.
+- **`RpcOutboxClient.best_block_hash()` uses `block_in_place`** — the current
+  implementation calls `chain_getHead` synchronously via `tokio::task::block_in_place`
+  to satisfy the non-async `fn best_block_hash(&self) -> Hash` signature. This is
+  acceptable for the POC (fast RPC read, infrequent call path) but should be
+  replaced with a cached/subscribed best-hash approach for production.
+- **HTTP provider as a future `OutboxQuery` implementation** — the `OutboxQuery`
+  trait is the right abstraction point. An HTTP provider client that queries a
+  running provider process (§7.3) would be a third `OutboxQuery` impl without
+  touching any collator logic. Deferred to production hardening.
 - **Outbox leaf granularity** — `XcmpMessageSource::take_outbound_messages`
   records each XCMP page (not individual XCM messages) as a single MMR leaf.
   Sender and receiver must hash the same unit; verify this is consistent before
