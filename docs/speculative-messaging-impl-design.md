@@ -141,7 +141,7 @@ How our design maps onto the existing parachain–relay-chain communication flow
    outbound XCM into `OutgoingMMRs`. `ingest_verified_messages` verifies batches,
    updates `IncomingState`, dispatches XCM, records consumed sources.
 4. **Collect outputs** (§5.3). Collator calls `compute_provides_root()` and
-   `get_requires_commitments()` via runtime API. Overrides requires with
+   `requires_commitments()` via runtime API. Overrides requires with
    LateBlockProof transformed roots. Assembles `CandidateCommitments`.
 5. **Build receipt**. Collator hashes commitments → `commitments_hash`. Builds
    `CommittedCandidateReceipt` with descriptor + hash + signature. Submits
@@ -1061,7 +1061,7 @@ let commitments = if api_version >= SPECULATIVE_API_VERSION {
     CandidateCommitments {
         // ... existing fields from collation_info ...
         provides: self.runtime_api.compute_provides_root(block_hash)?,
-        requires: self.runtime_api.get_requires_commitments(block_hash)?,
+        requires: self.runtime_api.requires_commitments(block_hash)?,
     }
 } else {
     // Legacy parachain: unchanged v9 path, no speculative fields
@@ -1074,11 +1074,11 @@ let commitments = if api_version >= SPECULATIVE_API_VERSION {
 The collator already branches on `api_version` for PoV encoding format in the
 existing code (line ~267). The same pattern gates speculative fields — a
 speculative-capable runtime exports `compute_provides_root` and
-`get_requires_commitments` at the known API version; a non-speculative runtime
+`requires_commitments` at the known API version; a non-speculative runtime
 doesn't. No new `CollationInfo` fields or pipeline changes needed.
 
 ```rust
-pub fn get_requires_commitments() -> Vec<RequiresCommitment> {
+pub fn requires_commitments() -> Vec<RequiresCommitment> {
     let mut consumed = ConsumedSourcesThisBlock::<T>::get();
     consumed.sort_by_key(|(source, _)| *source);
     consumed.dedup_by_key(|(source, _)| *source);
@@ -1100,6 +1100,13 @@ for proof in &self.prechecked_late_block_proofs {
 }
 requires.sort_by_key(|r| r.source);
 ```
+
+**POC status:** The above override is not yet implemented in the collator. In the current
+POC, `late_block_proofs` is always `Vec::new()` and no pre-flight LBP fetch happens
+(see §10.4 tracker and §12). If the source root advances between batch fetch and
+enactment, the candidate is rejected with `UnsatisfiedRequires` and the collator retries.
+The PVF-side `apply_messaging_proofs` is complete and correct — the gap is purely on the
+collator pre-fetch side.
 
 ---
 
@@ -1148,7 +1155,7 @@ ignoring the trailing extension for pre-speculative candidates.
 
 **Current-codebase embedding:**
 
-1. In `polkadot/parachain/src/primitives.rs`: `ValidationResultExtension` and `TrailingOption` defined; `speculative` field added as last field of `ValidationResult`.
+1. In `polkadot/parachain/src/primitives.rs`: `ValidationResultExtension` and `TrailingOption` defined; `speculative` field added as last field of `ValidationResult`. Note: the same file also defines `ValidationParamsExtension::V4` (the *input* side, carrying `relay_parent`/`scheduling_parent`) — this is a separate enum with the same variant index `4` but a different purpose. When reading the file, search for `ValidationResultExtension` specifically.
 2. In `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`: after block execution, call `PSC::speculative_extension()` to read `ValidationResultExtension::V4` from runtime state; pass to `apply_messaging_proofs`; set `speculative` field in the returned `ValidationResult`.
 3. In `polkadot/parachain/src/wasm_api.rs`: no separate entrypoint needed — `validate_block` returns `ValidationResult` with the speculative extension populated.
 4. In `polkadot/node/core/candidate-validation`: decode `speculative` field; extract `provides_root`/`requires` from `ValidationResultExtension::V4`; reconstruct `v10::CandidateCommitments` for v4 candidates.
@@ -1262,7 +1269,7 @@ the `provides_root` of the fetched batch. If they differ, the collator fetches a
 `LateBlockProof` from the provider, prechecks it, and:
 
 1. Uses `proof.new_provides_root` (not `batch.provides_root`) in the candidate
-   commitments via the standard `get_requires_commitments()` path.
+   commitments via the standard `requires_commitments()` path.
 2. Wraps both block data and proofs in `ParachainBlockDataV4` and encodes
    the full struct as the PoV content.
 
@@ -1863,7 +1870,7 @@ Add `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`,
 `ProvideInherent`. Re-verify subtree proofs, message continuity, subtree-root
 reconstruction, and the one-root-per-source-per-block invariant. Dispatch through
 `T::XcmpMessageHandler::handle_xcmp_messages(...)`. Expose
-`get_requires_commitments()` runtime API.
+`requires_commitments()` runtime API.
 
 ### 10.3 Step 3: Sender Runtime Outbox Path
 
@@ -1964,14 +1971,14 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | Step | Description | Status | Notes |
 |------|-------------|--------|-------|
 | 10.1 | Primitives & version gating | ✅ | `v10` types, `MMRExtensionProof.old_leaf_count`, `CandidateDescriptorV2::new_v4()` version-byte approach. V4 struct family removed. |
-| 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `get_requires_commitments`. 11/11 tests pass. |
+| 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `requires_commitments`. 11/11 tests pass. |
 | 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
 | 10.4 | Collator-side inherent injection & commitment assembly | 🔶 | Slot-based path complete: `provides`/`requires` read from runtime via `SpeculativeInboxApi` after block execution in `build_collation_for_core`, flowed through `CollatorMessage` to `build_multi_block_collation` in `service.rs`. `ParachainBlockDataV4` wrapping works. Remaining gap: single-block path (`build_collation` in basic/lookahead collators) still passes `None`/empty. Collator-side LBP pre-fetch deferred (see §12). |
 | 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4` via `TrailingOption<ValidationResultExtension>` (not a separate `ValidationResultV4` struct — backward-compatible trailing field on existing `ValidationResult`). `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
 | 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
-| 10.9 | Off-chain networking | ✅ | `OutboxQuery` async trait with `RpcOutboxClient` (JSON-RPC WebSocket). `SpeculativeMessageSources` is generic-free. `fetch_ingress_for_block` is fully async. `--speculative-sender <PARA_ID>=<WS_URL>` CLI arg added to omni-node. At startup the node async-connects to each configured sender and populates `SpeculativeMessageSources`; connection failures are logged and skipped gracefully. Both slot-based and lookahead/basic collator paths wired. |
+| 10.9 | Off-chain networking | ✅ | `OutboxQuery` async trait with `RpcOutboxClient` (JSON-RPC WebSocket). `SpeculativeMessageSources` is generic-free. `fetch_ingress_for_block` is fully async. `--speculative-sender <PARA_ID>=<WS_URL>` CLI arg added to omni-node. At startup the node async-connects to each configured sender and populates `SpeculativeMessageSources`; connection failures are logged and skipped gracefully. Slot-based ingress injection path fully wired. Note: basic/lookahead collator paths inject ingress but still hardcode `provides=None, requires=[]` for commitment assembly (see §10.4). |
 | 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–5 ✅. Zombienet config added: `cumulus/zombienet/examples/speculative_messaging_poc.toml` — two Penpal instances (para 2000 sender, para 2001 receiver) on Rococo-local, receiver started with `--speculative-sender 2000=ws://127.0.0.1:9955`. Milestones 6–8 (live network verification) pending actual run. |
 
 ---
