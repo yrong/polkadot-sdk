@@ -150,8 +150,6 @@ where
 	PF: Environment<Block>,
 	CS: CollatorServiceInterface<Block>,
 	Client: ProvideRuntimeApi<Block> + sc_client_api::UsageProvider<Block>,
-	Client::Api: cumulus_primitives_core::SpeculativeOutboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 	P: Pair,
 	P::Public: AppPublic + Member,
 	P::Signature: TryFrom<Vec<u8>> + Member + Codec,
@@ -407,23 +405,7 @@ where
 		let Some(built) = maybe_candidate else { return Ok(None) };
 
 		let hash = built.block.header().hash();
-		let mut candidate = ParachainCandidate::from(built);
-
-		// Step 7: Late Block Proofs.
-		// If the block requires speculative roots that are already outdated on the
-		// relay chain, we must fetch late block proofs from the source parachains.
-		if let Ok(requires) = self.collator_service.para_client().runtime_api().requires_commitments(hash) {
-			for req in requires {
-				// 1. Check if req.expected_root is already outdated on the relay chain.
-				// For the PoC, we assume if we have a source client, we fetch a proof
-				// connecting the old root to the current root of that source.
-				if let Some((_, source_client)) = self.speculative_sources.sources.iter().find(|(id, _)| *id == req.source) {
-					if let Some(proof) = source_client.runtime_api().generate_late_block_proof(hash, req.source, req.expected_root).ok().flatten() {
-						candidate.late_block_proofs.push(proof);
-					}
-				}
-			}
-		}
+		let candidate = ParachainCandidate::from(built);
 
 		if let Some((collation, block_data)) =
 			self.collator_service.build_collation(parent_header, hash, candidate)

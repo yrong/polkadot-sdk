@@ -177,9 +177,7 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spaw
 		+ RelayParentOffsetApi<Block>
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
-		+ KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+		+ KeyToIncludeInRelayProof<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,

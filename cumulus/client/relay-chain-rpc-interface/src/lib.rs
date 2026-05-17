@@ -16,6 +16,7 @@
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
 use async_trait::async_trait;
+use codec::{Decode, Encode};
 use core::time::Duration;
 use cumulus_primitives_core::{
 	relay_chain::{
@@ -86,8 +87,8 @@ impl RelayChainInterface for RelayChainRpcInterface {
 	async fn provides_root(
 		&self,
 		para_id: ParaId,
-		relay_parent: PHash,
-	) -> RelayChainResult<Option<Hash>> {
+		relay_parent: RelayHash,
+	) -> RelayChainResult<Option<RelayHash>> {
 		let payload = para_id.encode();
 		let response = self.call_runtime_api("ParachainHost_provides_root", relay_parent, &payload).await?;
 		Ok(Decode::decode(&mut &response[..])?)

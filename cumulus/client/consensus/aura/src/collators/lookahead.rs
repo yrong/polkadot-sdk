@@ -175,9 +175,7 @@ where
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+		+ KeyToIncludeInRelayProof<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -232,9 +230,7 @@ where
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+		+ KeyToIncludeInRelayProof<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -280,7 +276,7 @@ where
 				para_id: params.para_id,
 				proposer: params.proposer,
 				collator_service: params.collator_service,
-				speculative_sources: params.speculative_sources,
+				speculative_sources: params.speculative_sources.clone(),
 			};
 
 			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
@@ -442,15 +438,7 @@ where
 				let relay_proof_request =
 					super::get_relay_proof_request(&*params.para_client, parent_hash);
 
-				let speculative_ingress = crate::collators::fetch_ingress_for_block(
-					&*params.para_client,
-					parent_hash,
-					params.para_id,
-					&params.speculative_sources,
-					relay_parent,
-					&params.relay_client,
-					validation_data.relay_parent_number,
-				);
+				let speculative_ingress = cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
 
 				let (parachain_inherent_data, other_inherent_data) = match collator
 					.create_inherent_data(

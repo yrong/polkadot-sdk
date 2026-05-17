@@ -112,7 +112,7 @@ impl RelayChainInterface for RelayChainInProcessInterface {
 		&self,
 		para_id: ParaId,
 		relay_parent: PHash,
-	) -> RelayChainResult<Option<Hash>> {
+	) -> RelayChainResult<Option<PHash>> {
 		Ok(self.full_client.runtime_api().provides_root(relay_parent, para_id)?)
 	}
 

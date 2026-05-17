@@ -21,7 +21,6 @@
 use cumulus_client_network::WaitToAnnounce;
 use cumulus_primitives_core::{
 	CollationInfo, CollectCollationInfo, ParachainBlockData, ParachainBlockDataV4,
-	SpeculativeInboxApi, SpeculativeOutboxApi,
 };
 
 use polkadot_primitives::UMP_SEPARATOR;
@@ -116,9 +115,7 @@ where
 	Block: BlockT,
 	BS: BlockBackend<Block>,
 	RA: ProvideRuntimeApi<Block>,
-	RA::Api: CollectCollationInfo<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
+	RA::Api: CollectCollationInfo<Block>,
 {
 	fn split_at_separator(messages: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 		let mut parts = messages.splitn(2, |m: &Vec<u8>| m.is_empty());
@@ -261,8 +258,6 @@ where
 		let mut processed_downward_messages = 0;
 		let mut hrmp_watermark = None;
 		let mut head_data = None;
-		let mut provides = None;
-		let mut requires = Vec::new();
 
 		for block in &blocks {
 			let block_hash = block.hash();
@@ -279,24 +274,7 @@ where
 				.ok()
 				.flatten()?;
 
-			let runtime_api = self.runtime_api.runtime_api();
-			if let Ok(p) = runtime_api.compute_provides_root(block_hash) {
-				provides = p;
-			}
-			if let Ok(r) = runtime_api.requires_commitments(block_hash) {
-				requires.extend(r);
-			}
-
-			// Pre-transform the commitments using the late block proofs,
-			// just as the PVF will do during execution.
-			for proof in &late_block_proofs {
-				if let Some(req) = requires.iter_mut().find(|r| r.source == proof.source) {
-					req.expected_root = proof.new_provides_root;
-				}
-			}
-			requires.sort_by_key(|r| r.source);
-		}
-		// We are always using the `api_version` of the parent block. The `api_version` can only
+			// We are always using the `api_version` of the parent block. The `api_version` can only
 			// change with a runtime upgrade and this is when we want to observe the old
 			// `api_version`. Because this old `api_version` is the one used to validate this
 			// block. Otherwise, we already assume the `api_version` is higher than what the relay
@@ -388,8 +366,8 @@ where
 			hrmp_watermark: hrmp_watermark?,
 			head_data: head_data?,
 			proof_of_validity: MaybeCompressedPoV::Compressed(pov),
-			provides,
-			requires,
+			provides: None,
+			requires: Vec::new(),
 		};
 
 		Some((collation, block_data))
@@ -412,9 +390,7 @@ where
 	Block: BlockT,
 	BS: BlockBackend<Block>,
 	RA: ProvideRuntimeApi<Block>,
-	RA::Api: CollectCollationInfo<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
+	RA::Api: CollectCollationInfo<Block>,
 {
 	fn check_block_status(&self, hash: Block::Hash, header: &Block::Header) -> bool {
 		CollatorService::check_block_status(self, hash, header)

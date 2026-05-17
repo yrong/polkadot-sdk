@@ -23,12 +23,20 @@ use sp_runtime::traits::Block as BlockT;
 pub const DEFAULT_MAX_MESSAGES_PER_SOURCE: u32 = 32;
 
 /// Sender parachain clients used to build speculative ingress for this collator.
-#[derive(Clone)]
 pub struct SpeculativeMessageSources<Client> {
 	/// `(source_para_id, sender_chain_client)`.
 	pub sources: Vec<(ParaId, Arc<Client>)>,
 	/// Maximum messages to pull from each source per block.
 	pub max_messages_per_source: u32,
+}
+
+impl<Client> Clone for SpeculativeMessageSources<Client> {
+	fn clone(&self) -> Self {
+		Self {
+			sources: self.sources.clone(),
+			max_messages_per_source: self.max_messages_per_source,
+		}
+	}
 }
 
 impl<Client> Default for SpeculativeMessageSources<Client> {
@@ -93,7 +101,7 @@ where
 		// If so, we try to fetch from the block that matches the relay chain's root.
 		let mut fetch_at = sender_best;
 		if let Ok(Some(relay_provides_root)) =
-			futures::executor::block_on(relay_client.provides_root(relay_parent, *source))
+			futures::executor::block_on(relay_client.provides_root(*source, relay_parent))
 		{
 			if relay_provides_root != Hash::default() && relay_provides_root != expected_provides_root {
 				if let Ok(Some(at_relay)) = sender
