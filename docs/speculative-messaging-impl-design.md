@@ -2018,6 +2018,13 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 - Formalize PoV / validation ABI extensions.
 - Tighten proof size and storage growth guarantees.
 - Expand adversarial testing and security review scope.
+- **`NodeRuntimeApi` requires `SpeculativeOutboxApi` for all omni-node parachains** —
+  both `SpeculativeInboxApi` and `SpeculativeOutboxApi` are currently unconditional
+  bounds in `NodeRuntimeApi`. Any parachain that does not implement `SpeculativeOutboxApi`
+  will fail to satisfy `ConstructNodeRuntimeApi` and will not compile against omni-node.
+  For the POC this is acceptable since Penpal implements both, but in production the
+  sender-side API should be optional (e.g. gated on a feature flag or a separate
+  `SpeculativeCollatorRuntimeApi` supertrait).
 - **`RpcOutboxClient.best_block_hash()` uses `block_in_place`** — the current
   implementation calls `chain_getHead` synchronously via `tokio::task::block_in_place`
   to satisfy the non-async `fn best_block_hash(&self) -> Hash` signature. This is
