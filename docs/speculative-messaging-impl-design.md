@@ -1472,16 +1472,29 @@ last-seen root.
 
 ### 7.1 Model
 
-The POC uses a **relayer/provider** model rather than native collator-to-collator P2P:
+**POC implementation: direct client approach.** The receiver collator holds
+in-process references to sender chain clients (`Arc<SenderClient>`), configured
+statically via `SpeculativeMessageSources`. Before each block proposal, the collator
+queries the sender chain's `SpeculativeOutboxApi` runtime APIs directly (no
+separate process, no HTTP). This works on zombienet where both parachains run
+in the same process tree.
 
-- One or more provider processes watch source chain blocks and serve `MessageBatch` data to destination collators.
-- Destination collators fetch batches from known providers before block proposal, precheck them locally, and encode accepted batches into `SpeculativeIngress`.
-- The transport is a data-fetch path, not a consensus path. Consensus depends only on `SpeculativeIngress` being embedded in the block body and re-verified deterministically during PVF execution.
+The design doc originally described an HTTP relayer/provider model — one or more
+provider processes watching source chain blocks and serving `MessageBatch` data
+over HTTP. That model is deferred to production hardening (§12) as a
+convenience optimization for multi-host deployments.
 
-The relay-chain interaction is **pull-based**: destination collators ask a
-provider for batches they want to import. If no provider answers, the destination
-simply skips speculative ingress for that source in this block and can fall back
-to HRMP.
+The direct client path is implemented in:
+- `cumulus/client/consensus/aura/src/collators/speculative_ingress.rs` —
+  `fetch_ingress_for_block()`: async, queries relay chain for the current provides
+  root, queries sender's `SpeculativeOutboxApi`, assembles `MessageBatch`es.
+- `cumulus/pallets/speculative-inbox/src/client.rs` — `build_message_batch()`
+  and `fetch_speculative_ingress()`: lower-level batch construction helpers.
+
+The transport is a data-fetch path, not a consensus path. Consensus depends only
+on `SpeculativeIngress` being embedded in the block body and re-verified
+deterministically during PVF execution. If no sender client is configured, the
+collator simply produces empty ingress and falls back to HRMP.
 
 ### 7.2 Sender-Side: Batch Construction and Retention
 
@@ -1936,8 +1949,8 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
-| 10.9 | Off-chain networking | ❌ | Provider/relayer process not started. No HTTP batch fetch, no destination-side fetcher. |
-| 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–3 ✅. Milestones 4–5 ✅ (steps 6, 8 done). Milestones 6–8 ❌ (blocked on step 9 off-chain networking). |
+| 10.9 | Off-chain networking | 🔶 | Direct client approach wired: `fetch_ingress_for_block` (async) in `speculative_ingress.rs` queries sender's `SpeculativeOutboxApi` directly. Wired into `build_collation_for_core` via `SpeculativeMessageSources`. HTTP provider (§7.3) deferred to production. Node setup to configure `SpeculativeMessageSources` in penpal/test nodes is a follow-up. |
+| 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–5 ✅. Milestones 6–8 require node setup wiring and zombienet config (follow-up). |
 
 ---
 
