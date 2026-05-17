@@ -177,7 +177,9 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spaw
 		+ RelayParentOffsetApi<Block>
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -285,4 +287,8 @@ struct CollatorMessage<Block: BlockT> {
 	pub validation_data: PersistedValidationData,
 	/// Late block proofs for speculative messaging dependencies (v10+).
 	pub late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+	/// Speculative messaging provides commitment for this block (sender side).
+	pub provides: Option<polkadot_primitives::v10::ProvidesCommitment>,
+	/// Speculative messaging requires commitments for this block (receiver side).
+	pub requires: Vec<polkadot_primitives::v10::RequiresCommitment>,
 }

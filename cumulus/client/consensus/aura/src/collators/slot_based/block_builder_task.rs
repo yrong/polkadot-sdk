@@ -35,7 +35,8 @@ use cumulus_client_proof_size_recording::prepare_proof_size_recording_aux_data;
 use cumulus_primitives_aura::{AuraUnincludedSegmentApi, Slot};
 use cumulus_primitives_core::{
 	BlockBundleInfo, ClaimQueueOffset, CoreInfo, CoreSelector, CumulusDigestItem,
-	PersistedValidationData, RelayParentOffsetApi, TargetBlockRate,
+	PersistedValidationData, RelayParentOffsetApi, SpeculativeInboxApi, SpeculativeOutboxApi,
+	TargetBlockRate,
 };
 use cumulus_relay_chain_interface::RelayChainInterface;
 use futures::prelude::*;
@@ -143,7 +144,9 @@ where
 		+ AuraUnincludedSegmentApi<Block>
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
-		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>,
+		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RelayClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -574,7 +577,7 @@ async fn build_collation_for_core<
 		relay_slot,
 		para_slot,
 		para_client,
-		speculative_sources,
+		speculative_sources: _,
 	}: BuildCollationParams<'_, Block, P, RelayClient, BI, CIDP, Proposer, CS, CHP, Client>,
 ) -> Result<Option<Block::Header>, ()>
 where
@@ -592,7 +595,9 @@ where
 	Client: ProvideRuntimeApi<Block> + UsageProvider<Block>,
 	Client::Api: AuraUnincludedSegmentApi<Block>
 		+ ApiExt<Block>
-		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>,
+		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
 {
 	let core_start = Instant::now();
 
@@ -829,6 +834,18 @@ where
 
 	let late_block_proofs = Vec::new();
 
+	// Read speculative messaging provides/requires from the last built block's runtime state.
+	let (provides, requires) = blocks
+		.last()
+		.map(|last_block| {
+			let h = last_block.hash();
+			let api = para_client.runtime_api();
+			let provides = api.compute_provides_root(h).unwrap_or(None);
+			let requires = api.requires_commitments(h).unwrap_or_default();
+			(provides, requires)
+		})
+		.unwrap_or_default();
+
 	tracing::trace!(
 		target: LOG_TARGET,
 		?core_index,
@@ -846,6 +863,8 @@ where
 		core_index,
 		validation_data,
 		late_block_proofs,
+		provides,
+		requires,
 	}) {
 		tracing::error!(target: crate::LOG_TARGET, ?err, "Unable to send block to collation task.");
 		Err(())

@@ -1904,6 +1904,25 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 
 ---
 
+## 10.11 POC Status Tracker
+
+Legend: ✅ done · 🔶 partial · ❌ not started
+
+| Step | Description | Status | Notes |
+|------|-------------|--------|-------|
+| 10.1 | Primitives & version gating | ✅ | `v10` types, `MMRExtensionProof.old_leaf_count`, `CandidateDescriptorV2::new_v4()` version-byte approach. V4 struct family removed. |
+| 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `get_requires_commitments`. 11/11 tests pass. |
+| 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
+| 10.4 | Collator-side inherent injection & commitment assembly | 🔶 | `SpeculativeIngress` inherent plumbing in place; `ParachainBlockDataV4` wrapping works. `provides`/`requires` now read from runtime via `SpeculativeOutboxApi`/`SpeculativeInboxApi` after block execution in `block_builder_task.rs` and passed through `CollatorMessage` to `build_multi_block_collation`. Collator-side LBP collection removed (see §12 Production Hardening). Single-block path (`build_collation`) still passes `None`/empty. |
+| 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4`, `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
+| 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
+| 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
+| 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
+| 10.9 | Off-chain networking | ❌ | Provider/relayer process not started. No HTTP batch fetch, no destination-side fetcher. |
+| 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–3 ✅. Milestones 4–5 ✅ (steps 6, 8 done). Milestones 6–8 ❌ (blocked on step 9 off-chain networking). |
+
+---
+
 ## 11. What's NOT In This POC
 
 - **Speculative (acknowledged) delivery mode**: requires Low-Latency v2's collator acknowledgement signatures, which are not yet implemented in the codebase. The receiver cannot optimistically build on an un-included sender block without a signed canonicality commitment from the sender's collators.

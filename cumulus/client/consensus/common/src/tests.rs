@@ -108,6 +108,10 @@ impl RelayChainInterface for Relaychain {
 		unimplemented!("Not needed for test")
 	}
 
+	async fn provides_root(&self, _: ParaId, _: PHash) -> RelayChainResult<Option<PHash>> {
+		unimplemented!("Not needed for test")
+	}
+
 	async fn retrieve_dmq_contents(
 		&self,
 		_: ParaId,
