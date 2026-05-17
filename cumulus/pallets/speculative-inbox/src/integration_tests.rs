@@ -20,14 +20,9 @@ use cumulus_primitives_core::ParaId;
 use frame_support::{assert_noop, assert_ok, traits::Hooks};
 use polkadot_primitives::v10::{MessageBatch, OutgoingMessage, SpeculativeIngress};
 use sp_core::H256;
-use sp_runtime::traits::Hash as _;
-use sp_runtime::traits::Keccak256;
+use sp_runtime::traits::{Hash as _, Keccak256};
 
-fn build_valid_batch(
-	source: ParaId,
-	destination: ParaId,
-	messages: Vec<Vec<u8>>,
-) -> MessageBatch {
+fn build_valid_batch(source: ParaId, destination: ParaId, messages: Vec<Vec<u8>>) -> MessageBatch {
 	SpeculativeOutbox::<Test>::record_outbound_messages(destination, messages.clone());
 	let provides = SpeculativeOutbox::<Test>::compute_provides_root().unwrap();
 	let (subtree_root, _) = SpeculativeOutbox::<Test>::destination_state(destination).unwrap();
@@ -46,10 +41,7 @@ fn build_valid_batch(
 		messages: messages
 			.into_iter()
 			.enumerate()
-			.map(|(i, payload)| OutgoingMessage {
-				position: i as u64,
-				payload,
-			})
+			.map(|(i, payload)| OutgoingMessage { position: i as u64, payload })
 			.collect(),
 	}
 }
@@ -136,10 +128,7 @@ fn ingest_second_batch_requires_consecutive_positions() {
 			subtree_inclusion_proof: proof,
 			number_of_destinations,
 			leaf_index,
-			messages: vec![OutgoingMessage {
-				position: 1,
-				payload: b"two".to_vec(),
-			}],
+			messages: vec![OutgoingMessage { position: 1, payload: b"two".to_vec() }],
 		};
 
 		assert_ok!(SpeculativeInbox::<Test>::ingest_verified_messages(
@@ -160,27 +149,20 @@ fn late_block_proof_roundtrip() {
 			destination,
 			vec![b"msg1".to_vec(), b"msg2".to_vec()],
 		);
-		let old_provides_root =
-			SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
+		let old_provides_root = SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
 
 		// Finalize block 1 so history is captured.
 		System::set_block_number(1);
 		SpeculativeOutbox::<Test>::on_finalize(1);
 
 		// Advance: record a third message.
-		SpeculativeOutbox::<Test>::record_outbound_messages(
-			destination,
-			vec![b"msg3".to_vec()],
-		);
-		let new_provides_root =
-			SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
+		SpeculativeOutbox::<Test>::record_outbound_messages(destination, vec![b"msg3".to_vec()]);
+		let new_provides_root = SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
 
 		// Generate the late block proof.
-		let proof = SpeculativeOutbox::<Test>::generate_late_block_proof(
-			destination,
-			old_provides_root,
-		)
-		.expect("proof should be generated");
+		let proof =
+			SpeculativeOutbox::<Test>::generate_late_block_proof(destination, old_provides_root)
+				.expect("proof should be generated");
 
 		assert_eq!(proof.old_provides_root, old_provides_root);
 		assert_eq!(proof.new_provides_root, new_provides_root);
@@ -225,20 +207,14 @@ fn ingest_after_root_advance_records_old_root_in_requires() {
 		// Block 2: record msg2 — root advances.
 		System::set_block_number(2);
 		SpeculativeInbox::<Test>::on_initialize(2);
-		SpeculativeOutbox::<Test>::record_outbound_messages(
-			destination,
-			vec![b"msg2".to_vec()],
-		);
-		let new_provides_root =
-			SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
+		SpeculativeOutbox::<Test>::record_outbound_messages(destination, vec![b"msg2".to_vec()]);
+		let new_provides_root = SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
 		assert_ne!(old_provides_root, new_provides_root);
 
 		// The late block proof connects old → new root.
-		let proof = SpeculativeOutbox::<Test>::generate_late_block_proof(
-			destination,
-			old_provides_root,
-		)
-		.expect("proof must be generated");
+		let proof =
+			SpeculativeOutbox::<Test>::generate_late_block_proof(destination, old_provides_root)
+				.expect("proof must be generated");
 		assert_eq!(proof.new_provides_root, new_provides_root);
 	});
 }

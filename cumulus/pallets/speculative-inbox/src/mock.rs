@@ -17,11 +17,7 @@
 use crate as speculative_inbox;
 use cumulus_pallet_speculative_outbox as speculative_outbox;
 use cumulus_primitives_core::ParaId;
-use frame_support::{
-	derive_impl, parameter_types,
-	traits::Everything,
-	weights::Weight,
-};
+use frame_support::{derive_impl, parameter_types, traits::Everything, weights::Weight};
 use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
 use sp_core::H256;
 use sp_runtime::{
@@ -88,8 +84,6 @@ impl speculative_inbox::Config for Test {
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
-	let t = frame_system::GenesisConfig::<Test>::default()
-		.build_storage()
-		.unwrap();
+	let t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 	sp_io::TestExternalities::new(t)
 }

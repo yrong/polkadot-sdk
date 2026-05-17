@@ -24,11 +24,13 @@
 //! contain randomness based data.
 use codec::{Decode, Encode};
 use polkadot_primitives::{
+	v10::{
+		CandidateCommitments as CandidateCommitmentsV10, ProvidesCommitment, RequiresCommitment,
+	},
 	AppVerify, CandidateCommitments, CandidateDescriptorV2, CandidateHash, CandidateReceiptV2,
 	CollatorId, CollatorSignature, CommittedCandidateReceiptV2, CoreIndex, Hash, HashT, HeadData,
-	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex,
-	ValidationCode, ValidationCodeHash, ValidatorId,
-	v10::{CandidateCommitments as CandidateCommitmentsV10, ProvidesCommitment, RequiresCommitment},
+	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex, ValidationCode,
+	ValidationCodeHash, ValidatorId,
 };
 pub use rand;
 use scale_info::TypeInfo;
@@ -377,7 +379,8 @@ pub fn dummy_candidate_commitments(head_data: impl Into<Option<HeadData>>) -> Ca
 		horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0_u32,
-		provides: None, requires: vec![],
+		provides: None,
+		requires: vec![],
 	}
 }
 
@@ -535,7 +538,8 @@ pub fn make_candidate(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
-		provides: None, requires: vec![],
+		provides: None,
+		requires: vec![],
 	};
 
 	let mut candidate =
@@ -567,7 +571,8 @@ pub fn make_candidate_v2(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
-		provides: None, requires: vec![],
+		provides: None,
+		requires: vec![],
 	};
 
 	let mut descriptor = dummy_candidate_descriptor_v2(relay_parent_hash);
@@ -597,7 +602,8 @@ pub fn make_candidate_v3(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
-		provides: None, requires: vec![],
+		provides: None,
+		requires: vec![],
 	};
 
 	let descriptor = CandidateDescriptorV2::new_v3(

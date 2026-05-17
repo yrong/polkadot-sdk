@@ -429,6 +429,12 @@ where
 		proof: StorageProof,
 		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
-		CollatorService::build_multi_block_collation(self, parent_header, blocks, proof, late_block_proofs)
+		CollatorService::build_multi_block_collation(
+			self,
+			parent_header,
+			blocks,
+			proof,
+			late_block_proofs,
+		)
 	}
 }

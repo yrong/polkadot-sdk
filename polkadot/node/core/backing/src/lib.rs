@@ -1905,7 +1905,10 @@ async fn maybe_validate_and_import<Context>(
 
 	// Version consistency + V3 gating for Seconded statements (shared logic).
 	if let StatementWithPVD::Seconded(receipt, _) = statement.payload() {
-		if let Err(reason) = receipt.descriptor.check_version_acceptance(state.v3_ever_seen, state.speculative_ever_seen) {
+		if let Err(reason) = receipt
+			.descriptor
+			.check_version_acceptance(state.v3_ever_seen, state.speculative_ever_seen)
+		{
 			gum::debug!(
 				target: LOG_TARGET,
 				?scheduling_parent,
@@ -2074,7 +2077,10 @@ async fn handle_second_message<Context>(
 	}
 
 	// Version consistency + V3 gating (shared logic from primitives).
-	if let Err(reason) = candidate.descriptor().check_version_acceptance(state.v3_ever_seen, state.speculative_ever_seen) {
+	if let Err(reason) = candidate
+		.descriptor()
+		.check_version_acceptance(state.v3_ever_seen, state.speculative_ever_seen)
+	{
 		gum::debug!(
 			target: LOG_TARGET,
 			?candidate_hash,

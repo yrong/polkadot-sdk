@@ -226,7 +226,8 @@ pub mod pallet {
 		///
 		/// For V4 candidates (speculative messaging), this should return
 		/// the provides root and requires commitments.
-		fn speculative_extension() -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
+		fn speculative_extension(
+		) -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
 			None
 		}
 

@@ -7,14 +7,11 @@
 use std::sync::Arc;
 
 use cumulus_pallet_speculative_inbox::client::{
-	empty_speculative_ingress,
-	fetch_speculative_ingress as fetch_batches_from_senders,
+	empty_speculative_ingress, fetch_speculative_ingress as fetch_batches_from_senders,
 };
 use cumulus_primitives_core::{ParaId, SpeculativeInboxApi, SpeculativeOutboxApi};
 use cumulus_relay_chain_interface::RelayChainInterface;
-use polkadot_primitives::{
-	v10::SpeculativeIngress, BlockNumber, Hash,
-};
+use polkadot_primitives::{v10::SpeculativeIngress, BlockNumber, Hash};
 use sc_client_api::UsageProvider;
 use sp_api::ProvideRuntimeApi;
 use sp_runtime::traits::Block as BlockT;
@@ -41,10 +38,7 @@ impl<Client> Clone for SpeculativeMessageSources<Client> {
 
 impl<Client> Default for SpeculativeMessageSources<Client> {
 	fn default() -> Self {
-		Self {
-			sources: Vec::new(),
-			max_messages_per_source: DEFAULT_MAX_MESSAGES_PER_SOURCE,
-		}
+		Self { sources: Vec::new(), max_messages_per_source: DEFAULT_MAX_MESSAGES_PER_SOURCE }
 	}
 }
 
@@ -103,7 +97,9 @@ where
 		if let Ok(Some(relay_provides_root)) =
 			futures::executor::block_on(relay_client.provides_root(*source, relay_parent))
 		{
-			if relay_provides_root != Hash::default() && relay_provides_root != expected_provides_root {
+			if relay_provides_root != Hash::default() &&
+				relay_provides_root != expected_provides_root
+			{
 				if let Ok(Some(at_relay)) = sender
 					.as_ref()
 					.runtime_api()

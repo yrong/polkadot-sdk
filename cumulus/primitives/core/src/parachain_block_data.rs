@@ -205,7 +205,10 @@ pub struct ParachainBlockDataV4<Block> {
 
 impl<Block> ParachainBlockDataV4<Block> {
 	/// Create a new instance of `ParachainBlockDataV4`.
-	pub fn new(inner: ParachainBlockData<Block>, late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>) -> Self {
+	pub fn new(
+		inner: ParachainBlockData<Block>,
+		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+	) -> Self {
 		Self { inner, late_block_proofs }
 	}
 }

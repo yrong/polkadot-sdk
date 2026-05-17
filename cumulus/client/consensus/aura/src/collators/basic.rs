@@ -107,8 +107,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	Client::Api: AuraApi<Block, P::Public>
-		+ CollectCollationInfo<Block>,
+	Client::Api: AuraApi<Block, P::Public> + CollectCollationInfo<Block>,
 	RClient: RelayChainInterface + Send + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + Send + 'static,
 	CIDP::InherentDataProviders: Send,
@@ -245,7 +244,8 @@ where
 				continue;
 			}
 
-			let speculative_ingress = cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
+			let speculative_ingress =
+				cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
 
 			let (parachain_inherent_data, other_inherent_data) = try_request!(
 				collator

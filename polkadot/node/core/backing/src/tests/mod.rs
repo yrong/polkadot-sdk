@@ -30,8 +30,7 @@ use polkadot_node_subsystem_test_helpers::mock::new_leaf;
 use polkadot_primitives::{
 	node_features, BlockNumber, CandidateDescriptorV2, CandidateDescriptorVersion, CollatorId,
 	CollatorSignature, CoreState, GroupRotationInfo, HeadData, Header, MutateDescriptorV2,
-	OccupiedCore, PersistedValidationData, ScheduledCore, SessionIndex,
-	LEGACY_MIN_BACKING_VOTES,
+	OccupiedCore, PersistedValidationData, ScheduledCore, SessionIndex, LEGACY_MIN_BACKING_VOTES,
 };
 use polkadot_primitives_test_helpers::{
 	dummy_candidate_receipt_bad_sig, dummy_committed_candidate_receipt_v2, dummy_hash,
@@ -256,7 +255,8 @@ impl TestCandidateBuilder {
 				new_validation_code: None,
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
-				provides: None, requires: vec![],
+				provides: None,
+				requires: vec![],
 			},
 		}
 	}
@@ -3864,8 +3864,10 @@ fn concurrent_dependent_candidates() {
 								new_validation_code: None,
 								processed_downward_messages: 0,
 								hrmp_watermark: 0,
-								provides: None, requires: vec![],
-							}.into(),
+								provides: None,
+								requires: vec![],
+							}
+							.into(),
 							pvd.clone(),
 						)))
 						.unwrap();
@@ -4111,7 +4113,8 @@ fn v3_capable_validator_backs_v1_descriptor() {
 				new_validation_code: None,
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
-				provides: None, requires: vec![],
+				provides: None,
+				requires: vec![],
 			},
 		};
 

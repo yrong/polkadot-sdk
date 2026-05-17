@@ -51,12 +51,13 @@ use sp_runtime::{
 };
 
 use frame_support::pallet_prelude::*;
-use frame_system::{ensure_none, pallet_prelude::{BlockNumberFor, OriginFor}};
+use frame_system::{
+	ensure_none,
+	pallet_prelude::{BlockNumberFor, OriginFor},
+};
 
 use cumulus_primitives_core::ParaId;
-use polkadot_parachain_primitives::primitives::{
-	XcmpMessageFormat, XcmpMessageHandler,
-};
+use polkadot_parachain_primitives::primitives::{XcmpMessageFormat, XcmpMessageHandler};
 use polkadot_primitives::v10::{RequiresCommitment, SpeculativeIngress};
 
 use mmr_lib::{Merge, Result as MmrResult};
@@ -122,11 +123,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		/// Speculative messages were ingested from a source.
-		MessagesIngested {
-			source: ParaId,
-			provides_root: H256,
-			message_count: u32,
-		},
+		MessagesIngested { source: ParaId, provides_root: H256, message_count: u32 },
 	}
 
 	#[pallet::error]
@@ -152,8 +149,7 @@ pub mod pallet {
 	/// Cleared in `on_initialize`, populated by `ingest_verified_messages`,
 	/// then read after block execution to populate `CandidateCommitments.requires`.
 	#[pallet::storage]
-	pub type ConsumedSourcesThisBlock<T: Config> =
-		StorageValue<_, Vec<(ParaId, H256)>, ValueQuery>;
+	pub type ConsumedSourcesThisBlock<T: Config> = StorageValue<_, Vec<(ParaId, H256)>, ValueQuery>;
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
@@ -203,15 +199,9 @@ pub mod pallet {
 
 				// 3. Verify message continuity and reconstruct local subtree
 				for msg in &batch.messages {
-					let expected_position = if state.mmr_size == 0 {
-						0
-					} else {
-						state.last_processed + 1
-					};
-					ensure!(
-						msg.position == expected_position,
-						Error::<T>::NonConsecutiveMessage
-					);
+					let expected_position =
+						if state.mmr_size == 0 { 0 } else { state.last_processed + 1 };
+					ensure!(msg.position == expected_position, Error::<T>::NonConsecutiveMessage);
 					let msg_hash = Keccak256::hash(&msg.payload);
 					state.mmr_peaks = append_leaf_to_peaks::<Keccak256Merge>(
 						state.mmr_peaks,
@@ -224,15 +214,12 @@ pub mod pallet {
 
 				// 4. Verify reconstructed MMR subtree root matches batch
 				let computed_root = bag_peaks::<Keccak256Merge>(&state.mmr_peaks);
-				ensure!(
-					computed_root == batch.subtree_root,
-					Error::<T>::SubtreeRootMismatch
-				);
+				ensure!(computed_root == batch.subtree_root, Error::<T>::SubtreeRootMismatch);
 				// 5. Enforce one distinct top-level provides root per source per block
 				if state.last_processed > 0 {
 					ensure!(
-						state.last_seen_provides_root == batch.provides_root
-							|| !consumed.iter().any(|(source, _)| source == &batch.source),
+						state.last_seen_provides_root == batch.provides_root ||
+							!consumed.iter().any(|(source, _)| source == &batch.source),
 						Error::<T>::MultipleRootsPerSourceInOneBlock,
 					);
 				}
@@ -244,9 +231,8 @@ pub mod pallet {
 				consumed.push((batch.source, batch.provides_root));
 
 				// 7. Dispatch through the standard XCMP handler
-				let encoded_batch = encode_xcmp_batch(
-					batch.messages.iter().map(|msg| msg.payload.as_slice()),
-				);
+				let encoded_batch =
+					encode_xcmp_batch(batch.messages.iter().map(|msg| msg.payload.as_slice()));
 				let max_weight = T::ReservedXcmpWeight::get();
 				T::XcmpMessageHandler::handle_xcmp_messages(
 					core::iter::once((
@@ -276,10 +262,8 @@ pub mod pallet {
 		const INHERENT_IDENTIFIER: InherentIdentifier = INHERENT_IDENTIFIER;
 
 		fn create_inherent(data: &sp_inherents::InherentData) -> Option<Self::Call> {
-			let ingress = data
-				.get_data::<SpeculativeIngress>(&Self::INHERENT_IDENTIFIER)
-				.ok()
-				.flatten()?;
+			let ingress =
+				data.get_data::<SpeculativeIngress>(&Self::INHERENT_IDENTIFIER).ok().flatten()?;
 			Some(Call::ingest_verified_messages { ingress })
 		}
 
@@ -293,13 +277,7 @@ impl<T: Config> Pallet<T> {
 	/// Next message position the collator should fetch from `source`.
 	pub fn next_expected_message_position(source: ParaId) -> u64 {
 		IncomingState::<T>::get(&source)
-			.map(|state| {
-				if state.mmr_size == 0 {
-					0
-				} else {
-					state.last_processed + 1
-				}
-			})
+			.map(|state| if state.mmr_size == 0 { 0 } else { state.last_processed + 1 })
 			.unwrap_or(0)
 	}
 
@@ -384,7 +362,8 @@ where
 	current
 }
 
-fn append_leaf_to_peaks<M: Merge>(	mut peaks: Vec<M::Item>,
+fn append_leaf_to_peaks<M: Merge>(
+	mut peaks: Vec<M::Item>,
 	size: u64,
 	leaf: M::Item,
 ) -> Vec<M::Item> {
@@ -416,13 +395,10 @@ mod tests {
 
 	#[test]
 	fn test_mmr_root_matches_after_multiple_pushes() {
-		let leaves: Vec<H256> = (0..11u8)
-			.map(|i| Keccak256::hash(&[i]))
-			.collect();
+		let leaves: Vec<H256> = (0..11u8).map(|i| Keccak256::hash(&[i])).collect();
 
 		let store = mmr_lib::util::MemStore::<H256>::default();
-		let mut mmr =
-			mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
+		let mut mmr = mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
 
 		let mut peaks = Vec::new();
 		let mut size = 0;
@@ -440,8 +416,7 @@ mod tests {
 	#[test]
 	fn test_top_level_merkle_proof_roundtrip() {
 		// The top-level tree is a plain binary Merkle tree (not MMR).
-		let leaves: Vec<Vec<u8>> =
-			vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
+		let leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
 		let proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(leaves.clone(), 1);
 		assert!(binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 			&proof.root,
