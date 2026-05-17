@@ -577,7 +577,7 @@ async fn build_collation_for_core<
 		relay_slot,
 		para_slot,
 		para_client,
-		speculative_sources: _,
+		speculative_sources,
 	}: BuildCollationParams<'_, Block, P, RelayClient, BI, CIDP, Proposer, CS, CHP, Client>,
 ) -> Result<Option<Block::Header>, ()>
 where
@@ -675,8 +675,20 @@ where
 		let relay_proof_request =
 			crate::collators::get_relay_proof_request::<Block, Client>(para_client, parent_hash);
 
-		let speculative_ingress =
-			cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
+		let speculative_ingress = if speculative_sources.sources.is_empty() {
+			cumulus_pallet_speculative_inbox::client::empty_speculative_ingress()
+		} else {
+			crate::collators::speculative_ingress::fetch_ingress_for_block(
+				para_client,
+				parent_hash,
+				para_id,
+				speculative_sources,
+				relay_parent_hash,
+				relay_client,
+				*relay_parent_header.number(),
+			)
+			.await
+		};
 
 		let (parachain_inherent_data, other_inherent_data) = match collator
 			.create_inherent_data_with_rp_offset(

@@ -59,7 +59,7 @@ impl<Client> SpeculativeMessageSources<Client> {
 /// When `sources` is empty, returns empty ingress (legacy behaviour). Otherwise
 /// queries each sender's outbox at its best block and the receiver's expected
 /// message cursor via [`SpeculativeInboxApi`].
-pub fn fetch_ingress_for_block<Block, Client, RClient>(
+pub async fn fetch_ingress_for_block<Block, Client, RClient>(
 	receiver: &Client,
 	receiver_parent: Hash,
 	destination: ParaId,
@@ -95,7 +95,7 @@ where
 		// If so, we try to fetch from the block that matches the relay chain's root.
 		let mut fetch_at = sender_best;
 		if let Ok(Some(relay_provides_root)) =
-			futures::executor::block_on(relay_client.provides_root(*source, relay_parent))
+			relay_client.provides_root(*source, relay_parent).await
 		{
 			if relay_provides_root != Hash::default() &&
 				relay_provides_root != expected_provides_root
