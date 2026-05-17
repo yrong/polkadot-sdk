@@ -29,7 +29,10 @@ pub mod types;
 
 use crate::cli::AuthoringPolicy;
 
-use cumulus_primitives_core::{CollectCollationInfo, GetParachainInfo, RelayParentOffsetApi};
+use cumulus_primitives_core::{
+	CollectCollationInfo, GetParachainInfo, RelayParentOffsetApi, SpeculativeInboxApi,
+	SpeculativeOutboxApi,
+};
 use sc_client_db::DbHash;
 use sc_offchain::OffchainWorkerApi;
 use serde::de::DeserializeOwned;
@@ -75,6 +78,8 @@ pub trait NodeRuntimeApi<Block: BlockT>:
 	+ GetParachainInfo<Block>
 	+ TransactionStorageApi<Block>
 	+ RelayParentOffsetApi<Block>
+	+ SpeculativeOutboxApi<Block>
+	+ SpeculativeInboxApi<Block>
 	+ Sized
 {
 }
@@ -90,6 +95,8 @@ impl<T, Block: BlockT> NodeRuntimeApi<Block> for T where
 		+ CollectCollationInfo<Block>
 		+ GetParachainInfo<Block>
 		+ TransactionStorageApi<Block>
+		+ SpeculativeOutboxApi<Block>
+		+ SpeculativeInboxApi<Block>
 {
 }
 

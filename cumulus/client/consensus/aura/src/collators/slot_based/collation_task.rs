@@ -128,6 +128,8 @@ async fn handle_collation_message<Block: BlockT, RClient: RelayChainInterface + 
 		core_index,
 		validation_data,
 		late_block_proofs,
+		provides,
+		requires,
 	} = message;
 
 	let (collation, block_data) = match collator_service.build_multi_block_collation(
@@ -135,6 +137,8 @@ async fn handle_collation_message<Block: BlockT, RClient: RelayChainInterface + 
 		blocks,
 		proof,
 		late_block_proofs,
+		provides,
+		requires,
 	) {
 		Some(collation) => collation,
 		None => {

@@ -71,6 +71,8 @@ pub trait ServiceInterface<Block: BlockT> {
 		blocks: Vec<Block>,
 		proof: StorageProof,
 		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+		provides: Option<polkadot_primitives::v10::ProvidesCommitment>,
+		requires: Vec<polkadot_primitives::v10::RequiresCommitment>,
 	) -> Option<(Collation, ParachainBlockData<Block>)>;
 
 	/// Inform networking systems that the block should be announced after a signal has
@@ -240,6 +242,8 @@ where
 		blocks: Vec<Block>,
 		proof: StorageProof,
 		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+		provides: Option<polkadot_primitives::v10::ProvidesCommitment>,
+		requires: Vec<polkadot_primitives::v10::RequiresCommitment>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		let compact_proof =
 			match proof.into_compact_proof::<HashingFor<Block>>(*parent_header.state_root()) {
@@ -366,8 +370,8 @@ where
 			hrmp_watermark: hrmp_watermark?,
 			head_data: head_data?,
 			proof_of_validity: MaybeCompressedPoV::Compressed(pov),
-			provides: None,
-			requires: Vec::new(),
+			provides,
+			requires,
 		};
 
 		Some((collation, block_data))
@@ -408,6 +412,8 @@ where
 			vec![candidate.block],
 			candidate.proof,
 			candidate.late_block_proofs,
+			None,
+			Vec::new(),
 		)
 	}
 
@@ -428,6 +434,8 @@ where
 		blocks: Vec<Block>,
 		proof: StorageProof,
 		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+		provides: Option<polkadot_primitives::v10::ProvidesCommitment>,
+		requires: Vec<polkadot_primitives::v10::RequiresCommitment>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		CollatorService::build_multi_block_collation(
 			self,
@@ -435,6 +443,8 @@ where
 			blocks,
 			proof,
 			late_block_proofs,
+			provides,
+			requires,
 		)
 	}
 }

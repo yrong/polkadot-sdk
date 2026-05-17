@@ -126,6 +126,10 @@ impl RelayChainInterface for DummyRelayChainInterface {
 		Ok(self.relay_backend.blockchain().info().finalized_hash)
 	}
 
+	async fn provides_root(&self, _: ParaId, _: PHash) -> RelayChainResult<Option<PHash>> {
+		unimplemented!("Not needed for test")
+	}
+
 	async fn retrieve_dmq_contents(
 		&self,
 		_: ParaId,
