@@ -1,0 +1,63 @@
+# Speculative messaging POC — two Penpal parachains on Rococo-local.
+#
+# Para 2000 = SENDER  — produces outbound XCM via pallet-speculative-outbox.
+# Para 2001 = RECEIVER — fetches batches from the sender over JSON-RPC and
+#                        includes them via pallet-speculative-inbox.
+#
+# Build before running:
+#   cargo build -p polkadot --release
+#   cargo build -p polkadot-omni-node --release
+#
+# Run with zombienet (native provider):
+#   zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc.toml
+#
+# The sender's RPC port is pinned to 9955 so the receiver can reference it
+# at a known address via --speculative-sender.
+
+[relaychain]
+default_command = "../../target/release/polkadot"
+default_args = ["-lparachain=debug,runtime=debug"]
+chain = "rococo-local"
+
+	[[relaychain.nodes]]
+	name = "alice"
+	validator = true
+
+	[[relaychain.nodes]]
+	name = "bob"
+	validator = true
+
+# ── Para 2000: Sender ─────────────────────────────────────────────────────────
+
+[[parachains]]
+id = 2000
+chain = "penpal-rococo-local"
+cumulus_based = true
+
+	[[parachains.collators]]
+	name = "sender"
+	validator = true
+	command = "../../target/release/polkadot-omni-node"
+	rpc_port = 9955
+	args = [
+		"--authoring=slot-based",
+		"-lparachain=debug,cumulus-collator=debug",
+	]
+
+# ── Para 2001: Receiver ───────────────────────────────────────────────────────
+
+[[parachains]]
+id = 2001
+chain = "penpal-rococo-local"
+cumulus_based = true
+
+	[[parachains.collators]]
+	name = "receiver"
+	validator = true
+	command = "../../target/release/polkadot-omni-node"
+	args = [
+		"--authoring=slot-based",
+		# Pull speculative batches from the sender via its JSON-RPC endpoint.
+		"--speculative-sender=2000=ws://127.0.0.1:9955",
+		"-lparachain=debug,cumulus-collator=debug",
+	]

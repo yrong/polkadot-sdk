@@ -1972,7 +1972,7 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
 | 10.9 | Off-chain networking | ✅ | `OutboxQuery` async trait with `RpcOutboxClient` (JSON-RPC WebSocket). `SpeculativeMessageSources` is generic-free. `fetch_ingress_for_block` is fully async. `--speculative-sender <PARA_ID>=<WS_URL>` CLI arg added to omni-node. At startup the node async-connects to each configured sender and populates `SpeculativeMessageSources`; connection failures are logged and skipped gracefully. Both slot-based and lookahead/basic collator paths wired. |
-| 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–5 ✅. Milestones 6–8 require node setup wiring and zombienet config (follow-up). |
+| 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–5 ✅. Zombienet config added: `cumulus/zombienet/examples/speculative_messaging_poc.toml` — two Penpal instances (para 2000 sender, para 2001 receiver) on Rococo-local, receiver started with `--speculative-sender 2000=ws://127.0.0.1:9955`. Milestones 6–8 (live network verification) pending actual run. |
 
 ---
 
