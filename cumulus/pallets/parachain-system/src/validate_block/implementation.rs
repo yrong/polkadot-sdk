@@ -785,3 +785,173 @@ fn host_transaction_index_index(_extrinsic: u32, _size: u32, _context_hash: [u8;
 fn host_transaction_index_renew(_extrinsic: u32, _context_hash: [u8; 32]) {
 	// No-op host function used during parachain validation.
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use codec::Encode;
+	use polkadot_primitives::v10::{LateBlockProof, MMRExtensionProof};
+	use polkadot_parachain_primitives::primitives::ValidationResultExtension;
+	use sp_runtime::traits::Hash as _;
+
+	fn build_peaks(leaf_hashes: &[polkadot_primitives::Hash]) -> Vec<polkadot_primitives::Hash> {
+		let mut peaks = Vec::new();
+		for (i, &leaf) in leaf_hashes.iter().enumerate() {
+			peaks = append_mmr_leaf::<Keccak256Merge>(peaks, i as u64, leaf);
+		}
+		peaks
+	}
+
+	fn keccak(data: &[u8]) -> polkadot_primitives::Hash {
+		Keccak256::hash(data)
+	}
+
+	#[test]
+	fn verify_mmr_extension_accepts_valid_proof() {
+		let leaf1 = keccak(b"msg1");
+		let leaf2 = keccak(b"msg2");
+		let leaf3 = keccak(b"msg3");
+
+		let old_peaks = build_peaks(&[leaf1, leaf2]);
+		let old_root = bag_mmr_peaks::<Keccak256Merge>(&old_peaks).unwrap();
+
+		let new_peaks = build_peaks(&[leaf1, leaf2, leaf3]);
+		let new_root = bag_mmr_peaks::<Keccak256Merge>(&new_peaks).unwrap();
+
+		let ext = MMRExtensionProof {
+			old_peaks,
+			old_leaf_count: 2,
+			new_peaks,
+			connecting_nodes: alloc::vec![leaf3],
+		};
+		assert!(verify_mmr_extension(old_root, new_root, &ext));
+	}
+
+	#[test]
+	fn verify_mmr_extension_rejects_wrong_connecting_nodes() {
+		let leaf1 = keccak(b"msg1");
+		let leaf2 = keccak(b"msg2");
+		let leaf3 = keccak(b"msg3");
+
+		let old_peaks = build_peaks(&[leaf1, leaf2]);
+		let old_root = bag_mmr_peaks::<Keccak256Merge>(&old_peaks).unwrap();
+		let new_peaks = build_peaks(&[leaf1, leaf2, leaf3]);
+		let new_root = bag_mmr_peaks::<Keccak256Merge>(&new_peaks).unwrap();
+
+		let ext = MMRExtensionProof {
+			old_peaks,
+			old_leaf_count: 2,
+			new_peaks,
+			connecting_nodes: alloc::vec![keccak(b"wrong")],
+		};
+		assert!(!verify_mmr_extension(old_root, new_root, &ext));
+	}
+
+	#[test]
+	fn verify_mmr_extension_rejects_empty_connecting_nodes() {
+		let leaf1 = keccak(b"msg1");
+		let leaf2 = keccak(b"msg2");
+		let leaf3 = keccak(b"msg3");
+
+		let old_peaks = build_peaks(&[leaf1, leaf2]);
+		let old_root = bag_mmr_peaks::<Keccak256Merge>(&old_peaks).unwrap();
+		let new_peaks = build_peaks(&[leaf1, leaf2, leaf3]);
+		let new_root = bag_mmr_peaks::<Keccak256Merge>(&new_peaks).unwrap();
+
+		let ext = MMRExtensionProof {
+			old_peaks,
+			old_leaf_count: 2,
+			new_peaks,
+			connecting_nodes: alloc::vec![],
+		};
+		assert!(!verify_mmr_extension(old_root, new_root, &ext));
+	}
+
+	fn build_proof_for_test(
+		para_id: polkadot_primitives::Id,
+		msg1: &[u8],
+		msg2: &[u8],
+	) -> (polkadot_primitives::Hash, polkadot_primitives::Hash, LateBlockProof) {
+		let leaf1 = keccak(msg1);
+		let leaf2 = keccak(msg2);
+
+		let old_subtree_peaks = build_peaks(&[leaf1]);
+		let old_subtree_root = bag_mmr_peaks::<Keccak256Merge>(&old_subtree_peaks).unwrap();
+
+		let new_subtree_peaks = build_peaks(&[leaf1, leaf2]);
+		let new_subtree_root = bag_mmr_peaks::<Keccak256Merge>(&new_subtree_peaks).unwrap();
+
+		let old_leaves = alloc::vec![(para_id, old_subtree_root).encode()];
+		let old_provides_root = binary_merkle_tree::merkle_root::<Keccak256, _>(&old_leaves);
+
+		let new_leaves = alloc::vec![(para_id, new_subtree_root).encode()];
+		let new_provides_root = binary_merkle_tree::merkle_root::<Keccak256, _>(&new_leaves);
+
+		let old_proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(old_leaves, 0u32);
+		let new_proof = binary_merkle_tree::merkle_proof::<Keccak256, _, _>(new_leaves, 0u32);
+
+		let proof = LateBlockProof {
+			source: para_id,
+			number_of_destinations: 1,
+			leaf_index: 0,
+			old_provides_root,
+			old_subtree_root,
+			old_subtree_proof: old_proof.proof,
+			new_provides_root,
+			new_subtree_root,
+			new_subtree_proof: new_proof.proof,
+			subtree_extension: Some(MMRExtensionProof {
+				old_peaks: old_subtree_peaks,
+				old_leaf_count: 1,
+				new_peaks: new_subtree_peaks,
+				connecting_nodes: alloc::vec![leaf2],
+			}),
+		};
+
+		(old_provides_root, new_provides_root, proof)
+	}
+
+	#[test]
+	fn apply_messaging_proofs_transforms_requires_on_valid_proof() {
+		let para_id: polkadot_primitives::Id = 1000u32.into();
+		let (old_provides_root, new_provides_root, proof) =
+			build_proof_for_test(para_id, b"msg1", b"msg2");
+
+		let mut ext = Some(ValidationResultExtension::V4 {
+			provides_root: None,
+			requires: alloc::vec![(para_id, old_provides_root)],
+		});
+
+		apply_messaging_proofs(para_id, &mut ext, alloc::vec![proof]);
+
+		if let Some(ValidationResultExtension::V4 { ref requires, .. }) = ext {
+			assert_eq!(requires[0].1, new_provides_root, "requires should be updated to new root");
+		} else {
+			panic!("extension should remain V4");
+		}
+	}
+
+	#[test]
+	fn apply_messaging_proofs_does_not_transform_on_invalid_extension() {
+		let para_id: polkadot_primitives::Id = 1000u32.into();
+		let (old_provides_root, _, mut proof) =
+			build_proof_for_test(para_id, b"msg1", b"msg2");
+
+		if let Some(ref mut ext) = proof.subtree_extension {
+			ext.connecting_nodes[0] = keccak(b"tampered");
+		}
+
+		let mut ext = Some(ValidationResultExtension::V4 {
+			provides_root: None,
+			requires: alloc::vec![(para_id, old_provides_root)],
+		});
+
+		apply_messaging_proofs(para_id, &mut ext, alloc::vec![proof]);
+
+		if let Some(ValidationResultExtension::V4 { ref requires, .. }) = ext {
+			assert_eq!(requires[0].1, old_provides_root, "requires should NOT be updated");
+		} else {
+			panic!("extension should remain V4");
+		}
+	}
+}

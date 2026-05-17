@@ -143,9 +143,7 @@ where
 		+ AuraUnincludedSegmentApi<Block>
 		+ TargetBlockRate<Block>
 		+ BlockBuilder<Block>
-		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RelayClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -191,9 +189,10 @@ where
 				para_id,
 				proposer,
 				collator_service,
+				speculative_sources: speculative_sources.clone(),
 			};
 
-			collator_util::Collator::<Block, P, _, _, _, _, _>::new(params)
+			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
 		};
 
 		let mut best_notifications = match relay_client.new_best_notification_stream().await {
@@ -516,7 +515,7 @@ struct BuildCollationParams<
 	code_hash_provider: &'a CHP,
 	slot_claim: &'a SlotClaim<P::Public>,
 	collator_sender: &'a sc_utils::mpsc::TracingUnboundedSender<CollatorMessage<Block>>,
-	collator: &'a mut Collator<Block, P, BI, CIDP, RelayClient, Proposer, CS>,
+	collator: &'a mut Collator<Block, P, BI, CIDP, RelayClient, Proposer, CS, Client>,
 	allowed_pov_size: usize,
 	core_info: CoreInfo,
 	core_index: CoreIndex,
@@ -593,9 +592,7 @@ where
 	Client: ProvideRuntimeApi<Block> + UsageProvider<Block>,
 	Client::Api: AuraUnincludedSegmentApi<Block>
 		+ ApiExt<Block>
-		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+		+ cumulus_primitives_core::KeyToIncludeInRelayProof<Block>,
 {
 	let core_start = Instant::now();
 
@@ -673,15 +670,7 @@ where
 		let relay_proof_request =
 			crate::collators::get_relay_proof_request::<Block, Client>(para_client, parent_hash);
 
-		let speculative_ingress = crate::collators::fetch_ingress_for_block(
-			para_client,
-			parent_hash,
-			para_id,
-			speculative_sources,
-			relay_parent_hash,
-			relay_client,
-			validation_data.relay_parent_number,
-		);
+		let speculative_ingress = cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
 
 		let (parachain_inherent_data, other_inherent_data) = match collator
 			.create_inherent_data_with_rp_offset(
@@ -837,51 +826,7 @@ where
 
 	let proof = StorageProof::merge(proofs);
 
-	let mut late_block_proofs = Vec::new();
-
-	// Check for missing proofs (e.g. root advanced but no new messages).
-	for block in &blocks {
-		let hash = block.hash();
-		if let Ok(requires) = para_client.runtime_api().requires_commitments(hash) {
-			for req in requires {
-				// If we don't have a proof for this requirement yet, check if one is needed.
-				if !late_block_proofs
-					.iter()
-					.any(|p| p.source == req.source && p.old_provides_root == req.expected_root)
-				{
-					if let Ok(Some(relay_provides_root)) = futures::executor::block_on(
-						relay_client.provides_root(relay_parent_hash, req.source),
-					) {
-						if relay_provides_root != Hash::default() &&
-							req.expected_root != relay_provides_root
-						{
-							if let Some((_, source_client)) =
-								speculative_sources.sources.iter().find(|(id, _)| *id == req.source)
-							{
-								let source_best = source_client.as_ref().usage_info().chain.best_hash;
-								if let Ok(Some(at_relay)) = source_client
-									.as_ref()
-									.runtime_api()
-									.block_hash_for_provides_root(source_best, relay_provides_root)
-								{
-									if let Ok(Some(proof)) = source_client
-										.as_ref()
-										.runtime_api()
-										.generate_late_block_proof(
-											at_relay,
-											req.source,
-											req.expected_root,
-										) {
-										late_block_proofs.push(proof);
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
+	let late_block_proofs = Vec::new();
 
 	tracing::trace!(
 		target: LOG_TARGET,

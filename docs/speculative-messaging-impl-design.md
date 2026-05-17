@@ -1953,6 +1953,21 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 - **`block_number_for_provides_root` linear scan** — `HistoricalProvidesRoots`
   is scanned linearly (O(N) in the retention window) to look up a block number
   by root hash. A reverse index `(H256 → BlockNumber)` would make this O(1).
+- **Collator-side Late Block Proof collection not yet implemented.** The POC
+  omits the pre-flight LBP fetch in the collator (`cumulus/client/consensus/aura`).
+  The code was stubbed but had unresolvable compile issues:
+  `CollatorServiceInterface` does not expose the para chain client (needed to call
+  `requires_commitments` after block execution), `generate_late_block_proof` trait
+  bounds could not be added to generic collator `run` functions without breaking all
+  non-speculative runtimes, and `relay_client.provides_root` argument order was
+  wrong. Without collator-side LBP collection, the candidate is submitted with the
+  old `requires` root; if the source root has advanced the relay chain rejects with
+  `UnsatisfiedRequires` and the collator retries (§7.4 resubmission loop). The
+  consensus-critical path — PVF-side `apply_messaging_proofs` in
+  `validate_block/implementation.rs` — is fully intact. Restoring the collator-side
+  optimization requires either: (a) exposing a para client accessor on
+  `CollatorServiceInterface`, or (b) reading provides/requires before calling
+  `build_collation` via a new field on `ParachainCandidate`.
 
 ### Optional Future Directions
 - Super-chain / intra-block messaging.

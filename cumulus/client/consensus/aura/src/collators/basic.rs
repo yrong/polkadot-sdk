@@ -108,9 +108,7 @@ where
 		+ Sync
 		+ 'static,
 	Client::Api: AuraApi<Block, P::Public>
-		+ CollectCollationInfo<Block>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
-		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+		+ CollectCollationInfo<Block>,
 	RClient: RelayChainInterface + Send + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + Send + 'static,
 	CIDP::InherentDataProviders: Send,
@@ -144,7 +142,7 @@ where
 				para_id: params.para_id,
 				proposer: params.proposer,
 				collator_service: params.collator_service,
-				speculative_sources: params.speculative_sources,
+				speculative_sources: params.speculative_sources.clone(),
 			};
 
 			collator_util::Collator::<Block, P, _, _, _, _, _, _>::new(params)
@@ -247,15 +245,7 @@ where
 				continue;
 			}
 
-			let speculative_ingress = crate::collators::fetch_ingress_for_block(
-				&*params.para_client,
-				parent_hash,
-				params.para_id,
-				&params.speculative_sources,
-				*request.relay_parent(),
-				&params.relay_client,
-				validation_data.relay_parent_number,
-			);
+			let speculative_ingress = cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
 
 			let (parachain_inherent_data, other_inherent_data) = try_request!(
 				collator

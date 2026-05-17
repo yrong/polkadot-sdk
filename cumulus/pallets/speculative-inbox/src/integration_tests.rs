@@ -17,9 +17,11 @@
 use crate::{mock::*, Error, Pallet as SpeculativeInbox};
 use cumulus_pallet_speculative_outbox::Pallet as SpeculativeOutbox;
 use cumulus_primitives_core::ParaId;
-use frame_support::{assert_noop, assert_ok};
+use frame_support::{assert_noop, assert_ok, traits::Hooks};
 use polkadot_primitives::v10::{MessageBatch, OutgoingMessage, SpeculativeIngress};
 use sp_core::H256;
+use sp_runtime::traits::Hash as _;
+use sp_runtime::traits::Keccak256;
 
 fn build_valid_batch(
 	source: ParaId,
@@ -145,5 +147,98 @@ fn ingest_second_batch_requires_consecutive_positions() {
 			SpeculativeIngress { batches: vec![batch2] },
 		));
 		assert_eq!(SpeculativeInbox::<Test>::get_requires_commitments().len(), 1);
+	});
+}
+
+#[test]
+fn late_block_proof_roundtrip() {
+	new_test_ext().execute_with(|| {
+		let destination = SelfParaId::get();
+
+		// Block 1: record two messages.
+		SpeculativeOutbox::<Test>::record_outbound_messages(
+			destination,
+			vec![b"msg1".to_vec(), b"msg2".to_vec()],
+		);
+		let old_provides_root =
+			SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
+
+		// Finalize block 1 so history is captured.
+		System::set_block_number(1);
+		SpeculativeOutbox::<Test>::on_finalize(1);
+
+		// Advance: record a third message.
+		SpeculativeOutbox::<Test>::record_outbound_messages(
+			destination,
+			vec![b"msg3".to_vec()],
+		);
+		let new_provides_root =
+			SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
+
+		// Generate the late block proof.
+		let proof = SpeculativeOutbox::<Test>::generate_late_block_proof(
+			destination,
+			old_provides_root,
+		)
+		.expect("proof should be generated");
+
+		assert_eq!(proof.old_provides_root, old_provides_root);
+		assert_eq!(proof.new_provides_root, new_provides_root);
+		// Note: proof.source is filled in by the runtime API layer (penpal sets it to
+		// ParachainInfo::parachain_id()). At the pallet level it is set to `dest`.
+
+		let ext = proof.subtree_extension.as_ref().expect("subtree extension must be present");
+		assert_eq!(ext.connecting_nodes.len(), 1, "one new message appended");
+		assert_eq!(
+			ext.connecting_nodes[0],
+			Keccak256::hash(b"msg3"),
+			"connecting_node must be Keccak256(payload)"
+		);
+		assert_eq!(ext.old_leaf_count, 2, "old MMR had 2 leaves");
+	});
+}
+
+#[test]
+fn ingest_after_root_advance_records_old_root_in_requires() {
+	new_test_ext().execute_with(|| {
+		let source = ParaId::new(1000);
+		let destination = SelfParaId::get();
+
+		// Block 1: record msg1 and finalize.
+		let batch1 = build_valid_batch(source, destination, vec![b"msg1".to_vec()]);
+		let old_provides_root = batch1.provides_root;
+
+		System::set_block_number(1);
+		SpeculativeOutbox::<Test>::on_finalize(1);
+		SpeculativeInbox::<Test>::on_initialize(1);
+
+		// Ingest the first batch — requires records old_provides_root.
+		assert_ok!(SpeculativeInbox::<Test>::ingest_verified_messages(
+			RuntimeOrigin::none(),
+			SpeculativeIngress { batches: vec![batch1] },
+		));
+		let requires = SpeculativeInbox::<Test>::get_requires_commitments();
+		assert_eq!(requires.len(), 1);
+		assert_eq!(requires[0].source, source);
+		assert_eq!(requires[0].expected_root, old_provides_root);
+
+		// Block 2: record msg2 — root advances.
+		System::set_block_number(2);
+		SpeculativeInbox::<Test>::on_initialize(2);
+		SpeculativeOutbox::<Test>::record_outbound_messages(
+			destination,
+			vec![b"msg2".to_vec()],
+		);
+		let new_provides_root =
+			SpeculativeOutbox::<Test>::compute_provides_root().unwrap().root;
+		assert_ne!(old_provides_root, new_provides_root);
+
+		// The late block proof connects old → new root.
+		let proof = SpeculativeOutbox::<Test>::generate_late_block_proof(
+			destination,
+			old_provides_root,
+		)
+		.expect("proof must be generated");
+		assert_eq!(proof.new_provides_root, new_provides_root);
 	});
 }
