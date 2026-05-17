@@ -144,8 +144,8 @@ fn apply_messaging_proofs(
 					let old_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 						&proof.old_provides_root,
 						proof.old_subtree_proof.iter().copied(),
-						proof.number_of_destinations,
-						proof.leaf_index,
+						proof.old_number_of_destinations,
+						proof.old_leaf_index,
 						&old_leaf,
 					);
 
@@ -897,6 +897,8 @@ mod tests {
 
 		let proof = LateBlockProof {
 			source: para_id,
+			old_number_of_destinations: 1,
+			old_leaf_index: 0,
 			number_of_destinations: 1,
 			leaf_index: 0,
 			old_provides_root,

@@ -95,10 +95,16 @@ pub struct LateBlockProof {
 	/// The source parachain this proof covers.
 	pub source: ParaId,
 
-	/// The total number of destinations in the source's provides root.
-	/// Required to verify the binary Merkle proof.
+	/// Number of destinations in the OLD provides root's Merkle tree.
+	/// Required to verify old_subtree_proof.
+	pub old_number_of_destinations: u32,
+	/// Leaf index of the receiver in the OLD provides root's Merkle tree.
+	pub old_leaf_index: u32,
+
+	/// Number of destinations in the NEW (current) provides root's Merkle tree.
+	/// Required to verify new_subtree_proof.
 	pub number_of_destinations: u32,
-	/// The index of the receiver's subtree in the source's top-level tree.
+	/// Leaf index of the receiver in the NEW provides root's Merkle tree.
 	pub leaf_index: u32,
 
 	/// The provides root the receiver block was built against (the old root

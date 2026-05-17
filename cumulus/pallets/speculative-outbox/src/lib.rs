@@ -287,6 +287,8 @@ impl<T: Config> Pallet<T> {
 
 		Some(polkadot_primitives::v10::LateBlockProof {
 			source: dest,
+			old_number_of_destinations: old_roots.len() as u32,
+			old_leaf_index: old_leaf_idx as u32,
 			number_of_destinations: num_dest,
 			leaf_index: leaf_idx,
 			old_provides_root,

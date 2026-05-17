@@ -215,11 +215,12 @@ pub mod pallet {
 				// 4. Verify reconstructed MMR subtree root matches batch
 				let computed_root = bag_peaks::<Keccak256Merge>(&state.mmr_peaks);
 				ensure!(computed_root == batch.subtree_root, Error::<T>::SubtreeRootMismatch);
-				// 5. Enforce one distinct top-level provides root per source per block
-				if state.last_processed > 0 {
+				// 5. Enforce one distinct top-level provides root per source per block.
+				// Gate on whether this source was already consumed in this block — not on
+				// last_processed, which would skip the check for the very first message.
+				if consumed.iter().any(|(source, _)| source == &batch.source) {
 					ensure!(
-						state.last_seen_provides_root == batch.provides_root ||
-							!consumed.iter().any(|(source, _)| source == &batch.source),
+						state.last_seen_provides_root == batch.provides_root,
 						Error::<T>::MultipleRootsPerSourceInOneBlock,
 					);
 				}
@@ -250,7 +251,7 @@ pub mod pallet {
 				});
 			}
 
-			ConsumedSourcesThisBlock::<T>::put(consumed);
+			ConsumedSourcesThisBlock::<T>::mutate(|v| v.extend(consumed));
 			Ok(())
 		}
 	}
