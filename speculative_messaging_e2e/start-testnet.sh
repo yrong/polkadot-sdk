@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../" && pwd)"
-TOML="${ROOT_DIR}/cumulus/zombienet/examples/speculative_messaging_poc/network.toml"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../" && pwd)"
+TOML="${ROOT_DIR}/speculative_messaging_e2e/network.toml"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${PROFILE:-release}"
 
@@ -17,7 +17,7 @@ ZOMBIENET_LOG="${ZOMBIENET_LOG:-/tmp/speculative-messaging-poc.log}"
 ZOMBIENET_DIR="${ZOMBIENET_DIR:-/tmp/speculative-messaging-poc}"
 
 echo "[1/4] Stopping any previous run (best-effort)"
-pkill -f "speculative_messaging_poc" 2>/dev/null || true
+pkill -f "speculative_messaging_e2e" 2>/dev/null || true
 rm -rf "${ZOMBIENET_DIR}"
 
 echo "[2/4] Spawning zombienet: ${TOML}"

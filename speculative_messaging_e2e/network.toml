@@ -9,7 +9,7 @@
 #   cargo build -p polkadot-parachain --release
 #
 # Run with zombienet (native provider):
-#   zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc/network.toml
+#   zombienet --provider native spawn speculative_messaging_e2e/network.toml
 #
 # The sender's RPC port is pinned to 9955 so the receiver can reference it
 # at a known address via --speculative-sender.
@@ -31,14 +31,17 @@ balance = 2000000000000000000000
 [[relaychain.nodes]]
 name = "bob"
 validator = true
+balance = 2000000000000000000000
 
 [[relaychain.nodes]]
 name = "charlie"
 validator = true
+balance = 2000000000000000000000
 
 [[relaychain.nodes]]
 name = "dave"
 validator = true
+balance = 2000000000000000000000
 
 # ── Para 2000: Sender ─────────────────────────────────────────────────────────
 
