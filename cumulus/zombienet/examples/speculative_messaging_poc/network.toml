@@ -1,4 +1,4 @@
-# Speculative messaging POC — two Penpal parachains on Rococo-local.
+# Speculative messaging POC — two Penpal parachains on Westend-local.
 #
 # Para 2000 = SENDER  — produces outbound XCM via pallet-speculative-outbox.
 # Para 2001 = RECEIVER — fetches batches from the sender over JSON-RPC and
@@ -16,13 +16,15 @@
 
 [relaychain]
 default_command = "{{POLKADOT_BINARY}}"
-default_args = ["-lparachain=debug,runtime=debug,runtime::inclusion=debug", "--pruning=archive"]
-chain = "rococo-local"
+default_args = [
+	"-lparachain=debug,runtime=debug,runtime::inclusion=debug",
+	"--pruning=archive",
+]
+chain = "westend-local"
 
 [[relaychain.nodes]]
 name = "alice"
 validator = true
-rpc_port = 9900
 ws_port = 9901
 balance = 2000000000000000000000
 
@@ -42,32 +44,32 @@ validator = true
 
 [[parachains]]
 id = 2000
-chain = "penpal-rococo-2000"
+chain = "penpal-westend-2000"
 cumulus_based = true
 
 [[parachains.collators]]
 name = "sender"
 validator = true
 command = "{{POLKADOT_PARACHAIN_BINARY}}"
-rpc_port = 9955
+ws_port = 9955
 args = [
-	"--authoring=slot-based",
+	"--force-authoring",
 	"-lparachain=debug,cumulus-collator=debug,speculative::outbox=debug,aura::cumulus=debug",
 	"--pruning=archive",
 ]
 
 [[parachains]]
 id = 2001
-chain = "penpal-rococo-2001"
+chain = "penpal-westend-2001"
 cumulus_based = true
 
 [[parachains.collators]]
 name = "receiver"
 validator = true
 command = "{{POLKADOT_PARACHAIN_BINARY}}"
-rpc_port = 9966
+ws_port = 9966
 args = [
-	"--authoring=slot-based",
+	"--force-authoring",
 	# Pull speculative batches from the sender via its JSON-RPC endpoint.
 	"--speculative-sender=2000=ws://127.0.0.1:9955",
 	"-lparachain=debug,cumulus-collator=debug,speculative::inbox=debug,aura::cumulus=debug",

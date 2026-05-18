@@ -37,7 +37,7 @@ use cumulus_client_collator::service::ServiceInterface as CollatorServiceInterfa
 use cumulus_client_consensus_common::{self as consensus_common, ParachainBlockImportMarker};
 use cumulus_primitives_aura::AuraUnincludedSegmentApi;
 use cumulus_primitives_core::{
-	CollectCollationInfo, KeyToIncludeInRelayProof, PersistedValidationData,
+	CollectCollationInfo, KeyToIncludeInRelayProof, PersistedValidationData, SpeculativeInboxApi,
 };
 use cumulus_relay_chain_interface::RelayChainInterface;
 use sp_consensus::Environment;
@@ -175,7 +175,8 @@ where
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ SpeculativeInboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -230,7 +231,8 @@ where
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ SpeculativeInboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -437,8 +439,20 @@ where
 				let relay_proof_request =
 					super::get_relay_proof_request(&*params.para_client, parent_hash);
 
-				let speculative_ingress =
-					cumulus_pallet_speculative_inbox::client::empty_speculative_ingress();
+				let speculative_ingress = if params.speculative_sources.sources.is_empty() {
+					cumulus_pallet_speculative_inbox::client::empty_speculative_ingress()
+				} else {
+					crate::collators::speculative_ingress::fetch_ingress_for_block(
+						para_client,
+						parent_hash,
+						params.para_id,
+						&params.speculative_sources,
+						relay_parent,
+						&params.relay_client,
+						*relay_parent_header.number(),
+					)
+					.await
+				};
 
 				let (parachain_inherent_data, other_inherent_data) = match collator
 					.create_inherent_data(

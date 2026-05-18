@@ -854,7 +854,9 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 	for StartLookaheadAuraConsensus<Block, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
-	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>,
+	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
