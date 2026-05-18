@@ -14,7 +14,9 @@
 //!    that the node recognises (i.e. NOT 0x0100..00 which was the pre-fix symptom)
 
 use jsonrpsee::{core::client::ClientT, rpc_params, ws_client::WsClientBuilder};
-use parity_scale_codec::Decode;
+use parity_scale_codec::{Decode, Encode};
+use sp_core::H256;
+use sp_runtime::traits::Keccak256;
 
 // Sender node WS-RPC endpoint (pinned in network.toml)
 const SENDER_URL: &str = "ws://127.0.0.1:9955";
@@ -159,10 +161,10 @@ async fn main() {
     )
     .await;
 
-    match dest_state {
+    match &dest_state {
         Ok(Some((root, leaf_count))) => pass!(
             "destination_state",
-            format!("Some(root={}, leaf_count={})", fmt_hash(&root), leaf_count)
+            format!("Some(root={}, leaf_count={})", fmt_hash(root), leaf_count)
         ),
         Ok(None) => pass!("destination_state", "None (no messages to dest 2001 yet)"),
         Err(e) => fail!("destination_state", e),
@@ -202,10 +204,53 @@ async fn main() {
         .await;
 
         match proof {
-            Ok(Some((hashes, num_dests, leaf_idx))) => pass!(
-                "subtree_inclusion_proof",
-                format!("Some(proof_len={}, num_dests={}, leaf_idx={})", hashes.len(), num_dests, leaf_idx)
-            ),
+            Ok(Some((ref hashes, num_dests, leaf_idx))) => {
+                pass!(
+                    "subtree_inclusion_proof",
+                    format!("Some(proof_len={}, num_dests={}, leaf_idx={})", hashes.len(), num_dests, leaf_idx)
+                );
+
+                // Independently verify the proof.
+                // Leaf = SCALE-encode((dest_para_id: u32, subtree_root: [u8;32])).
+                // binary_merkle_tree::verify_proof hashes the leaf with Keccak256 internally.
+                let (subtree_root, _) = dest_state
+                    .as_ref()
+                    .ok()
+                    .and_then(|o| *o)
+                    .unwrap_or(([0u8; 32], 0));
+                let provides_root = H256::from(p.root);
+                let proof_hashes: Vec<H256> = hashes.iter().map(|h| H256::from(*h)).collect();
+                let leaf_data = (DEST_PARA_ID, subtree_root).encode();
+
+                let proof_ok = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
+                    &provides_root,
+                    proof_hashes,
+                    num_dests,
+                    leaf_idx,
+                    &leaf_data,
+                );
+
+                if proof_ok {
+                    pass!(
+                        "subtree_inclusion_proof (verify)",
+                        format!(
+                            "valid — leaf=encode((dest={DEST_PARA_ID}, subtree_root={})) ∈ provides_root={} [proof_len={}, {num_dests} dest(s)]",
+                            fmt_hash(&subtree_root),
+                            fmt_hash(&provides_root.into()),
+                            hashes.len(),
+                        )
+                    );
+                } else {
+                    fail!(
+                        "subtree_inclusion_proof (verify)",
+                        format!(
+                            "INVALID — leaf=encode((dest={DEST_PARA_ID}, subtree_root={})) NOT in provides_root={}",
+                            fmt_hash(&subtree_root),
+                            fmt_hash(&provides_root.into()),
+                        )
+                    );
+                }
+            },
             Ok(None) =>
                 fail!("subtree_inclusion_proof", "None — expected Some for non-empty outbox"),
             Err(e) => fail!("subtree_inclusion_proof", e),
