@@ -6,6 +6,9 @@ TOML="${ROOT_DIR}/cumulus/zombienet/examples/speculative_messaging_poc/network.t
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${PROFILE:-release}"
 
+export POLKADOT_BINARY="${POLKADOT_BINARY:-"${ROOT_DIR}/target/${PROFILE}/polkadot"}"
+export POLKADOT_PARACHAIN_BINARY="${POLKADOT_PARACHAIN_BINARY:-"${ROOT_DIR}/target/${PROFILE}/polkadot-parachain"}"
+
 RELAY_WS="${RELAY_WS:-ws://127.0.0.1:9900}"
 SENDER_WS="${SENDER_WS:-ws://127.0.0.1:9955}"
 RECEIVER_WS="${RECEIVER_WS:-ws://127.0.0.1:9966}"
