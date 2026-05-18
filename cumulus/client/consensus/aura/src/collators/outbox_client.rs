@@ -125,11 +125,23 @@ impl OutboxQuery for RpcOutboxClient {
 	}
 
 	async fn compute_provides_root(&self, at: Hash) -> Option<ProvidesCommitment> {
-		self.state_call("SpeculativeOutboxApi_compute_provides_root", at, vec![]).await
+		self.state_call::<Option<ProvidesCommitment>>(
+			"SpeculativeOutboxApi_compute_provides_root",
+			at,
+			vec![],
+		)
+		.await
+		.flatten()
 	}
 
 	async fn destination_state(&self, at: Hash, dest: ParaId) -> Option<(Hash, u64)> {
-		self.state_call("SpeculativeOutboxApi_destination_state", at, dest.encode()).await
+		self.state_call::<Option<(Hash, u64)>>(
+			"SpeculativeOutboxApi_destination_state",
+			at,
+			dest.encode(),
+		)
+		.await
+		.flatten()
 	}
 
 	async fn outbound_messages(
@@ -154,21 +166,23 @@ impl OutboxQuery for RpcOutboxClient {
 		dest: ParaId,
 		root: Hash,
 	) -> Option<(Vec<Hash>, u32, u32)> {
-		self.state_call(
+		self.state_call::<Option<(Vec<Hash>, u32, u32)>>(
 			"SpeculativeOutboxApi_subtree_inclusion_proof",
 			at,
 			(dest, root).encode(),
 		)
 		.await
+		.flatten()
 	}
 
 	async fn block_hash_for_provides_root(&self, at: Hash, root: Hash) -> Option<Hash> {
-		self.state_call(
+		self.state_call::<Option<Hash>>(
 			"SpeculativeOutboxApi_block_hash_for_provides_root",
 			at,
 			root.encode(),
 		)
 		.await
+		.flatten()
 	}
 }
 
