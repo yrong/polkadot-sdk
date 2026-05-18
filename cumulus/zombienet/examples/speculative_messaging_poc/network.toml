@@ -42,7 +42,7 @@ validator = true
 
 [[parachains]]
 id = 2000
-chain = "penpal-rococo-local"
+chain = "penpal-rococo-2000"
 cumulus_based = true
 
 [[parachains.collators]]
@@ -58,7 +58,7 @@ args = [
 
 [[parachains]]
 id = 2001
-chain = "penpal-rococo-local"
+chain = "penpal-rococo-2001"
 cumulus_based = true
 
 [[parachains.collators]]
