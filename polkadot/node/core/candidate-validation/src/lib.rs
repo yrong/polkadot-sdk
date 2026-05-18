@@ -53,7 +53,7 @@ use polkadot_primitives::{
 	},
 	node_features::FeatureIndex,
 	transpose_claim_queue, AuthorityDiscoveryId, CandidateCommitments,
-	CandidateDescriptorV2 as CandidateDescriptor, CandidateDescriptorVersion, CandidateEvent,
+	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
 	PersistedValidationData, ProvidesCommitment, PvfExecKind as RuntimePvfExecKind, PvfPrepKind,
