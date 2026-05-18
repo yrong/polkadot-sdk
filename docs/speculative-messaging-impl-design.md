@@ -182,9 +182,28 @@ How our design maps onto the existing parachain–relay-chain communication flow
 
 ## 2. Commitments Versioning Strategy
 
-New types go into a **new `v10` primitives module**. The existing `v9` types are
-frozen. New speculative-messaging candidates use `v10` types, while legacy
-candidates continue to use the existing `v9` path.
+**Original intent:** new types go into a new `v10` primitives module, `v9` types frozen,
+v4 candidates use `v10::CandidateCommitments` while legacy candidates use `v9`.
+
+**POC implementation (diverges from intent):** `v9::CandidateCommitments` was extended
+directly with `provides` and `requires` fields. `v10::CandidateCommitments` is a
+re-export alias for the same type:
+
+```rust
+// polkadot/primitives/src/v10/mod.rs
+/// Re-uses v9 `CandidateCommitments` directly since v9 now has the speculative fields.
+pub use crate::v9::CandidateCommitments;
+```
+
+This means `v9` is **not** frozen. The rationale: maintaining two separate commitment
+structs would require updating every site that constructs or matches on
+`CandidateCommitments`. Since enforcement is v4-descriptor-gated (the relay chain only
+checks `provides`/`requires` for v4 candidates), correctness is preserved — pre-v4
+candidates carry the new fields as `None`/empty but the relay chain ignores them.
+
+In production, the right approach is to keep `v9::CandidateCommitments` frozen and
+introduce a genuinely additive `v10::CandidateCommitments` with a separate codec path.
+For the POC the single-struct approach is a deliberate simplification.
 
 ```
 polkadot/primitives/src/v10/mod.rs  ← NEW FILE
@@ -213,16 +232,14 @@ already handles multi-version coexistence via `descriptor.version()`. In
 production, a separate struct would provide better type safety; for the POC the
 version-byte approach is sufficient.
 
-Concretely, the intended behavior:
+Concretely, the enforcement behavior:
 
-- legacy candidates keep their existing commitments layout and validation/reconstruction path
-- v4 candidates use the extended commitments layout with speculative messaging fields
-- relay-chain inclusion only enforces requires/provides matching for v4+ candidates
+- legacy (pre-v4) candidates carry `provides: None, requires: []` — relay chain ignores these fields
+- v4 candidates use the extended commitments layout with speculative messaging fields enforced
+- relay-chain inclusion only checks requires/provides matching for v4+ candidates
 - node-side candidate validation reconstructs commitments according to the candidate descriptor version
 
-This means the upgrade is additive: pre-v4 parachains remain valid, v4 parachains
-opt into new semantics, and both formats coexist during migration. Every component
-that touches commitments is version-aware:
+Every component that touches commitments is version-aware:
 
 - **Collator** (§5.3): branches on `api_version` to include speculative fields for
   v4 parachains, skips them for legacy.
@@ -230,27 +247,23 @@ that touches commitments is version-aware:
   unchanged into `PendingAvailability`.
 - **Relay chain enactment** (§4.2): only enforces `requires`/`provides` matching
   for `descriptor.version() >= V4` candidates.
-- **Node-side validation** (§6.1): reconstructs `v9::CandidateCommitments` for V1–V3,
-  `v10::CandidateCommitments` for V4.
+- **Node-side validation** (§6.1): reconstructs commitments the same way for both
+  (since `v9` and `v10` share the same struct in the POC), but only extracts
+  speculative fields from `ValidationResultExtension::V4` for v4 candidates.
 - **Relay chain runtime API** (`check_validation_outputs`): accepts the extended
-  type from the start, ignoring optional speculative fields for pre-speculative
-  candidates.
+  type, ignoring speculative fields for pre-v4 candidates.
 
 ```rust
-// In v10/mod.rs:
-// Note: the POC does NOT introduce a new CandidateDescriptorV4 struct. Instead,
-// CandidateDescriptorV2::new_v4() sets version byte 2, making version() return
-// CandidateDescriptorVersion::V4. The struct layout is unchanged.
-
+// In v10/mod.rs — same struct as v9, extended in place for the POC:
 pub struct CandidateCommitments<N = BlockNumber> {
     pub upward_messages: UpwardMessages,
-    pub horizontal_messages: HorizontalMessages,  // HRMP (legacy, coexists in Phase 1)
+    pub horizontal_messages: HorizontalMessages,
     pub new_validation_code: Option<ValidationCode>,
     pub head_data: HeadData,
     pub processed_downward_messages: u32,
     pub hrmp_watermark: N,
 
-    // ── New speculative messaging fields ──
+    // ── Speculative messaging fields (None/empty for pre-v4 candidates) ──
     pub provides: Option<ProvidesCommitment>,
     pub requires: Vec<RequiresCommitment>,
 }
