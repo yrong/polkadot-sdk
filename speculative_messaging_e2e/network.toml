@@ -17,7 +17,7 @@
 [relaychain]
 default_command = "{{POLKADOT_BINARY}}"
 default_args = [
-	"-lparachain=debug,runtime=debug,runtime::inclusion=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug",
+	"-lparachain=debug,runtime=debug,runtime::inclusion=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug,parachain::collator-protocol=debug",
 	"--pruning=archive",
 ]
 chain = "westend-local"
