@@ -46,7 +46,7 @@ use pallet_message_queue::OnQueueChanged;
 use polkadot_primitives::{
 	effective_minimum_backing_votes, skip_ump_signals, supermajority_threshold, well_known_keys,
 	BackedCandidate, CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
-	CandidateHash, CandidateReceiptV2 as CandidateReceipt,
+	CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex, HeadData,
 	Id as ParaId, RequiresCommitment, SignedAvailabilityBitfields, SigningContext, UpwardMessage,
 	ValidatorId, ValidatorIndex, ValidityAttestation,
@@ -549,6 +549,10 @@ impl<T: Config> Pallet<T> {
 			PendingAvailability::<T>::mutate(paraid, |candidates| {
 				if let Some(candidates) = candidates {
 					let mut last_enacted_index: Option<usize> = None;
+					// Index of the first v4 candidate whose requires were unsatisfied.
+					// When set, this candidate and all descendants are dropped (not enacted)
+					// so the core is freed immediately for collator retry.
+					let mut drop_from_index: Option<usize> = None;
 
 					for (candidate_index, candidate) in candidates.iter_mut().enumerate() {
 						if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
@@ -579,13 +583,20 @@ impl<T: Config> Pallet<T> {
 								matches!(last_enacted_index, Some(old_index) if old_index == prev_candidate_index)
 							};
 
-							// Speculative messaging: check requirements if the candidate is v4.
-							if can_enact {
-								if !Self::requires_satisfied(&candidate.commitments.requires) {
-									// Requirement not satisfied. We cannot enact this
-									// candidate or any of its descendants in this block.
-									can_enact = false;
+							// Speculative messaging (v4 only): if requires are not satisfied,
+							// drop this candidate and all its descendants rather than stalling.
+							// Stalling would block the core until the availability timeout;
+							// dropping immediately lets the collator retry on the next slot.
+							if can_enact &&
+								candidate.descriptor.version() ==
+									CandidateDescriptorVersion::V4 &&
+								!Self::requires_satisfied(&candidate.commitments.requires)
+							{
+								// Record the first drop index; stop looking for more to enact.
+								if drop_from_index.is_none() {
+									drop_from_index = Some(candidate_index);
 								}
+								can_enact = false;
 							}
 
 							if can_enact {
@@ -624,6 +635,26 @@ impl<T: Config> Pallet<T> {
 								candidate.backing_group,
 							);
 							weight.saturating_accrue(enact_weight);
+						}
+					}
+
+					// Drop candidates with unsatisfied requires (and all their descendants).
+					// These have already become available but cannot be enacted; removing them
+					// immediately frees the core so the collator can retry on the next slot
+					// rather than waiting out the full availability timeout.
+					if let Some(drop_idx) = drop_from_index {
+						// Adjust for how many candidates were already drained above.
+						let enacted_count = last_enacted_index.map_or(0, |i| i + 1);
+						let adjusted = drop_idx.saturating_sub(enacted_count);
+						// Drain from the adjusted position to end, freeing all cores.
+						for candidate in candidates.drain(adjusted..) {
+							log::debug!(
+								target: "runtime::inclusion",
+								"Dropping candidate {:?} (para {:?}): unsatisfied requires",
+								candidate.hash,
+								paraid,
+							);
+							freed_cores.push((candidate.core, candidate.hash));
 						}
 					}
 				}
@@ -959,8 +990,7 @@ impl<T: Config> Pallet<T> {
 				"Candidate {:?} requirements no longer satisfied at enactment",
 				candidate_hash
 			);
-		}
-		if let Some(ref p) = commitments.provides {
+		} else if let Some(ref p) = commitments.provides {
 			Self::update_provides_root(receipt.descriptor.para_id(), p.root);
 		}
 
