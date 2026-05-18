@@ -302,6 +302,8 @@ where
 	let mut hrmp_watermark = Default::default();
 	let mut head_data = None;
 	let mut new_validation_code = None;
+	// Captured inside the last block's externalities context so storage APIs are available.
+	let mut speculative_ext: Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> = None;
 	let num_blocks = blocks.len();
 
 	// Create the db
@@ -425,6 +427,9 @@ where
 						crate::CustomValidationHeadData::<PSC>::get()
 							.map_or_else(|| HeadData(parent_header.encode()), HeadData),
 					);
+					// Must be called here while externalities are still active; storage
+					// iteration in compute_provides_root panics outside this context.
+					speculative_ext = PSC::speculative_extension();
 				}
 			},
 		);
@@ -495,7 +500,7 @@ where
 
 	horizontal_messages.sort_by(|a, b| a.recipient.cmp(&b.recipient));
 
-	let mut extension = PSC::speculative_extension();
+	let mut extension = speculative_ext;
 	if let Some(proofs) = messaging_proofs {
 		apply_messaging_proofs(PSC::SelfParaId::get(), &mut extension, proofs);
 	}
