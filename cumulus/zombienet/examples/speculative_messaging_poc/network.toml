@@ -6,7 +6,7 @@
 #
 # Build before running:
 #   cargo build -p polkadot --release
-#   cargo build -p polkadot-omni-node --release
+#   cargo build -p polkadot-parachain --release
 #
 # Run with zombienet (native provider):
 #   zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc/network.toml
@@ -48,7 +48,7 @@ cumulus_based = true
 [[parachains.collators]]
 name = "sender"
 validator = true
-command = "../../../target/release/polkadot-omni-node"
+command = "../../../target/release/polkadot-parachain"
 rpc_port = 9955
 args = [
 	"--authoring=slot-based",
@@ -66,7 +66,7 @@ cumulus_based = true
 [[parachains.collators]]
 name = "receiver"
 validator = true
-command = "../../../target/release/polkadot-omni-node"
+command = "../../../target/release/polkadot-parachain"
 rpc_port = 9966
 args = [
 	"--authoring=slot-based",

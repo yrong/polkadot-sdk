@@ -23,14 +23,14 @@ The script will:
 
 End-to-end test for the speculative messaging POC. Spawns:
 - Rococo-local relay chain (Alice + Bob validators)
-- Para 2000 — sender Penpal collator (`polkadot-omni-node`, slot-based)
-- Para 2001 — receiver Penpal collator (`polkadot-omni-node`, slot-based, connected to sender via `--speculative-sender`)
+- Para 2000 — sender Penpal collator (`polkadot-parachain`, slot-based)
+- Para 2001 — receiver Penpal collator (`polkadot-parachain`, slot-based, connected to sender via `--speculative-sender`)
 
 ### Build
 
 ```bash
 cargo build -p polkadot --release
-cargo build -p polkadot-omni-node --release
+cargo build -p polkadot-parachain --release
 ```
 
 ### Run
