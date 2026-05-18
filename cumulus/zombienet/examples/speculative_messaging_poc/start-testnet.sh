@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../" && pwd)"
-TOML="${ROOT_DIR}/cumulus/zombienet/examples/speculative_messaging_poc.toml"
+TOML="${ROOT_DIR}/cumulus/zombienet/examples/speculative_messaging_poc/network.toml"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${PROFILE:-release}"
 

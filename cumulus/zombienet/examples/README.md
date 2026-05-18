@@ -19,7 +19,7 @@ The script will:
 2. Add the release directory to `PATH`
 3. Spawn the network using `zombie-cli`
 
-## Speculative Messaging POC (`speculative_messaging_poc.toml`)
+## Speculative Messaging POC (`speculative_messaging_poc/network.toml`)
 
 End-to-end test for the speculative messaging POC. Spawns:
 - Rococo-local relay chain (Alice + Bob validators)
@@ -36,7 +36,7 @@ cargo build -p polkadot-omni-node --release
 ### Run
 
 ```bash
-zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc.toml
+zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc/network.toml
 ```
 
 ### Trigger XCM from sender to receiver

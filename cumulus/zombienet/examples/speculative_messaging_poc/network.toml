@@ -9,23 +9,34 @@
 #   cargo build -p polkadot-omni-node --release
 #
 # Run with zombienet (native provider):
-#   zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc.toml
+#   zombienet --provider native spawn cumulus/zombienet/examples/speculative_messaging_poc/network.toml
 #
 # The sender's RPC port is pinned to 9955 so the receiver can reference it
 # at a known address via --speculative-sender.
 
 [relaychain]
-default_command = "../../target/release/polkadot"
-default_args = ["-lparachain=debug,runtime=debug"]
+default_command = "../../../target/release/polkadot"
+default_args = ["-lparachain=debug,runtime=debug", "--pruning=archive"]
 chain = "rococo-local"
 
-	[[relaychain.nodes]]
-	name = "alice"
-	validator = true
+[[relaychain.nodes]]
+name = "alice"
+validator = true
+rpc_port = 9900
+ws_port = 9901
+balance = 2000000000000000000000
 
-	[[relaychain.nodes]]
-	name = "bob"
-	validator = true
+[[relaychain.nodes]]
+name = "bob"
+validator = true
+
+[[relaychain.nodes]]
+name = "charlie"
+validator = true
+
+[[relaychain.nodes]]
+name = "dave"
+validator = true
 
 # ── Para 2000: Sender ─────────────────────────────────────────────────────────
 
@@ -34,15 +45,16 @@ id = 2000
 chain = "penpal-rococo-local"
 cumulus_based = true
 
-	[[parachains.collators]]
-	name = "sender"
-	validator = true
-	command = "../../target/release/polkadot-omni-node"
-	rpc_port = 9955
-	args = [
-		"--authoring=slot-based",
-		"-lparachain=debug,cumulus-collator=debug",
-	]
+[[parachains.collators]]
+name = "sender"
+validator = true
+command = "../../../target/release/polkadot-omni-node"
+rpc_port = 9955
+args = [
+	"--authoring=slot-based",
+	"-lparachain=debug,cumulus-collator=debug",
+	"--pruning=archive",
+]
 
 # ── Para 2001: Receiver ───────────────────────────────────────────────────────
 
@@ -51,14 +63,15 @@ id = 2001
 chain = "penpal-rococo-local"
 cumulus_based = true
 
-	[[parachains.collators]]
-	name = "receiver"
-	validator = true
-	command = "../../target/release/polkadot-omni-node"
-	rpc_port = 9966
-	args = [
-		"--authoring=slot-based",
-		# Pull speculative batches from the sender via its JSON-RPC endpoint.
-		"--speculative-sender=2000=ws://127.0.0.1:9955",
-		"-lparachain=debug,cumulus-collator=debug",
-	]
+[[parachains.collators]]
+name = "receiver"
+validator = true
+command = "../../../target/release/polkadot-omni-node"
+rpc_port = 9966
+args = [
+	"--authoring=slot-based",
+	# Pull speculative batches from the sender via its JSON-RPC endpoint.
+	"--speculative-sender=2000=ws://127.0.0.1:9955",
+	"-lparachain=debug,cumulus-collator=debug",
+	"--pruning=archive",
+]
