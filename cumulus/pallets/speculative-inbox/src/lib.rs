@@ -57,7 +57,7 @@ use frame_system::{
 };
 
 use cumulus_primitives_core::ParaId;
-use polkadot_parachain_primitives::primitives::{XcmpMessageFormat, XcmpMessageHandler};
+use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
 use polkadot_primitives::v10::{RequiresCommitment, SpeculativeIngress};
 
 use mmr_lib::{Merge, Result as MmrResult};
@@ -134,9 +134,6 @@ pub mod pallet {
 		NonConsecutiveMessage,
 		/// Reconstructed local subtree root does not match the batch's claimed subtree root.
 		SubtreeRootMismatch,
-		/// The XCMP message format in an incoming batch payload is unrecognized.
-		/// This may happen if the sender's or receiver's XcmpMessageHandler is misconfigured.
-		InvalidXcmpMessageFormat,
 		/// Multiple distinct provides roots for the same source in one block.
 		MultipleRootsPerSourceInOneBlock,
 	}
@@ -251,18 +248,21 @@ pub mod pallet {
 				IncomingState::<T>::insert(batch.source, state);
 				consumed.push((batch.source, batch.provides_root));
 
-				// 7. Dispatch through the standard XCMP handler
-				let encoded_batch =
-					encode_xcmp_batch(batch.messages.iter().map(|msg| msg.payload.as_slice()));
+				// 7. Dispatch through the standard XCMP handler.
+				// Each payload is a full XCMP page from XcmpQueue::take_outbound_messages
+				// (format_byte + versioned_xcm_bytes). Pass each page directly rather than
+				// re-encoding to avoid prepending a duplicate format byte.
 				let max_weight = T::ReservedXcmpWeight::get();
-				T::XcmpMessageHandler::handle_xcmp_messages(
-					core::iter::once((
-						batch.source,
-						batch.source_relay_parent_number,
-						encoded_batch.as_slice(),
-					)),
-					max_weight,
-				);
+				for msg in &batch.messages {
+					T::XcmpMessageHandler::handle_xcmp_messages(
+						core::iter::once((
+							batch.source,
+							batch.source_relay_parent_number,
+							msg.payload.as_slice(),
+						)),
+						max_weight,
+					);
+				}
 
 				Self::deposit_event(Event::MessagesIngested {
 					source: batch.source,
@@ -333,15 +333,6 @@ impl<T: Config> Pallet<T> {
 }
 
 // ── Helpers ──
-
-/// Encode a batch of XCM payloads in the wire format expected by `handle_xcmp_messages`.
-fn encode_xcmp_batch<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
-	let mut page = XcmpMessageFormat::ConcatenatedVersionedXcm.encode();
-	for payload in payloads {
-		page.extend_from_slice(payload);
-	}
-	page
-}
 
 /// Verify that an MMR root R_old is an ancestor of R_new using an extension proof.
 ///
