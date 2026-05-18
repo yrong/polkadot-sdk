@@ -110,14 +110,15 @@ impl RpcOutboxClient {
 #[async_trait::async_trait]
 impl OutboxQuery for RpcOutboxClient {
 	fn best_block_hash(&self) -> Hash {
-		// Pass `null` explicitly so the server returns the head hash rather than
-		// treating the missing argument as an error.
-		// TODO: replace with a subscription-based cached value for production.
 		tokio::task::block_in_place(|| {
 			tokio::runtime::Handle::current().block_on(async {
+				// chain_getBlockHash with no params returns the best block hash.
+				// chain_getHead returns the best block HEADER (not the hash) so must not be used.
 				self.client
-					.request::<Hash, _>("chain_getHead", rpc_params![None::<u64>])
+					.request::<Option<Hash>, _>("chain_getBlockHash", rpc_params![])
 					.await
+					.ok()
+					.flatten()
 					.unwrap_or_default()
 			})
 		})
