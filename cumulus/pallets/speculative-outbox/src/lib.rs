@@ -125,6 +125,18 @@ pub mod pallet {
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn on_finalize(n: BlockNumberFor<T>) {
+			// Prune BEFORE inserting so that when the same provides root persists
+			// across the retention window, the prune does not delete the entry we
+			// are about to write (insert-then-prune would wipe a stable root).
+			let retention_window: BlockNumberFor<T> = 256u32.into();
+			if n > retention_window {
+				let prune_at = n - retention_window;
+				if let Some(old_root) = HistoricalProvidesRoots::<T>::take(prune_at) {
+					ProvidesRootIndex::<T>::remove(old_root);
+				}
+				let _ = HistoricalSubtreeState::<T>::clear_prefix(prune_at, 100, None);
+			}
+
 			if let Some(provides) = Self::compute_provides_root() {
 				log::debug!(
 					target: "speculative::outbox",
@@ -143,16 +155,6 @@ pub mod pallet {
 						(root, state.peaks, state.leaf_count),
 					);
 				}
-			}
-
-			// Simple pruning: keep only the last 256 blocks of history.
-			let retention_window: BlockNumberFor<T> = 256u32.into();
-			if n > retention_window {
-				let prune_at = n - retention_window;
-				if let Some(old_root) = HistoricalProvidesRoots::<T>::take(prune_at) {
-					ProvidesRootIndex::<T>::remove(old_root);
-				}
-				let _ = HistoricalSubtreeState::<T>::clear_prefix(prune_at, 100, None);
 			}
 		}
 	}
