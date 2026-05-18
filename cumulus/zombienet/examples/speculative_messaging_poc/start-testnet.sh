@@ -13,11 +13,11 @@ RECEIVER_WS="${RECEIVER_WS:-ws://127.0.0.1:9966}"
 ZOMBIENET_LOG="${ZOMBIENET_LOG:-/tmp/speculative-messaging-poc.log}"
 ZOMBIENET_DIR="${ZOMBIENET_DIR:-/tmp/speculative-messaging-poc}"
 
-echo "[1/3] Stopping any previous run (best-effort)"
+echo "[1/4] Stopping any previous run (best-effort)"
 pkill -f "speculative_messaging_poc" 2>/dev/null || true
 rm -rf "${ZOMBIENET_DIR}"
 
-echo "[2/3] Spawning zombienet: ${TOML}"
+echo "[2/4] Spawning zombienet: ${TOML}"
 echo "  logs: ${ZOMBIENET_LOG}"
 zombienet --provider native spawn --dir="${ZOMBIENET_DIR}" "${TOML}" >"${ZOMBIENET_LOG}" 2>&1 &
 ZOMBIE_PID="$!"
@@ -64,7 +64,7 @@ const { ApiPromise, WsProvider } = require('@polkadot/api');
 NODE
 )
 
-echo "[3/3] Waiting for sender parachain (${SENDER_WS})..."
+echo "[3/4] Waiting for sender parachain (${SENDER_WS})..."
 (cd "${SCRIPT_DIR}" && node - <<NODE
 const { ApiPromise, WsProvider } = require('@polkadot/api');
 (async () => {
@@ -81,6 +81,9 @@ const { ApiPromise, WsProvider } = require('@polkadot/api');
 })();
 NODE
 )
+
+echo "[4/4] Opening HRMP channels 2000 ↔ 2001..."
+(cd "${SCRIPT_DIR}" && RELAY_WS="${RELAY_WS}" node open-hrmp.js)
 
 echo
 echo "Network is up."
