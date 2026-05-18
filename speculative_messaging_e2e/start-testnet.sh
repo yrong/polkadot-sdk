@@ -34,10 +34,10 @@ fi
 echo "  waiting for relay (${RELAY_WS}) to accept connections..."
 node - <<NODE
 const { URL } = require('url');
-const u = new URL(process.env.RELAY_WS || 'ws://127.0.0.1:9900');
+const u = new URL(process.env.RELAY_WS || 'ws://127.0.0.1:9901');
 const net = require('net');
 (async () => {
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 1200; i++) {
     const ok = await new Promise(res => {
       const s = net.createConnection({ host: u.hostname, port: Number(u.port || 80) });
       s.on('connect', () => { s.destroy(); res(true); });
@@ -57,7 +57,7 @@ echo "  waiting for relay height > 2..."
 const { ApiPromise, WsProvider } = require('@polkadot/api');
 (async () => {
   const api = await ApiPromise.create({ provider: new WsProvider('${RELAY_WS}') });
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 1200; i++) {
     const n = (await api.rpc.chain.getHeader()).number.toNumber();
     if (n > 2) { console.log('  relay best=' + n); await api.disconnect(); process.exit(0); }
     await new Promise(r => setTimeout(r, 1000));
@@ -71,7 +71,7 @@ echo "[3/4] Waiting for sender parachain (${SENDER_WS})..."
 (cd "${SCRIPT_DIR}" && node - <<NODE
 const { ApiPromise, WsProvider } = require('@polkadot/api');
 (async () => {
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 1200; i++) {
     try {
       const api = await ApiPromise.create({ provider: new WsProvider('${SENDER_WS}'), throwOnConnect: true });
       const n = (await api.rpc.chain.getHeader()).number.toNumber();
