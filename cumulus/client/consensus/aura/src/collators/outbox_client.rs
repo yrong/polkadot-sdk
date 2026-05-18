@@ -74,12 +74,36 @@ impl RpcOutboxClient {
 	}
 
 	async fn state_call<R: Decode + Send>(&self, method: &str, at: Hash, args: Vec<u8>) -> Option<R> {
-		let result: sp_core::Bytes = self
+		let result: sp_core::Bytes = match self
 			.client
 			.request("state_call", rpc_params![method, sp_core::Bytes(args), at])
 			.await
-			.ok()?;
-		R::decode(&mut &result.0[..]).ok()
+		{
+			Ok(r) => r,
+			Err(e) => {
+				tracing::warn!(
+					target: "aura::cumulus",
+					%method,
+					?at,
+					error = %e,
+					"state_call RPC failed",
+				);
+				return None;
+			},
+		};
+		match R::decode(&mut &result.0[..]) {
+			Ok(v) => Some(v),
+			Err(e) => {
+				tracing::warn!(
+					target: "aura::cumulus",
+					%method,
+					?at,
+					error = %e,
+					"state_call SCALE decode failed",
+				);
+				None
+			},
+		}
 	}
 }
 
@@ -187,8 +211,23 @@ pub async fn build_message_batch_from_query(
 		"building message batch",
 	);
 
-	let (proof, number_of_destinations, leaf_index) =
-		source.subtree_inclusion_proof(at, destination, subtree_root).await?;
+	let (proof, number_of_destinations, leaf_index) = match source
+		.subtree_inclusion_proof(at, destination, subtree_root)
+		.await
+	{
+		Some(p) => p,
+		None => {
+			tracing::warn!(
+				target: "aura::cumulus",
+				source = ?source_para_id,
+				dest = ?destination,
+				?subtree_root,
+				provides_root = ?provides.root,
+				"subtree_inclusion_proof returned None — batch dropped",
+			);
+			return None;
+		},
+	};
 
 	Some(MessageBatch {
 		source: source_para_id,
