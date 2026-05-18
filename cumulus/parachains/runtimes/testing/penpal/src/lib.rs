@@ -1232,7 +1232,17 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		}
 		fn block_hash_for_provides_root(provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
 			let number = SpeculativeOutbox::block_number_for_provides_root(provides_root)?;
-			Some(frame_system::Pallet::<Runtime>::block_hash(number))
+			// frame_system stores block N's hash during block N+1's on_initialize,
+			// so block_hash(N) at block N's state is always zero. Use N-1 instead,
+			// whose hash is guaranteed to be in storage. The outbox state is the
+			// same at N-1 since messages accumulate and are never removed.
+			let hash_at = number.saturating_sub(1u32.into());
+			let hash = frame_system::Pallet::<Runtime>::block_hash(hash_at);
+			if hash == polkadot_primitives::Hash::default() {
+				None
+			} else {
+				Some(hash)
+			}
 		}
 		}
 	impl cumulus_primitives_core::SpeculativeInboxApi<Block> for Runtime {
