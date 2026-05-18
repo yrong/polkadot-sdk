@@ -16,7 +16,7 @@
 
 [relaychain]
 default_command = "../../../target/release/polkadot"
-default_args = ["-lparachain=debug,runtime=debug", "--pruning=archive"]
+default_args = ["-lparachain=debug,runtime=debug,runtime::inclusion=debug", "--pruning=archive"]
 chain = "rococo-local"
 
 [[relaychain.nodes]]
@@ -52,11 +52,9 @@ command = "../../../target/release/polkadot-parachain"
 rpc_port = 9955
 args = [
 	"--authoring=slot-based",
-	"-lparachain=debug,cumulus-collator=debug",
+	"-lparachain=debug,cumulus-collator=debug,speculative::outbox=debug,aura::cumulus=debug",
 	"--pruning=archive",
 ]
-
-# ── Para 2001: Receiver ───────────────────────────────────────────────────────
 
 [[parachains]]
 id = 2001
@@ -72,6 +70,6 @@ args = [
 	"--authoring=slot-based",
 	# Pull speculative batches from the sender via its JSON-RPC endpoint.
 	"--speculative-sender=2000=ws://127.0.0.1:9955",
-	"-lparachain=debug,cumulus-collator=debug",
+	"-lparachain=debug,cumulus-collator=debug,speculative::inbox=debug,aura::cumulus=debug",
 	"--pruning=archive",
 ]
