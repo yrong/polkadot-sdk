@@ -179,6 +179,12 @@ pub mod pallet {
 			// if the source chain's top-level root has advanced beyond what the batch was
 			// built against.
 
+			log::debug!(
+				target: "speculative::inbox",
+				"ingest_verified_messages: {} batch(es)",
+				ingress.batches.len(),
+			);
+
 			let mut consumed: Vec<(ParaId, H256)> = Vec::new();
 
 			for batch in ingress.batches {
@@ -192,6 +198,13 @@ pub mod pallet {
 					batch.leaf_index,
 					&leaf,
 				);
+				if !valid {
+					log::warn!(
+						target: "speculative::inbox",
+						"InvalidSubtreeProof for source={:?} provides_root={:?}",
+						batch.source, batch.provides_root,
+					);
+				}
 				ensure!(valid, Error::<T>::InvalidSubtreeProof);
 
 				// 2. Load or init per-source state
@@ -214,6 +227,13 @@ pub mod pallet {
 
 				// 4. Verify reconstructed MMR subtree root matches batch
 				let computed_root = bag_peaks::<Keccak256Merge>(&state.mmr_peaks);
+				if computed_root != batch.subtree_root {
+					log::warn!(
+						target: "speculative::inbox",
+						"SubtreeRootMismatch for source={:?}: computed={:?} expected={:?}",
+						batch.source, computed_root, batch.subtree_root,
+					);
+				}
 				ensure!(computed_root == batch.subtree_root, Error::<T>::SubtreeRootMismatch);
 				// 5. Enforce one distinct top-level provides root per source per block.
 				// Gate on whether this source was already consumed in this block — not on
@@ -249,6 +269,11 @@ pub mod pallet {
 					provides_root: batch.provides_root,
 					message_count: batch.messages.len() as u32,
 				});
+				log::debug!(
+					target: "speculative::inbox",
+					"ingested {} message(s) from source={:?} provides_root={:?}",
+					batch.messages.len(), batch.source, batch.provides_root,
+				);
 			}
 
 			ConsumedSourcesThisBlock::<T>::mutate(|v| v.extend(consumed));

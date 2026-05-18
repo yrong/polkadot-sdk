@@ -592,6 +592,11 @@ impl<T: Config> Pallet<T> {
 									CandidateDescriptorVersion::V4 &&
 								!Self::requires_satisfied(&candidate.commitments.requires)
 							{
+								log::debug!(
+									target: LOG_TARGET,
+									"dropping v4 candidate {:?} (para {:?}): unsatisfied requires",
+									candidate.hash, paraid,
+								);
 								// Record the first drop index; stop looking for more to enact.
 								if drop_from_index.is_none() {
 									drop_from_index = Some(candidate_index);
@@ -991,6 +996,11 @@ impl<T: Config> Pallet<T> {
 				candidate_hash
 			);
 		} else if let Some(ref p) = commitments.provides {
+			log::debug!(
+				target: LOG_TARGET,
+				"updating ProvidesRoots[{:?}] = {:?} after enactment",
+				receipt.descriptor.para_id(), p.root,
+			);
 			Self::update_provides_root(receipt.descriptor.para_id(), p.root);
 		}
 

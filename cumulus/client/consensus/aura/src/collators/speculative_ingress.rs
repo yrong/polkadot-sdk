@@ -97,6 +97,13 @@ where
 	let receiver_api = receiver.runtime_api();
 	let mut batches = Vec::new();
 
+	tracing::debug!(
+		target: "aura::cumulus",
+		%relay_parent_number,
+		sources = config.sources.len(),
+		"fetch_ingress_for_block: fetching speculative batches",
+	);
+
 	for (source, sender) in &config.sources {
 		let from_position = receiver_api
 			.next_expected_message_position(receiver_parent, *source)
@@ -116,15 +123,29 @@ where
 			if relay_provides_root != Hash::default() &&
 				relay_provides_root != expected_provides_root
 			{
+				tracing::debug!(
+					target: "aura::cumulus",
+					source = ?source,
+					?relay_provides_root,
+					?expected_provides_root,
+					"relay provides_root advanced; looking up sender block for new root",
+				);
 				if let Some(at_relay) =
 					sender.block_hash_for_provides_root(sender_best, relay_provides_root).await
 				{
 					fetch_at = at_relay;
+				} else {
+					tracing::warn!(
+						target: "aura::cumulus",
+						source = ?source,
+						?relay_provides_root,
+						"could not find sender block for relay provides_root; using sender best",
+					);
 				}
 			}
 		}
 
-		if let Some(batch) = build_message_batch_from_query(
+		match build_message_batch_from_query(
 			sender.as_ref(),
 			fetch_at,
 			*source,
@@ -136,9 +157,32 @@ where
 		)
 		.await
 		{
-			batches.push(batch);
+			Some(batch) => {
+				tracing::debug!(
+					target: "aura::cumulus",
+					source = ?source,
+					messages = batch.messages.len(),
+					provides_root = ?batch.provides_root,
+					"fetched speculative batch",
+				);
+				batches.push(batch);
+			},
+			None => {
+				tracing::trace!(
+					target: "aura::cumulus",
+					source = ?source,
+					from_position,
+					"no speculative messages available",
+				);
+			},
 		}
 	}
+
+	tracing::debug!(
+		target: "aura::cumulus",
+		total_batches = batches.len(),
+		"fetch_ingress_for_block: done",
+	);
 
 	SpeculativeIngress { batches }
 }

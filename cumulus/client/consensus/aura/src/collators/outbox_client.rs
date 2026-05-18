@@ -167,8 +167,25 @@ pub async fn build_message_batch_from_query(
 	let (subtree_root, _) = source.destination_state(at, destination).await?;
 	let messages = source.outbound_messages(at, destination, from_position, max_messages).await;
 	if messages.is_empty() {
+		tracing::trace!(
+			target: "aura::cumulus",
+			source = ?source_para_id,
+			dest = ?destination,
+			from_position,
+			"outbound_messages: empty",
+		);
 		return None;
 	}
+
+	tracing::debug!(
+		target: "aura::cumulus",
+		source = ?source_para_id,
+		dest = ?destination,
+		count = messages.len(),
+		provides_root = ?provides.root,
+		?subtree_root,
+		"building message batch",
+	);
 
 	let (proof, number_of_destinations, leaf_index) =
 		source.subtree_inclusion_proof(at, destination, subtree_root).await?;

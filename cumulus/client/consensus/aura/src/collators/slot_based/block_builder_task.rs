@@ -859,6 +859,15 @@ where
 		})
 		.unwrap_or_default();
 
+	tracing::debug!(
+		target: LOG_TARGET,
+		?core_index,
+		has_provides = provides.is_some(),
+		requires_count = requires.len(),
+		use_v4 = provides.is_some() || !requires.is_empty(),
+		"speculative messaging commitments for candidate",
+	);
+
 	tracing::trace!(
 		target: LOG_TARGET,
 		?core_index,

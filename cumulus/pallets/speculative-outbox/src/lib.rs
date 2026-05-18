@@ -126,6 +126,11 @@ pub mod pallet {
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn on_finalize(n: BlockNumberFor<T>) {
 			if let Some(provides) = Self::compute_provides_root() {
+				log::debug!(
+					target: "speculative::outbox",
+					"block {:?}: provides_root={:?}",
+					n, provides.root,
+				);
 				HistoricalProvidesRoots::<T>::insert(n, provides.root);
 				ProvidesRootIndex::<T>::insert(provides.root, n);
 
@@ -157,6 +162,7 @@ pub mod pallet {
 		pub fn record_outbound_messages(dest: ParaId, payloads: Vec<Vec<u8>>) {
 			let count = payloads.len() as u32;
 			let mut state = OutgoingMMRState::<T>::get(&dest);
+			let position_before = state.leaf_count;
 
 			for payload in payloads {
 				OutgoingMessages::<T>::insert(dest, state.leaf_count, &payload);
@@ -170,6 +176,11 @@ pub mod pallet {
 			}
 
 			OutgoingMMRState::<T>::insert(dest, state);
+			log::debug!(
+				target: "speculative::outbox",
+				"recorded {} message(s) to dest={:?} positions {}..{}",
+				count, dest, position_before, position_before + count as u64,
+			);
 			Self::deposit_event(Event::MessagesRecorded { destination: dest, count });
 		}
 	}
