@@ -1356,28 +1356,23 @@ async fn validate_candidate(
 				} else {
 					// Backing-only: validate UMP signals against the claim queue.
 					if let Some(claim_queue) = &pre.claim_queue {
-						// UMP signals are only supported for V1-V3 descriptors via
-						// CommittedCandidateReceiptV2. Speculative messaging (V4)
-						// uses a different mechanism.
-						if candidate_receipt.descriptor.version() < CandidateDescriptorVersion::V4 {
-							let committed_candidate_receipt = CommittedCandidateReceipt {
-								descriptor: candidate_receipt.descriptor.clone(),
-								commitments: commitments_v9.clone(),
-							};
+						let committed_candidate_receipt = CommittedCandidateReceipt {
+							descriptor: candidate_receipt.descriptor.clone(),
+							commitments: commitments_v9.clone(),
+						};
 
-							if let Err(err) = committed_candidate_receipt
-								.parse_ump_signals(&transpose_claim_queue(claim_queue.0.clone()))
-							{
-								gum::warn!(
-									target: LOG_TARGET,
-									candidate_hash = ?candidate_receipt.hash(),
-									"Invalid UMP signals: {}",
-									err
-								);
-								return Ok(ValidationResult::Invalid(
-									InvalidCandidate::InvalidUMPSignals(err),
-								));
-							}
+						if let Err(err) = committed_candidate_receipt
+							.parse_ump_signals(&transpose_claim_queue(claim_queue.0.clone()))
+						{
+							gum::warn!(
+								target: LOG_TARGET,
+								candidate_hash = ?candidate_receipt.hash(),
+								"Invalid UMP signals: {}",
+								err
+							);
+							return Ok(ValidationResult::Invalid(
+								InvalidCandidate::InvalidUMPSignals(err),
+							));
 						}
 					}
 

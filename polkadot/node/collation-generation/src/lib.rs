@@ -688,10 +688,8 @@ async fn construct_and_distribute_receipt(
 
 		let ccr = CommittedCandidateReceiptV2 { descriptor, commitments: commitments.clone() };
 
-		if !use_v4 {
-			ccr.parse_ump_signals(&transposed_claim_queue)
-				.map_err(Error::CandidateReceiptCheck)?;
-		}
+		ccr.parse_ump_signals(&transposed_claim_queue)
+			.map_err(Error::CandidateReceiptCheck)?;
 
 		ccr.to_plain()
 	};

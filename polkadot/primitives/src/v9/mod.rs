@@ -2997,8 +2997,13 @@ impl<H: Copy + AsRef<[u8]>> CommittedCandidateReceiptV2<H> {
 			CandidateDescriptorVersion::Unknown => {
 				return Err(CommittedCandidateReceiptError::UnknownVersion(self.descriptor.version))
 			},
+			CandidateDescriptorVersion::V4 => {
+				// V4 (speculative messaging) candidates may carry a SelectCore UMP signal
+				// for elastic scaling but are not required to. Whether or not signals are
+				// present, fall through to check_core_index using the descriptor core index.
+			},
 			_ if signals.is_empty() => {
-				// V3 and above require UMP signals.
+				// V3 requires UMP signals.
 				return Err(CommittedCandidateReceiptError::NoUMPSignalWithV3Descriptor);
 			},
 			_ => {},
