@@ -95,10 +95,17 @@ pub mod pallet {
 	pub type OutgoingMMRState<T: Config> =
 		StorageMap<_, Twox64Concat, ParaId, MMRState, ValueQuery>;
 
-	/// Historical provides roots for late block proof generation.
+	/// Historical provides roots for late block proof generation. Keyed by block number.
 	#[pallet::storage]
 	pub type HistoricalProvidesRoots<T: Config> =
 		StorageMap<_, Twox64Concat, BlockNumberFor<T>, H256>;
+
+	/// Reverse index: provides root hash → block number that produced it.
+	/// Allows O(1) lookup in `block_number_for_provides_root` / `generate_late_block_proof`.
+	/// Bounded to the same 256-block retention window as `HistoricalProvidesRoots`.
+	#[pallet::storage]
+	pub type ProvidesRootIndex<T: Config> =
+		StorageMap<_, Identity, H256, BlockNumberFor<T>>;
 
 	/// Historical subtree roots, peaks, and leaf counts per destination.
 	/// Stores (root, peaks, leaf_count) so extension proofs can be built without a full node store.
@@ -122,6 +129,7 @@ pub mod pallet {
 		fn on_finalize(n: BlockNumberFor<T>) {
 			if let Some(provides) = Self::compute_provides_root() {
 				HistoricalProvidesRoots::<T>::insert(n, provides.root);
+				ProvidesRootIndex::<T>::insert(provides.root, n);
 
 				// Record current subtree state for all active destinations.
 				for (dest, state) in OutgoingMMRState::<T>::iter() {
@@ -138,7 +146,9 @@ pub mod pallet {
 			let retention_window: BlockNumberFor<T> = 256u32.into();
 			if n > retention_window {
 				let prune_at = n - retention_window;
-				HistoricalProvidesRoots::<T>::remove(prune_at);
+				if let Some(old_root) = HistoricalProvidesRoots::<T>::take(prune_at) {
+					ProvidesRootIndex::<T>::remove(old_root);
+				}
 				let _ = HistoricalSubtreeState::<T>::clear_prefix(prune_at, 100, None);
 			}
 		}
@@ -303,7 +313,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Find the block number that produced the given provides root.
 	pub fn block_number_for_provides_root(root: H256) -> Option<BlockNumberFor<T>> {
-		HistoricalProvidesRoots::<T>::iter().find(|(_, r)| r == &root).map(|(n, _)| n)
+		ProvidesRootIndex::<T>::get(root)
 	}
 
 	/// Generate an MMR extension proof from stored peaks.
