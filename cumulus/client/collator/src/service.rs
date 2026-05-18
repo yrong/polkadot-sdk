@@ -403,9 +403,15 @@ where
 	fn build_collation(
 		&self,
 		parent_header: &Block::Header,
-		_: Block::Hash,
+		block_hash: Block::Hash,
 		candidate: ParachainCandidate<Block>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
+		tracing::debug!(
+			target: LOG_TARGET,
+			?block_hash,
+			n_late_block_proofs = candidate.late_block_proofs.len(),
+			"build_collation (ServiceInterface): provides=None requires=[]",
+		);
 		CollatorService::build_multi_block_collation(
 			self,
 			parent_header,

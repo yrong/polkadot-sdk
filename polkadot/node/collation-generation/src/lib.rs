@@ -625,6 +625,16 @@ async fn construct_and_distribute_receipt(
 		.collect();
 	let has_speculative = provides.is_some() || !requires.is_empty();
 
+	gum::debug!(
+		target: LOG_TARGET,
+		?para_id,
+		?relay_parent,
+		?has_speculative,
+		provides_root = ?provides.as_ref().map(|p| p.root),
+		n_requires = requires.len(),
+		"speculative commitment fields for collation",
+	);
+
 	let commitments = CandidateCommitments {
 		upward_messages: collation.upward_messages,
 		horizontal_messages: collation.horizontal_messages,
@@ -643,6 +653,17 @@ async fn construct_and_distribute_receipt(
 	let receipt = {
 		let sched_parent = scheduling_parent.unwrap_or(relay_parent);
 		let use_v4 = speculative_enabled && has_speculative;
+
+		gum::debug!(
+			target: LOG_TARGET,
+			?para_id,
+			?relay_parent,
+			?speculative_enabled,
+			?v3_enabled,
+			?has_speculative,
+			?use_v4,
+			"descriptor version selection",
+		);
 
 		let descriptor = if use_v4 {
 			CandidateDescriptorV2::new_v4(
@@ -691,7 +712,18 @@ async fn construct_and_distribute_receipt(
 		ccr.parse_ump_signals(&transposed_claim_queue)
 			.map_err(Error::CandidateReceiptCheck)?;
 
-		ccr.to_plain()
+		let plain = ccr.to_plain();
+
+		gum::debug!(
+			target: LOG_TARGET,
+			?para_id,
+			candidate_hash = ?plain.hash(),
+			commitments_hash = ?plain.commitments_hash,
+			descriptor_version = ?plain.descriptor.version(),
+			"candidate receipt built",
+		);
+
+		plain
 	};
 
 	gum::debug!(

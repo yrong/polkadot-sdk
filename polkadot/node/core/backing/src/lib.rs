@@ -1912,6 +1912,10 @@ async fn maybe_validate_and_import<Context>(
 			gum::debug!(
 				target: LOG_TARGET,
 				?scheduling_parent,
+				v3_ever_seen = state.v3_ever_seen,
+				speculative_ever_seen = state.speculative_ever_seen,
+				descriptor_version = ?receipt.descriptor.version(),
+				%reason,
 				"Not importing Seconded statement: {}",
 				reason,
 			);

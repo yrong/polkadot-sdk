@@ -855,8 +855,10 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
 	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>
-		+ cumulus_primitives_core::SpeculativeInboxApi<Block>,
-	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>,
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {

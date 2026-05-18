@@ -1308,17 +1308,35 @@ async fn validate_candidate(
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
 				let (provides, requires) = match res.speculative.0 {
-					Some(ValidationResultExtension::V4 { provides_root, requires }) => (
-						provides_root.map(|root| ProvidesCommitment { root }),
-						requires
-							.into_iter()
-							.map(|(source, expected_root)| RequiresCommitment {
-								source,
-								expected_root,
-							})
-							.collect(),
-					),
-					None => (None, Vec::new()),
+					Some(ValidationResultExtension::V4 { provides_root, requires }) => {
+						gum::debug!(
+							target: LOG_TARGET,
+							?para_id,
+							?candidate_hash,
+							?provides_root,
+							n_requires = requires.len(),
+							"validation result has V4 speculative extension",
+						);
+						(
+							provides_root.map(|root| ProvidesCommitment { root }),
+							requires
+								.into_iter()
+								.map(|(source, expected_root)| RequiresCommitment {
+									source,
+									expected_root,
+								})
+								.collect(),
+						)
+					},
+					None => {
+						gum::debug!(
+							target: LOG_TARGET,
+							?para_id,
+							?candidate_hash,
+							"validation result has no speculative extension",
+						);
+						(None, Vec::new())
+					},
 				};
 
 				let commitments_v9 = CandidateCommitments {
@@ -1333,6 +1351,16 @@ async fn validate_candidate(
 				};
 
 				let commitments_hash = commitments_v9.hash();
+
+				gum::debug!(
+					target: LOG_TARGET,
+					?para_id,
+					?candidate_hash,
+					receipt_commitments_hash = ?candidate_receipt.commitments_hash,
+					recomputed_commitments_hash = ?commitments_hash,
+					hashes_match = candidate_receipt.commitments_hash == commitments_hash,
+					"commitments hash check",
+				);
 
 				if candidate_receipt.commitments_hash != commitments_hash {
 					gum::info!(

@@ -38,6 +38,7 @@ use cumulus_client_consensus_common::{self as consensus_common, ParachainBlockIm
 use cumulus_primitives_aura::AuraUnincludedSegmentApi;
 use cumulus_primitives_core::{
 	CollectCollationInfo, KeyToIncludeInRelayProof, PersistedValidationData, SpeculativeInboxApi,
+	SpeculativeOutboxApi,
 };
 use cumulus_relay_chain_interface::RelayChainInterface;
 use sp_consensus::Environment;
@@ -176,7 +177,8 @@ where
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
 		+ KeyToIncludeInRelayProof<Block>
-		+ SpeculativeInboxApi<Block>,
+		+ SpeculativeInboxApi<Block>
+		+ SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -232,7 +234,8 @@ where
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
 		+ KeyToIncludeInRelayProof<Block>
-		+ SpeculativeInboxApi<Block>,
+		+ SpeculativeInboxApi<Block>
+		+ SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -454,6 +457,14 @@ where
 					.await
 				};
 
+				tracing::debug!(
+					target: crate::LOG_TARGET,
+					?parent_hash,
+					n_sources = params.speculative_sources.sources.len(),
+					n_batches = speculative_ingress.batches.len(),
+					"speculative ingress resolved before inherent data",
+				);
+
 				let (parachain_inherent_data, other_inherent_data) = match collator
 					.create_inherent_data(
 						relay_parent,
@@ -509,7 +520,7 @@ where
 					)
 					.await
 				{
-					Ok(Some((collation, block_data))) => {
+					Ok(Some((mut collation, block_data))) => {
 						let Some(new_block_header) =
 							block_data.blocks().first().map(|b| b.header().clone())
 						else {
@@ -518,6 +529,40 @@ where
 						};
 
 						let new_block_hash = new_block_header.hash();
+
+						// Fetch speculative commitment fields from the runtime state of the
+						// newly built block, so the collation's provides/requires match what
+						// validate_block will recompute via speculative_extension().
+						let runtime_api = para_client.runtime_api();
+						let provides = runtime_api
+							.compute_provides_root(new_block_hash)
+							.unwrap_or(None);
+						let requires = runtime_api
+							.requires_commitments(new_block_hash)
+							.unwrap_or_default();
+
+						tracing::debug!(
+							target: crate::LOG_TARGET,
+							?new_block_hash,
+							provides_root = ?provides.as_ref().map(|p| p.root),
+							n_requires = requires.len(),
+							"patching speculative fields onto collation from runtime state",
+						);
+
+						collation.provides = provides;
+						collation.requires = requires;
+
+						tracing::debug!(
+							target: crate::LOG_TARGET,
+							?parent_hash,
+							?new_block_hash,
+							block_number = %new_block_header.number(),
+							provides = ?collation.provides.as_ref().map(|p| p.root),
+							n_requires = collation.requires.len(),
+							n_horiz = collation.horizontal_messages.len(),
+							n_ump = collation.upward_messages.len(),
+							"collation built successfully",
+						);
 
 						// Here we are assuming that the import logic protects against equivocations
 						// and provides sybil-resistance, as it should.

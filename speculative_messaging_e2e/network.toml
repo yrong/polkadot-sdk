@@ -17,7 +17,7 @@
 [relaychain]
 default_command = "{{POLKADOT_BINARY}}"
 default_args = [
-	"-lparachain=debug,runtime=debug,runtime::inclusion=debug",
+	"-lparachain=debug,runtime=debug,runtime::inclusion=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug",
 	"--pruning=archive",
 ]
 chain = "westend-local"
@@ -57,7 +57,7 @@ command = "{{POLKADOT_PARACHAIN_BINARY}}"
 ws_port = 9955
 args = [
 	"--force-authoring",
-	"-lparachain=debug,cumulus-collator=debug,speculative::outbox=debug,aura::cumulus=debug",
+	"-lparachain=debug,cumulus-collator=debug,speculative::outbox=debug,aura::cumulus=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug",
 	"--pruning=archive",
 ]
 
@@ -75,6 +75,6 @@ args = [
 	"--force-authoring",
 	# Pull speculative batches from the sender via its JSON-RPC endpoint.
 	"--speculative-sender=2000=ws://127.0.0.1:9955",
-	"-lparachain=debug,cumulus-collator=debug,speculative::inbox=debug,aura::cumulus=debug",
+	"-lparachain=debug,cumulus-collator=debug,speculative::inbox=debug,aura::cumulus=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug",
 	"--pruning=archive",
 ]
