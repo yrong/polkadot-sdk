@@ -72,7 +72,6 @@ impl frame_system::Config for Test {
 }
 
 impl speculative_outbox::Config for Test {
-	type RuntimeEvent = RuntimeEvent;
 	type InnerXcmpMessageSource = NoopXcmpSource;
 }
 

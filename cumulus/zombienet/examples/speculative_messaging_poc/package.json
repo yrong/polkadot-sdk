@@ -1,0 +1,15 @@
+{
+  "name": "speculative-messaging-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "E2E test scripts for the speculative messaging POC",
+  "scripts": {
+    "send": "node send-xcm.js",
+    "observe": "node observe.js"
+  },
+  "dependencies": {
+    "@polkadot/api": "^12.0.0",
+    "@polkadot/util": "^13.0.0",
+    "@polkadot/util-crypto": "^13.0.0"
+  }
+}
