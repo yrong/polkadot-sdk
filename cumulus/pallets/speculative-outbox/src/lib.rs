@@ -359,7 +359,10 @@ impl<T: Config> XcmpMessageSource for Pallet<T> {
 		for (dest, data) in &messages {
 			Pallet::<T>::record_outbound_messages(*dest, vec![data.clone()]);
 		}
-		messages
+		// Messages are delivered exclusively via the speculative pathway.
+		// Returning them here would also put them into horizontal_messages,
+		// causing double processing on the receiver side.
+		Vec::new()
 	}
 }
 
