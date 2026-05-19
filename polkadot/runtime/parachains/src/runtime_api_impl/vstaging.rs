@@ -50,3 +50,10 @@ pub fn ancestor_relay_parent_info<T: shared::Config>(
 ) -> Option<RelayParentInfo<T::Hash, BlockNumberFor<T>>> {
 	shared::Pallet::<T>::get_relay_parent_info(session_index, relay_parent)
 }
+
+/// Implementation of `provides_root` runtime API.
+pub fn provides_root<T: crate::inclusion::Config>(
+	para_id: ParaId,
+) -> Option<polkadot_primitives::Hash> {
+	crate::inclusion::Pallet::<T>::provides_root(&para_id)
+}

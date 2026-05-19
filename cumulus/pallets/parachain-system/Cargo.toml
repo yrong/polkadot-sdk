@@ -24,6 +24,8 @@ scale-info = { features = ["derive"], workspace = true }
 trie-db = { workspace = true }
 
 # Substrate
+binary-merkle-tree = { workspace = true }
+mmr-lib = { workspace = true }
 frame-benchmarking = { optional = true, workspace = true }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
@@ -82,6 +84,7 @@ cumulus-test-relay-sproof-builder = { workspace = true, default-features = true 
 [features]
 default = ["std"]
 std = [
+	"binary-merkle-tree/std",
 	"bytes/std",
 	"codec/std",
 	"cumulus-pallet-parachain-system-proc-macro/std",
@@ -94,6 +97,7 @@ std = [
 	"frame-support/std",
 	"frame-system/std",
 	"log/std",
+	"mmr-lib/std",
 	"pallet-message-queue/std",
 	"polkadot-parachain-primitives/std",
 	"polkadot-primitives/std",

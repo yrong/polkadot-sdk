@@ -94,13 +94,14 @@ pub fn run<Block, P, BI, CIDP, Client, RClient, Proposer, CS>(
 	params: Params<BI, CIDP, Client, RClient, Proposer, CS>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT + Send,
+	Block: BlockT<Hash = polkadot_primitives::Hash> + Send,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
 		+ HeaderBackend<Block>
 		+ BlockBackend<Block>
 		+ CallApiAt<Block>
+		+ sc_client_api::UsageProvider<Block>
 		+ Send
 		+ Sync
 		+ 'static,
@@ -249,6 +250,7 @@ where
 						claim.timestamp(),
 						Default::default(),
 						params.collator_peer_id,
+						Some(cumulus_pallet_speculative_inbox::client::empty_speculative_ingress()),
 					)
 					.await
 			);

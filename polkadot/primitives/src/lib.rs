@@ -24,6 +24,10 @@
 // released version of the Polkadot runtime.
 pub mod v9;
 
+// The `v10` version contains speculative-messaging primitives alongside
+// all stable v9 types.
+pub mod v10;
+
 // The 'staging' version is special - it contains primitives which are
 // still in development. Once they are considered stable, they will be
 // moved to a new versioned module.
@@ -56,21 +60,28 @@ pub use v9::{
 	HorizontalMessages, HrmpChannelId, Id, InboundDownwardMessage, InboundHrmpMessage, IndexedVec,
 	InherentData, InvalidDisputeStatementKind, Moment, MultiDisputeStatementSet, NodeFeatures,
 	Nonce, OccupiedCore, OccupiedCoreAssumption, OutboundHrmpMessage, ParathreadClaim,
-	ParathreadEntry, PersistedValidationData, PvfCheckStatement, PvfExecKind, PvfPrepKind,
-	RuntimeMetricLabel, RuntimeMetricLabelValue, RuntimeMetricLabelValues, RuntimeMetricLabels,
-	RuntimeMetricOp, RuntimeMetricUpdate, ScheduledCore, SchedulerParams, ScrapedOnChainVotes,
-	SessionIndex, SessionInfo, Signature, Signed, SignedAvailabilityBitfield,
-	SignedAvailabilityBitfields, SignedStatement, SigningContext, Slot, TransposedClaimQueue,
-	UMPSignal, UncheckedSigned, UncheckedSignedAvailabilityBitfield,
-	UncheckedSignedAvailabilityBitfields, UncheckedSignedStatement, UpgradeGoAhead,
-	UpgradeRestriction, UpwardMessage, ValidDisputeStatementKind, ValidationCode,
-	ValidationCodeHash, ValidatorId, ValidatorIndex, ValidatorSignature, ValidityAttestation,
-	ValidityError, ASSIGNMENT_KEY_TYPE_ID, DEFAULT_CLAIM_QUEUE_OFFSET,
-	DEFAULT_SCHEDULING_LOOKAHEAD, LEGACY_MIN_BACKING_VOTES, LOWEST_PUBLIC_ID, MAX_CODE_SIZE,
-	MAX_HEAD_DATA_SIZE, MAX_POV_SIZE, MIN_CODE_SIZE, ON_DEMAND_DEFAULT_QUEUE_MAX_SIZE,
-	ON_DEMAND_MAX_QUEUE_MAX_SIZE, PARACHAINS_INHERENT_IDENTIFIER, PARACHAIN_KEY_TYPE_ID,
-	RELAY_CHAIN_SLOT_DURATION_MILLIS, UMP_SEPARATOR,
+	ParathreadEntry, PersistedValidationData, ProvidesCommitment, PvfCheckStatement, PvfExecKind,
+	PvfPrepKind, RequiresCommitment, RuntimeMetricLabel, RuntimeMetricLabelValue,
+	RuntimeMetricLabelValues, RuntimeMetricLabels, RuntimeMetricOp, RuntimeMetricUpdate,
+	ScheduledCore, SchedulerParams, ScrapedOnChainVotes, SessionIndex, SessionInfo, Signature,
+	Signed, SignedAvailabilityBitfield, SignedAvailabilityBitfields, SignedStatement,
+	SigningContext, Slot, TrailingOption, TransposedClaimQueue, UMPSignal, UncheckedSigned,
+	UncheckedSignedAvailabilityBitfield, UncheckedSignedAvailabilityBitfields,
+	UncheckedSignedStatement, UpgradeGoAhead, UpgradeRestriction, UpwardMessage,
+	ValidDisputeStatementKind, ValidationCode, ValidationCodeHash, ValidatorId, ValidatorIndex,
+	ValidatorSignature, ValidityAttestation, ValidityError, ASSIGNMENT_KEY_TYPE_ID,
+	DEFAULT_CLAIM_QUEUE_OFFSET, DEFAULT_SCHEDULING_LOOKAHEAD, LEGACY_MIN_BACKING_VOTES,
+	LOWEST_PUBLIC_ID, MAX_CODE_SIZE, MAX_HEAD_DATA_SIZE, MAX_POV_SIZE, MIN_CODE_SIZE,
+	ON_DEMAND_DEFAULT_QUEUE_MAX_SIZE, ON_DEMAND_MAX_QUEUE_MAX_SIZE, PARACHAINS_INHERENT_IDENTIFIER,
+	PARACHAIN_KEY_TYPE_ID, RELAY_CHAIN_SLOT_DURATION_MILLIS, UMP_SEPARATOR,
 };
+
+pub use v10::LateBlockProof;
+
+/// Alias for `CandidateCommitments` used by v10 callers.
+/// Since v9 `CandidateCommitments` now includes the speculative fields,
+/// v10 no longer needs a separate type.
+pub use v9::CandidateCommitments as CandidateCommitmentsV10;
 
 #[cfg(feature = "test")]
 pub use v9::{AppVerify, MutateDescriptorV2};

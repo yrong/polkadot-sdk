@@ -45,7 +45,12 @@ use sp_timestamp::Timestamp;
 
 pub mod basic;
 pub mod lookahead;
+pub mod outbox_client;
 pub mod slot_based;
+pub mod speculative_ingress;
+
+pub use outbox_client::{OutboxQuery, RpcOutboxClient};
+pub use speculative_ingress::{fetch_ingress_for_block, SpeculativeMessageSources};
 
 // Helper to pre-connect to the backing group we got assigned to and keep the connection
 // open until backing group changes or own slot ends.

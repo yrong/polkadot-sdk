@@ -603,7 +603,7 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	type SelfParaId = parachain_info::Pallet<Runtime>;
 	type DmpQueue = frame_support::traits::EnqueueWithOrigin<MessageQueue, RelayOrigin>;
 	type ReservedDmpWeight = ReservedDmpWeight;
-	type OutboundXcmpMessageSource = XcmpQueue;
+	type OutboundXcmpMessageSource = SpeculativeOutbox;
 	type XcmpMessageHandler = XcmpQueue;
 	type ReservedXcmpWeight = ReservedXcmpWeight;
 	type CheckAssociatedRelayNumber = RelayNumberMonotonicallyIncreases;
@@ -614,6 +614,17 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 		UNINCLUDED_SEGMENT_CAPACITY,
 	>;
 	type RelayParentOffset = ConstU32<0>;
+
+	fn speculative_extension(
+	) -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
+		Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
+			provides_root: SpeculativeOutbox::compute_provides_root().map(|p| p.root),
+			requires: SpeculativeInbox::get_requires_commitments()
+				.into_iter()
+				.map(|r| (r.source, r.expected_root))
+				.collect(),
+		})
+	}
 }
 
 impl parachain_info::Config for Runtime {}
@@ -671,6 +682,17 @@ impl cumulus_pallet_xcmp_queue::Config for Runtime {
 	type ControllerOriginConverter = XcmOriginToTransactDispatchOrigin;
 	type WeightInfo = ();
 	type PriceForSiblingDelivery = PriceForSiblingParachainDelivery;
+}
+
+impl cumulus_pallet_speculative_outbox::Config for Runtime {
+	type InnerXcmpMessageSource = XcmpQueue;
+}
+
+impl cumulus_pallet_speculative_inbox::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type SelfParaId = ParachainInfo;
+	type XcmpMessageHandler = XcmpQueue;
+	type ReservedXcmpWeight = ReservedXcmpWeight;
 }
 
 parameter_types! {
@@ -819,6 +841,9 @@ construct_runtime!(
 		ParachainSystem: cumulus_pallet_parachain_system = 1,
 		Timestamp: pallet_timestamp = 2,
 		ParachainInfo: parachain_info = 3,
+			// Speculative messaging (after ParachainSystem per §3.3).
+			SpeculativeOutbox: cumulus_pallet_speculative_outbox = 4,
+			SpeculativeInbox: cumulus_pallet_speculative_inbox = 5,
 
 		// Monetary stuff.
 		Balances: pallet_balances = 10,
@@ -1184,6 +1209,51 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 			slot: cumulus_primitives_aura::Slot,
 		) -> bool {
 			ConsensusHook::can_build_upon(included_hash, slot)
+		}
+	}
+
+	impl cumulus_primitives_core::SpeculativeOutboxApi<Block> for Runtime {
+		fn compute_provides_root() -> Option<polkadot_primitives::v10::ProvidesCommitment> {
+			SpeculativeOutbox::compute_provides_root()
+		}
+		fn destination_state(dest: ParaId) -> Option<(polkadot_primitives::Hash, u64)> {
+			SpeculativeOutbox::destination_state(dest)
+		}
+		fn outbound_messages(dest: ParaId, from_position: u64, max_messages: u32) -> Vec<(u64, Vec<u8>)> {
+			SpeculativeOutbox::outbound_messages(dest, from_position, max_messages)
+		}
+		fn subtree_inclusion_proof(dest: ParaId, subtree_root: polkadot_primitives::Hash) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)> {
+			SpeculativeOutbox::subtree_inclusion_proof(dest, subtree_root)
+		}
+		fn generate_late_block_proof(dest: ParaId, old_provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v10::LateBlockProof> {
+			let mut proof = SpeculativeOutbox::generate_late_block_proof(dest, old_provides_root)?;
+			proof.source = ParachainInfo::parachain_id();
+			Some(proof)
+		}
+		fn block_hash_for_provides_root(provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
+			let number = SpeculativeOutbox::block_number_for_provides_root(provides_root)?;
+			// frame_system stores block N's hash during block N+1's on_initialize,
+			// so block_hash(N) at block N's state is always zero. Use N-1 instead,
+			// whose hash is guaranteed to be in storage. The outbox state is the
+			// same at N-1 since messages accumulate and are never removed.
+			let hash_at = number.saturating_sub(1u32.into());
+			let hash = frame_system::Pallet::<Runtime>::block_hash(hash_at);
+			if hash == polkadot_primitives::Hash::default() {
+				None
+			} else {
+				Some(hash)
+			}
+		}
+		}
+	impl cumulus_primitives_core::SpeculativeInboxApi<Block> for Runtime {
+		fn requires_commitments() -> Vec<polkadot_primitives::v10::RequiresCommitment> {
+			SpeculativeInbox::get_requires_commitments()
+		}
+		fn next_expected_message_position(source: ParaId) -> u64 {
+			SpeculativeInbox::next_expected_message_position(source)
+		}
+		fn last_seen_provides_root(source: ParaId) -> polkadot_primitives::Hash {
+			SpeculativeInbox::last_seen_provides_root(source)
 		}
 	}
 );

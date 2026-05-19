@@ -222,6 +222,15 @@ pub mod pallet {
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
+		/// Hook to retrieve the speculative messaging extension, if any.
+		///
+		/// For V4 candidates (speculative messaging), this should return
+		/// the provides root and requires commitments.
+		fn speculative_extension(
+		) -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
+			None
+		}
+
 		/// Something which can be notified when the validation data is set.
 		type OnSystemEvent: OnSystemEvent;
 

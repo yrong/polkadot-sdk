@@ -43,7 +43,9 @@ use polkadot_node_subsystem_util::{
 	runtime::{fetch_scheduling_lookahead, ClaimQueueSnapshot},
 };
 use polkadot_overseer::{ActivatedLeaf, ActiveLeavesUpdate};
-use polkadot_parachain_primitives::primitives::ValidationResult as WasmValidationResult;
+use polkadot_parachain_primitives::primitives::{
+	ValidationResult as WasmValidationResult, ValidationResultExtension,
+};
 use polkadot_primitives::{
 	executor_params::{
 		DEFAULT_APPROVAL_EXECUTION_TIMEOUT, DEFAULT_BACKING_EXECUTION_TIMEOUT,
@@ -54,8 +56,8 @@ use polkadot_primitives::{
 	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
-	PersistedValidationData, PvfExecKind as RuntimePvfExecKind, PvfPrepKind, SessionIndex,
-	ValidationCode, ValidationCodeHash, ValidatorId,
+	PersistedValidationData, ProvidesCommitment, PvfExecKind as RuntimePvfExecKind, PvfPrepKind,
+	RequiresCommitment, SessionIndex, ValidationCode, ValidationCodeHash, ValidatorId,
 };
 use sp_application_crypto::{AppCrypto, ByteArray};
 use sp_keystore::KeystorePtr;
@@ -1305,21 +1307,62 @@ async fn validate_candidate(
 				gum::info!(target: LOG_TARGET, ?para_id, "Invalid candidate (para_head)");
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
-				let committed_candidate_receipt = CommittedCandidateReceipt {
-					descriptor: candidate_receipt.descriptor.clone(),
-					commitments: CandidateCommitments {
-						head_data: res.head_data,
-						upward_messages: res.upward_messages,
-						horizontal_messages: res.horizontal_messages,
-						new_validation_code: res.new_validation_code,
-						processed_downward_messages: res.processed_downward_messages,
-						hrmp_watermark: res.hrmp_watermark,
+				let (provides, requires) = match res.speculative.0 {
+					Some(ValidationResultExtension::V4 { provides_root, requires }) => {
+						gum::debug!(
+							target: LOG_TARGET,
+							?para_id,
+							?candidate_hash,
+							?provides_root,
+							n_requires = requires.len(),
+							"validation result has V4 speculative extension",
+						);
+						(
+							provides_root.map(|root| ProvidesCommitment { root }),
+							requires
+								.into_iter()
+								.map(|(source, expected_root)| RequiresCommitment {
+									source,
+									expected_root,
+								})
+								.collect(),
+						)
+					},
+					None => {
+						gum::debug!(
+							target: LOG_TARGET,
+							?para_id,
+							?candidate_hash,
+							"validation result has no speculative extension",
+						);
+						(None, Vec::new())
 					},
 				};
 
-				if candidate_receipt.commitments_hash !=
-					committed_candidate_receipt.commitments.hash()
-				{
+				let commitments_v9 = CandidateCommitments {
+					head_data: res.head_data,
+					upward_messages: res.upward_messages,
+					horizontal_messages: res.horizontal_messages,
+					new_validation_code: res.new_validation_code,
+					processed_downward_messages: res.processed_downward_messages,
+					hrmp_watermark: res.hrmp_watermark,
+					provides,
+					requires,
+				};
+
+				let commitments_hash = commitments_v9.hash();
+
+				gum::debug!(
+					target: LOG_TARGET,
+					?para_id,
+					?candidate_hash,
+					receipt_commitments_hash = ?candidate_receipt.commitments_hash,
+					recomputed_commitments_hash = ?commitments_hash,
+					hashes_match = candidate_receipt.commitments_hash == commitments_hash,
+					"commitments hash check",
+				);
+
+				if candidate_receipt.commitments_hash != commitments_hash {
 					gum::info!(
 						target: LOG_TARGET,
 						?para_id,
@@ -1331,7 +1374,7 @@ async fn validate_candidate(
 						target: LOG_TARGET,
 						?para_id,
 						?candidate_hash,
-						produced_commitments = ?committed_candidate_receipt.commitments,
+						produced_commitments = ?commitments_v9,
 						"Invalid candidate commitments"
 					);
 
@@ -1341,6 +1384,11 @@ async fn validate_candidate(
 				} else {
 					// Backing-only: validate UMP signals against the claim queue.
 					if let Some(claim_queue) = &pre.claim_queue {
+						let committed_candidate_receipt = CommittedCandidateReceipt {
+							descriptor: candidate_receipt.descriptor.clone(),
+							commitments: commitments_v9.clone(),
+						};
+
 						if let Err(err) = committed_candidate_receipt
 							.parse_ump_signals(&transpose_claim_queue(claim_queue.0.clone()))
 						{
@@ -1357,7 +1405,7 @@ async fn validate_candidate(
 					}
 
 					Ok(ValidationResult::Valid(
-						committed_candidate_receipt.commitments,
+						commitments_v9.into(),
 						(*persisted_validation_data).clone(),
 					))
 				}

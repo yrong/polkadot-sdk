@@ -606,6 +606,7 @@ impl<T: Config> Pallet<T> {
 
 		let node_features = configuration::ActiveConfig::<T>::get().node_features;
 		let v3_enabled = FeatureIndex::CandidateReceiptV3.is_set(&node_features);
+		let speculative_enabled = FeatureIndex::SpeculativeMessaging.is_set(&node_features);
 
 		let backed_candidates_with_core = sanitize_backed_candidates::<T>(
 			backed_candidates,
@@ -613,6 +614,7 @@ impl<T: Config> Pallet<T> {
 			concluded_invalid_hashes,
 			eligible,
 			v3_enabled,
+			speculative_enabled,
 		);
 		let count = count_backed_candidates(&backed_candidates_with_core);
 
@@ -947,6 +949,7 @@ fn check_descriptor_version_and_signals<T: crate::inclusion::Config>(
 	candidate: &BackedCandidate<T::Hash>,
 	allowed_scheduling_parents: &AllowedSchedulingParentsTracker<T::Hash, BlockNumberFor<T>>,
 	v3_enabled: bool,
+	speculative_enabled: bool,
 ) -> bool {
 	let current_session_index = shared::CurrentSessionIndex::<T>::get();
 	let descriptor_version = candidate.descriptor().version();
@@ -961,8 +964,10 @@ fn check_descriptor_version_and_signals<T: crate::inclusion::Config>(
 		return false;
 	}
 
-	// Version consistency + V3 gating (shared logic from primitives).
-	if let Err(reason) = candidate.descriptor().check_version_acceptance(v3_enabled) {
+	// Version consistency + V3/V4 gating (shared logic from primitives).
+	if let Err(reason) =
+		candidate.descriptor().check_version_acceptance(v3_enabled, speculative_enabled)
+	{
 		log::debug!(
 			target: LOG_TARGET,
 			"{}. Dropping candidate {:?} for paraid {:?}.",
@@ -1105,6 +1110,7 @@ fn sanitize_backed_candidates<T: crate::inclusion::Config>(
 	concluded_invalid_with_descendants: BTreeSet<CandidateHash>,
 	scheduled: BTreeMap<ParaId, BTreeSet<CoreIndex>>,
 	v3_enabled: bool,
+	speculative_enabled: bool,
 ) -> BTreeMap<ParaId, Vec<(BackedCandidate<T::Hash>, CoreIndex)>> {
 	// Map the candidates to the right paraids, while making sure that the order between candidates
 	// of the same para is preserved.
@@ -1115,6 +1121,7 @@ fn sanitize_backed_candidates<T: crate::inclusion::Config>(
 			&candidate,
 			allowed_scheduling_parents,
 			v3_enabled,
+			speculative_enabled,
 		) {
 			continue;
 		}

@@ -82,6 +82,8 @@ fn dummy_candidate() -> CommittedCandidateReceiptV2 {
 			head_data: HeadData(Vec::new()),
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
+			provides: None,
+			requires: vec![],
 		},
 	}
 }
@@ -122,6 +124,10 @@ impl RelayChainInterface for DummyRelayChainInterface {
 	}
 	async fn finalized_block_hash(&self) -> RelayChainResult<PHash> {
 		Ok(self.relay_backend.blockchain().info().finalized_hash)
+	}
+
+	async fn provides_root(&self, _: ParaId, _: PHash) -> RelayChainResult<Option<PHash>> {
+		unimplemented!("Not needed for test")
 	}
 
 	async fn retrieve_dmq_contents(

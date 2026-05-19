@@ -4871,12 +4871,14 @@ dependencies = [
  "cumulus-client-consensus-common",
  "cumulus-client-parachain-inherent",
  "cumulus-client-proof-size-recording",
+ "cumulus-pallet-speculative-inbox",
  "cumulus-primitives-aura",
  "cumulus-primitives-core",
  "cumulus-relay-chain-interface",
  "cumulus-test-client",
  "cumulus-test-relay-sproof-builder",
  "futures",
+ "jsonrpsee",
  "parity-scale-codec",
  "parking_lot 0.12.3",
  "polkadot-node-primitives",
@@ -5170,6 +5172,7 @@ version = "0.7.0"
 dependencies = [
  "array-bytes 6.2.2",
  "assert_matches",
+ "binary-merkle-tree 13.0.0",
  "bytes",
  "cumulus-pallet-parachain-system-proc-macro",
  "cumulus-primitives-core",
@@ -5191,6 +5194,7 @@ dependencies = [
  "log",
  "pallet-message-queue",
  "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
  "polkadot-parachain-primitives",
  "polkadot-primitives",
  "polkadot-runtime-parachains",
@@ -5253,6 +5257,53 @@ dependencies = [
  "polkadot-primitives",
  "scale-info",
  "sp-runtime 31.0.1",
+]
+
+[[package]]
+name = "cumulus-pallet-speculative-inbox"
+version = "0.1.0"
+dependencies = [
+ "binary-merkle-tree 13.0.0",
+ "cumulus-pallet-parachain-system",
+ "cumulus-pallet-speculative-outbox",
+ "cumulus-primitives-core",
+ "frame-support",
+ "frame-system",
+ "log",
+ "pallet-balances",
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-parachain-primitives",
+ "polkadot-primitives",
+ "scale-info",
+ "sp-api 26.0.0",
+ "sp-core 28.0.0",
+ "sp-inherents 26.0.0",
+ "sp-io 30.0.0",
+ "sp-mmr-primitives",
+ "sp-runtime 31.0.1",
+]
+
+[[package]]
+name = "cumulus-pallet-speculative-outbox"
+version = "0.1.0"
+dependencies = [
+ "binary-merkle-tree 13.0.0",
+ "cumulus-pallet-parachain-system",
+ "cumulus-primitives-core",
+ "frame-support",
+ "frame-system",
+ "log",
+ "pallet-balances",
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-parachain-primitives",
+ "polkadot-primitives",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-mmr-primitives",
+ "sp-runtime 31.0.1",
+ "sp-std 14.0.0",
 ]
 
 [[package]]
@@ -15591,6 +15642,8 @@ dependencies = [
  "cumulus-pallet-aura-ext",
  "cumulus-pallet-parachain-system",
  "cumulus-pallet-session-benchmarking",
+ "cumulus-pallet-speculative-inbox",
+ "cumulus-pallet-speculative-outbox",
  "cumulus-pallet-xcm",
  "cumulus-pallet-xcmp-queue",
  "cumulus-primitives-aura",

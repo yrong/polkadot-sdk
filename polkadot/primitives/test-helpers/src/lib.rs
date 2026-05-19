@@ -24,6 +24,9 @@
 //! contain randomness based data.
 use codec::{Decode, Encode};
 use polkadot_primitives::{
+	v10::{
+		CandidateCommitments as CandidateCommitmentsV10, ProvidesCommitment, RequiresCommitment,
+	},
 	AppVerify, CandidateCommitments, CandidateDescriptorV2, CandidateHash, CandidateReceiptV2,
 	CollatorId, CollatorSignature, CommittedCandidateReceiptV2, CoreIndex, Hash, HashT, HeadData,
 	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex, ValidationCode,
@@ -376,6 +379,8 @@ pub fn dummy_candidate_commitments(head_data: impl Into<Option<HeadData>>) -> Ca
 		horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0_u32,
+		provides: None,
+		requires: vec![],
 	}
 }
 
@@ -533,6 +538,8 @@ pub fn make_candidate(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
+		provides: None,
+		requires: vec![],
 	};
 
 	let mut candidate =
@@ -564,6 +571,8 @@ pub fn make_candidate_v2(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
+		provides: None,
+		requires: vec![],
 	};
 
 	let mut descriptor = dummy_candidate_descriptor_v2(relay_parent_hash);
@@ -593,6 +602,8 @@ pub fn make_candidate_v3(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
+		provides: None,
+		requires: vec![],
 	};
 
 	let descriptor = CandidateDescriptorV2::new_v3(
@@ -712,6 +723,34 @@ pub fn make_valid_candidate_descriptor_v3<H: AsRef<[u8]> + Copy + Default>(
 		validation_code_hash,
 		scheduling_parent,
 	)
+}
+
+// ── V10 Speculative Messaging Test Helpers ──
+
+/// Create v10 candidate commitments with filler data.
+pub fn dummy_candidate_commitments_v10(
+	head_data: impl Into<Option<HeadData>>,
+) -> CandidateCommitmentsV10 {
+	CandidateCommitmentsV10 {
+		head_data: head_data.into().unwrap_or(dummy_head_data()),
+		upward_messages: vec![].try_into().expect("empty vec fits within bounds"),
+		new_validation_code: None,
+		horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
+		processed_downward_messages: 0,
+		hrmp_watermark: 0_u32,
+		provides: None,
+		requires: vec![],
+	}
+}
+
+/// Create a dummy provides commitment.
+pub fn dummy_provides_commitment() -> ProvidesCommitment {
+	ProvidesCommitment { root: Hash::zero() }
+}
+
+/// Create a dummy requires commitment.
+pub fn dummy_requires_commitment(source: ParaId, expected_root: Hash) -> RequiresCommitment {
+	RequiresCommitment { source, expected_root }
 }
 
 /// After manually modifying the candidate descriptor, resign with a defined collator key.

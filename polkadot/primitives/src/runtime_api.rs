@@ -343,5 +343,9 @@ sp_api::decl_runtime_apis! {
 			session_index: SessionIndex,
 			relay_parent: Hash,
 		) -> Option<RelayParentInfo<Hash, BlockNumber>>;
+
+		/// Read the latest provides root for a parachain (Phase 1).
+		#[api_version(17)]
+		fn provides_root(para_id: ppp::Id) -> Option<Hash>;
 	}
 }

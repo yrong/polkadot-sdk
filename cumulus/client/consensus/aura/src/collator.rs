@@ -140,7 +140,7 @@ pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS> {
 
 impl<Block, P, BI, CIDP, RClient, PF, CS> Collator<Block, P, BI, CIDP, RClient, PF, CS>
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	RClient: RelayChainInterface,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
 	BI: BlockImport<Block> + ParachainBlockImportMarker + Send + Sync + 'static,
@@ -177,6 +177,7 @@ where
 		relay_parent_descendants: Option<RelayParentData>,
 		relay_proof_request: RelayProofRequest,
 		collator_peer_id: PeerId,
+		speculative_ingress: Option<polkadot_primitives::v10::SpeculativeIngress>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
 		let paras_inherent_data = ParachainInherentDataProvider::create_at(
 			relay_parent,
@@ -213,6 +214,14 @@ where
 			other_inherent_data.replace_data(sp_timestamp::INHERENT_IDENTIFIER, &timestamp);
 		}
 
+		if let Some(ingress) = speculative_ingress {
+			cumulus_pallet_speculative_inbox::client::inject_speculative_ingress(
+				&mut other_inherent_data,
+				ingress,
+			)
+			.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+		}
+
 		Ok((paras_inherent_data, other_inherent_data))
 	}
 
@@ -226,6 +235,7 @@ where
 		timestamp: impl Into<Option<Timestamp>>,
 		relay_proof_request: RelayProofRequest,
 		collator_peer_id: PeerId,
+		speculative_ingress: Option<polkadot_primitives::v10::SpeculativeIngress>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
 		self.create_inherent_data_with_rp_offset(
 			relay_parent,
@@ -235,6 +245,7 @@ where
 			None,
 			relay_proof_request,
 			collator_peer_id,
+			speculative_ingress,
 		)
 		.await
 	}
@@ -386,11 +397,13 @@ where
 			})
 			.await?;
 
-		let Some(candidate) = maybe_candidate else { return Ok(None) };
+		let Some(built) = maybe_candidate else { return Ok(None) };
 
-		let hash = candidate.block.header().hash();
+		let hash = built.block.header().hash();
+		let candidate = ParachainCandidate::from(built);
+
 		if let Some((collation, block_data)) =
-			self.collator_service.build_collation(parent_header, hash, candidate.into())
+			self.collator_service.build_collation(parent_header, hash, candidate)
 		{
 			block_data.log_size_info();
 

@@ -45,3 +45,4 @@ target.noindex/
 rustc-ice-*
 /.claude/settings.local.json
 *.local.md
+speculative_messaging_e2e_backup

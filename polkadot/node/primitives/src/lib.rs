@@ -30,11 +30,11 @@ use futures::Future;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use polkadot_primitives::{
-	BlakeTwo256, BlockNumber, CandidateCommitments, CandidateHash, ChunkIndex, CollatorPair,
-	CommittedCandidateReceiptError, CommittedCandidateReceiptV2 as CommittedCandidateReceipt,
-	CompactStatement, CoreIndex, EncodeAs, Hash, HashT, HeadData, Id as ParaId,
-	PersistedValidationData, SessionIndex, Signed, UncheckedSigned, ValidationCode,
-	ValidationCodeHash, MAX_CODE_SIZE, MAX_POV_SIZE,
+	BlakeTwo256, BlockNumber, CandidateCommitments, CandidateCommitmentsV10, CandidateHash,
+	ChunkIndex, CollatorPair, CommittedCandidateReceiptError,
+	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CompactStatement, CoreIndex,
+	EncodeAs, Hash, HashT, HeadData, Id as ParaId, PersistedValidationData, SessionIndex, Signed,
+	UncheckedSigned, ValidationCode, ValidationCodeHash, MAX_CODE_SIZE, MAX_POV_SIZE,
 };
 pub use sp_consensus_babe::{
 	AllowedSlots as BabeAllowedSlots, BabeEpochConfiguration, Epoch as BabeEpoch,
@@ -367,7 +367,7 @@ pub enum InvalidCandidate {
 pub enum ValidationResult {
 	/// Candidate is valid. The validation process yields these outputs and the persisted
 	/// validation data used to form inputs.
-	Valid(CandidateCommitments, PersistedValidationData),
+	Valid(CandidateCommitmentsV10, PersistedValidationData),
 	/// Candidate is invalid.
 	Invalid(InvalidCandidate),
 }
@@ -445,6 +445,10 @@ pub struct Collation<BlockNumber = polkadot_primitives::BlockNumber> {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: BlockNumber,
+	/// The provides commitment (None if no outbox state exists yet).
+	pub provides: Option<polkadot_primitives::v10::ProvidesCommitment>,
+	/// The requires commitments, sorted by source: ParaId, at most one per source.
+	pub requires: Vec<polkadot_primitives::v10::RequiresCommitment>,
 }
 
 /// Signal that is being returned when a collation was seconded by a validator.

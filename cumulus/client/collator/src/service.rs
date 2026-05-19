@@ -256,9 +256,10 @@ where
 		let mut head_data = None;
 
 		for block in &blocks {
+			let block_hash = block.hash();
 			// Create the parachain block data for the validators.
 			let (collation_info, _api_version) = self
-				.fetch_collation_info(block.hash(), block.header())
+				.fetch_collation_info(block_hash, block.header())
 				.map_err(|e| {
 					tracing::error!(
 						target: LOG_TARGET,
@@ -310,16 +311,16 @@ where
 			block_data: BlockData(if api_version >= 3 {
 				block_data.encode()
 			} else {
-				let block_data = block_data.as_v0();
+				let block_data_v0 = block_data.as_v0();
 
-				if block_data.is_none() {
+				if block_data_v0.is_none() {
 					tracing::error!(
 						target: LOG_TARGET,
 						"Trying to submit a collation with multiple blocks is not supported by the current runtime."
 					);
 				}
 
-				block_data?.encode()
+				block_data_v0?.encode()
 			}),
 		});
 
@@ -359,6 +360,8 @@ where
 			hrmp_watermark: hrmp_watermark?,
 			head_data: head_data?,
 			proof_of_validity: MaybeCompressedPoV::Compressed(pov),
+			provides: None,
+			requires: Vec::new(),
 		};
 
 		Some((collation, block_data))
