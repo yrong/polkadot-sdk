@@ -81,19 +81,9 @@ async function waitForRemarked(api, expected, timeoutMs) {
       }
     };
 
-    // Scan last 10 blocks in case delivery already happened.
-    (async () => {
-      const head = await api.rpc.chain.getHeader();
-      for (let i = 0; i < 10; i++) {
-        const n = head.number.toNumber() - i;
-        if (n < 0) break;
-        await check(await api.rpc.chain.getBlockHash(n));
-        if (done) return;
-      }
-      if (!done) {
-        unsub = await api.rpc.chain.subscribeNewHeads(h => check(h.hash));
-      }
-    })().catch(e => { if (!done) reject(e); });
+    api.rpc.chain.subscribeNewHeads(h => check(h.hash))
+      .then(u => { unsub = u; if (done) unsub(); })
+      .catch(e => { if (!done) reject(e); });
   });
 }
 
@@ -141,6 +131,13 @@ async function main() {
   console.log(`  remark: ${REMARK}`);
   console.log(`  expected hash: ${u8aToHex(expected)}`);
 
+  const tSend = Date.now();
+
+  // Start watching the receiver immediately so we don't miss speculative delivery
+  // that may arrive before or concurrently with the sender's isInBlock event.
+  console.log(`\nWaiting for system.Remarked on receiver (${REMARK_TIMEOUT / 1000}s timeout)...`);
+  const remarkedPromise = waitForRemarked(receiverApi, expected, REMARK_TIMEOUT);
+
   await new Promise((resolve, reject) => {
     let unsub;
     sendTx.signAndSend(alice, ({ status, events }) => {
@@ -155,10 +152,20 @@ async function main() {
       }
     }).then(u => unsub = u).catch(reject);
   });
+  const tSenderIncluded = Date.now();
 
-  console.log(`\nWaiting for system.Remarked on receiver (${REMARK_TIMEOUT / 1000}s timeout)...`);
-  const result = await waitForRemarked(receiverApi, expected, REMARK_TIMEOUT);
+  const result = await remarkedPromise;
+  const tDelivered = Date.now();
+
+  const sendToInclude  = ((tSenderIncluded - tSend)      / 1000).toFixed(2);
+  const includeToDeliv = ((tDelivered - tSenderIncluded) / 1000).toFixed(2);
+  const totalLatency   = ((tDelivered - tSend)           / 1000).toFixed(2);
+
   console.log(`\n✅ Delivered via speculative messaging! system.Remarked in block ${result.blockHash}`);
+  console.log(`\nLatency breakdown:`);
+  console.log(`  sign → sender included          : ${sendToInclude}s`);
+  console.log(`  sender included → delivered     : ${includeToDeliv}s  (negative = speculative pre-delivery)`);
+  console.log(`  total (sign → delivered)        : ${totalLatency}s`);
 
   await Promise.all([senderApi.disconnect(), receiverApi.disconnect()]);
 }
