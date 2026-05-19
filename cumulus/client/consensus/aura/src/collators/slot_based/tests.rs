@@ -228,6 +228,10 @@ impl RelayChainInterface for TestRelayClient {
 		unimplemented!("Not needed for test")
 	}
 
+	async fn provides_root(&self, _: ParaId, _: RelayHash) -> RelayChainResult<Option<RelayHash>> {
+		unimplemented!("Not needed for test")
+	}
+
 	async fn retrieve_dmq_contents(
 		&self,
 		_: ParaId,

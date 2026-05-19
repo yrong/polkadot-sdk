@@ -353,6 +353,10 @@ impl RelayChainInterface for Relaychain {
 		unimplemented!("Not needed for test")
 	}
 
+	async fn provides_root(&self, _: ParaId, _: PHash) -> RelayChainResult<Option<PHash>> {
+		unimplemented!("Not needed for test")
+	}
+
 	async fn retrieve_dmq_contents(
 		&self,
 		_: ParaId,
@@ -564,6 +568,8 @@ fn make_candidate_chain(candidate_number_range: Range<u32>) -> Vec<CommittedCand
 				horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
+				provides: None,
+				requires: vec![],
 			},
 		});
 	}

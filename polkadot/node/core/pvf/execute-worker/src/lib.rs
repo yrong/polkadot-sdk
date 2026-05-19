@@ -258,8 +258,9 @@ pub fn worker_entrypoint(
 				// 3. The PVF will decode ValidationParams + optional extension as the entire input
 				let extension: TrailingOption<ValidationParamsExtension> =
 					match request.descriptor_version {
-						CandidateDescriptorVersion::V3 => {
-							// V3 candidate - append extension with both parent hashes
+						CandidateDescriptorVersion::V3 | CandidateDescriptorVersion::V4 => {
+							// V3 and V4 both use the V3 extension; the runtime does not
+							// branch on the variant tag so no separate V4 variant is needed.
 							TrailingOption(Some(ValidationParamsExtension::V3 {
 								relay_parent: request.relay_parent,
 								scheduling_parent: request.scheduling_parent,

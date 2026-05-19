@@ -169,6 +169,8 @@ impl CandidateBuilder {
 				head_data: self.para_head,
 				processed_downward_messages: 1,
 				hrmp_watermark: self.hrmp_watermark,
+				provides: None,
+				requires: vec![],
 			},
 		};
 

@@ -37,7 +37,8 @@ use cumulus_client_collator::service::ServiceInterface as CollatorServiceInterfa
 use cumulus_client_consensus_common::{self as consensus_common, ParachainBlockImportMarker};
 use cumulus_primitives_aura::AuraUnincludedSegmentApi;
 use cumulus_primitives_core::{
-	CollectCollationInfo, KeyToIncludeInRelayProof, PersistedValidationData,
+	CollectCollationInfo, KeyToIncludeInRelayProof, PersistedValidationData, SpeculativeInboxApi,
+	SpeculativeOutboxApi,
 };
 use cumulus_relay_chain_interface::RelayChainInterface;
 use sp_consensus::Environment;
@@ -109,6 +110,8 @@ pub struct Params<BI, CIDP, Client, Backend, RClient, CHP, ProposerFactory, CS> 
 	/// The maximum percentage of the maximum PoV size that the collator can use.
 	/// It will be removed once <https://github.com/paritytech/polkadot-sdk/issues/6020> is fixed.
 	pub max_pov_percentage: Option<u32>,
+	/// Off-chain sender chains to pull speculative message batches from.
+	pub speculative_sources: crate::collators::SpeculativeMessageSources,
 }
 
 /// Get the current parachain slot from a given block hash.
@@ -160,19 +163,22 @@ pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS>(
 	params: Params<BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
 		+ HeaderBackend<Block>
 		+ BlockBackend<Block>
+		+ sc_client_api::UsageProvider<Block>
 		+ Send
 		+ Sync
 		+ 'static,
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ SpeculativeInboxApi<Block>
+		+ SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -214,19 +220,22 @@ pub fn run_with_export<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Propos
 	>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore
 		+ HeaderBackend<Block>
 		+ BlockBackend<Block>
+		+ sc_client_api::UsageProvider<Block>
 		+ Send
 		+ Sync
 		+ 'static,
 	Client::Api: AuraApi<Block, P::Public>
 		+ CollectCollationInfo<Block>
 		+ AuraUnincludedSegmentApi<Block>
-		+ KeyToIncludeInRelayProof<Block>,
+		+ KeyToIncludeInRelayProof<Block>
+		+ SpeculativeInboxApi<Block>
+		+ SpeculativeOutboxApi<Block>,
 	Backend: sc_client_api::Backend<Block> + 'static,
 	RClient: RelayChainInterface + Clone + 'static,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
@@ -433,6 +442,29 @@ where
 				let relay_proof_request =
 					super::get_relay_proof_request(&*params.para_client, parent_hash);
 
+				let speculative_ingress = if params.speculative_sources.sources.is_empty() {
+					cumulus_pallet_speculative_inbox::client::empty_speculative_ingress()
+				} else {
+					crate::collators::speculative_ingress::fetch_ingress_for_block(
+						para_client,
+						parent_hash,
+						params.para_id,
+						&params.speculative_sources,
+						relay_parent,
+						&params.relay_client,
+						*relay_parent_header.number(),
+					)
+					.await
+				};
+
+				tracing::debug!(
+					target: crate::LOG_TARGET,
+					?parent_hash,
+					n_sources = params.speculative_sources.sources.len(),
+					n_batches = speculative_ingress.batches.len(),
+					"speculative ingress resolved before inherent data",
+				);
+
 				let (parachain_inherent_data, other_inherent_data) = match collator
 					.create_inherent_data(
 						relay_parent,
@@ -441,6 +473,7 @@ where
 						slot_claim.timestamp(),
 						relay_proof_request,
 						params.collator_peer_id,
+						Some(speculative_ingress),
 					)
 					.await
 				{
@@ -487,7 +520,7 @@ where
 					)
 					.await
 				{
-					Ok(Some((collation, block_data))) => {
+					Ok(Some((mut collation, block_data))) => {
 						let Some(new_block_header) =
 							block_data.blocks().first().map(|b| b.header().clone())
 						else {
@@ -496,6 +529,38 @@ where
 						};
 
 						let new_block_hash = new_block_header.hash();
+
+						// Fetch speculative commitment fields from the runtime state of the
+						// newly built block, so the collation's provides/requires match what
+						// validate_block will recompute via speculative_extension().
+						let runtime_api = para_client.runtime_api();
+						let provides =
+							runtime_api.compute_provides_root(new_block_hash).unwrap_or(None);
+						let requires =
+							runtime_api.requires_commitments(new_block_hash).unwrap_or_default();
+
+						tracing::debug!(
+							target: crate::LOG_TARGET,
+							?new_block_hash,
+							provides_root = ?provides.as_ref().map(|p| p.root),
+							n_requires = requires.len(),
+							"patching speculative fields onto collation from runtime state",
+						);
+
+						collation.provides = provides;
+						collation.requires = requires;
+
+						tracing::debug!(
+							target: crate::LOG_TARGET,
+							?parent_hash,
+							?new_block_hash,
+							block_number = %new_block_header.number(),
+							provides = ?collation.provides.as_ref().map(|p| p.root),
+							n_requires = collation.requires.len(),
+							n_horiz = collation.horizontal_messages.len(),
+							n_ump = collation.upward_messages.len(),
+							"collation built successfully",
+						);
 
 						// Here we are assuming that the import logic protects against equivocations
 						// and provides sybil-resistance, as it should.

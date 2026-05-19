@@ -1759,8 +1759,9 @@ where
 {
 	let peer_data = state.peer_data.get_mut(&peer_id).ok_or(AdvertisementError::UnknownPeer)?;
 
-	// For non-V3 descriptors, the relay parent must equal the scheduling parent.
+	// For non-V3/V4 descriptors, the relay parent must equal the scheduling parent.
 	if candidate_descriptor_version != CandidateDescriptorVersion::V3 &&
+		candidate_descriptor_version != CandidateDescriptorVersion::V4 &&
 		relay_parent != scheduling_parent
 	{
 		return Err(AdvertisementError::RelayParentMismatch);
@@ -1772,9 +1773,10 @@ where
 		.get(&scheduling_parent)
 		.ok_or(AdvertisementError::SchedulingParentUnknown)?;
 
-	// V3 candidate descriptors require the scheduling_parent to be the block from the last
-	// finished relay chain slot. We compare slot numbers rather than timestamps to keep
-	// the logic simple and aligned with how BABE/Aura reason about slots.
+	// V3/V4 candidate descriptors require the scheduling_parent to be the block from the last
+	// finished relay chain slot. For V4 in the PoC the scheduling_parent defaults to relay_parent
+	// (same as V2 behaviour); only apply the strict slot check for V3 where an explicit
+	// scheduling_parent distinct from relay_parent is always set.
 	if candidate_descriptor_version == CandidateDescriptorVersion::V3 {
 		if !is_scheduling_parent_valid(&scheduling_parent, &state.leaf_scheduling_info) {
 			return Err(AdvertisementError::SchedulingParentNotValid);
@@ -3154,12 +3156,15 @@ pub fn descriptor_version_sanity_check_with_params(
 ) -> std::result::Result<(), SecondingError> {
 	match descriptor.version() {
 		CandidateDescriptorVersion::V1 => Ok(()),
-		CandidateDescriptorVersion::V2 | CandidateDescriptorVersion::V3 => {
-			// V3 descriptors must only arrive via V3 protocol.
-			if descriptor.version() == CandidateDescriptorVersion::V3 &&
+		CandidateDescriptorVersion::V2 |
+		CandidateDescriptorVersion::V3 |
+		CandidateDescriptorVersion::V4 => {
+			// V3/V4 descriptors must only arrive via V3 protocol.
+			if (descriptor.version() == CandidateDescriptorVersion::V3 ||
+				descriptor.version() == CandidateDescriptorVersion::V4) &&
 				collator_protocol_version != CollationVersion::V3
 			{
-				return Err(SecondingError::InvalidReceiptVersion(CandidateDescriptorVersion::V3));
+				return Err(SecondingError::InvalidReceiptVersion(descriptor.version()));
 			}
 
 			if let Some(core_index) = descriptor.core_index() {

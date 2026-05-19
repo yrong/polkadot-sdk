@@ -42,6 +42,7 @@ use cumulus_client_consensus_aura::{
 	collators::{
 		lookahead::{self as aura, Params as AuraParams},
 		slot_based::{SlotBasedBlockImport, SlotBasedBlockImportHandle},
+		RpcOutboxClient, SpeculativeMessageSources,
 	},
 	equivocation_import_queue::Verifier as EquivocationVerifier,
 };
@@ -225,6 +226,7 @@ where
 			max_pov_percentage,
 			statement_store_config,
 			storage_monitor,
+			speculative_sources_config: _, // not used in dev mode
 		} = node_extra_args;
 
 		// Warn about args that have no effect in dev mode (collation-specific).
@@ -568,7 +570,11 @@ where
 		+ pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>
 		+ substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>
 		+ TargetBlockRate<Block>
-		+ GetParachainInfo<Block>,
+		+ GetParachainInfo<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
@@ -601,6 +607,8 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
 	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId> + TargetBlockRate<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
@@ -655,7 +663,12 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 	> for StartSlotBasedAuraConsensus<Block, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
-	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId> + TargetBlockRate<Block>,
+	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>
+		+ TargetBlockRate<Block>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
@@ -748,6 +761,7 @@ where
 		let wait_client = client.clone();
 		let fut = async move {
 			wait_for_aura::<Block, RuntimeApi, AuraId>(wait_client).await;
+
 			// We have a separate function only to be able to use `docify::export` on this
 			// piece of code.
 			Self::launch_slot_based_collator(params);
@@ -812,7 +826,11 @@ impl<Block: BlockT<Hash = DbHash>, RuntimeApi, AuraId>
 	for StartLookaheadAuraConsensus<Block, RuntimeApi, AuraId>
 where
 	RuntimeApi: ConstructNodeRuntimeApi<Block, ParachainClient<Block, RuntimeApi>>,
-	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>,
+	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>
+		+ cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
+	RuntimeApi::BoundedRuntimeApi: cumulus_primitives_core::SpeculativeInboxApi<Block>
+		+ cumulus_primitives_core::SpeculativeOutboxApi<Block>,
 	AuraId: AuraIdT + Sync + Send,
 	<AuraId as AppCrypto>::Pair: Send + Sync,
 {
@@ -894,11 +912,39 @@ where
 				authoring_duration: Duration::from_millis(2000),
 				reinitialize: false,
 				max_pov_percentage: node_extra_args.max_pov_percentage,
+				speculative_sources: Default::default(), // replaced below after async connect
 			},
 		};
 
+		let speculative_sources_config = node_extra_args.speculative_sources_config;
 		let fut = async move {
 			wait_for_aura(client).await;
+
+			// Connect to each configured sender chain now that we're inside an async context.
+			let mut params = params;
+			if !speculative_sources_config.is_empty() {
+				let mut sources = Vec::new();
+				for (para_id, url) in &speculative_sources_config {
+					match RpcOutboxClient::connect(url).await {
+						Ok(client) => {
+							log::info!(
+								target: "aura",
+								"Connected to speculative messaging sender para_id={para_id} url={url}"
+							);
+							sources.push((*para_id, client));
+						},
+						Err(err) => {
+							log::warn!(
+								target: "aura",
+								"Failed to connect to speculative messaging sender para_id={para_id} url={url}: {err:?}, skipping"
+							);
+						},
+					}
+				}
+				params.params.speculative_sources =
+					SpeculativeMessageSources::with_sources(sources);
+			}
+
 			aura::run_with_export::<Block, <AuraId as AppCrypto>::Pair, _, _, _, _, _, _, _, _>(
 				params,
 			)

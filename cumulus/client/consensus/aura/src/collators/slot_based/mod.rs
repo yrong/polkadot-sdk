@@ -159,7 +159,7 @@ pub struct Params<Block, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, 
 pub fn run<Block, P, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spawner>(
 	params: Params<Block, BI, CIDP, Client, Backend, RClient, CHP, Proposer, CS, Spawner>,
 ) where
-	Block: BlockT,
+	Block: BlockT<Hash = polkadot_primitives::Hash>,
 	Client: ProvideRuntimeApi<Block>
 		+ BlockOf
 		+ AuxStore

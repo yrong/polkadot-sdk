@@ -415,6 +415,8 @@ impl XcmpMessageHandler for () {
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum ValidationParamsExtension {
 	/// V3 extension - contains relay_parent and scheduling_parent hashes.
+	/// Used for both V3 and V4 (speculative messaging) candidates, since the
+	/// runtime does not branch on the variant tag.
 	#[codec(index = 3)]
 	V3 {
 		/// The relay parent block hash.
@@ -422,13 +424,25 @@ pub enum ValidationParamsExtension {
 		/// The scheduling parent block hash (may differ from relay_parent in V3).
 		scheduling_parent: Hash,
 	},
-	// Future versions would add new variants:
-	// #[codec(index = 4)]
-	// V4 {
-	//     relay_parent: Hash,
-	//     scheduling_parent: Hash,
-	//     new_field: SomeType,
-	// },
+}
+
+/// Versioned extension appended to `ValidationResult` for speculative messaging.
+///
+/// Encoded as `TrailingOption<ValidationResultExtension>` after the
+/// `ValidationResult` bytes. For V4+ candidates the PVF appends a `V4` variant
+/// with provides/requires; for pre-V4 runtimes nothing is appended and the
+/// node-side decodes `TrailingOption(None)`.
+#[derive(Clone, Encode, Decode, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub enum ValidationResultExtension {
+	/// V4 extension — speculative messaging provides root and requires commitments.
+	#[codec(index = 4)]
+	V4 {
+		/// The provides root (top-level Merkle tree over per-destination MMR roots).
+		provides_root: Option<Hash>,
+		/// The requires commitments (source parachain → expected provides root).
+		requires: Vec<(Id, Hash)>,
+	},
 }
 
 /// A wrapper that decodes `T` if bytes remain after prior fields, or returns
@@ -457,8 +471,8 @@ pub enum ValidationParamsExtension {
 /// - The PVF receives this as the entire input (no wrapper struct)
 ///
 /// If you're considering using this elsewhere, you probably want `Option<T>` instead.
-#[derive(Clone)]
-#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "std", derive(Hash))]
 pub struct TrailingOption<T>(pub Option<T>);
 
 impl<T: Decode> Decode for TrailingOption<T> {
@@ -487,6 +501,22 @@ impl<T> TrailingOption<T> {
 		self.0
 	}
 }
+
+impl<T> Default for TrailingOption<T> {
+	fn default() -> Self {
+		TrailingOption(None)
+	}
+}
+
+impl<T: scale_info::TypeInfo + 'static> scale_info::TypeInfo for TrailingOption<T> {
+	type Identity = Self;
+
+	fn type_info() -> scale_info::Type {
+		<Option<T>>::type_info()
+	}
+}
+
+impl<T: codec::DecodeWithMemTracking> codec::DecodeWithMemTracking for TrailingOption<T> {}
 
 /// Validation parameters for evaluating the parachain validity function.
 // TODO: balance downloads (https://github.com/paritytech/polkadot/issues/220)
@@ -539,6 +569,8 @@ pub struct ValidationResult {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: RelayChainBlockNumber,
+	/// Speculative messaging extension (v10+). Wrapped in TrailingOption for compatibility.
+	pub speculative: TrailingOption<ValidationResultExtension>,
 }
 
 #[cfg(test)]

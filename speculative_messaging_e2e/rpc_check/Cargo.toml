@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "speculative-rpc-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+jsonrpsee = { version = "0.24.10", features = ["ws-client"] }
+parity-scale-codec = { version = "3.7.5", features = ["derive"] }
+hex = "0.4"
+serde_json = "1"
+binary-merkle-tree = "16.1"
+sp-runtime = "44"
+sp-core = "38"

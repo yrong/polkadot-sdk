@@ -46,10 +46,10 @@ use pallet_message_queue::OnQueueChanged;
 use polkadot_primitives::{
 	effective_minimum_backing_votes, skip_ump_signals, supermajority_threshold, well_known_keys,
 	BackedCandidate, CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
-	CandidateHash, CandidateReceiptV2 as CandidateReceipt,
+	CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex, HeadData,
-	Id as ParaId, SignedAvailabilityBitfields, SigningContext, UpwardMessage, ValidatorId,
-	ValidatorIndex, ValidityAttestation,
+	Id as ParaId, RequiresCommitment, SignedAvailabilityBitfields, SigningContext, UpwardMessage,
+	ValidatorId, ValidatorIndex, ValidityAttestation,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{traits::One, DispatchError, SaturatedConversion, Saturating};
@@ -343,6 +343,8 @@ pub mod pallet {
 		/// The `para_head` hash in the candidate descriptor doesn't match the hash of the actual
 		/// para head in the commitments.
 		ParaHeadMismatch,
+		/// One or more speculative messaging requirements were not satisfied at enactment.
+		UnsatisfiedRequires,
 	}
 
 	/// Candidates pending availability by `ParaId`. They form a chain starting from the latest
@@ -358,6 +360,21 @@ pub mod pallet {
 		ParaId,
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
+
+	// ── Phase 1 Speculative Messaging (POC) ─────────────────────────────────────
+	//
+	// These storage items implement the relay-chain side of inclusion-based
+	// speculative messaging (design doc: docs/speculative-messaging-impl-design.md).
+	//
+	// ProvidesRoots  — one hash per parachain, updated at enactment. The relay
+	//                  chain only ever stores the latest provides root; old roots
+	//                  are overwritten. No history is kept.
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	/// Latest provides root per parachain for speculative messaging (Phase 1).
+	#[pallet::storage]
+	pub(crate) type ProvidesRoots<T: Config> =
+		StorageMap<_, Twox64Concat, polkadot_primitives::Id, polkadot_primitives::Hash>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
@@ -532,6 +549,10 @@ impl<T: Config> Pallet<T> {
 			PendingAvailability::<T>::mutate(paraid, |candidates| {
 				if let Some(candidates) = candidates {
 					let mut last_enacted_index: Option<usize> = None;
+					// Index of the first v4 candidate whose requires were unsatisfied.
+					// When set, this candidate and all descendants are dropped (not enacted)
+					// so the core is freed immediately for collator retry.
+					let mut drop_from_index: Option<usize> = None;
 
 					for (candidate_index, candidate) in candidates.iter_mut().enumerate() {
 						if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
@@ -554,13 +575,33 @@ impl<T: Config> Pallet<T> {
 						if candidate.availability_votes.count_ones() >= threshold {
 							// We can only enact a candidate if we've enacted all of its
 							// predecessors already.
-							let can_enact = if candidate_index == 0 {
+							let mut can_enact = if candidate_index == 0 {
 								last_enacted_index == None
 							} else {
 								let prev_candidate_index = usize::try_from(candidate_index - 1)
 									.expect("Previous `if` would have caught a 0 candidate index.");
 								matches!(last_enacted_index, Some(old_index) if old_index == prev_candidate_index)
 							};
+
+							// Speculative messaging (v4 only): if requires are not satisfied,
+							// drop this candidate and all its descendants rather than stalling.
+							// Stalling would block the core until the availability timeout;
+							// dropping immediately lets the collator retry on the next slot.
+							if can_enact &&
+								candidate.descriptor.version() == CandidateDescriptorVersion::V4 &&
+								!Self::requires_satisfied(&candidate.commitments.requires)
+							{
+								log::debug!(
+									target: LOG_TARGET,
+									"dropping v4 candidate {:?} (para {:?}): unsatisfied requires",
+									candidate.hash, paraid,
+								);
+								// Record the first drop index; stop looking for more to enact.
+								if drop_from_index.is_none() {
+									drop_from_index = Some(candidate_index);
+								}
+								can_enact = false;
+							}
 
 							if can_enact {
 								last_enacted_index = Some(candidate_index);
@@ -600,9 +641,30 @@ impl<T: Config> Pallet<T> {
 							weight.saturating_accrue(enact_weight);
 						}
 					}
+
+					// Drop candidates with unsatisfied requires (and all their descendants).
+					// These have already become available but cannot be enacted; removing them
+					// immediately frees the core so the collator can retry on the next slot
+					// rather than waiting out the full availability timeout.
+					if let Some(drop_idx) = drop_from_index {
+						// Adjust for how many candidates were already drained above.
+						let enacted_count = last_enacted_index.map_or(0, |i| i + 1);
+						let adjusted = drop_idx.saturating_sub(enacted_count);
+						// Drain from the adjusted position to end, freeing all cores.
+						for candidate in candidates.drain(adjusted..) {
+							log::debug!(
+								target: "runtime::inclusion",
+								"Dropping candidate {:?} (para {:?}): unsatisfied requires",
+								candidate.hash,
+								paraid,
+							);
+							freed_cores.push((candidate.core, candidate.hash));
+						}
+					}
 				}
 			});
 		}
+
 		// For relay chain blocks, we're (ab)using the proof size
 		// to limit the raw transaction size of `ParaInherent` and
 		// there's no state proof (aka PoV) associated with it.
@@ -716,7 +778,7 @@ impl<T: Config> Pallet<T> {
 						pending_availability.push_back(new_candidate);
 					} else {
 						*pending_availability =
-							Some([new_candidate].into_iter().collect::<VecDeque<_>>())
+							Some([new_candidate].into_iter().collect::<VecDeque<_>>());
 					}
 				});
 
@@ -844,6 +906,28 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	// ── Phase 1 Speculative Messaging helpers ────────────────────────────────────
+
+	/// Read the latest provides root for a parachain.
+	pub(crate) fn provides_root(
+		para_id: &polkadot_primitives::Id,
+	) -> Option<polkadot_primitives::Hash> {
+		ProvidesRoots::<T>::get(para_id)
+	}
+
+	/// Returns true when every requirement matches the persisted provides root.
+	pub(crate) fn requires_satisfied(requires: &[RequiresCommitment]) -> bool {
+		requires.iter().all(|r| Self::provides_root(&r.source) == Some(r.expected_root))
+	}
+
+	/// Update the provides root after a candidate is enacted.
+	pub(crate) fn update_provides_root(
+		para_id: polkadot_primitives::Id,
+		root: polkadot_primitives::Hash,
+	) {
+		ProvidesRoots::<T>::insert(para_id, root);
+	}
+
 	fn enact_candidate(
 		relay_parent_number: BlockNumberFor<T>,
 		receipt: CommittedCandidateReceipt<T::Hash>,
@@ -852,6 +936,7 @@ impl<T: Config> Pallet<T> {
 		core_index: CoreIndex,
 		backing_group: GroupIndex,
 	) {
+		let candidate_hash = receipt.hash();
 		let plain = receipt.to_plain();
 		let commitments = receipt.commitments;
 		let config = configuration::ActiveConfig::<T>::get();
@@ -902,6 +987,21 @@ impl<T: Config> Pallet<T> {
 			receipt.descriptor.para_id(),
 			commitments.horizontal_messages,
 		);
+
+		// Finalize speculative messaging: check requirements and update ProvidesRoots.
+		if !Self::requires_satisfied(&commitments.requires) {
+			defensive!(
+				"Candidate {:?} requirements no longer satisfied at enactment",
+				candidate_hash
+			);
+		} else if let Some(ref p) = commitments.provides {
+			log::debug!(
+				target: LOG_TARGET,
+				"updating ProvidesRoots[{:?}] = {:?} after enactment",
+				receipt.descriptor.para_id(), p.root,
+			);
+			Self::update_provides_root(receipt.descriptor.para_id(), p.root);
+		}
 
 		Self::deposit_event(Event::<T>::CandidateIncluded(
 			plain,
