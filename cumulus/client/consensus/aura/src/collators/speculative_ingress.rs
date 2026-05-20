@@ -119,35 +119,36 @@ where
 
 		let sender_best = sender.best_block_hash();
 
+		// Fetch the relay's committed provides_root for this source.
+		// None / default means the sender has not yet been relay-enacted.
+		let relay_provides_root: Option<Hash> = relay_client
+			.provides_root(*source, relay_parent)
+			.await
+			.ok()
+			.flatten()
+			.filter(|r| *r != Hash::default());
+
 		// If the relay chain has a newer provides root for this source, find the matching
 		// sender block so we fetch the right batch.
 		let mut fetch_at = sender_best;
-		if let Ok(Some(relay_provides_root)) =
-			relay_client.provides_root(*source, relay_parent).await
-		{
-			if relay_provides_root != Hash::default() &&
-				relay_provides_root != expected_provides_root
-			{
+		if let Some(relay_root) = relay_provides_root {
+			if relay_root != expected_provides_root {
 				tracing::debug!(
 					target: "aura::cumulus",
 					source = ?source,
-					?relay_provides_root,
+					?relay_root,
 					?expected_provides_root,
 					"relay provides_root advanced; looking up sender block for new root",
 				);
 				if let Some(at_relay) =
-					sender.block_hash_for_provides_root(sender_best, relay_provides_root).await
+					sender.block_hash_for_provides_root(sender_best, relay_root).await
 				{
 					fetch_at = at_relay;
 				} else {
-					// Cannot locate the relay-root block — fall back to sender_best and let
-					// the relay's enactment-time check decide. ProvidesRoots lags by 1-2
-					// relay blocks, so a root mismatch at fetch time is normal and the
-					// candidate may still succeed once the sender's block is enacted.
 					tracing::debug!(
 						target: "aura::cumulus",
 						source = ?source,
-						?relay_provides_root,
+						?relay_root,
 						"could not find sender block for relay provides_root; using sender best",
 					);
 				}
@@ -167,6 +168,26 @@ where
 		.await
 		{
 			Some(batch) => {
+				// Root guard: only submit a speculative batch when the relay has already
+				// committed a matching provides_root for this source. This ensures the
+				// relay's requires_satisfied check will pass at inclusion time, preventing
+				// the competing n_requires=0 / n_requires=1 fork contention that causes
+				// post-delivery stalls.
+				//
+				// Trade-off: we lose the narrow speculative window before relay enactment
+				// (~6-18s), but eliminate the ~60s stall when the wrong fork gets backed.
+				let relay_committed = relay_provides_root
+					.map_or(false, |r| r == batch.provides_root);
+				if !relay_committed {
+					tracing::debug!(
+						target: "aura::cumulus",
+						source = ?source,
+						?relay_provides_root,
+						batch_provides_root = ?batch.provides_root,
+						"root guard: relay has not committed matching provides_root; skipping batch",
+					);
+					continue;
+				}
 				tracing::debug!(
 					target: "aura::cumulus",
 					source = ?source,

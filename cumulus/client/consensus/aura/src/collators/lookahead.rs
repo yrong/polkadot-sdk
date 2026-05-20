@@ -69,7 +69,7 @@ use sp_runtime::{
 	Saturating,
 };
 use sp_timestamp::Timestamp;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 /// Parameters for [`run`].
 pub struct Params<BI, CIDP, Client, Backend, RClient, CHP, ProposerFactory, CS> {
@@ -291,6 +291,11 @@ where
 			params.overseer_handle.clone(),
 		);
 
+		// Track para block heights where we have already submitted a speculative collation
+		// (n_requires > 0). Non-speculative (n_requires=0) forks at those same heights are
+		// suppressed so the relay cannot prefer a simpler fork over the delivery block.
+		let mut speculative_built_heights = BTreeSet::new();
+
 		while let Some(relay_parent_header) = import_notifications.next().await {
 			let relay_parent = relay_parent_header.hash();
 
@@ -357,6 +362,9 @@ where
 			let para_client = &*params.para_client;
 			let keystore = &params.keystore;
 			let included_block_hash = included_header.hash();
+
+			// Prune heights that have been relay-included — no longer need suppression.
+			speculative_built_heights.retain(|h| h > included_header.number());
 
 			// Build in a loop until not allowed. Note that the authorities can change
 			// at any block, so we need to re-claim our slot every time.
@@ -561,6 +569,27 @@ where
 							n_ump = collation.upward_messages.len(),
 							"collation built successfully",
 						);
+
+						// Suppress a non-speculative fork if we already submitted a speculative
+						// collation at this height. The relay has no preference for the richer
+						// candidate, so giving it a simpler alternative risks it backing the
+						// simpler fork and orphaning the delivery block.
+						if collation.requires.is_empty() &&
+							speculative_built_heights.contains(new_block_header.number())
+						{
+							tracing::debug!(
+								target: crate::LOG_TARGET,
+								block_number = %new_block_header.number(),
+								"suppressing non-speculative fork: speculative collation already submitted at this height",
+							);
+							parent_hash = new_block_hash;
+							parent_header = new_block_header;
+							continue;
+						}
+
+						if !collation.requires.is_empty() {
+							speculative_built_heights.insert(*new_block_header.number());
+						}
 
 						// Here we are assuming that the import logic protects against equivocations
 						// and provides sybil-resistance, as it should.
