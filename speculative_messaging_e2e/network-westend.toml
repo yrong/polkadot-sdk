@@ -1,0 +1,80 @@
+# Speculative messaging POC — two Penpal parachains on Westend-local.
+#
+# Para 2000 = SENDER  — produces outbound XCM via pallet-speculative-outbox.
+# Para 2001 = RECEIVER — fetches batches from the sender over JSON-RPC and
+#                        includes them via pallet-speculative-inbox.
+#
+# Build before running:
+#   cargo build -p polkadot --release
+#   cargo build -p polkadot-parachain --release
+#
+# Run with zombienet (native provider):
+#   zombienet --provider native spawn speculative_messaging_e2e/network.toml
+#
+# The sender's RPC port is pinned to 9955 so the receiver can reference it
+# at a known address via --speculative-sender.
+
+[relaychain]
+default_command = "{{POLKADOT_BINARY}}"
+default_args = [
+	"-lparachain=debug,runtime=debug,runtime::inclusion=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug,parachain::collator-protocol=debug",
+	"--pruning=archive",
+]
+chain = "westend-local"
+
+[[relaychain.nodes]]
+name = "alice"
+validator = true
+ws_port = 9901
+balance = 2000000000000000000000
+
+[[relaychain.nodes]]
+name = "bob"
+validator = true
+balance = 2000000000000000000000
+
+[[relaychain.nodes]]
+name = "charlie"
+validator = true
+balance = 2000000000000000000000
+
+[[relaychain.nodes]]
+name = "dave"
+validator = true
+balance = 2000000000000000000000
+
+# ── Para 2000: Sender ─────────────────────────────────────────────────────────
+
+[[parachains]]
+id = 2000
+chain = "penpal-westend-2000"
+cumulus_based = true
+
+[[parachains.collators]]
+name = "sender"
+validator = true
+command = "{{POLKADOT_PARACHAIN_BINARY}}"
+ws_port = 9955
+args = [
+	"--force-authoring",
+	"-lparachain=debug,cumulus-collator=debug,speculative::outbox=debug,aura::cumulus=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug",
+	"--pruning=archive",
+]
+
+[[parachains]]
+id = 2001
+chain = "penpal-westend-2001"
+cumulus_based = true
+
+[[parachains.collators]]
+name = "receiver"
+validator = true
+command = "{{POLKADOT_PARACHAIN_BINARY}}"
+ws_port = 9966
+args = [
+	"--force-authoring",
+	# Pull speculative batches from the sender via its JSON-RPC endpoint.
+	"--speculative-sender=2000=ws://127.0.0.1:9955",
+	"-lparachain=debug,cumulus-collator=debug,speculative::inbox=debug,aura::cumulus=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug",
+	"--pruning=archive",
+]
