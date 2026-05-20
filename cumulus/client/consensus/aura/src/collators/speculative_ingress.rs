@@ -77,7 +77,7 @@ impl SpeculativeMessageSources {
 /// message cursor via [`SpeculativeInboxApi`].
 pub async fn fetch_ingress_for_block<Block, Client, RClient>(
 	receiver: &Client,
-	receiver_parent: Hash,
+	_receiver_parent: Hash,
 	destination: ParaId,
 	config: &SpeculativeMessageSources,
 	relay_parent: Hash,
@@ -97,6 +97,11 @@ where
 	let receiver_api = receiver.runtime_api();
 	let mut batches = Vec::new();
 
+	// Use the finalized head for position tracking rather than the fork parent.
+	// This prevents re-delivering messages that are already committed on the
+	// canonical chain when the collator builds competing forks from older parents.
+	let finalized_hash = receiver.usage_info().chain.finalized_hash;
+
 	tracing::debug!(
 		target: "aura::cumulus",
 		%relay_parent_number,
@@ -106,10 +111,10 @@ where
 
 	for (source, sender) in &config.sources {
 		let from_position = receiver_api
-			.next_expected_message_position(receiver_parent, *source)
+			.next_expected_message_position(finalized_hash, *source)
 			.unwrap_or(0);
 		let expected_provides_root = receiver_api
-			.last_seen_provides_root(receiver_parent, *source)
+			.last_seen_provides_root(finalized_hash, *source)
 			.unwrap_or_default();
 
 		let sender_best = sender.best_block_hash();
@@ -135,7 +140,11 @@ where
 				{
 					fetch_at = at_relay;
 				} else {
-					tracing::warn!(
+					// Cannot locate the relay-root block — fall back to sender_best and let
+					// the relay's enactment-time check decide. ProvidesRoots lags by 1-2
+					// relay blocks, so a root mismatch at fetch time is normal and the
+					// candidate may still succeed once the sender's block is enacted.
+					tracing::debug!(
 						target: "aura::cumulus",
 						source = ?source,
 						?relay_provides_root,
