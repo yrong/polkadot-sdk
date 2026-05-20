@@ -1976,13 +1976,13 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | 10.1 | Primitives & version gating | ✅ | `v10` types, `MMRExtensionProof.old_leaf_count`, `CandidateDescriptorV2::new_v4()` version-byte approach. V4 struct family removed. |
 | 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `requires_commitments`. 11/11 tests pass. |
 | 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
-| 10.4 | Collator-side inherent injection & commitment assembly | ✅ | Lookahead collator path complete: `speculative_ingress` fetched in `lookahead.rs` before block proposal, injected via `create_inherent_data`; after `build_collation` returns, `compute_provides_root` and `requires_commitments` are queried against the newly built block hash and patched directly onto the collation (`collation.provides`, `collation.requires`). `build_multi_block_collation` and `ServiceInterface` are unchanged — speculative fields are set only in the post-build patch. Slot-based collator has no speculative logic (not used for the POC). Collator-side LBP pre-fetch deferred (see §12). |
+| 10.4 | Collator-side inherent injection & commitment assembly | ✅ | Lookahead collator path complete: `speculative_ingress` fetched in `lookahead.rs` before block proposal, injected via `create_inherent_data`; after `build_collation` returns, `compute_provides_root` and `requires_commitments` are queried against the newly built block hash and patched directly onto the collation (`collation.provides`, `collation.requires`). **Root guard** (`speculative_ingress.rs`): batch is only included if `relay_provides_root == batch.provides_root`; premature speculative submissions (relay hasn't committed sender's block yet) are dropped, eliminating n_requires=0/n_requires=1 fork contention and post-delivery stalls. **Fork suppression** (`lookahead.rs`): `speculative_built_heights: BTreeSet<BlockNumber>` tracks heights where a speculative collation was submitted; n_requires=0 collations at those heights are suppressed on subsequent relay-parent notifications. `build_multi_block_collation` and `ServiceInterface` are unchanged. Slot-based collator has no speculative logic (not used for the POC). Collator-side LBP pre-fetch deferred (see §12). |
 | 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4` via `TrailingOption<ValidationResultExtension>` (not a separate `ValidationResultV4` struct — backward-compatible trailing field on existing `ValidationResult`). `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
 | 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
 | 10.9 | Off-chain networking | ✅ | `OutboxQuery` async trait with `RpcOutboxClient` (JSON-RPC WebSocket). `SpeculativeMessageSources` is generic-free. `fetch_ingress_for_block` is fully async. `--speculative-sender <PARA_ID>=<WS_URL>` CLI arg added to omni-node. At startup the lookahead collator async-connects to each configured sender and populates `SpeculativeMessageSources`; connection failures are logged and skipped gracefully. Slot-based collator has no speculative networking (not used for the POC). |
-| 10.10 | POC runtime & test milestones | 🔶 | Milestones 1–5 ✅. E2e tooling lives at `speculative_messaging_e2e/` in the repo root: `network.toml` (two Penpal instances — para 2000 sender, para 2001 receiver — on Rococo-local), `start-testnet.sh`, `send-xcm.js`, `observe.js`. Receiver started with `--speculative-sender 2000=ws://127.0.0.1:9955`. Milestones 6–8 (live network verification) pending actual run. |
+| 10.10 | POC runtime & test milestones | ✅ | All milestones complete. E2e tooling lives at `speculative_messaging_e2e/` in the repo root: `network-rococo.toml` (two Penpal instances — para 2000 sender, para 2001 receiver — on Rococo-local), `start-testnet.sh`, `send-xcm.js`, `observe.js`. Receiver started with `--speculative-sender 2000=ws://127.0.0.1:9955`. `send-xcm.js` uses `subscribeAllHeads` (not `subscribeNewHeads`) so speculative delivery in non-best fork blocks is detected. Live runs confirm end-to-end delivery with latency ~18–30 s (sender relay-inclusion + receiver slot alignment). |
 
 ---
 
@@ -2093,3 +2093,297 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 
 - [speculative-messaging-design.md](speculative-messaging-design.md) — Full high-level design including Late Block Proofs, trust domains, super chains, and LLv2 integration.
 - [xcmp-mmd-minimal-poc.md](xcmp-mmd-minimal-poc.md) — Superseded earlier POC using BEEFY-anchored proofs. Retained for historical reference.
+
+---
+
+## 14. Appendix: Collator-Side Code Walkthrough
+
+End-to-end trace of how speculative messaging fields flow through the collator
+pipeline on each slot, with file and line references.
+
+### 14.1 Entry Point
+
+```
+cumulus/polkadot-omni-node/lib/src/nodes/aura.rs:948
+  StartLookaheadAuraConsensus::start_consensus()
+    → aura::run_with_export()          [cumulus/client/consensus/aura/src/collators/lookahead.rs]
+```
+
+`StartLookaheadAuraConsensus` is the omni-node's lookahead collator handle. It
+carries `speculative_sources` (populated from `--speculative-sender` CLI args at
+startup) down into the per-slot loop inside `run_with_export`.
+
+### 14.2 Per-Slot Flow
+
+**Step 1 — Fetch ingress** (`lookahead.rs:445–458`)
+
+```rust
+let speculative_ingress = if params.speculative_sources.sources.is_empty() {
+    empty_speculative_ingress()
+} else {
+    fetch_ingress_for_block(...).await   // speculative_ingress.rs
+};
+```
+
+`fetch_ingress_for_block` queries each configured sender chain via `OutboxQuery`
+(either `DirectOutboxClient` or `RpcOutboxClient`), builds `MessageBatch`es, and
+returns a `SpeculativeIngress`.
+
+**Root guard.** After building each batch, `fetch_ingress_for_block` checks
+whether the relay chain has already committed a matching `provides_root` for the
+source parachain (`relay_provides_root == batch.provides_root`). If not, the batch
+is silently dropped and the block is built without speculative ingress (`n_requires=0`).
+This ensures the relay's `requires_satisfied` check passes at inclusion time,
+eliminating the fork-contention stall that occurs when a premature `n_requires=1`
+candidate competes with simpler `n_requires=0` forks. Tradeoff: the narrow
+pre-enactment speculative window (~6–18 s before the relay commits the sender's
+block) is lost; steady-state delivery latency is ~18–30 s (sender relay-inclusion
+plus receiver slot alignment).
+
+**Step 2 — Inject as inherent** (`lookahead.rs:468–485`)
+
+```rust
+let (parachain_inherent_data, other_inherent_data) =
+    collator.create_inherent_data(..., Some(speculative_ingress)).await;
+```
+
+`create_inherent_data` puts the `SpeculativeIngress` into `InherentData` under
+`SPECULATIVE_INGRESS_IDENTIFIER`. During block construction, `ProvideInherent`
+for `pallet-speculative-inbox` picks it up and creates the
+`ingest_verified_messages` extrinsic in the block body.
+
+**Step 3 — Build block and collation** (`lookahead.rs:512–521`)
+
+```rust
+collator.collate(..., (parachain_inherent_data, other_inherent_data), ...).await
+```
+
+Internally calls `build_block_and_import` (executes the block, running
+`ingest_verified_messages` which verifies batches, updates `IncomingState`, and
+writes `ConsumedSourcesThisBlock`), then `collator_service.build_collation` to
+wrap the block into a `Collation` with its PoV.
+
+**Step 4 — Patch speculative fields** (`lookahead.rs:536–551`)
+
+```rust
+let runtime_api = para_client.runtime_api();
+let provides = runtime_api.compute_provides_root(new_block_hash).unwrap_or(None);
+let requires = runtime_api.requires_commitments(new_block_hash).unwrap_or_default();
+collation.provides = provides;
+collation.requires = requires;
+```
+
+After block execution, these runtime API calls read the sender-side MMR root
+(`OutgoingMMRs` → `compute_provides_root`) and the receiver-side consumed sources
+(`ConsumedSourcesThisBlock` → `requires_commitments`) from the newly built block's
+state. The values are patched directly onto the `Collation` struct.
+
+**Fork suppression.** Immediately after patching, the collator checks whether
+`collation.requires` is non-empty (i.e. `n_requires > 0`). If so, it inserts the
+block number into a per-session `BTreeSet<BlockNumber>` called
+`speculative_built_heights`. On any subsequent relay-parent notification, if the
+collator would build a `n_requires=0` collation at a height already in the set, it
+skips the `SubmitCollation` call and advances `parent_hash` without submitting.
+The set is pruned to heights above the current `included_header.number()` on each
+relay-parent iteration.
+
+This prevents the relay from being offered a simpler non-speculative alternative
+after a speculative one has already been submitted, closing the window where the
+relay could back the wrong fork and cause a post-delivery stall.
+
+**Step 5 — Commitments assembly** (`polkadot/node/collation-generation/src/lib.rs:620–647`)
+
+```rust
+let provides = collation.provides.map(|p| ProvidesCommitment { root: p.root });
+let requires = collation.requires.into_iter()
+    .map(|r| RequiresCommitment { source: r.source, expected_root: r.expected_root })
+    .collect();
+
+let commitments = CandidateCommitments {
+    upward_messages, horizontal_messages, new_validation_code,
+    head_data, processed_downward_messages, hrmp_watermark,
+    provides,
+    requires,
+};
+```
+
+The collation-generation subsystem reads `collation.provides/requires`, maps them
+into the primitives types, and assembles `CandidateCommitments`. The commitments
+are hashed to produce `commitments_hash` in the `CandidateDescriptor`, which is
+what backing validators check against after running the PVF.
+
+### 14.3 Relay Chain Side Walkthrough
+
+All relay-chain speculative messaging logic lives in
+`polkadot/runtime/parachains/src/inclusion/mod.rs`.
+
+**Storage** (line 376)
+
+```rust
+pub(crate) type ProvidesRoots<T: Config> =
+    StorageMap<_, Twox64Concat, polkadot_primitives::Id, polkadot_primitives::Hash>;
+```
+
+One hash per parachain — the latest enacted `provides` root. Overwritten on each
+successful enactment; no history kept.
+
+**Stage 1 — Backing / pending-availability admission** (`process_candidates`)
+
+`process_candidates` accepts backed candidates and moves them into
+`PendingAvailability`. The full `CandidateCommitments` (including `provides` and
+`requires`) are stored there unchanged. No `requires` satisfaction check happens
+here — the relay chain does not gate backing on speculative dependencies.
+
+**Stage 2 — Availability check and enactment gate** (lines 590–603)
+
+Once a candidate accumulates enough availability votes, the relay chain decides
+whether to enact it:
+
+```rust
+if can_enact &&
+    candidate.descriptor.version() == CandidateDescriptorVersion::V4 &&
+    !Self::requires_satisfied(&candidate.commitments.requires)
+{
+    // Drop this candidate and all its descendants.
+    drop_from_index = Some(candidate_index);
+    can_enact = false;
+}
+```
+
+`requires_satisfied` is a pure hash comparison (line 919):
+
+```rust
+pub(crate) fn requires_satisfied(requires: &[RequiresCommitment]) -> bool {
+    requires.iter().all(|r| Self::provides_root(&r.source) == Some(r.expected_root))
+}
+```
+
+If unsatisfied, the candidate is dropped immediately rather than stalling the
+core — letting the collator retry on the next slot. The check is only applied to
+V4 candidates; V1/V2/V3 candidates skip it entirely.
+
+**Stage 3 — Enactment** (`enact_candidate`, lines 991–1003)
+
+```rust
+if !Self::requires_satisfied(&commitments.requires) {
+    defensive!("requirements no longer satisfied at enactment");
+} else if let Some(ref p) = commitments.provides {
+    Self::update_provides_root(receipt.descriptor.para_id(), p.root);
+}
+```
+
+After all standard effects (UMP, HRMP, head update), the relay chain:
+1. Re-checks `requires` as a defensive assertion (should always pass since stage 2 already verified it)
+2. If the candidate has a `provides` commitment, writes `ProvidesRoots[para_id] = root`
+
+This persisted root is what future receiver candidates match against in their
+`RequiresCommitment.expected_root`.
+
+**What the relay chain does NOT do**
+
+- No MMR or Merkle proof verification — all cryptographic work is in the PVF
+- No message payload storage — payloads live in the parachain's block body
+- No history — only the latest `ProvidesRoots` entry per parachain is kept
+- No in-block ordering — a providing and consuming candidate in the same relay
+  block: the provider must be enacted first; the consumer succeeds in relay
+  block N+1
+
+### 14.4 Late Block Proof Collator Integration Plan
+
+The PVF side (`validate_block/implementation.rs`) is fully implemented. The gap
+is the collator-side pre-fetch and PoV wrapping. The natural integration points
+are `speculative_ingress.rs` and `lookahead.rs`, with no changes needed to the
+PVF or relay chain.
+
+**Step 1 — Add `generate_late_block_proof` to `OutboxQuery`** (`outbox_client.rs`)
+
+```rust
+async fn generate_late_block_proof(
+    &self,
+    at: Hash,
+    dest: ParaId,
+    old_provides_root: Hash,
+) -> Option<LateBlockProof>;
+```
+
+Implement for both `DirectOutboxClient` (calls `SpeculativeOutboxApi::generate_late_block_proof`)
+and `RpcOutboxClient` (translates to `state_call`).
+
+**Step 2 — Fetch LBPs alongside batches** (`speculative_ingress.rs`)
+
+After building each batch in `fetch_ingress_for_block`, compare
+`batch.provides_root` against `relay_client.provides_root(source, relay_parent)`.
+If they differ, call `sender.generate_late_block_proof(fetch_at, dest, batch.provides_root)`.
+
+Change the return type from `SpeculativeIngress` to a tuple:
+```rust
+(SpeculativeIngress, Vec<LateBlockProof>)
+```
+
+**Step 3 — Override `requires` with transformed roots** (`lookahead.rs`)
+
+After `runtime_api.requires_commitments()`, apply proof-transformed roots:
+```rust
+for proof in &late_block_proofs {
+    if let Some(r) = requires.iter_mut().find(|r| r.source == proof.source) {
+        r.expected_root = proof.new_provides_root;
+    }
+}
+```
+
+**Step 4 — Re-wrap the PoV as `ParachainBlockDataV4`** (`lookahead.rs`)
+
+After `collate()` returns, if there are late block proofs, decompress the PoV,
+re-encode as `ParachainBlockDataV4`, and re-compress:
+```rust
+if !late_block_proofs.is_empty() {
+    if let MaybeCompressedPoV::Compressed(ref pov) = collation.proof_of_validity {
+        let decompressed = pov.decompress()?;
+        let inner = ParachainBlockData::decode(&mut &decompressed.block_data.0[..])?;
+        let pov_v4 = ParachainBlockDataV4 { inner, late_block_proofs };
+        collation.proof_of_validity = maybe_compress_pov(PoV {
+            block_data: BlockData(pov_v4.encode()),
+        });
+    }
+}
+```
+
+The decompress/re-encode/re-compress only triggers when a LBP is actually needed
+(source root has advanced), not on every block. For production, the cleaner approach
+is to pass `late_block_proofs` into `build_collation` in `service.rs` before
+compression, avoiding the round-trip — but that requires a signature change.
+
+**No changes needed:** PVF side (`validate_block/implementation.rs`), relay chain
+(`inclusion/mod.rs`), or `collation-generation`.
+
+### 14.5 Summary Diagram
+
+```
+StartLookaheadAuraConsensus::start_consensus()  [aura.rs:948]
+  └─ aura::run_with_export()  [lookahead.rs]
+       └─ per slot:
+            ├─ fetch_ingress_for_block()  [speculative_ingress.rs]
+            │    └─ OutboxQuery (DirectOutboxClient / RpcOutboxClient)
+            │         → MessageBatch[]  →  SpeculativeIngress
+            │
+            ├─ collator.create_inherent_data(Some(speculative_ingress))
+            │    └─ InherentData[SPECULATIVE_INGRESS_IDENTIFIER] = ingress
+            │
+            ├─ collator.collate(inherent_data)  [collator.rs:377]
+            │    ├─ build_block_and_import()
+            │    │    └─ block execution:
+            │    │         ingest_verified_messages()  ← verifies proofs, updates
+            │    │         IncomingState, writes ConsumedSourcesThisBlock
+            │    └─ collator_service.build_collation()
+            │         → Collation (provides/requires still empty)
+            │
+            ├─ runtime_api.compute_provides_root(new_block_hash)
+            │    → collation.provides = Some(ProvidesCommitment { root })
+            ├─ runtime_api.requires_commitments(new_block_hash)
+            │    → collation.requires = Vec<RequiresCommitment>
+            │
+            └─ collation-generation subsystem  [collation-generation/src/lib.rs:620]
+                 → CandidateCommitments { ..., provides, requires }
+                 → commitments_hash in CandidateDescriptor
+                 → submitted to relay chain for backing
+```
