@@ -11,12 +11,16 @@ echo "=== Stopping speculative messaging testnet ==="
 # zombienet itself: matched by the network.toml path or the spawn command.
 if pkill -f "speculative_messaging_e2e/network.toml" 2>/dev/null; then
   echo "  stopped zombienet"
+else
+  echo "  no zombienet running"
 fi
 
 # Kill any residual polkadot / polkadot-parachain processes from this testnet.
 # Match on the data dir zombienet created so we don't kill unrelated nodes.
 if pkill -f "${ZOMBIENET_DIR}" 2>/dev/null; then
   echo "  stopped child node processes"
+else
+  echo "  no child node processes running"
 fi
 
 # Brief wait to let processes exit cleanly before removing their files.

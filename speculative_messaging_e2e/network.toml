@@ -1,4 +1,4 @@
-# Speculative messaging POC — two Penpal parachains on Westend-local.
+# Speculative messaging POC — two Penpal parachains on Rococo-local.
 #
 # Para 2000 = SENDER  — produces outbound XCM via pallet-speculative-outbox.
 # Para 2001 = RECEIVER — fetches batches from the sender over JSON-RPC and
@@ -9,7 +9,7 @@
 #   cargo build -p polkadot-parachain --release
 #
 # Run with zombienet (native provider):
-#   zombienet --provider native spawn speculative_messaging_e2e/network.toml
+#   zombienet --provider native spawn speculative_messaging_e2e/network-rococo.toml
 #
 # The sender's RPC port is pinned to 9955 so the receiver can reference it
 # at a known address via --speculative-sender.
@@ -20,7 +20,7 @@ default_args = [
 	"-lparachain=debug,runtime=debug,runtime::inclusion=debug,parachain::collation-generation=debug,parachain::candidate-backing=debug,parachain::candidate-validation=debug,parachain::collator-protocol=debug",
 	"--pruning=archive",
 ]
-chain = "westend-local"
+chain = "rococo-local"
 
 [[relaychain.nodes]]
 name = "alice"
@@ -47,7 +47,7 @@ balance = 2000000000000000000000
 
 [[parachains]]
 id = 2000
-chain = "penpal-westend-2000"
+chain = "penpal-rococo-2000"
 cumulus_based = true
 
 [[parachains.collators]]
@@ -63,7 +63,7 @@ args = [
 
 [[parachains]]
 id = 2001
-chain = "penpal-westend-2001"
+chain = "penpal-rococo-2001"
 cumulus_based = true
 
 [[parachains.collators]]

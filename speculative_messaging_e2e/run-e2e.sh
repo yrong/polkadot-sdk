@@ -27,6 +27,10 @@ export RELAY_WS="${RELAY_WS:-ws://127.0.0.1:9901}"
 export SENDER_WS="${SENDER_WS:-ws://127.0.0.1:9955}"
 export RECEIVER_WS="${RECEIVER_WS:-ws://127.0.0.1:9966}"
 
+echo "=== [0/3] Cleanup any previous testnet ==="
+"${E2E_DIR}/cleanup.sh"
+
+echo
 echo "=== [1/3] Build binaries (PROFILE=${PROFILE}) ==="
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "${E2E_DIR}/build-binaries.sh"

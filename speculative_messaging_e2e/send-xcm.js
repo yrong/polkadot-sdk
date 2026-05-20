@@ -17,7 +17,7 @@
 
 const { ApiPromise, WsProvider, Keyring } = require('@polkadot/api');
 const { u8aEq, u8aToHex, u8aConcat, stringToU8a, u8aFixLength } = require('@polkadot/util');
-const { blake2AsU8a, cryptoWaitReady } = require('@polkadot/util-crypto');
+const { blake2AsU8a, xxhashAsU8a, cryptoWaitReady } = require('@polkadot/util-crypto');
 
 const SENDER_WS       = process.env.SENDER_WS    || 'ws://127.0.0.1:9955';
 const RECEIVER_WS     = process.env.RECEIVER_WS  || 'ws://127.0.0.1:9966';
@@ -57,7 +57,16 @@ async function maybePrefund(destApi, signer, paraId) {
   console.log('  prefund included');
 }
 
+// Compute the System.Events storage key (no map key — it's a plain StorageValue).
+// Key = xxhash128("System") ++ xxhash128("Events")
+function eventsStorageKey() {
+  const prefix = u8aConcat(xxhashAsU8a('System', 128), xxhashAsU8a('Events', 128));
+  return u8aToHex(prefix);
+}
+
 async function waitForRemarked(api, expected, timeoutMs) {
+  const storageKey = eventsStorageKey();
+
   return new Promise((resolve, reject) => {
     let done = false;
     let unsub;
@@ -68,20 +77,27 @@ async function waitForRemarked(api, expected, timeoutMs) {
 
     const check = async (blockHash) => {
       if (done) return;
-      const apiAt = await api.at(blockHash);
-      const events = await apiAt.query.system.events();
-      for (const { event } of events) {
-        if (event.section === 'system' && event.method === 'Remarked') {
-          if (u8aEq(event.data[1].toU8a(), expected)) {
-            done = true; clearTimeout(timer); unsub?.();
-            resolve({ blockHash: blockHash.toHex() });
-            return;
+      try {
+        // Query events storage directly — bypasses extrinsic decoding entirely.
+        const raw = await api.rpc.state.getStorage(storageKey, blockHash);
+        if (!raw || raw.isEmpty) return;
+        const events = api.registry.createType('Vec<FrameSystemEventRecord>', raw.toU8a(true));
+        for (const record of events) {
+          const { event } = record;
+          if (event.section === 'system' && event.method === 'Remarked') {
+            if (u8aEq(event.data[1].toU8a(), expected)) {
+              done = true; clearTimeout(timer); unsub?.();
+              resolve({ blockHash: blockHash.toHex() });
+              return;
+            }
           }
         }
+      } catch (e) {
+        console.warn(`  [waitForRemarked] error checking block ${blockHash.toHex()}: ${e.message}`);
       }
     };
 
-    api.rpc.chain.subscribeNewHeads(h => check(h.hash))
+    api.rpc.chain.subscribeAllHeads(h => check(h.hash))
       .then(u => { unsub = u; if (done) unsub(); })
       .catch(e => { if (!done) reject(e); });
   });
