@@ -2076,11 +2076,76 @@ Legend: ✅ done · 🔶 partial · ❌ not started
   make the hashes differ, causing **all V2/V3 candidates from legacy parachains to
   fail the commitments hash check** on new relay chain nodes.
   The POC is unaffected because both Penpal instances run the upgraded runtime.
-  The fix for production requires version-conditional hash computation in
-  `candidate-validation/src/lib.rs`: for V2/V3 descriptors, reconstruct and hash
-  using a legacy 6-field struct; for V4, use the full 8-field struct. This in turn
-  requires either a separate `LegacyCandidateCommitments` type or properly freezing
-  v9 and versioning the full receipt chain (see §2).
+  **Fix plan (pre-production):** properly freeze `v9::CandidateCommitments`
+  (remove `provides`/`requires`) and introduce a genuinely additive
+  `v10::CandidateCommitments` with those fields. Steps:
+  1. Remove `provides`/`requires` from `v9::CandidateCommitments`; update
+     `v10/mod.rs` to define a new struct (not a re-export) with all v9 fields
+     plus the two new ones. Add `From<v9> for v10` (provides=None, requires=[]).
+  2. Make `CommittedCandidateReceipt` generic over the commitments type, or
+     introduce a `CommittedCandidateReceiptV4` — the generic approach is cleaner.
+  3. Update `collation-generation`: V4 descriptor path produces v10 commitments;
+     V2/V3 path stays with v9. Hash boundary is intentional — different versions,
+     different encodings.
+  4. Update `candidate-validation` and `backing`: thread the right commitments
+     type through `BackgroundValidationOutputs` based on descriptor version.
+  5. Update relay chain runtime: store v10 in `PendingAvailability` (convert
+     v9→v10 on admission); read `provides`/`requires` from v10 at enactment.
+  Legacy parachains without speculative pallets continue producing V2/V3
+  candidates with unchanged v9 encoding — zero impact on them.
+- **No HRMP fallback when speculative pathway is used.** The outbox pallet's
+  `XcmpMessageSource::take_outbound_messages` returns `Vec::new()`, suppressing
+  standard HRMP delivery. If the speculative pathway breaks (no receiver
+  collator fetching, relay root mismatch, fork suppression), those messages
+  are silently dropped — no fallback delivery mechanism exists. A sender
+  running with the speculative-outbox pallet cannot deliver messages to
+  receivers that lack the speculative-inbox pallet.
+  **Fix plan (pre-production):** either (a) make the outbox return messages
+  from `take_outbound_messages` in addition to recording them, or (b) add a
+  runtime flag per destination to toggle between speculative-only and dual-path
+  delivery. Option (b) is cleaner — dual-path means messages flow through both
+  speculative (fast) and HRMP (reliable fallback); the receiver deduplicates.
+- **Inherent `ingest_verified_messages` has no weight or size bounds.** The
+  call is annotated `(0, DispatchClass::Mandatory)` with no explicit limit on
+  `batches.len()` or per-batch `messages.len()`. While the collator-side cap
+  (`max_messages_per_source = 32`) and `MAX_REQUIRES_PER_BLOCK = 32` provide
+  practical bounding in the happy path, the unpriced weight means a buggy or
+  malicious inherent could submit an oversized payload that exceeds block
+  weight/proof-size limits at zero cost to the submitter.
+  **Fix plan (pre-production):** add a `RefundWeight`-style annotation or
+  explicit `batch_count * per_batch_weight + message_count * per_message_weight`
+  so the block author pays proportionally to the data submitted.
+- **Duplicated `Keccak256Merge` and MMR helpers across three crates.**
+  `Keccak256Merge`, `bag_peaks`, `append_leaf_to_peaks`, and
+  `verify_mmr_extension` are defined identically in `speculative-inbox`,
+  `speculative-outbox`, and `parachain-system/src/validate_block`. For the POC
+  this is acceptable, but production should extract them into a shared
+  `speculative-messaging-primitives` crate or reuse an existing MMR crate.
+- **`HistoricalProvidesRoots` / `HistoricalSubtreeState` storage growth.**
+  The 256-block retention window prunes per-block entries in `on_finalize`,
+  but `HistoricalSubtreeState` stores `(root, peaks, leaf_count)` per block
+  *per destination* — with many parachains this could accumulate significant
+  on-chain state within the window. Confirm worst-case storage under full load.
+  Consider reducing retention or pruning more aggressively.
+- **`subtree_inclusion_proof` rebuilds sorted root list on every call.**
+  `speculative-outbox/src/lib.rs` iterates all `OutgoingMMRState` entries,
+  sorts by ParaId, and builds a Merkle proof on every RPC query. For chains
+  with many active destinations this is O(D log D) per call. Cache the sorted
+  list (or the top-level Merkle tree) once per block in `on_finalize`.
+- **`ParachainHost` API version bumped 16→17 without migration guard.**
+  Adding `provides_root` to the vstaging runtime API increments the
+  `ParachainHost` version. Older nodes calling API v16 get an
+  `ApiError::Version` — harmless for non-speculative use but worth noting
+  in release notes. The `rococo`/`westend` genesis presets enable
+  `SpeculativeMessaging` unconditionally; a runtime upgrade gating the feature
+  behind a governance flag would be safer.
+- **End-to-end integration test for the full pipeline.** The existing tests
+  cover individual components (MMR, Merkle proofs, inclusion, inbox pallet
+  integration), but there is no test exercising the full flow from outbox
+  recording → off-chain batch fetch → inbox ingestion → relay inclusion
+  with `requires_satisfied`. Adding a `#[test]` that simulates two parachains
+  with the full speculative messaging stack would catch integration-level
+  regressions early.
 
 ### Optional Future Directions
 - Super-chain / intra-block messaging.
@@ -2387,3 +2452,168 @@ StartLookaheadAuraConsensus::start_consensus()  [aura.rs:948]
                  → commitments_hash in CandidateDescriptor
                  → submitted to relay chain for backing
 ```
+
+---
+
+## 15. Appendix: Execute-First, Match-Later — The Core Mental Model
+
+### 15.1 How This Differs From HRMP
+
+In HRMP the relay chain is in the **critical path** of message delivery:
+
+```
+Sender enacted on relay  →  relay stores payload in HRMP queue
+                         →  relay delivers to receiver at next inclusion
+                         →  receiver runtime reads from downward/HRMP queue
+```
+
+The relay mediates every step. The receiver cannot act until the relay has
+already confirmed the sender and routed the payload.
+
+Speculative messaging inverts this:
+
+```
+Receiver executes XCM speculatively (local, off-chain fetch)
+  →  block built, backed, made available
+  →  relay checks dependency at enactment time
+  →  pass → state changes canonical  /  fail → block dropped, retry
+```
+
+The relay chain is no longer in the critical path of *execution* — it is only
+in the critical path of *settlement*.
+
+### 15.2 What "Speculative" Means Precisely
+
+When the receiver collator builds a block it:
+
+1. Fetches the sender's `MessageBatch` directly over RPC (`RpcOutboxClient`)
+2. Injects it as a `SpeculativeIngress` inherent
+3. Executes the block — `ingest_verified_messages` verifies the subtree proof
+   locally, dispatches the XCM payload through `XcmpMessageHandler`, updates
+   balances and other state, and writes `ConsumedSourcesThisBlock`
+4. Reads back `requires_commitments()` from its own post-execution state and
+   patches `collation.requires`
+
+All of step 3 happens **before the relay chain has seen anything**. The receiver
+bets that the sender's block will be relay-committed by the time the receiver's
+own block reaches enactment. That is the speculation.
+
+The relay chain's `requires_satisfied` check at enactment time is the settlement:
+
+- **Bet wins** (sender enacted before or at receiver enactment): block is enacted,
+  XCM effects become canonical.
+- **Bet loses** (sender not yet enacted): block is dropped, state changes
+  discarded, collator retries next slot with a fresh fetch.
+
+### 15.3 Failure Is Safe
+
+Because the entire receiver block is discarded atomically on a failed
+`requires_satisfied` check, there is no partial execution risk. The XCM payload
+is either fully applied (canonical) or fully rolled back (dropped), never half-way.
+
+The receiver chain itself never stalls — a dropped speculative block is simply
+not enacted; the collator builds a new block next slot, either with updated
+speculative ingress or without it (`n_requires=0`) if the RPC is unavailable.
+Degraded mode is normal block production with no speculative delivery.
+
+### 15.4 Why This Enables Lower Latency
+
+HRMP delivery latency is:
+
+```
+sender tx → sender relay-included → relay routes → receiver relay-included
+≈ (1-2 relay blocks for sender) + (1-2 relay blocks for delivery)
+≈ 12–24 s
+```
+
+Speculative delivery latency is:
+
+```
+sender tx → sender relay-included → receiver relay-included
+≈ (1-2 relay blocks for sender) + (receiver slot alignment)
+≈ 18–30 s  (with root guard)  /  6–18 s  (without root guard, best case)
+```
+
+The relay's message-routing step is eliminated. The receiver acts as soon as it
+can observe the sender's state directly, rather than waiting for the relay to
+deliver it. The root guard (§14.2) trades the narrow pre-enactment window for
+reliable inclusion without post-delivery stalls.
+
+---
+
+## 16. Appendix: Where CollationGeneration Runs
+
+### 16.1 The Subsystem Is Collator-Side
+
+`polkadot/node/collation-generation/src/lib.rs` is the `CollationGeneration`
+subsystem. Despite living under `polkadot/node/`, it runs inside the **collator
+node process**, not on validator nodes. It is wired into the collator's overseer,
+not the validator's.
+
+### 16.2 What It Does
+
+After the lookahead collator builds a block and patches `collation.provides` /
+`collation.requires` (§14.2 steps 4–5), it sends a
+`CollationGenerationMessage::SubmitCollation` to the overseer. The
+`CollationGeneration` subsystem picks this up and:
+
+1. **Maps speculative fields into `CandidateCommitments`**
+
+```rust
+let provides = collation.provides.map(|p| ProvidesCommitment { root: p.root });
+let requires = collation.requires.into_iter()
+    .map(|r| RequiresCommitment { source: r.source, expected_root: r.expected_root })
+    .collect();
+
+let commitments = CandidateCommitments { ..., provides, requires };
+```
+
+Without this step the speculative fields set by the lookahead collator would be
+silently dropped and never reach the candidate receipt.
+
+2. **Selects the right descriptor version**
+
+```rust
+let speculative_enabled = FeatureIndex::SpeculativeMessaging.is_set(&node_features);
+let use_v4 = speculative_enabled && has_speculative;
+
+let descriptor = if use_v4 {
+    CandidateDescriptorV2::new_v4(...)   // carries speculative commitments
+} else if scheduling_parent.is_some() && v3_enabled {
+    CandidateDescriptorV2::new_v3(...)
+} else {
+    CandidateDescriptorV2::new(...)      // V2 legacy
+};
+```
+
+V4 is gated on both the runtime feature flag (`FeatureIndex::SpeculativeMessaging`
+queried from the relay chain) and whether the collation actually has speculative
+content (`has_speculative = provides.is_some() || !requires.is_empty()`). This
+means speculative fields are only used when the relay chain runtime supports them,
+providing a clean upgrade path.
+
+3. **Builds and submits the `CommittedCandidateReceipt`**
+
+The commitments are hashed to produce `commitments_hash` in the descriptor.
+The finished receipt and PoV are sent to backing validators.
+
+### 16.3 Validators Are Downstream
+
+Validators receive the finished receipt and PoV from the collator. They run the
+PVF (`validate_block`) to independently recompute commitments and verify the hash
+matches the receipt — but they do not construct the receipt themselves. All
+descriptor version selection and speculative field mapping happens on the collator
+side in this subsystem.
+
+```
+Collator node
+  lookahead.rs          — builds block, patches collation.provides/requires
+  collation-generation  — maps into CandidateCommitments, selects V4 descriptor,
+                          builds CommittedCandidateReceipt, submits to validators
+
+Validator node
+  candidate-validation  — runs PVF, recomputes commitments, checks hash
+  inclusion/mod.rs      — enactment-time requires_satisfied check
+```
+
+
