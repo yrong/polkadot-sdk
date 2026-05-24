@@ -136,7 +136,7 @@ How our design maps onto the existing parachain–relay-chain communication flow
    fetches and prechecks `LateBlockProof` (§6.2).
 2. **Assemble inherents and PoV** (§3.3, §6.2). Collator creates `InherentData`:
    parachain-system data + `SpeculativeIngress` (batches). Wraps block data and
-   `LateBlockProof`s in `ParachainBlockDataV4` and encodes as the PoV content.
+   `LateBlockProof`s in `ParachainBlockData::V2` and encodes as the PoV content.
 3. **Execute block** (§5.1, §5.2). Runtime executes. Outbox wrapper records
    outbound XCM into `OutgoingMMRs`. `ingest_verified_messages` verifies batches,
    updates `IncomingState`, dispatches XCM, records consumed sources.
@@ -151,7 +151,7 @@ How our design maps onto the existing parachain–relay-chain communication flow
 
 6. **PVF execution** (§6, §6.2). Each backing validator spins up Wasm sandbox,
    loads the parachain's Wasm blob, calls `validate_block` with the PoV. PVF
-   decodes `ParachainBlockDataV4` from the PoV bytes (getting both block data and
+   decodes `ParachainBlockData::V2` from the PoV bytes (getting both block data and
    `LateBlockProof`s in one call), executes the block deterministically —
    same inherents, same `ingest_verified_messages`, same outbox updates. Verifies
    each late block proof via `apply_messaging_proofs`, transforms requires in
@@ -1273,36 +1273,40 @@ the `provides_root` of the fetched batch. If they differ, the collator fetches a
 
 1. Uses `proof.new_provides_root` (not `batch.provides_root`) in the candidate
    commitments via the standard `requires_commitments()` path.
-2. Wraps both block data and proofs in `ParachainBlockDataV4` and encodes
+2. Wraps both block data and proofs in `ParachainBlockData::V2` and encodes
    the full struct as the PoV content.
 
-**`ParachainBlockDataV4` wrapper type.** Instead of appending raw proof bytes after
+**`ParachainBlockData::V2` wrapper type.** Instead of appending raw proof bytes after
 the SCALE-encoded block data and parsing them with a manual cursor, the POC defines
-a formal wrapper struct:
+a new versioned variant in `ParachainBlockData`:
 
 ```rust
-/// Extended block data for v4 speculative-messaging candidates.
-#[derive(Encode, Decode)]
-pub struct ParachainBlockDataV4 {
-    pub inner: ParachainBlockData,
-    pub late_block_proofs: Vec<LateBlockProof>,
+pub enum ParachainBlockData<Block> {
+    V0 { ... },
+    V1 { ... },
+    /// Speculative Messaging version.
+    V2 {
+        blocks: Vec<Block>,
+        proof: CompactProof,
+        late_block_proofs: Vec<LateBlockProof>,
+    },
 }
 ```
 
-The wire format is a single SCALE-encoded `ParachainBlockDataV4` — no manual
+The wire format is a single SCALE-encoded `ParachainBlockData::V2` — no manual
 length-prefixed sections, no cursor arithmetic. The collator constructs it directly:
 
 ```rust
 // In the collator's proposal path:
 let block_data = build_block(...)?;  // existing PoV content
-let pov_v4 = ParachainBlockDataV4 {
+let pov_v4 = ParachainBlockData::V2 {
     inner: block_data,
     late_block_proofs,
 };
 let pov_bytes = pov_v4.encode();
 ```
 
-**PVF decode.** The `validate_block` entry point decodes `ParachainBlockDataV4`
+**PVF decode.** The `validate_block` entry point decodes `ParachainBlockData::V2`
 from the PoV bytes in one SCALE decode call. If the decode fails (wrong format,
 truncated data, etc.), the candidate is invalid — same error model as any other
 SCALE decode:
@@ -1310,21 +1314,21 @@ SCALE decode:
 ```rust
 fn validate_block(params: ValidationParams) -> Result<ValidationResultV4, ValidationError> {
     // Single decode: block data + late block proofs in one call.
-    let pov_v4 = ParachainBlockDataV4::decode(&mut &params.pov.block_data[..])
+    let pov_v4 = ParachainBlockData::V2::decode(&mut &params.pov.block_data[..])
         .map_err(|_| ValidationError::InvalidBlockData)?;
 
     // 1. Execute the block with the inner block data
-    let mut result = execute_block(&pov_v4.inner)?;
+    let mut result = execute_block(&pov_v4)?;
 
     // 2. Verify each late block proof and transform requires
     let mut transformed_requires = Vec::new();
-    for proof in &pov_v4.late_block_proofs {
+    for proof in &pov_v4.late_block_proofs() {
         let transformed = verify_and_transform(&result.requires, proof)?;
         transformed_requires.push(transformed);
     }
     // Keep non-transformed requires for sources without proofs
     for req in &result.requires {
-        if !pov_v4.late_block_proofs.iter().any(|p| p.source == req.source) {
+        if !pov_v4.late_block_proofs().iter().any(|p| p.source == req.source) {
             transformed_requires.push(req.clone());
         }
     }
@@ -1335,20 +1339,20 @@ fn validate_block(params: ValidationParams) -> Result<ValidationResultV4, Valida
 ```
 
 No SCALE cursor tricks, no manual offset tracking, no `parse_late_block_proofs`
-function. The `ParachainBlockDataV4::decode` call either succeeds with both block
+function. The `ParachainBlockData::V2::decode` call either succeeds with both block
 data and proofs, or fails cleanly.
 
 **Version gating.** The collator and PVF must agree on the wire format. The
 descriptor version (`candidate.descriptor.version()`) distinguishes the two cases:
 
-- `V4` candidates: the PoV content is a SCALE-encoded `ParachainBlockDataV4`
+- `V4` candidates: the PoV content is a SCALE-encoded `ParachainBlockData::V2`
 - Pre-`V4` candidates: the PoV content is a plain `ParachainBlockData` (unchanged)
 
 The collator branches on the candidate version when constructing the PoV:
 
 ```rust
 if candidate_version >= V4 {
-    let pov_v4 = ParachainBlockDataV4 { inner: block_data, late_block_proofs };
+    let pov_v4 = ParachainBlockData::V2 { blocks, proof, late_block_proofs };
     pov.0 = pov_v4.encode();
 } else {
     pov.0 = block_data.encode();
@@ -1363,9 +1367,9 @@ fn validate_block(params: ValidationParams) -> Result<..., ValidationError> {
     // the PoV bytes). In practice the PVF runtime knows its own version
     // from the runtime API version or descriptor header.
     if is_v4_candidate() {
-        let pov = ParachainBlockDataV4::decode(&mut &params.pov.block_data[..])
+        let pov = ParachainBlockData::V2::decode(&mut &params.pov.block_data[..])
             .map_err(|_| ValidationError::InvalidBlockData)?;
-        let result = execute_block(&pov.inner)?;
+        let result = execute_block(&pov)?;
         // ... verify late_block_proofs from pov ...
     } else {
         let block_data = ParachainBlockData::decode(&mut &params.pov.block_data[..])
@@ -1384,7 +1388,7 @@ problems:
    pattern requires `let mut sub = &cursor[..]; u32::decode(&mut sub)`, which is
    easy to get wrong. A bug here silently produces garbage verification.
 2. **No compile-time structure.** The wire format exists only as a comment diagram
-   and the order of manual decode calls. `ParachainBlockDataV4` gives the compiler
+   and the order of manual decode calls. `ParachainBlockData::V2` gives the compiler
    a single struct to check, and SCALE derive handles the encoding/decoding.
 3. **Cleaner version gating.** With the wrapper, the version distinction is "use
    this type or that type" rather than "decode this struct, then manually parse
@@ -1395,7 +1399,7 @@ bytes via `params.pov.block_data`. The only difference is what type we decode fr
 those bytes.
 
 The relay chain never sees the proofs and never verifies them. The entire
-pipeline is: collator wraps proofs in `ParachainBlockDataV4` → PVF decodes and
+pipeline is: collator wraps proofs in `ParachainBlockData::V2` → PVF decodes and
 verifies proofs in one SCALE decode → transforms requires → node-side validation
 reconstructs commitments from the transformed result → relay chain matches
 `expected_root` against `ProvidesRoots`. See §4.4 for what the relay chain does
@@ -1652,7 +1656,7 @@ are met. At most one distinct `provides_root` per source per block.
 
 **Injection.** Selected batches are encoded into `SpeculativeIngress` and
 injected into `InherentData` under `SPECULATIVE_INGRESS_IDENTIFIER`. Prechecked
-`LateBlockProof` data and the block data are wrapped in `ParachainBlockDataV4`
+`LateBlockProof` data and the block data are wrapped in `ParachainBlockData::V2`
 for the PoV.
 
 **Resubmission.** After submitting the candidate, the collator watches the relay
@@ -1927,7 +1931,7 @@ legacy path. Continue hash-checking against the candidate receipt.
 Add `LateBlockProof` and `MMRExtensionProof` types to `v10` primitives. Implement
 PoV-based proof verification: collator fetches and prechecks proofs, uses
 transformed root in candidate commitments, wraps proofs and block data in
-`ParachainBlockDataV4`. PVF decodes `ParachainBlockDataV4` from the PoV during
+`ParachainBlockData::V2`. PVF decodes `ParachainBlockData::V2` from the PoV during
 `validate_block`, verifies proofs, and transforms requires. Collator precheck
 and PVF verification use the same logic; mismatches cause commitments hash
 mismatch (candidate rejected).
@@ -1977,7 +1981,7 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 | 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `requires_commitments`. 11/11 tests pass. |
 | 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
 | 10.4 | Collator-side inherent injection & commitment assembly | ✅ | Lookahead collator path complete: `speculative_ingress` fetched in `lookahead.rs` before block proposal, injected via `create_inherent_data`; after `build_collation` returns, `compute_provides_root` and `requires_commitments` are queried against the newly built block hash and patched directly onto the collation (`collation.provides`, `collation.requires`). **Root guard** (`speculative_ingress.rs`): batch is only included if `relay_provides_root == batch.provides_root`; premature speculative submissions (relay hasn't committed sender's block yet) are dropped, eliminating n_requires=0/n_requires=1 fork contention and post-delivery stalls. **Fork suppression** (`lookahead.rs`): `speculative_built_heights: BTreeSet<BlockNumber>` tracks heights where a speculative collation was submitted; n_requires=0 collations at those heights are suppressed on subsequent relay-parent notifications. `build_multi_block_collation` and `ServiceInterface` are unchanged. Slot-based collator has no speculative logic (not used for the POC). Collator-side LBP pre-fetch deferred (see §12). |
-| 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4` via `TrailingOption<ValidationResultExtension>` (not a separate `ValidationResultV4` struct — backward-compatible trailing field on existing `ValidationResult`). `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockDataV4` decoded in `validate_block`. |
+| 10.5 | PVF / Wasm validation ABI | ✅ | `ValidationResultExtension::V4` via `TrailingOption<ValidationResultExtension>` (not a separate `ValidationResultV4` struct — backward-compatible trailing field on existing `ValidationResult`). `apply_messaging_proofs`, `verify_mmr_extension` (connecting_nodes replay). `ParachainBlockData::V2` decoded in `validate_block`. |
 | 10.6 | Node-side candidate validation | ✅ | v4 `CandidateCommitments` reconstruction from `ValidationResultExtension::V4` and hash check implemented in `candidate-validation/src/lib.rs` lines 1310–1337. |
 | 10.7 | Late block proofs (PVF side) | ✅ | PVF-side proof verification complete. Collator-side pre-fetch not implemented (see §10.4). |
 | 10.8 | Relay-chain enactment rules | ✅ | `ProvidesRoots` storage, `requires_satisfied`, `update_provides_root`, enactment-time check (lines 582–588, 956–964) and `UnsatisfiedRequires` error all wired in `inclusion/mod.rs`. |
@@ -2396,18 +2400,18 @@ for proof in &late_block_proofs {
 }
 ```
 
-**Step 4 — Re-wrap the PoV as `ParachainBlockDataV4`** (`lookahead.rs`)
+**Step 4 — Re-wrap the PoV as `ParachainBlockData::V2`** (`lookahead.rs`)
 
 After `collate()` returns, if there are late block proofs, decompress the PoV,
-re-encode as `ParachainBlockDataV4`, and re-compress:
+re-encode as `ParachainBlockData::V2`, and re-compress:
 ```rust
 if !late_block_proofs.is_empty() {
     if let MaybeCompressedPoV::Compressed(ref pov) = collation.proof_of_validity {
         let decompressed = pov.decompress()?;
-        let inner = ParachainBlockData::decode(&mut &decompressed.block_data.0[..])?;
-        let pov_v4 = ParachainBlockDataV4 { inner, late_block_proofs };
+        let (blocks, proof) = ParachainBlockData::decode(&mut &decompressed.block_data.0[..])?.into_inner();
+        let pov_v2 = ParachainBlockData::V2 { blocks, proof, late_block_proofs };
         collation.proof_of_validity = maybe_compress_pov(PoV {
-            block_data: BlockData(pov_v4.encode()),
+            block_data: BlockData(pov_v2.encode()),
         });
     }
 }

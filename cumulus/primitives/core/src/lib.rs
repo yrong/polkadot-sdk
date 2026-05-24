@@ -33,7 +33,7 @@ pub const REF_TIME_PER_CORE_IN_SECS: u64 = 2;
 
 pub mod parachain_block_data;
 
-pub use parachain_block_data::{ParachainBlockData, ParachainBlockDataV4};
+pub use parachain_block_data::ParachainBlockData;
 pub use polkadot_core_primitives::InboundDownwardMessage;
 pub use polkadot_parachain_primitives::primitives::{
 	DmpMessageHandler, Id as ParaId, IsSystem, UpwardMessage, ValidationParams, XcmpMessageFormat,

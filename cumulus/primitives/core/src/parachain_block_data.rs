@@ -69,8 +69,19 @@ impl<'a, I: codec::Input> codec::Input for PrependBytesInput<'a, I> {
 /// passed to the parachain validation Wasm blob to be validated.
 #[derive(Clone)]
 pub enum ParachainBlockData<Block> {
-	V0 { block: [Block; 1], proof: CompactProof },
-	V1 { blocks: Vec<Block>, proof: CompactProof },
+	V0 {
+		block: [Block; 1],
+		proof: CompactProof,
+	},
+	V1 {
+		blocks: Vec<Block>,
+		proof: CompactProof,
+	},
+	V2 {
+		blocks: Vec<Block>,
+		proof: CompactProof,
+		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+	},
 }
 
 impl<Block: Encode> Encode for ParachainBlockData<Block> {
@@ -82,6 +93,14 @@ impl<Block: Encode> Encode for ParachainBlockData<Block> {
 				1u8.encode_to(&mut res);
 				blocks.encode_to(&mut res);
 				proof.encode_to(&mut res);
+				res
+			},
+			Self::V2 { blocks, proof, late_block_proofs } => {
+				let mut res = VERSIONED_PARACHAIN_BLOCK_DATA_PREFIX.to_vec();
+				2u8.encode_to(&mut res);
+				blocks.encode_to(&mut res);
+				proof.encode_to(&mut res);
+				late_block_proofs.encode_to(&mut res);
 				res
 			},
 		}
@@ -101,6 +120,14 @@ impl<Block: Decode> Decode for ParachainBlockData<Block> {
 
 					Ok(Self::V1 { blocks, proof })
 				},
+				2 => {
+					let blocks = Vec::<Block>::decode(input)?;
+					let proof = CompactProof::decode(input)?;
+					let late_block_proofs =
+						Vec::<polkadot_primitives::v10::LateBlockProof>::decode(input)?;
+
+					Ok(Self::V2 { blocks, proof, late_block_proofs })
+				},
 				_ => Err("Unknown `ParachainBlockData` version".into()),
 			}
 		} else {
@@ -119,11 +146,20 @@ impl<Block> ParachainBlockData<Block> {
 		Self::V1 { blocks, proof }
 	}
 
+	/// Creates a new instance of `Self` with late block proofs.
+	pub fn new_v2(
+		blocks: Vec<Block>,
+		proof: CompactProof,
+		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+	) -> Self {
+		Self::V2 { blocks, proof, late_block_proofs }
+	}
+
 	/// Returns references to the stored blocks.
 	pub fn blocks(&self) -> &[Block] {
 		match self {
 			Self::V0 { block, .. } => &block[..],
-			Self::V1 { blocks, .. } => &blocks,
+			Self::V1 { blocks, .. } | Self::V2 { blocks, .. } => &blocks,
 		}
 	}
 
@@ -131,7 +167,7 @@ impl<Block> ParachainBlockData<Block> {
 	pub fn blocks_mut(&mut self) -> &mut [Block] {
 		match self {
 			Self::V0 { ref mut block, .. } => block,
-			Self::V1 { ref mut blocks, .. } => blocks,
+			Self::V1 { ref mut blocks, .. } | Self::V2 { ref mut blocks, .. } => blocks,
 		}
 	}
 
@@ -139,15 +175,22 @@ impl<Block> ParachainBlockData<Block> {
 	pub fn into_blocks(self) -> Vec<Block> {
 		match self {
 			Self::V0 { block, .. } => block.into_iter().collect(),
-			Self::V1 { blocks, .. } => blocks,
+			Self::V1 { blocks, .. } | Self::V2 { blocks, .. } => blocks,
 		}
 	}
 
 	/// Returns a reference to the stored proof.
 	pub fn proof(&self) -> &CompactProof {
 		match self {
-			Self::V0 { proof, .. } => &proof,
-			Self::V1 { proof, .. } => proof,
+			Self::V0 { proof, .. } | Self::V1 { proof, .. } | Self::V2 { proof, .. } => &proof,
+		}
+	}
+
+	/// Returns a reference to the stored late block proofs, if any.
+	pub fn late_block_proofs(&self) -> &[polkadot_primitives::v10::LateBlockProof] {
+		match self {
+			Self::V2 { late_block_proofs, .. } => &late_block_proofs,
+			_ => &[],
 		}
 	}
 
@@ -155,7 +198,7 @@ impl<Block> ParachainBlockData<Block> {
 	pub fn into_inner(self) -> (Vec<Block>, CompactProof) {
 		match self {
 			Self::V0 { block, proof } => (block.into_iter().collect(), proof),
-			Self::V1 { blocks, proof } => (blocks, proof),
+			Self::V1 { blocks, proof } | Self::V2 { blocks, proof, .. } => (blocks, proof),
 		}
 	}
 }
@@ -168,6 +211,7 @@ impl<Block: BlockT> ParachainBlockData<Block> {
 			header_kb = %self.blocks().iter().map(|b| b.header().encoded_size()).sum::<usize>() as f64 / 1024f64,
 			extrinsics_kb = %self.blocks().iter().map(|b| b.extrinsics().encoded_size()).sum::<usize>() as f64 / 1024f64,
 			storage_proof_kb = %self.proof().encoded_size() as f64 / 1024f64,
+			late_block_proofs_kb = %self.late_block_proofs().encoded_size() as f64 / 1024f64,
 			"PoV size",
 		);
 	}
@@ -178,7 +222,7 @@ impl<Block: BlockT> ParachainBlockData<Block> {
 	pub fn as_v0(&self) -> Option<Self> {
 		match self {
 			Self::V0 { .. } => Some(self.clone()),
-			Self::V1 { blocks, proof } => {
+			Self::V1 { blocks, proof } | Self::V2 { blocks, proof, .. } => {
 				if blocks.len() != 1 {
 					return None;
 				}
@@ -191,27 +235,6 @@ impl<Block: BlockT> ParachainBlockData<Block> {
 	}
 }
 
-/// Extended block data for v4 speculative-messaging candidates.
-///
-/// Wraps the standard parachain block data and any late block proofs
-/// required for speculative messaging enactment.
-#[derive(codec::Encode, codec::Decode, Clone)]
-pub struct ParachainBlockDataV4<Block> {
-	/// Late block proofs for speculative messaging dependencies.
-	pub late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
-	/// The standard parachain block data (blocks + storage proof).
-	pub inner: ParachainBlockData<Block>,
-}
-
-impl<Block> ParachainBlockDataV4<Block> {
-	/// Create a new instance of `ParachainBlockDataV4`.
-	pub fn new(
-		inner: ParachainBlockData<Block>,
-		late_block_proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
-	) -> Self {
-		Self { inner, late_block_proofs }
-	}
-}
 
 #[cfg(test)]
 mod tests {
@@ -278,5 +301,40 @@ mod tests {
 
 		assert_eq!(v1.blocks(), decoded.blocks());
 		assert_eq!(v1.proof(), decoded.proof());
+	}
+
+	#[test]
+	fn decoding_encoding_v2_works() {
+		let v2 = ParachainBlockData::<TestBlock>::V2 {
+			blocks: vec![TestBlock::new(
+				Header::new_from_number(10),
+				vec![
+					TestExtrinsic::new_bare(MockCallU64(10)),
+					TestExtrinsic::new_bare(MockCallU64(100)),
+				],
+			)],
+			proof: CompactProof { encoded_nodes: vec![vec![10u8; 200], vec![20u8; 30]] },
+			late_block_proofs: vec![polkadot_primitives::v10::LateBlockProof {
+				source: 2000.into(),
+				old_number_of_destinations: 1,
+				old_leaf_index: 0,
+				number_of_destinations: 1,
+				leaf_index: 0,
+				old_provides_root: Default::default(),
+				old_subtree_root: Default::default(),
+				old_subtree_proof: vec![],
+				new_provides_root: Default::default(),
+				new_subtree_root: Default::default(),
+				new_subtree_proof: vec![],
+				subtree_extension: None,
+			}],
+		};
+
+		let encoded = v2.encode();
+		let decoded = ParachainBlockData::<TestBlock>::decode(&mut &encoded[..]).unwrap();
+
+		assert_eq!(v2.blocks(), decoded.blocks());
+		assert_eq!(v2.proof(), decoded.proof());
+		assert_eq!(v2.late_block_proofs(), decoded.late_block_proofs());
 	}
 }

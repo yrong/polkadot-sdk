@@ -271,15 +271,12 @@ where
 		sp_io::transaction_index::host_renew.replace_implementation(host_transaction_index_renew),
 	);
 
-	let (block_data, messaging_proofs) = if let Ok(pov_v4) = codec::decode_from_bytes::<
-		cumulus_primitives_core::ParachainBlockDataV4<B::LazyBlock>,
-	>(block_data.clone())
-	{
-		(pov_v4.inner, Some(pov_v4.late_block_proofs))
-	} else {
-		let pov = codec::decode_from_bytes::<ParachainBlockData<B::LazyBlock>>(block_data)
-			.expect("Invalid parachain block data");
-		(pov, None)
+	let block_data = codec::decode_from_bytes::<ParachainBlockData<B::LazyBlock>>(block_data)
+		.expect("Invalid parachain block data");
+
+	let messaging_proofs = match &block_data {
+		ParachainBlockData::V2 { late_block_proofs, .. } => Some(late_block_proofs.clone()),
+		_ => None,
 	};
 
 	// Initialize hashmaps randomness.
