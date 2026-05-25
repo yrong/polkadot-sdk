@@ -147,3 +147,19 @@ pub struct MMRExtensionProof {
 	/// Replaying these appends starting from old_peaks must reproduce new_peaks.
 	pub connecting_nodes: Vec<Hash>,
 }
+
+/// Per-source tracking for incoming speculative messages.
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo, Default)]
+pub struct SourceState {
+	/// Last processed message leaf index in the source's per-destination subtree.
+	pub last_processed: u64,
+	/// The source's top-level provides root for the latest batch we accepted.
+	pub last_seen_provides_root: Hash,
+	/// The source's subtree root we last accepted.
+	pub last_seen_subtree_root: Hash,
+	/// The current number of nodes in the receiver-local subtree MMR.
+	pub mmr_size: u64,
+	/// The peaks of the receiver-local subtree MMR.
+	/// Storing only peaks ensures O(log N) storage per source.
+	pub mmr_peaks: Vec<Hash>,
+}

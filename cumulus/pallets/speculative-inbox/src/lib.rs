@@ -41,8 +41,7 @@ mod integration_tests;
 extern crate alloc;
 use alloc::vec::Vec;
 
-use codec::{Decode, Encode};
-use scale_info::TypeInfo;
+use codec::Encode;
 use sp_core::H256;
 use sp_inherents::InherentIdentifier;
 use sp_runtime::{
@@ -58,7 +57,7 @@ use frame_system::{
 
 use cumulus_primitives_core::ParaId;
 use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
-use polkadot_primitives::v9::{RequiresCommitment, SpeculativeIngress};
+use polkadot_primitives::v9::{RequiresCommitment, SourceState, SpeculativeIngress};
 
 use mmr_lib::{Merge, Result as MmrResult};
 
@@ -76,22 +75,6 @@ impl Merge for Keccak256Merge {
 
 /// The inherent identifier for speculative ingress.
 pub const INHERENT_IDENTIFIER: InherentIdentifier = *b"specingr";
-
-/// Per-source tracking for incoming speculative messages.
-#[derive(Clone, Encode, Decode, TypeInfo, Default)]
-pub struct SourceState {
-	/// Last processed message leaf index in the source's per-destination subtree.
-	pub last_processed: u64,
-	/// The source's top-level provides root for the latest batch we accepted.
-	pub last_seen_provides_root: H256,
-	/// The source's subtree root we last accepted.
-	pub last_seen_subtree_root: H256,
-	/// The current number of nodes in the receiver-local subtree MMR.
-	pub mmr_size: u64,
-	/// The peaks of the receiver-local subtree MMR.
-	/// Storing only peaks ensures O(log N) storage per source.
-	pub mmr_peaks: Vec<H256>,
-}
 
 pub use pallet::*;
 

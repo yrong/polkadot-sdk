@@ -77,7 +77,8 @@ pub mod slashing;
 pub mod speculative;
 pub use speculative::{
 	LateBlockProof, MMRExtensionProof, MessageBatch, OutgoingMessage, ProvidesCommitment,
-	RequiresCommitment, SpeculativeIngress, MAX_REQUIRES_PER_BLOCK, SPECULATIVE_API_VERSION,
+	RequiresCommitment, SourceState, SpeculativeIngress, MAX_REQUIRES_PER_BLOCK,
+	SPECULATIVE_API_VERSION,
 };
 
 pub use async_backing::AsyncBackingParams;

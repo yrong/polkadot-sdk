@@ -235,7 +235,6 @@ impl<Block: BlockT> ParachainBlockData<Block> {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;

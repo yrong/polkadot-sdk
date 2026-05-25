@@ -183,17 +183,12 @@ How our design maps onto the existing parachain–relay-chain communication flow
 ## 2. Commitments Versioning Strategy
 
 **Original intent:** new types go into a new `v10` primitives module, `v9` types frozen,
-v4 candidates use `v10::CandidateCommitments` while legacy candidates use `v9`.
+v4 candidates use `CandidateCommitments` while legacy candidates use `v9`.
 
-**POC implementation (diverges from intent):** `v9::CandidateCommitments` was extended
-directly with `provides` and `requires` fields. `v10::CandidateCommitments` is a
-re-export alias for the same type:
-
-```rust
-// polkadot/primitives/src/v10/mod.rs
-/// Re-uses v9 `CandidateCommitments` directly since v9 now has the speculative fields.
-pub use crate::v9::CandidateCommitments;
-```
+**POC implementation (diverges from intent):** Speculative messaging primitives are
+defined in `polkadot/primitives/src/v9/speculative.rs`. The existing
+`v9::CandidateCommitments` was extended directly with `provides` and `requires` fields.
+The separate `v10` primitives module was removed for simplicity.
 
 This means `v9` is **not** frozen. The rationale: maintaining two separate commitment
 structs would require updating every site that constructs or matches on
@@ -202,11 +197,11 @@ checks `provides`/`requires` for v4 candidates), correctness is preserved — pr
 candidates carry the new fields as `None`/empty but the relay chain ignores them.
 
 In production, the right approach is to keep `v9::CandidateCommitments` frozen and
-introduce a genuinely additive `v10::CandidateCommitments` with a separate codec path.
+introduce a genuinely additive `CandidateCommitments` with a separate codec path.
 For the POC the single-struct approach is a deliberate simplification.
 
 ```
-polkadot/primitives/src/v10/mod.rs  ← NEW FILE
+polkadot/primitives/src/v9/speculative.rs  ← NEW MODULE
 ```
 
 A `CandidateDescriptor` version bump signals that the parachain supports
@@ -248,13 +243,13 @@ Every component that touches commitments is version-aware:
 - **Relay chain enactment** (§4.2): only enforces `requires`/`provides` matching
   for `descriptor.version() >= V4` candidates.
 - **Node-side validation** (§6.1): reconstructs commitments the same way for both
-  (since `v9` and `v10` share the same struct in the POC), but only extracts
+  (since only `v9` is used in the POC), but only extracts
   speculative fields from `ValidationResultExtension::V4` for v4 candidates.
 - **Relay chain runtime API** (`check_validation_outputs`): accepts the extended
   type, ignoring speculative fields for pre-v4 candidates.
 
 ```rust
-// In v10/mod.rs — same struct as v9, extended in place for the POC:
+// In v9/mod.rs — extended in place for the POC:
 pub struct CandidateCommitments<N = BlockNumber> {
     pub upward_messages: UpwardMessages,
     pub horizontal_messages: HorizontalMessages,
@@ -282,7 +277,7 @@ candidate commitments hashes.
 
 ---
 
-## 3. Primitives (polkadot-primitives v10)
+## 3. Primitives (polkadot-primitives v9::speculative)
 
 ### 3.1 Commitment Types
 
@@ -862,29 +857,29 @@ pub fn compute_provides_root() -> Option<ProvidesCommitment> {
 ### 5.2 Incoming Message State (Receiver Side)
 
 ```rust
-/// Per-source tracking.
-#[pallet::storage]
-pub type IncomingState<T: Config> = StorageMap<
-    _, Twox64Concat, ParaId, SourceState,
->;
-
-#[derive(Clone, Encode, Decode, TypeInfo, Default)]
+/// Per-source tracking (moved to polkadot-primitives).
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo, Default)]
 pub struct SourceState {
     /// Last processed message position in the source's subtree MMR.
     pub last_processed: u64,
     /// The source's top-level provides root for the latest batch we accepted.
     /// Used in the `MultipleRootsPerSourceInOneBlock` check.
-    pub last_seen_provides_root: H256,
+    pub last_seen_provides_root: Hash,
     /// The source's subtree root we last accepted.
     /// Used for diagnostics and LateBlockProof verification (the PVF compares
     /// `proof.old_subtree_root` against this value).
-    pub last_seen_subtree_root: H256,
+    pub last_seen_subtree_root: Hash,
     /// Leaf count of the receiver's local subtree MMR.
     pub mmr_size: u64,
     /// Peaks of the receiver's local subtree MMR — O(log n) hashes sufficient
     /// to reconstruct the root without storing all internal nodes.
-    pub mmr_peaks: Vec<H256>,
+    pub mmr_peaks: Vec<Hash>,
 }
+
+#[pallet::storage]
+pub type IncomingState<T: Config> = StorageMap<
+    _, Twox64Concat, ParaId, SourceState,
+>;
 
 /// Per-block sources actually consumed during THIS block.
 /// Cleared in `on_initialize`, populated by `ingest_verified_messages`,
@@ -1144,7 +1139,7 @@ pub struct ValidationResult {
     pub horizontal_messages: HorizontalMessages,
     pub processed_downward_messages: u32,
     pub hrmp_watermark: RelayChainBlockNumber,
-    /// Speculative messaging extension (v10+). Must be the LAST field.
+    /// Speculative messaging extension (v4+). Must be the LAST field.
     /// TrailingOption<T> greedily consumes all remaining bytes on decode.
     pub speculative: TrailingOption<ValidationResultExtension>,
 }
@@ -1161,7 +1156,7 @@ ignoring the trailing extension for pre-speculative candidates.
 1. In `polkadot/parachain/src/primitives.rs`: `ValidationResultExtension` and `TrailingOption` defined; `speculative` field added as last field of `ValidationResult`. Note: the same file also defines `ValidationParamsExtension::V4` (the *input* side, carrying `relay_parent`/`scheduling_parent`) — this is a separate enum with the same variant index `4` but a different purpose. When reading the file, search for `ValidationResultExtension` specifically.
 2. In `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`: after block execution, call `PSC::speculative_extension()` to read `ValidationResultExtension::V4` from runtime state; pass to `apply_messaging_proofs`; set `speculative` field in the returned `ValidationResult`.
 3. In `polkadot/parachain/src/wasm_api.rs`: no separate entrypoint needed — `validate_block` returns `ValidationResult` with the speculative extension populated.
-4. In `polkadot/node/core/candidate-validation`: decode `speculative` field; extract `provides_root`/`requires` from `ValidationResultExtension::V4`; reconstruct `v10::CandidateCommitments` for v4 candidates.
+4. In `polkadot/node/core/candidate-validation`: decode `speculative` field; extract `provides_root`/`requires` from `ValidationResultExtension::V4`; reconstruct `CandidateCommitments` for v4 candidates.
 5. Keep older descriptor versions on the legacy path (extension is `None`).
 
 ```rust
@@ -1227,7 +1222,7 @@ match candidate_receipt.descriptor.version() {
         ensure!(commitments.hash() == candidate_receipt.commitments_hash, ...);
     }
     V4 => {
-        let commitments = v10::CandidateCommitments {
+        let commitments = CandidateCommitments {
             head_data, upward_messages, horizontal_messages,
             new_validation_code, processed_downward_messages, hrmp_watermark,
             provides, requires,
@@ -1239,7 +1234,7 @@ match candidate_receipt.descriptor.version() {
 
 The corresponding implementation work:
 
-1. add `v10::CandidateCommitments` and speculative types in `polkadot/primitives`
+1. add `CandidateCommitments` and speculative types in `polkadot/primitives`
 2. extend candidate receipt / descriptor version handling so v4 candidates use the new commitments layout
 3. update `polkadot/node/core/candidate-validation` to reconstruct the correct commitments type per descriptor version
 4. keep all pre-v4 candidates on the unchanged legacy reconstruction path
@@ -1858,12 +1853,12 @@ Implement in the following order.
 ### 10.1 Step 1: Primitives and Version Gating
 
 **Files:**
-- `polkadot/primitives/src/v10/mod.rs`
+- `polkadot/primitives/src/v9/speculative.rs`
 - `polkadot/primitives/src/lib.rs`
 - `polkadot/primitives/test-helpers/src/lib.rs`
 
 Add `ProvidesCommitment`, `RequiresCommitment`, `MessageBatch`, `OutgoingMessage`,
-`SpeculativeIngress`, and v10 `CandidateCommitments`. Extend descriptor-version
+`SpeculativeIngress`, and `CandidateCommitments`. Extend descriptor-version
 handling for v4 speculative candidates. Update test helpers.
 
 ### 10.2 Step 2: Receiver Runtime Ingress Path
@@ -1916,7 +1911,7 @@ Ensure wasm result serialization returns the extended shape.
 **Files:**
 - `polkadot/node/core/candidate-validation/src/lib.rs`
 
-Decode the extended validation result for v4 candidates. Reconstruct v10
+Decode the extended validation result for v4 candidates. Reconstruct
 `CandidateCommitments` from returned outputs. Keep pre-v4 candidates on the
 legacy path. Continue hash-checking against the candidate receipt.
 
@@ -1928,7 +1923,7 @@ legacy path. Continue hash-checking against the candidate receipt.
 - `polkadot/parachain/src/wasm_api.rs` (PoV parsing)
 - provider/relayer process (same as step 9)
 
-Add `LateBlockProof` and `MMRExtensionProof` types to `v10` primitives. Implement
+Add `LateBlockProof` and `MMRExtensionProof` types to `v9::speculative` primitives. Implement
 PoV-based proof verification: collator fetches and prechecks proofs, uses
 transformed root in candidate commitments, wraps proofs and block data in
 `ParachainBlockData::V2`. PVF decodes `ParachainBlockData::V2` from the PoV during
@@ -1977,7 +1972,7 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 
 | Step | Description | Status | Notes |
 |------|-------------|--------|-------|
-| 10.1 | Primitives & version gating | ✅ | `v10` types, `MMRExtensionProof.old_leaf_count`, `CandidateDescriptorV2::new_v4()` version-byte approach. V4 struct family removed. |
+| 10.1 | Primitives & version gating | ✅ | `v9::speculative` types, `MMRExtensionProof.old_leaf_count`, `CandidateDescriptorV2::new_v4()` version-byte approach. V4 struct family removed. |
 | 10.2 | Receiver runtime ingress path | ✅ | `pallet-speculative-inbox` complete: `IncomingState`, `ConsumedSourcesThisBlock`, `ingest_verified_messages`, `requires_commitments`. 11/11 tests pass. |
 | 10.3 | Sender runtime outbox path | ✅ | `pallet-speculative-outbox` complete: peaks-only MMR, `HistoricalProvidesRoots`, `HistoricalSubtreeState`, `generate_late_block_proof`. |
 | 10.4 | Collator-side inherent injection & commitment assembly | ✅ | Lookahead collator path complete: `speculative_ingress` fetched in `lookahead.rs` before block proposal, injected via `create_inherent_data`; after `build_collation` returns, `compute_provides_root` and `requires_commitments` are queried against the newly built block hash and patched directly onto the collation (`collation.provides`, `collation.requires`). **Root guard** (`speculative_ingress.rs`): batch is only included if `relay_provides_root == batch.provides_root`; premature speculative submissions (relay hasn't committed sender's block yet) are dropped, eliminating n_requires=0/n_requires=1 fork contention and post-delivery stalls. **Fork suppression** (`lookahead.rs`): `speculative_built_heights: BTreeSet<BlockNumber>` tracks heights where a speculative collation was submitted; n_requires=0 collations at those heights are suppressed on subsequent relay-parent notifications. `build_multi_block_collation` and `ServiceInterface` are unchanged. Slot-based collator has no speculative logic (not used for the POC). Collator-side LBP pre-fetch deferred (see §12). |
@@ -2082,7 +2077,7 @@ Legend: ✅ done · 🔶 partial · ❌ not started
   The POC is unaffected because both Penpal instances run the upgraded runtime.
   **Fix plan (pre-production):** properly freeze `v9::CandidateCommitments`
   (remove `provides`/`requires`) and introduce a genuinely additive
-  `v10::CandidateCommitments` with those fields. Steps:
+  `CandidateCommitments` with those fields. Steps:
   1. Remove `provides`/`requires` from `v9::CandidateCommitments`; update
      `v10/mod.rs` to define a new struct (not a re-export) with all v9 fields
      plus the two new ones. Add `From<v9> for v10` (provides=None, requires=[]).
