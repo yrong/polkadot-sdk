@@ -14,29 +14,14 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
-//! `V10` Primitives.
-//!
-//! Extends v9 with speculative messaging types (Phase 1 — inclusion-based messaging).
-//! Unchanged types are re-exported from v9.
+//! Speculative messaging primitives (Phase 1 — inclusion-based messaging).
 
 use alloc::vec::Vec;
 
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use scale_info::TypeInfo;
 
-// ── Re-export unchanged types from v9 ──
-
-pub use crate::v9::{
-	AccountId, AccountIndex, AccountPublic, Balance, BlakeTwo256, Block, BlockId, BlockNumber,
-	CandidateHash, ChainId, CollatorId, CollatorSignature, CoreIndex, DownwardMessage, Hash, HashT,
-	HeadData, Header, HorizontalMessages, HrmpChannelId, Id, Id as ParaId, InboundDownwardMessage,
-	InboundHrmpMessage, Moment, Nonce, OutboundHrmpMessage, ProvidesCommitment, Remark,
-	RequiresCommitment, SessionIndex, Signature, Slot, UncheckedExtrinsic, UpwardMessage,
-	UpwardMessages, ValidationCode, ValidationCodeHash, ValidatorId, ValidatorSignature,
-	LOWEST_PUBLIC_ID,
-};
-
-// ── Speculative Messaging Types (v10 additions) ──
+use super::{BlockNumber, Hash, Id};
 
 /// The API version at which speculative messaging support was introduced.
 /// Collators and runtimes use this to gate speculative field population.
@@ -45,6 +30,26 @@ pub const SPECULATIVE_API_VERSION: u32 = 10;
 /// Maximum number of source parachains a receiver can consume from in one block.
 /// This bounds the size of `requires` in candidate commitments.
 pub const MAX_REQUIRES_PER_BLOCK: usize = 32;
+
+/// A commitment that a parachain provides a set of outbound speculative messages.
+/// The root is the top-level Merkle root over all per-destination MMR roots.
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
+#[cfg_attr(feature = "std", derive(Hash))]
+pub struct ProvidesCommitment {
+	/// Top-level Merkle root over all per-destination MMR roots.
+	pub root: Hash,
+}
+
+/// A commitment that a parachain requires messages from a source parachain.
+#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
+#[cfg_attr(feature = "std", derive(Hash))]
+pub struct RequiresCommitment {
+	/// The source parachain whose provides root we expect.
+	pub source: Id,
+	/// The provides root we built against (the source chain's top-level root at the
+	/// block from which we received messages).
+	pub expected_root: Hash,
+}
 
 /// Deterministic ingress payload carried in the parachain block body.
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
@@ -57,7 +62,7 @@ pub struct SpeculativeIngress {
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct MessageBatch {
 	/// Source parachain.
-	pub source: ParaId,
+	pub source: Id,
 	/// Source block hash that produced these messages.
 	pub source_block: Hash,
 	/// Relay-chain block number associated with the source batch.
@@ -93,7 +98,7 @@ pub struct OutgoingMessage {
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub struct LateBlockProof {
 	/// The source parachain this proof covers.
-	pub source: ParaId,
+	pub source: Id,
 
 	/// Number of destinations in the OLD provides root's Merkle tree.
 	/// Required to verify old_subtree_proof.
@@ -142,7 +147,3 @@ pub struct MMRExtensionProof {
 	/// Replaying these appends starting from old_peaks must reproduce new_peaks.
 	pub connecting_nodes: Vec<Hash>,
 }
-
-/// Commitments made in a v10 candidate receipt.
-/// Re-uses v9 `CandidateCommitments` directly since v9 now has the speculative fields.
-pub use crate::v9::CandidateCommitments;

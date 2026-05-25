@@ -24,7 +24,7 @@
 //! contain randomness based data.
 use codec::{Decode, Encode};
 use polkadot_primitives::{
-	v10::{
+	v9::{
 		CandidateCommitments as CandidateCommitmentsV10, ProvidesCommitment, RequiresCommitment,
 	},
 	AppVerify, CandidateCommitments, CandidateDescriptorV2, CandidateHash, CandidateReceiptV2,

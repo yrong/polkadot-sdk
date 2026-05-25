@@ -40,7 +40,7 @@ use frame_support::pallet_prelude::*;
 use frame_system::pallet_prelude::BlockNumberFor;
 
 use cumulus_primitives_core::{ParaId, XcmpMessageSource};
-use polkadot_primitives::v10::{MMRExtensionProof, ProvidesCommitment};
+use polkadot_primitives::v9::{MMRExtensionProof, ProvidesCommitment};
 
 use mmr_lib::{Merge, Result as MmrResult};
 
@@ -262,7 +262,7 @@ impl<T: Config> Pallet<T> {
 	pub fn generate_late_block_proof(
 		dest: ParaId,
 		old_provides_root: H256,
-	) -> Option<polkadot_primitives::v10::LateBlockProof> {
+	) -> Option<polkadot_primitives::v9::LateBlockProof> {
 		// 1. Find the block number that produced old_provides_root.
 		let (old_block_number, _) =
 			HistoricalProvidesRoots::<T>::iter().find(|(_, root)| root == &old_provides_root)?;
@@ -305,7 +305,7 @@ impl<T: Config> Pallet<T> {
 			None
 		};
 
-		Some(polkadot_primitives::v10::LateBlockProof {
+		Some(polkadot_primitives::v9::LateBlockProof {
 			source: dest,
 			old_number_of_destinations: old_roots.len() as u32,
 			old_leaf_index: old_leaf_idx as u32,

@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use cumulus_primitives_core::{ParaId, SpeculativeOutboxApi};
 use polkadot_primitives::{
-	v10::{MessageBatch, OutgoingMessage, SpeculativeIngress},
+	v9::{MessageBatch, OutgoingMessage, SpeculativeIngress},
 	BlockNumber, Hash,
 };
 use sp_api::ProvideRuntimeApi;

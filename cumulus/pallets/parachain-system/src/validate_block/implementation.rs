@@ -61,7 +61,7 @@ impl Merge for Keccak256Merge {
 fn verify_mmr_extension(
 	old_root: polkadot_primitives::Hash,
 	new_root: polkadot_primitives::Hash,
-	ext: &polkadot_primitives::v10::MMRExtensionProof,
+	ext: &polkadot_primitives::v9::MMRExtensionProof,
 ) -> bool {
 	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() || ext.connecting_nodes.is_empty() {
 		return false;
@@ -128,7 +128,7 @@ fn append_mmr_leaf<M: mmr_lib::Merge<Item = polkadot_primitives::Hash>>(
 fn apply_messaging_proofs(
 	para_id: polkadot_primitives::Id,
 	extension: &mut Option<polkadot_parachain_primitives::primitives::ValidationResultExtension>,
-	proofs: Vec<polkadot_primitives::v10::LateBlockProof>,
+	proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
 ) {
 	if let Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
 		ref mut requires,
@@ -800,7 +800,7 @@ mod tests {
 	use super::*;
 	use codec::Encode;
 	use polkadot_parachain_primitives::primitives::ValidationResultExtension;
-	use polkadot_primitives::v10::{LateBlockProof, MMRExtensionProof};
+	use polkadot_primitives::v9::{LateBlockProof, MMRExtensionProof};
 	use sp_runtime::traits::Hash as _;
 
 	fn build_peaks(leaf_hashes: &[polkadot_primitives::Hash]) -> Vec<polkadot_primitives::Hash> {

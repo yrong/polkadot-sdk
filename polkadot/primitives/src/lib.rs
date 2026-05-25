@@ -24,10 +24,6 @@
 // released version of the Polkadot runtime.
 pub mod v9;
 
-// The `v10` version contains speculative-messaging primitives alongside
-// all stable v9 types.
-pub mod v10;
-
 // The 'staging' version is special - it contains primitives which are
 // still in development. Once they are considered stable, they will be
 // moved to a new versioned module.
@@ -76,7 +72,7 @@ pub use v9::{
 	PARACHAIN_KEY_TYPE_ID, RELAY_CHAIN_SLOT_DURATION_MILLIS, UMP_SEPARATOR,
 };
 
-pub use v10::LateBlockProof;
+pub use v9::LateBlockProof;
 
 /// Alias for `CandidateCommitments` used by v10 callers.
 /// Since v9 `CandidateCommitments` now includes the speculative fields,

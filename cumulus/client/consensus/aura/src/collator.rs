@@ -226,7 +226,7 @@ where
 		timestamp: impl Into<Option<Timestamp>>,
 		relay_proof_request: RelayProofRequest,
 		collator_peer_id: PeerId,
-		speculative_ingress: Option<polkadot_primitives::v10::SpeculativeIngress>,
+		speculative_ingress: Option<polkadot_primitives::v9::SpeculativeIngress>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
 		let (paras_inherent_data, mut other_inherent_data) = self
 			.create_inherent_data_with_rp_offset(

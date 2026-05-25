@@ -66,7 +66,7 @@ macro_rules! impl_node_runtime_apis {
 			}
 
 			impl cumulus_primitives_core::SpeculativeOutboxApi<$block> for $runtime {
-				fn compute_provides_root() -> Option<polkadot_primitives::v10::ProvidesCommitment> {
+				fn compute_provides_root() -> Option<polkadot_primitives::v9::ProvidesCommitment> {
 					None
 				}
 				fn destination_state(_dest: cumulus_primitives_core::ParaId) -> Option<(polkadot_primitives::Hash, u64)> {
@@ -78,7 +78,7 @@ macro_rules! impl_node_runtime_apis {
 				fn subtree_inclusion_proof(_dest: cumulus_primitives_core::ParaId, _subtree_root: polkadot_primitives::Hash) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)> {
 					None
 				}
-				fn generate_late_block_proof(_dest: cumulus_primitives_core::ParaId, _old_provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v10::LateBlockProof> {
+				fn generate_late_block_proof(_dest: cumulus_primitives_core::ParaId, _old_provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v9::LateBlockProof> {
 					None
 				}
 				fn block_hash_for_provides_root(_provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
@@ -87,7 +87,7 @@ macro_rules! impl_node_runtime_apis {
 			}
 
 			impl cumulus_primitives_core::SpeculativeInboxApi<$block> for $runtime {
-				fn requires_commitments() -> Vec<polkadot_primitives::v10::RequiresCommitment> {
+				fn requires_commitments() -> Vec<polkadot_primitives::v9::RequiresCommitment> {
 					Vec::new()
 				}
 				fn next_expected_message_position(_source: cumulus_primitives_core::ParaId) -> u64 {

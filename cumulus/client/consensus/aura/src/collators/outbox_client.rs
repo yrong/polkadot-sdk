@@ -26,7 +26,7 @@ use std::sync::Arc;
 use codec::{Decode, Encode};
 use cumulus_primitives_core::ParaId;
 use jsonrpsee::{core::client::ClientT, rpc_params, ws_client::WsClientBuilder};
-use polkadot_primitives::{v10::ProvidesCommitment, BlockNumber, Hash};
+use polkadot_primitives::{v9::ProvidesCommitment, BlockNumber, Hash};
 
 /// Abstracts over RPC access to a sender chain's speculative outbox.
 #[async_trait::async_trait]
@@ -200,8 +200,8 @@ pub async fn build_message_batch_from_query(
 	source_relay_parent_number: BlockNumber,
 	from_position: u64,
 	max_messages: u32,
-) -> Option<polkadot_primitives::v10::MessageBatch> {
-	use polkadot_primitives::v10::{MessageBatch, OutgoingMessage};
+) -> Option<polkadot_primitives::v9::MessageBatch> {
+	use polkadot_primitives::v9::{MessageBatch, OutgoingMessage};
 
 	let provides = source.compute_provides_root(at).await?;
 	let (subtree_root, _) = source.destination_state(at, destination).await?;

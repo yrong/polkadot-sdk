@@ -74,6 +74,11 @@ pub use signed::{EncodeAs, Signed, UncheckedSigned};
 pub mod async_backing;
 pub mod executor_params;
 pub mod slashing;
+pub mod speculative;
+pub use speculative::{
+	LateBlockProof, MMRExtensionProof, MessageBatch, OutgoingMessage, ProvidesCommitment,
+	RequiresCommitment, SpeculativeIngress, MAX_REQUIRES_PER_BLOCK, SPECULATIVE_API_VERSION,
+};
 
 pub use async_backing::AsyncBackingParams;
 pub use executor_params::{
@@ -544,26 +549,6 @@ impl<H: Encode, N: Encode> PersistedValidationData<H, N> {
 	pub fn hash(&self) -> Hash {
 		BlakeTwo256::hash_of(self)
 	}
-}
-
-/// A commitment that a parachain provides a set of outbound speculative messages.
-/// The root is the top-level Merkle root over all per-destination MMR roots.
-#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
-#[cfg_attr(feature = "std", derive(Hash))]
-pub struct ProvidesCommitment {
-	/// Top-level Merkle root over all per-destination MMR roots.
-	pub root: Hash,
-}
-
-/// A commitment that a parachain requires messages from a source parachain.
-#[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
-#[cfg_attr(feature = "std", derive(Hash))]
-pub struct RequiresCommitment {
-	/// The source parachain whose provides root we expect.
-	pub source: Id,
-	/// The provides root we built against (the source chain's top-level root at the
-	/// block from which we received messages).
-	pub expected_root: Hash,
 }
 
 /// Commitments made in a `CandidateReceipt`. Many of these are outputs of validation.

@@ -18,7 +18,7 @@ use crate::{mock::*, Error, Pallet as SpeculativeInbox};
 use cumulus_pallet_speculative_outbox::Pallet as SpeculativeOutbox;
 use cumulus_primitives_core::ParaId;
 use frame_support::{assert_noop, assert_ok, traits::Hooks};
-use polkadot_primitives::v10::{MessageBatch, OutgoingMessage, SpeculativeIngress};
+use polkadot_primitives::v9::{MessageBatch, OutgoingMessage, SpeculativeIngress};
 use sp_core::H256;
 use sp_runtime::traits::{Hash as _, Keccak256};
 

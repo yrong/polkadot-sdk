@@ -25,7 +25,7 @@ const DEST_PARA_ID: u32 = 2001;
 
 type Hash = [u8; 32];
 
-// Mirrors polkadot_primitives::v10::ProvidesCommitment
+// Mirrors polkadot_primitives::v9::ProvidesCommitment
 #[derive(Decode, Debug)]
 struct ProvidesCommitment {
     root: Hash,

@@ -58,7 +58,7 @@ use frame_system::{
 
 use cumulus_primitives_core::ParaId;
 use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
-use polkadot_primitives::v10::{RequiresCommitment, SpeculativeIngress};
+use polkadot_primitives::v9::{RequiresCommitment, SpeculativeIngress};
 
 use mmr_lib::{Merge, Result as MmrResult};
 
@@ -341,7 +341,7 @@ impl<T: Config> Pallet<T> {
 fn verify_mmr_extension(
 	old_root: H256,
 	new_root: H256,
-	ext: &polkadot_primitives::v10::MMRExtensionProof,
+	ext: &polkadot_primitives::v9::MMRExtensionProof,
 ) -> bool {
 	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() || ext.connecting_nodes.is_empty() {
 		return false;

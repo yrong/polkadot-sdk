@@ -446,9 +446,9 @@ pub struct Collation<BlockNumber = polkadot_primitives::BlockNumber> {
 	/// processed.
 	pub hrmp_watermark: BlockNumber,
 	/// The provides commitment (None if no outbox state exists yet).
-	pub provides: Option<polkadot_primitives::v10::ProvidesCommitment>,
+	pub provides: Option<polkadot_primitives::v9::ProvidesCommitment>,
 	/// The requires commitments, sorted by source: ParaId, at most one per source.
-	pub requires: Vec<polkadot_primitives::v10::RequiresCommitment>,
+	pub requires: Vec<polkadot_primitives::v9::RequiresCommitment>,
 }
 
 /// Signal that is being returned when a collation was seconded by a validator.
