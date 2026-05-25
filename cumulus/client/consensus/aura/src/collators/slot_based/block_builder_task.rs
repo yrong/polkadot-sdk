@@ -126,7 +126,7 @@ pub fn run_block_builder<Block, P, BI, CIDP, Client, Backend, RelayClient, CHP, 
 	params: BuilderTaskParams<Block, BI, CIDP, Client, Backend, RelayClient, CHP, Proposer, CS>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
-	Block: BlockT<Hash = polkadot_primitives::Hash>,
+	Block: BlockT,
 	Client: ProvideRuntimeApi<Block>
 		+ UsageProvider<Block>
 		+ BlockOf
@@ -532,7 +532,7 @@ struct BuildCollationParams<
 ///
 /// One collation can be composed of multiple blocks.
 async fn build_collation_for_core<
-	Block: BlockT<Hash = polkadot_primitives::Hash>,
+	Block: BlockT,
 	P,
 	RelayClient,
 	BI,
@@ -671,7 +671,6 @@ where
 				Some(relay_parent_data.clone()),
 				relay_proof_request,
 				collator_peer_id,
-				None,
 			)
 			.await
 		{

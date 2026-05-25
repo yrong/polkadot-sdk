@@ -140,7 +140,7 @@ pub struct Collator<Block, P, BI, CIDP, RClient, PF, CS> {
 
 impl<Block, P, BI, CIDP, RClient, PF, CS> Collator<Block, P, BI, CIDP, RClient, PF, CS>
 where
-	Block: BlockT<Hash = polkadot_primitives::Hash>,
+	Block: BlockT,
 	RClient: RelayChainInterface,
 	CIDP: CreateInherentDataProviders<Block, ()> + 'static,
 	BI: BlockImport<Block> + ParachainBlockImportMarker + Send + Sync + 'static,
@@ -177,7 +177,6 @@ where
 		relay_parent_descendants: Option<RelayParentData>,
 		relay_proof_request: RelayProofRequest,
 		collator_peer_id: PeerId,
-		speculative_ingress: Option<polkadot_primitives::v10::SpeculativeIngress>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
 		let paras_inherent_data = ParachainInherentDataProvider::create_at(
 			relay_parent,
@@ -214,14 +213,6 @@ where
 			other_inherent_data.replace_data(sp_timestamp::INHERENT_IDENTIFIER, &timestamp);
 		}
 
-		if let Some(ingress) = speculative_ingress {
-			cumulus_pallet_speculative_inbox::client::inject_speculative_ingress(
-				&mut other_inherent_data,
-				ingress,
-			)
-			.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
-		}
-
 		Ok((paras_inherent_data, other_inherent_data))
 	}
 
@@ -237,17 +228,27 @@ where
 		collator_peer_id: PeerId,
 		speculative_ingress: Option<polkadot_primitives::v10::SpeculativeIngress>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
-		self.create_inherent_data_with_rp_offset(
-			relay_parent,
-			validation_data,
-			parent_hash,
-			timestamp,
-			None,
-			relay_proof_request,
-			collator_peer_id,
-			speculative_ingress,
-		)
-		.await
+		let (paras_inherent_data, mut other_inherent_data) = self
+			.create_inherent_data_with_rp_offset(
+				relay_parent,
+				validation_data,
+				parent_hash,
+				timestamp,
+				None,
+				relay_proof_request,
+				collator_peer_id,
+			)
+			.await?;
+
+		if let Some(ingress) = speculative_ingress {
+			cumulus_pallet_speculative_inbox::client::inject_speculative_ingress(
+				&mut other_inherent_data,
+				ingress,
+			)
+			.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+		}
+
+		Ok((paras_inherent_data, other_inherent_data))
 	}
 
 	/// Build and import a parachain block using the given parameters.
