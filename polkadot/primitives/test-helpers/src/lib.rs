@@ -24,9 +24,7 @@
 //! contain randomness based data.
 use codec::{Decode, Encode};
 use polkadot_primitives::{
-	v9::{
-		CandidateCommitments as CandidateCommitmentsV10, ProvidesCommitment, RequiresCommitment,
-	},
+	v9::{ProvidesCommitment, RequiresCommitment},
 	AppVerify, CandidateCommitments, CandidateDescriptorV2, CandidateHash, CandidateReceiptV2,
 	CollatorId, CollatorSignature, CommittedCandidateReceiptV2, CoreIndex, Hash, HashT, HeadData,
 	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex, ValidationCode,
@@ -725,13 +723,13 @@ pub fn make_valid_candidate_descriptor_v3<H: AsRef<[u8]> + Copy + Default>(
 	)
 }
 
-// ── V10 Speculative Messaging Test Helpers ──
+// ── Speculative Messaging Test Helpers ──
 
-/// Create v10 candidate commitments with filler data.
-pub fn dummy_candidate_commitments_v10(
+/// Create speculative candidate commitments with filler data.
+pub fn dummy_candidate_commitments_speculative(
 	head_data: impl Into<Option<HeadData>>,
-) -> CandidateCommitmentsV10 {
-	CandidateCommitmentsV10 {
+) -> CandidateCommitments {
+	CandidateCommitments {
 		head_data: head_data.into().unwrap_or(dummy_head_data()),
 		upward_messages: vec![].try_into().expect("empty vec fits within bounds"),
 		new_validation_code: None,

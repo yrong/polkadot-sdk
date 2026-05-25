@@ -176,8 +176,8 @@ where
 				//
 				// Trade-off: we lose the narrow speculative window before relay enactment
 				// (~6-18s), but eliminate the ~60s stall when the wrong fork gets backed.
-				let relay_committed = relay_provides_root
-					.map_or(false, |r| r == batch.provides_root);
+				let relay_committed =
+					relay_provides_root.map_or(false, |r| r == batch.provides_root);
 				if !relay_committed {
 					tracing::debug!(
 						target: "aura::cumulus",
