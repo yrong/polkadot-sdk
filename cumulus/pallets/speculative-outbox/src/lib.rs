@@ -42,7 +42,11 @@ use frame_system::pallet_prelude::BlockNumberFor;
 use cumulus_primitives_core::{ParaId, XcmpMessageSource};
 use polkadot_primitives::v9::{MMRExtensionProof, ProvidesCommitment};
 
-use mmr_lib::{leaf_index_to_pos, util::MemMMR, util::MemStore, Merge, Result as MmrResult};
+use mmr_lib::{
+	leaf_index_to_pos,
+	util::{MemMMR, MemStore},
+	Merge, Result as MmrResult,
+};
 
 /// Keccak256 merge for MMR node construction.
 /// Identical to the receiver-side `Keccak256Merge` in `pallet-speculative-inbox`.

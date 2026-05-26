@@ -25,7 +25,9 @@ use alloc::vec::Vec;
 
 use cumulus_primitives_core::{ParaId, SpeculativeOutboxApi};
 use polkadot_primitives::{
-	v9::{MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage, SpeculativeIngress},
+	v9::{
+		MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage, SpeculativeIngress,
+	},
 	BlockNumber, Hash,
 };
 use sp_api::ProvideRuntimeApi;
@@ -73,8 +75,9 @@ where
 	let api = client.runtime_api();
 	let provides = api.compute_provides_root(at).ok()??;
 	let (subtree_root, _) = api.destination_state(at, destination).ok()??;
-	let (messages, subtree_mmr_size, messages_proof) =
-		api.outbound_messages_with_proof(at, destination, from_position, max_messages).ok()??;
+	let (messages, subtree_mmr_size, messages_proof) = api
+		.outbound_messages_with_proof(at, destination, from_position, max_messages)
+		.ok()??;
 	if messages.is_empty() {
 		return None;
 	}

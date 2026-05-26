@@ -221,8 +221,7 @@ pub mod pallet {
 						batch.messages_proof.mmr_size,
 						batch.messages_proof.proof.clone(),
 					);
-					let verified =
-						proof.verify(batch.subtree_root, leaves).unwrap_or(false);
+					let verified = proof.verify(batch.subtree_root, leaves).unwrap_or(false);
 					if !verified {
 						log::warn!(
 							target: "speculative::inbox",

@@ -452,7 +452,10 @@ where
 
 				let (speculative_ingress, late_block_proofs) =
 					if params.speculative_sources.sources.is_empty() {
-						(cumulus_pallet_speculative_inbox::client::empty_speculative_ingress(), Vec::new())
+						(
+							cumulus_pallet_speculative_inbox::client::empty_speculative_ingress(),
+							Vec::new(),
+						)
 					} else {
 						crate::collators::speculative_ingress::fetch_ingress_for_block(
 							para_client,

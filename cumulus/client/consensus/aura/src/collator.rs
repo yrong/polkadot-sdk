@@ -408,9 +408,8 @@ where
 		let blocks = vec![built.block];
 		let proof = built.proof;
 
-		if let Some((collation, block_data)) = self
-			.collator_service
-			.build_multi_block_collation_with_late_block_proofs(
+		if let Some((collation, block_data)) =
+			self.collator_service.build_multi_block_collation_with_late_block_proofs(
 				parent_header,
 				blocks,
 				proof,
