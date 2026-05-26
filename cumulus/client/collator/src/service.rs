@@ -70,6 +70,20 @@ pub trait ServiceInterface<Block: BlockT> {
 		proof: StorageProof,
 	) -> Option<(Collation, ParachainBlockData<Block>)>;
 
+	/// Same as [`Self::build_multi_block_collation`] but additionally attaches the given
+	/// `late_block_proofs` to [`ParachainBlockData::V2`] for the PVF's
+	/// `apply_messaging_proofs` step. Default implementation calls
+	/// [`Self::build_multi_block_collation`] and discards the LBPs (legacy callers).
+	fn build_multi_block_collation_with_late_block_proofs(
+		&self,
+		parent_header: &Block::Header,
+		blocks: Vec<Block>,
+		proof: StorageProof,
+		_late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+	) -> Option<(Collation, ParachainBlockData<Block>)> {
+		self.build_multi_block_collation(parent_header, blocks, proof)
+	}
+
 	/// Inform networking systems that the block should be announced after a signal has
 	/// been received to indicate the block has been seconded by a relay-chain validator.
 	///
@@ -237,6 +251,23 @@ where
 		blocks: Vec<Block>,
 		proof: StorageProof,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
+		self.build_multi_block_collation_with_late_block_proofs(
+			parent_header,
+			blocks,
+			proof,
+			Vec::new(),
+		)
+	}
+
+	/// Same as [`Self::build_multi_block_collation`] but additionally attaches
+	/// `late_block_proofs` to the resulting [`ParachainBlockData::V2`] for the PVF.
+	fn build_multi_block_collation_with_late_block_proofs(
+		&self,
+		parent_header: &Block::Header,
+		blocks: Vec<Block>,
+		proof: StorageProof,
+		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		let compact_proof =
 			match proof.into_compact_proof::<HashingFor<Block>>(*parent_header.state_root()) {
 				Ok(proof) => proof,
@@ -305,7 +336,8 @@ where
 		// Sort by recipient as required by the relay chain rules.
 		horizontal_messages.sort_by(|a, b| a.recipient.cmp(&b.recipient));
 
-		let block_data = ParachainBlockData::<Block>::new(blocks, compact_proof);
+		let block_data =
+			ParachainBlockData::<Block>::new_v2(blocks, compact_proof, late_block_proofs);
 
 		let pov = polkadot_node_primitives::maybe_compress_pov(PoV {
 			block_data: BlockData(if api_version >= 3 {
@@ -422,5 +454,21 @@ where
 		proof: StorageProof,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		CollatorService::build_multi_block_collation(self, parent_header, blocks, proof)
+	}
+
+	fn build_multi_block_collation_with_late_block_proofs(
+		&self,
+		parent_header: &<Block as BlockT>::Header,
+		blocks: Vec<Block>,
+		proof: StorageProof,
+		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+	) -> Option<(Collation, ParachainBlockData<Block>)> {
+		CollatorService::build_multi_block_collation_with_late_block_proofs(
+			self,
+			parent_header,
+			blocks,
+			proof,
+			late_block_proofs,
+		)
 	}
 }

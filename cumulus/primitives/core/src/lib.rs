@@ -685,6 +685,14 @@ sp_api::decl_runtime_apis! {
 			from_position: u64,
 			max_messages: u32,
 		) -> Vec<(u64, Vec<u8>)>;
+		/// Read a slice of outbound messages with a combined MMR inclusion proof
+		/// against the per-destination subtree root. Returns
+		/// `(messages, subtree_mmr_size, messages_proof)`.
+		fn outbound_messages_with_proof(
+			dest: ParaId,
+			from_position: u64,
+			max_messages: u32,
+		) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)>;
 		/// Generate a subtree inclusion proof for `(dest, subtree_root)` in the
 		/// top-level provides root. Returns (proof, num_destinations, leaf_index).
 		fn subtree_inclusion_proof(
@@ -713,8 +721,5 @@ sp_api::decl_runtime_apis! {
 
 		/// Next expected message position from `source` for speculative ingress fetch.
 		fn next_expected_message_position(source: ParaId) -> u64;
-
-		/// Last seen provides root from `source`.
-		fn last_seen_provides_root(source: ParaId) -> polkadot_primitives::Hash;
 	}
 }

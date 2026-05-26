@@ -19,8 +19,9 @@
 //! Receiver-side pallet for the inclusion-based speculative messaging PoC.
 //!
 //! Verifies incoming `MessageBatch`es against on-chain state (subtree inclusion proof,
-//! message ordering, continuity), updates `IncomingState`, records consumed source roots,
-//! and dispatches payloads through the existing XCMP handler.
+//! per-message MMR inclusion proof, message ordering), updates `IncomingState`,
+//! records consumed source roots, and dispatches payloads through the existing XCMP
+//! handler.
 //!
 //! Messages arrive via a mandatory inherent (`ingest_verified_messages`), so that the
 //! same batches are deterministically re-validated by backing validators during PVF
@@ -59,7 +60,7 @@ use cumulus_primitives_core::ParaId;
 use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
 use polkadot_primitives::v9::{RequiresCommitment, SourceState, SpeculativeIngress};
 
-use mmr_lib::{Merge, Result as MmrResult};
+use mmr_lib::{leaf_index_to_pos, Merge, MerkleProof, Result as MmrResult};
 
 /// Keccak256 merge for MMR node construction.
 struct Keccak256Merge;
@@ -115,8 +116,8 @@ pub mod pallet {
 		InvalidSubtreeProof,
 		/// Messages are not consecutive (gap or reorder from last processed + 1).
 		NonConsecutiveMessage,
-		/// Reconstructed local subtree root does not match the batch's claimed subtree root.
-		SubtreeRootMismatch,
+		/// The combined MMR inclusion proof did not verify against the batch's subtree root.
+		InvalidMessagesProof,
 		/// Multiple distinct provides roots for the same source in one block.
 		MultipleRootsPerSourceInOneBlock,
 	}
@@ -168,8 +169,8 @@ pub mod pallet {
 			let mut consumed: Vec<(ParaId, H256)> = Vec::new();
 
 			for batch in ingress.batches {
-				// 1. Verify subtree_inclusion_proof using binary-merkle-tree
-				// Leaf is SCALE(destination_para_id, subtree_root)
+				// 1. Verify subtree_inclusion_proof against the batch's provides_root.
+				// Leaf is SCALE(destination_para_id, subtree_root).
 				let leaf = (T::SelfParaId::get(), batch.subtree_root).encode();
 				let valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 					&batch.provides_root,
@@ -187,48 +188,58 @@ pub mod pallet {
 				}
 				ensure!(valid, Error::<T>::InvalidSubtreeProof);
 
-				// 2. Load or init per-source state
-				let mut state = IncomingState::<T>::get(&batch.source).unwrap_or_default();
-
-				// 3. Verify message continuity and reconstruct local subtree
-				for msg in &batch.messages {
-					let expected_position =
-						if state.mmr_size == 0 { 0 } else { state.last_processed + 1 };
-					ensure!(msg.position == expected_position, Error::<T>::NonConsecutiveMessage);
-					let msg_hash = Keccak256::hash(&msg.payload);
-					state.mmr_peaks = append_leaf_to_peaks::<Keccak256Merge>(
-						state.mmr_peaks,
-						state.mmr_size,
-						msg_hash,
-					);
-					state.mmr_size += 1;
-					state.last_processed = msg.position;
-				}
-
-				// 4. Verify reconstructed MMR subtree root matches batch
-				let computed_root = bag_peaks::<Keccak256Merge>(&state.mmr_peaks);
-				if computed_root != batch.subtree_root {
-					log::warn!(
-						target: "speculative::inbox",
-						"SubtreeRootMismatch for source={:?}: computed={:?} expected={:?}",
-						batch.source, computed_root, batch.subtree_root,
-					);
-				}
-				ensure!(computed_root == batch.subtree_root, Error::<T>::SubtreeRootMismatch);
-				// 5. Enforce one distinct top-level provides root per source per block.
-				// Gate on whether this source was already consumed in this block — not on
-				// last_processed, which would skip the check for the very first message.
-				if consumed.iter().any(|(source, _)| source == &batch.source) {
+				// 2. Enforce one distinct top-level provides root per source per block.
+				// Use the local `consumed` list — we don't need cross-block state for this:
+				// the guard only matters within the current block.
+				if let Some((_, prior_root)) =
+					consumed.iter().find(|(source, _)| source == &batch.source)
+				{
 					ensure!(
-						state.last_seen_provides_root == batch.provides_root,
+						*prior_root == batch.provides_root,
 						Error::<T>::MultipleRootsPerSourceInOneBlock,
 					);
 				}
 
-				// 6. Update state
-				state.last_seen_provides_root = batch.provides_root;
-				state.last_seen_subtree_root = batch.subtree_root;
-				IncomingState::<T>::insert(batch.source, state);
+				// 3. Load per-source state for continuity check.
+				let mut next_expected = match IncomingState::<T>::get(&batch.source) {
+					Some(state) => state.last_processed.saturating_add(1),
+					None => 0,
+				};
+
+				// 4. Verify message continuity and collect MMR leaves for proof verification.
+				let mut leaves: Vec<(u64, H256)> = Vec::with_capacity(batch.messages.len());
+				for msg in &batch.messages {
+					ensure!(msg.position == next_expected, Error::<T>::NonConsecutiveMessage);
+					let leaf_hash = Keccak256::hash(&msg.payload);
+					leaves.push((leaf_index_to_pos(msg.position), leaf_hash));
+					next_expected = next_expected.saturating_add(1);
+				}
+
+				// 5. Verify the combined MMR inclusion proof against subtree_root.
+				if !leaves.is_empty() {
+					let proof = MerkleProof::<H256, Keccak256Merge>::new(
+						batch.subtree_mmr_size,
+						batch.messages_proof.clone(),
+					);
+					let verified =
+						proof.verify(batch.subtree_root, leaves).unwrap_or(false);
+					if !verified {
+						log::warn!(
+							target: "speculative::inbox",
+							"InvalidMessagesProof for source={:?} subtree_root={:?}",
+							batch.source, batch.subtree_root,
+						);
+					}
+					ensure!(verified, Error::<T>::InvalidMessagesProof);
+				}
+
+				// 6. Update state: record last_processed if any messages were consumed.
+				if let Some(last) = batch.messages.last() {
+					IncomingState::<T>::insert(
+						batch.source,
+						SourceState { last_processed: last.position },
+					);
+				}
 				consumed.push((batch.source, batch.provides_root));
 
 				// 7. Dispatch through the standard XCMP handler.
@@ -285,16 +296,10 @@ pub mod pallet {
 impl<T: Config> Pallet<T> {
 	/// Next message position the collator should fetch from `source`.
 	pub fn next_expected_message_position(source: ParaId) -> u64 {
-		IncomingState::<T>::get(&source)
-			.map(|state| if state.mmr_size == 0 { 0 } else { state.last_processed + 1 })
-			.unwrap_or(0)
-	}
-
-	/// Last seen provides root from `source`.
-	pub fn last_seen_provides_root(source: ParaId) -> H256 {
-		IncomingState::<T>::get(&source)
-			.map(|state| state.last_seen_provides_root)
-			.unwrap_or_default()
+		match IncomingState::<T>::get(&source) {
+			Some(state) => state.last_processed.saturating_add(1),
+			None => 0,
+		}
 	}
 
 	/// Get the requires commitments for this block (sources consumed + their provides roots).
@@ -317,101 +322,9 @@ impl<T: Config> Pallet<T> {
 
 // ── Helpers ──
 
-/// Verify that an MMR root R_old is an ancestor of R_new using an extension proof.
-///
-/// Replays the leaf appends in `ext.connecting_nodes` starting from `ext.old_peaks`
-/// at `ext.old_leaf_count`. The resulting peaks must match `ext.new_peaks` and bag to `new_root`.
-fn verify_mmr_extension(
-	old_root: H256,
-	new_root: H256,
-	ext: &polkadot_primitives::v9::MMRExtensionProof,
-) -> bool {
-	if ext.old_peaks.is_empty() || ext.new_peaks.is_empty() || ext.connecting_nodes.is_empty() {
-		return false;
-	}
-	let old_computed = bag_peaks::<Keccak256Merge>(&ext.old_peaks);
-	if old_computed != old_root {
-		return false;
-	}
-	// Replay each leaf append and confirm we arrive at ext.new_peaks.
-	let mut peaks = ext.old_peaks.clone();
-	let mut size = ext.old_leaf_count;
-	for &leaf_hash in &ext.connecting_nodes {
-		peaks = append_leaf_to_peaks::<Keccak256Merge>(peaks, size, leaf_hash);
-		size += 1;
-	}
-	if peaks != ext.new_peaks {
-		return false;
-	}
-	bag_peaks::<Keccak256Merge>(&ext.new_peaks) == new_root
-}
-
-/// Bag MMR peaks into a single root hash using mmr_lib's canonical merge order:
-/// merge(right_peak, next_left_peak) from right to left.
-fn bag_peaks<M: Merge>(peaks: &[M::Item]) -> M::Item
-where
-	M::Item: Default + Clone,
-{
-	if peaks.is_empty() {
-		return Default::default();
-	}
-	let mut current = peaks.last().unwrap().clone();
-	for peak in peaks[..peaks.len() - 1].iter().rev() {
-		current = M::merge(&current, peak).unwrap_or(current);
-	}
-	current
-}
-
-fn append_leaf_to_peaks<M: Merge>(
-	mut peaks: Vec<M::Item>,
-	size: u64,
-	leaf: M::Item,
-) -> Vec<M::Item> {
-	let mut current = leaf;
-	let mut current_size = size;
-	while current_size % 2 == 1 {
-		if let Some(last_peak) = peaks.pop() {
-			current = M::merge(&last_peak, &current).unwrap_or(current);
-		}
-		current_size /= 2;
-	}
-	peaks.push(current);
-	peaks
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use sp_core::H256;
-	use sp_runtime::traits::Keccak256;
-
-	#[test]
-	fn test_mmr_root_single_leaf() {
-		let leaf = Keccak256::hash(b"msg1");
-		let peaks = append_leaf_to_peaks::<Keccak256Merge>(Vec::new(), 0, leaf);
-		let root = bag_peaks::<Keccak256Merge>(&peaks);
-		assert_eq!(root, leaf);
-	}
-
-	#[test]
-	fn test_mmr_root_matches_after_multiple_pushes() {
-		let leaves: Vec<H256> = (0..11u8).map(|i| Keccak256::hash(&[i])).collect();
-
-		let store = mmr_lib::util::MemStore::<H256>::default();
-		let mut mmr = mmr_lib::util::MemMMR::<H256, Keccak256Merge>::new(0, &store);
-
-		let mut peaks = Vec::new();
-		let mut size = 0;
-		for leaf in &leaves {
-			mmr.push(*leaf).unwrap();
-			peaks = append_leaf_to_peaks::<Keccak256Merge>(peaks, size, *leaf);
-			size += 1;
-		}
-		let incremental_root = mmr.get_root().unwrap();
-
-		let peak_root = bag_peaks::<Keccak256Merge>(&peaks);
-		assert_eq!(peak_root, incremental_root);
-	}
 
 	#[test]
 	fn test_top_level_merkle_proof_roundtrip() {

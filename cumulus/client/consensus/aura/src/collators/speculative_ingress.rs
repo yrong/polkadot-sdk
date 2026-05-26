@@ -23,7 +23,10 @@ use super::outbox_client::{build_message_batch_from_query, OutboxQuery};
 use cumulus_pallet_speculative_inbox::client::empty_speculative_ingress;
 use cumulus_primitives_core::{ParaId, SpeculativeInboxApi};
 use cumulus_relay_chain_interface::RelayChainInterface;
-use polkadot_primitives::{v9::SpeculativeIngress, BlockNumber, Hash};
+use polkadot_primitives::{
+	v9::{LateBlockProof, SpeculativeIngress},
+	BlockNumber, Hash,
+};
 use sc_client_api::UsageProvider;
 use sp_api::ProvideRuntimeApi;
 use sp_runtime::traits::Block as BlockT;
@@ -70,11 +73,17 @@ impl SpeculativeMessageSources {
 	}
 }
 
-/// Fetch speculative ingress for the block being built on `receiver_parent`.
+/// Fetch speculative ingress (and any required late block proofs) for the block being
+/// built on `receiver_parent`.
 ///
-/// When `sources` is empty, returns empty ingress (legacy behaviour). Otherwise
+/// When `sources` is empty, returns empty ingress / no LBPs (legacy behaviour). Otherwise
 /// queries each sender's outbox at its best block and the receiver's expected
 /// message cursor via [`SpeculativeInboxApi`].
+///
+/// The collator attaches the returned `Vec<LateBlockProof>` to
+/// `ParachainBlockData::V2.late_block_proofs` so the PVF's `apply_messaging_proofs`
+/// can transform `requires[source].expected_root` from the (older) batch root to
+/// the relay-committed current root.
 pub async fn fetch_ingress_for_block<Block, Client, RClient>(
 	receiver: &Client,
 	_receiver_parent: Hash,
@@ -83,7 +92,7 @@ pub async fn fetch_ingress_for_block<Block, Client, RClient>(
 	relay_parent: Hash,
 	relay_client: &RClient,
 	relay_parent_number: BlockNumber,
-) -> SpeculativeIngress
+) -> (SpeculativeIngress, Vec<LateBlockProof>)
 where
 	Block: BlockT<Hash = Hash>,
 	Client: ProvideRuntimeApi<Block> + UsageProvider<Block>,
@@ -91,11 +100,12 @@ where
 	RClient: RelayChainInterface,
 {
 	if config.sources.is_empty() {
-		return empty_speculative_ingress();
+		return (empty_speculative_ingress(), Vec::new());
 	}
 
 	let receiver_api = receiver.runtime_api();
 	let mut batches = Vec::new();
+	let mut late_block_proofs = Vec::new();
 
 	// Use the finalized head for position tracking rather than the fork parent.
 	// This prevents re-delivering messages that are already committed on the
@@ -113,9 +123,6 @@ where
 		let from_position = receiver_api
 			.next_expected_message_position(finalized_hash, *source)
 			.unwrap_or(0);
-		let expected_provides_root = receiver_api
-			.last_seen_provides_root(finalized_hash, *source)
-			.unwrap_or_default();
 
 		let sender_best = sender.best_block_hash();
 
@@ -128,34 +135,34 @@ where
 			.flatten()
 			.filter(|r| *r != Hash::default());
 
-		// If the relay chain has a newer provides root for this source, find the matching
-		// sender block so we fetch the right batch.
+		// Pick a sender block for batch fetch. Prefer the block matching the relay's
+		// committed root so the batch lands on a relay-known root; otherwise fall back
+		// to the sender's best, which may have advanced past the relay.
 		let mut fetch_at = sender_best;
+		let mut fetch_at_root: Option<Hash> = None;
 		if let Some(relay_root) = relay_provides_root {
-			if relay_root != expected_provides_root {
+			tracing::debug!(
+				target: "aura::cumulus",
+				source = ?source,
+				?relay_root,
+				"looking up sender block for relay provides_root",
+			);
+			if let Some(at_relay) =
+				sender.block_hash_for_provides_root(sender_best, relay_root).await
+			{
+				fetch_at = at_relay;
+				fetch_at_root = Some(relay_root);
+			} else {
 				tracing::debug!(
 					target: "aura::cumulus",
 					source = ?source,
 					?relay_root,
-					?expected_provides_root,
-					"relay provides_root advanced; looking up sender block for new root",
+					"could not find sender block for relay provides_root; using sender best",
 				);
-				if let Some(at_relay) =
-					sender.block_hash_for_provides_root(sender_best, relay_root).await
-				{
-					fetch_at = at_relay;
-				} else {
-					tracing::debug!(
-						target: "aura::cumulus",
-						source = ?source,
-						?relay_root,
-						"could not find sender block for relay provides_root; using sender best",
-					);
-				}
 			}
 		}
 
-		match build_message_batch_from_query(
+		let batch = match build_message_batch_from_query(
 			sender.as_ref(),
 			fetch_at,
 			*source,
@@ -167,42 +174,81 @@ where
 		)
 		.await
 		{
-			Some(batch) => {
-				// Root guard: only submit a speculative batch when the relay has already
-				// committed a matching provides_root for this source. This ensures the
-				// relay's requires_satisfied check will pass at inclusion time, preventing
-				// the competing n_requires=0 / n_requires=1 fork contention that causes
-				// post-delivery stalls.
-				//
-				// Trade-off: we lose the narrow speculative window before relay enactment
-				// (~6-18s), but eliminate the ~60s stall when the wrong fork gets backed.
-				let relay_committed =
-					relay_provides_root.map_or(false, |r| r == batch.provides_root);
-				if !relay_committed {
-					tracing::debug!(
-						target: "aura::cumulus",
-						source = ?source,
-						?relay_provides_root,
-						batch_provides_root = ?batch.provides_root,
-						"root guard: relay has not committed matching provides_root; skipping batch",
-					);
-					continue;
-				}
-				tracing::debug!(
-					target: "aura::cumulus",
-					source = ?source,
-					messages = batch.messages.len(),
-					provides_root = ?batch.provides_root,
-					"fetched speculative batch",
-				);
-				batches.push(batch);
-			},
+			Some(b) => b,
 			None => {
 				tracing::trace!(
 					target: "aura::cumulus",
 					source = ?source,
 					from_position,
 					"no speculative messages available",
+				);
+				continue;
+			},
+		};
+
+		// Determine whether the batch needs a late block proof. The PVF requires an
+		// LBP whenever the batch's provides_root differs from the relay-committed
+		// current root for this source: the LBP authorizes the runtime-side
+		// `requires[source].expected_root` to be transformed from `old → new` so
+		// the relay's `requires_satisfied` check passes at enactment.
+		match (relay_provides_root, fetch_at_root) {
+			(Some(relay_root), Some(matched)) if matched == batch.provides_root => {
+				// Batch is built against the relay-current root. No LBP needed.
+				let _ = relay_root;
+				tracing::debug!(
+					target: "aura::cumulus",
+					source = ?source,
+					messages = batch.messages.len(),
+					provides_root = ?batch.provides_root,
+					"fetched speculative batch (no LBP required)",
+				);
+				batches.push(batch);
+			},
+			(Some(relay_root), _) => {
+				// Batch is built against an older root than the relay knows about.
+				// Fetch an LBP from the sender at the block that produced the relay's
+				// current root, proving the batch's root is an ancestor of relay_root.
+				let lbp_at = sender
+					.block_hash_for_provides_root(sender_best, relay_root)
+					.await
+					.unwrap_or(sender_best);
+				match sender
+					.generate_late_block_proof(lbp_at, destination, batch.provides_root)
+					.await
+				{
+					Some(proof) => {
+						tracing::debug!(
+							target: "aura::cumulus",
+							source = ?source,
+							messages = batch.messages.len(),
+							batch_provides_root = ?batch.provides_root,
+							?relay_root,
+							"fetched speculative batch + late block proof",
+						);
+						batches.push(batch);
+						late_block_proofs.push(proof);
+					},
+					None => {
+						tracing::warn!(
+							target: "aura::cumulus",
+							source = ?source,
+							batch_provides_root = ?batch.provides_root,
+							?relay_root,
+							"could not generate late block proof; skipping batch",
+						);
+					},
+				}
+			},
+			(None, _) => {
+				// Relay has no committed root for this source yet (sender hasn't been
+				// relay-enacted). Without a relay anchor, the receiver cannot pass
+				// requires_satisfied at inclusion time. Skip this batch — see the
+				// root guard discussion in the design doc.
+				tracing::debug!(
+					target: "aura::cumulus",
+					source = ?source,
+					batch_provides_root = ?batch.provides_root,
+					"root guard: relay has not committed any provides_root; skipping batch",
 				);
 			},
 		}
@@ -211,8 +257,9 @@ where
 	tracing::debug!(
 		target: "aura::cumulus",
 		total_batches = batches.len(),
+		total_lbps = late_block_proofs.len(),
 		"fetch_ingress_for_block: done",
 	);
 
-	SpeculativeIngress { batches }
+	(SpeculativeIngress { batches }, late_block_proofs)
 }

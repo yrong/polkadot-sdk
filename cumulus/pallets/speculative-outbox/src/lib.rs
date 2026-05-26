@@ -42,7 +42,7 @@ use frame_system::pallet_prelude::BlockNumberFor;
 use cumulus_primitives_core::{ParaId, XcmpMessageSource};
 use polkadot_primitives::v9::{MMRExtensionProof, ProvidesCommitment};
 
-use mmr_lib::{Merge, Result as MmrResult};
+use mmr_lib::{leaf_index_to_pos, util::MemMMR, util::MemStore, Merge, Result as MmrResult};
 
 /// Keccak256 merge for MMR node construction.
 /// Identical to the receiver-side `Keccak256Merge` in `pallet-speculative-inbox`.
@@ -229,6 +229,50 @@ impl<T: Config> Pallet<T> {
 		(from_position..end)
 			.filter_map(|pos| OutgoingMessages::<T>::get(dest, pos).map(|p| (pos, p)))
 			.collect()
+	}
+
+	/// Read a slice of outbound messages along with a combined MMR inclusion proof
+	/// against the per-destination `subtree_root`. The receiver verifies the returned
+	/// proof with `mmr_lib::MerkleProof::new(mmr_size, proof).verify(root, leaves)`.
+	///
+	/// Returns `None` if the destination has no messages or the requested slice is empty.
+	///
+	/// Cost: O(leaf_count) — replays all stored payloads into an in-memory MMR to produce
+	/// the proof. Acceptable for the PoC; production would want incremental MMR storage.
+	pub fn outbound_messages_with_proof(
+		dest: ParaId,
+		from_position: u64,
+		max_messages: u32,
+	) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<H256>)> {
+		let leaf_count = OutgoingMMRState::<T>::get(&dest).leaf_count;
+		if leaf_count == 0 {
+			return None;
+		}
+		let end = leaf_count.min(from_position.saturating_add(max_messages as u64));
+		if end <= from_position {
+			return None;
+		}
+
+		// Replay every stored payload through a MemMMR to derive node positions
+		// and the gen_proof witness items for the requested slice.
+		let store = MemStore::<H256>::default();
+		let mut mmr = MemMMR::<H256, Keccak256Merge>::new(0, &store);
+		let mut messages: Vec<(u64, Vec<u8>)> = Vec::new();
+		for leaf_idx in 0..leaf_count {
+			let payload = OutgoingMessages::<T>::get(dest, leaf_idx)?;
+			mmr.push(Keccak256::hash(&payload)).ok()?;
+			if leaf_idx >= from_position && leaf_idx < end {
+				messages.push((leaf_idx, payload));
+			}
+		}
+		if messages.is_empty() {
+			return None;
+		}
+
+		let positions: Vec<u64> = (from_position..end).map(leaf_index_to_pos).collect();
+		let mmr_size = mmr.mmr_size();
+		let proof = mmr.gen_proof(positions).ok()?;
+		Some((messages, mmr_size, proof.proof_items().to_vec()))
 	}
 
 	/// Generate a Merkle inclusion proof that `(dest, subtree_root)` is in

@@ -1222,6 +1222,13 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		fn outbound_messages(dest: ParaId, from_position: u64, max_messages: u32) -> Vec<(u64, Vec<u8>)> {
 			SpeculativeOutbox::outbound_messages(dest, from_position, max_messages)
 		}
+		fn outbound_messages_with_proof(
+			dest: ParaId,
+			from_position: u64,
+			max_messages: u32,
+		) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)> {
+			SpeculativeOutbox::outbound_messages_with_proof(dest, from_position, max_messages)
+		}
 		fn subtree_inclusion_proof(dest: ParaId, subtree_root: polkadot_primitives::Hash) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)> {
 			SpeculativeOutbox::subtree_inclusion_proof(dest, subtree_root)
 		}
@@ -1251,9 +1258,6 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		}
 		fn next_expected_message_position(source: ParaId) -> u64 {
 			SpeculativeInbox::next_expected_message_position(source)
-		}
-		fn last_seen_provides_root(source: ParaId) -> polkadot_primitives::Hash {
-			SpeculativeInbox::last_seen_provides_root(source)
 		}
 	}
 );

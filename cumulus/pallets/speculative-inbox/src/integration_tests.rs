@@ -23,10 +23,22 @@ use sp_core::H256;
 use sp_runtime::traits::{Hash as _, Keccak256};
 
 fn build_valid_batch(source: ParaId, destination: ParaId, messages: Vec<Vec<u8>>) -> MessageBatch {
+	let count = messages.len() as u64;
 	SpeculativeOutbox::<Test>::record_outbound_messages(destination, messages.clone());
 	let provides = SpeculativeOutbox::<Test>::compute_provides_root().unwrap();
-	let (subtree_root, _) = SpeculativeOutbox::<Test>::destination_state(destination).unwrap();
-	let (proof, number_of_destinations, leaf_index) =
+	let (subtree_root, leaf_count) =
+		SpeculativeOutbox::<Test>::destination_state(destination).unwrap();
+	let from_position = leaf_count - count;
+
+	let (returned_msgs, subtree_mmr_size, messages_proof) =
+		SpeculativeOutbox::<Test>::outbound_messages_with_proof(
+			destination,
+			from_position,
+			count as u32,
+		)
+		.expect("messages_with_proof");
+
+	let (subtree_inclusion_proof, number_of_destinations, leaf_index) =
 		SpeculativeOutbox::<Test>::subtree_inclusion_proof(destination, subtree_root).unwrap();
 
 	MessageBatch {
@@ -35,13 +47,14 @@ fn build_valid_batch(source: ParaId, destination: ParaId, messages: Vec<Vec<u8>>
 		source_relay_parent_number: 1,
 		provides_root: provides.root,
 		subtree_root,
-		subtree_inclusion_proof: proof,
+		subtree_mmr_size,
+		messages_proof,
+		subtree_inclusion_proof,
 		number_of_destinations,
 		leaf_index,
-		messages: messages
+		messages: returned_msgs
 			.into_iter()
-			.enumerate()
-			.map(|(i, payload)| OutgoingMessage { position: i as u64, payload })
+			.map(|(position, payload)| OutgoingMessage { position, payload })
 			.collect(),
 	}
 }
@@ -101,6 +114,25 @@ fn ingest_rejects_non_consecutive_messages() {
 }
 
 #[test]
+fn ingest_rejects_invalid_messages_proof() {
+	new_test_ext().execute_with(|| {
+		let source = ParaId::new(1000);
+		let destination = SelfParaId::get();
+		let mut batch = build_valid_batch(source, destination, vec![b"first".to_vec()]);
+		// Corrupt the payload — the proof was generated against Keccak256(b"first").
+		batch.messages[0].payload = b"tampered".to_vec();
+
+		assert_noop!(
+			SpeculativeInbox::<Test>::ingest_verified_messages(
+				RuntimeOrigin::none(),
+				SpeculativeIngress { batches: vec![batch] },
+			),
+			Error::<Test>::InvalidMessagesProof,
+		);
+	});
+}
+
+#[test]
 fn ingest_second_batch_requires_consecutive_positions() {
 	new_test_ext().execute_with(|| {
 		let source = ParaId::new(1000);
@@ -112,24 +144,8 @@ fn ingest_second_batch_requires_consecutive_positions() {
 			SpeculativeIngress { batches: vec![batch1] },
 		));
 
-		// Record one more message on the sender outbox.
-		SpeculativeOutbox::<Test>::record_outbound_messages(destination, vec![b"two".to_vec()]);
-		let provides = SpeculativeOutbox::<Test>::compute_provides_root().unwrap();
-		let (subtree_root, _) = SpeculativeOutbox::<Test>::destination_state(destination).unwrap();
-		let (proof, number_of_destinations, leaf_index) =
-			SpeculativeOutbox::<Test>::subtree_inclusion_proof(destination, subtree_root).unwrap();
-
-		let batch2 = MessageBatch {
-			source,
-			source_block: H256::from_low_u64_be(2),
-			source_relay_parent_number: 2,
-			provides_root: provides.root,
-			subtree_root,
-			subtree_inclusion_proof: proof,
-			number_of_destinations,
-			leaf_index,
-			messages: vec![OutgoingMessage { position: 1, payload: b"two".to_vec() }],
-		};
+		// Build a batch covering only the second message.
+		let batch2 = build_valid_batch(source, destination, vec![b"two".to_vec()]);
 
 		assert_ok!(SpeculativeInbox::<Test>::ingest_verified_messages(
 			RuntimeOrigin::none(),

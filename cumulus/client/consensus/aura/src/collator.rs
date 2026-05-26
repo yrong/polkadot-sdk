@@ -374,6 +374,10 @@ where
 	///
 	/// The Aura pre-digest should not be explicitly provided and is set internally.
 	///
+	/// `late_block_proofs` is attached to the resulting `ParachainBlockData::V2`
+	/// so the PVF can transform `requires[source].expected_root` from old → new
+	/// at validation time. Pass an empty `Vec` when no LBPs are needed.
+	///
 	/// This does not announce the collation to the parachain network or the relay chain.
 	pub async fn collate(
 		&mut self,
@@ -383,6 +387,7 @@ where
 		inherent_data: (ParachainInherentData, InherentData),
 		proposal_duration: Duration,
 		max_pov_size: usize,
+		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
 	) -> Result<Option<(Collation, ParachainBlockData<Block>)>, Box<dyn Error + Send + 'static>> {
 		let maybe_candidate = self
 			.build_block_and_import(BuildBlockAndImportParams {
@@ -400,12 +405,17 @@ where
 
 		let Some(built) = maybe_candidate else { return Ok(None) };
 
-		let hash = built.block.header().hash();
-		let candidate = ParachainCandidate::from(built);
+		let blocks = vec![built.block];
+		let proof = built.proof;
 
-		if let Some((collation, block_data)) =
-			self.collator_service.build_collation(parent_header, hash, candidate)
-		{
+		if let Some((collation, block_data)) = self
+			.collator_service
+			.build_multi_block_collation_with_late_block_proofs(
+				parent_header,
+				blocks,
+				proof,
+				late_block_proofs,
+			) {
 			block_data.log_size_info();
 
 			if let MaybeCompressedPoV::Compressed(ref pov) = collation.proof_of_validity {

@@ -64,7 +64,6 @@ pub fn build_message_batch<Block, Client>(
 	source_block: Hash,
 	source_relay_parent_number: BlockNumber,
 	from_position: u64,
-	expected_provides_root: Hash,
 	max_messages: u32,
 ) -> Option<MessageBatch>
 where
@@ -75,12 +74,13 @@ where
 	let api = client.runtime_api();
 	let provides = api.compute_provides_root(at).ok()??;
 	let (subtree_root, _) = api.destination_state(at, destination).ok()??;
-	let messages = api.outbound_messages(at, destination, from_position, max_messages).ok()?;
+	let (messages, subtree_mmr_size, messages_proof) =
+		api.outbound_messages_with_proof(at, destination, from_position, max_messages).ok()??;
 	if messages.is_empty() {
 		return None;
 	}
 
-	let (proof, number_of_destinations, leaf_index) =
+	let (subtree_inclusion_proof, number_of_destinations, leaf_index) =
 		api.subtree_inclusion_proof(at, destination, subtree_root).ok()??;
 
 	let batch = MessageBatch {
@@ -89,7 +89,9 @@ where
 		source_relay_parent_number,
 		provides_root: provides.root,
 		subtree_root,
-		subtree_inclusion_proof: proof,
+		subtree_mmr_size,
+		messages_proof,
+		subtree_inclusion_proof,
 		number_of_destinations,
 		leaf_index,
 		messages: messages
@@ -104,10 +106,10 @@ where
 /// Fetch batches from one or more sender chains and assemble ingress.
 ///
 /// Each entry is `(source_para_id, sender_client, sender_block_hash, relay_parent_number,
-/// from_position, expected_provides_root)`. Failures for individual sources are skipped (collator
-/// continues without that source).
+/// from_position)`. Failures for individual sources are skipped (collator continues
+/// without that source).
 pub fn fetch_speculative_ingress<Block, Client>(
-	sources: &[(ParaId, &Client, <Block as BlockT>::Hash, BlockNumber, u64, Hash)],
+	sources: &[(ParaId, &Client, <Block as BlockT>::Hash, BlockNumber, u64)],
 	destination: ParaId,
 	max_messages_per_source: u32,
 ) -> SpeculativeIngress
@@ -117,8 +119,7 @@ where
 	Client::Api: SpeculativeOutboxApi<Block>,
 {
 	let mut batches = Vec::new();
-	for (source, client, at, relay_parent_number, from_position, expected_provides_root) in sources
-	{
+	for (source, client, at, relay_parent_number, from_position) in sources {
 		let source_block = *at;
 		if let Some(batch) = build_message_batch::<Block, Client>(
 			client,
@@ -128,7 +129,6 @@ where
 			source_block,
 			*relay_parent_number,
 			*from_position,
-			*expected_provides_root,
 			max_messages_per_source,
 		) {
 			batches.push(batch);
