@@ -303,6 +303,9 @@ where
 	let mut speculative_ext: Option<
 		polkadot_parachain_primitives::primitives::ValidationResultExtension,
 	> = None;
+	// `SelfParaId::get()` may read storage (e.g. parachain_info pallet), so capture it
+	// inside externalities alongside `speculative_ext`.
+	let mut self_para_id: Option<polkadot_primitives::Id> = None;
 	let num_blocks = blocks.len();
 
 	// Create the db
@@ -429,6 +432,7 @@ where
 					// Must be called here while externalities are still active; storage
 					// iteration in compute_provides_root panics outside this context.
 					speculative_ext = PSC::speculative_extension();
+					self_para_id = Some(PSC::SelfParaId::get());
 				}
 			},
 		);
@@ -501,7 +505,8 @@ where
 
 	let mut extension = speculative_ext;
 	if let Some(proofs) = messaging_proofs {
-		apply_messaging_proofs(PSC::SelfParaId::get(), &mut extension, proofs);
+		let para_id = self_para_id.expect("self_para_id captured during last block execution; qed");
+		apply_messaging_proofs(para_id, &mut extension, proofs);
 	}
 
 	ValidationResult {
