@@ -231,12 +231,13 @@ pub async fn build_message_batch_from_query(
 	at: Hash,
 	source_para_id: ParaId,
 	destination: ParaId,
-	source_block: Hash,
 	source_relay_parent_number: BlockNumber,
 	from_position: u64,
 	max_messages: u32,
 ) -> Option<polkadot_primitives::v9::MessageBatch> {
-	use polkadot_primitives::v9::{MessageBatch, OutgoingMessage};
+	use polkadot_primitives::v9::{
+		MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage,
+	};
 
 	let provides = source.compute_provides_root(at).await?;
 	let (subtree_root, _) = source.destination_state(at, destination).await?;
@@ -285,15 +286,15 @@ pub async fn build_message_batch_from_query(
 
 	Some(MessageBatch {
 		source: source_para_id,
-		source_block,
 		source_relay_parent_number,
 		provides_root: provides.root,
 		subtree_root,
-		subtree_mmr_size,
-		messages_proof,
-		subtree_inclusion_proof,
-		number_of_destinations,
-		leaf_index,
+		messages_proof: MmrInclusionProof { mmr_size: subtree_mmr_size, proof: messages_proof },
+		subtree_inclusion_proof: MerkleSubtreeProof {
+			proof: subtree_inclusion_proof,
+			number_of_leaves: number_of_destinations,
+			leaf_index,
+		},
 		messages: messages
 			.into_iter()
 			.map(|(position, payload)| OutgoingMessage { position, payload })

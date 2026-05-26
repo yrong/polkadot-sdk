@@ -167,7 +167,6 @@ where
 			fetch_at,
 			*source,
 			destination,
-			fetch_at,
 			relay_parent_number,
 			from_position,
 			config.max_messages_per_source,

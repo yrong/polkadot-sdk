@@ -143,9 +143,9 @@ fn apply_messaging_proofs(
 					let old_leaf = (para_id, proof.old_subtree_root).encode();
 					let old_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 						&proof.old_provides_root,
-						proof.old_subtree_proof.iter().copied(),
-						proof.old_number_of_destinations,
-						proof.old_leaf_index,
+						proof.old_subtree_proof.proof.iter().copied(),
+						proof.old_subtree_proof.number_of_leaves,
+						proof.old_subtree_proof.leaf_index,
 						&old_leaf,
 					);
 
@@ -153,9 +153,9 @@ fn apply_messaging_proofs(
 					let new_leaf = (para_id, proof.new_subtree_root).encode();
 					let new_valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 						&proof.new_provides_root,
-						proof.new_subtree_proof.iter().copied(),
-						proof.number_of_destinations,
-						proof.leaf_index,
+						proof.new_subtree_proof.proof.iter().copied(),
+						proof.new_subtree_proof.number_of_leaves,
+						proof.new_subtree_proof.leaf_index,
 						&new_leaf,
 					);
 
@@ -906,16 +906,20 @@ mod tests {
 
 		let proof = LateBlockProof {
 			source: para_id,
-			old_number_of_destinations: 1,
-			old_leaf_index: 0,
-			number_of_destinations: 1,
-			leaf_index: 0,
 			old_provides_root,
 			old_subtree_root,
-			old_subtree_proof: old_proof.proof,
+			old_subtree_proof: polkadot_primitives::v9::MerkleSubtreeProof {
+				proof: old_proof.proof,
+				number_of_leaves: 1,
+				leaf_index: 0,
+			},
 			new_provides_root,
 			new_subtree_root,
-			new_subtree_proof: new_proof.proof,
+			new_subtree_proof: polkadot_primitives::v9::MerkleSubtreeProof {
+				proof: new_proof.proof,
+				number_of_leaves: 1,
+				leaf_index: 0,
+			},
 			subtree_extension: Some(MMRExtensionProof {
 				old_peaks: old_subtree_peaks,
 				old_leaf_count: 1,

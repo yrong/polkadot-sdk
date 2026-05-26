@@ -18,8 +18,9 @@ use crate::{mock::*, Error, Pallet as SpeculativeInbox};
 use cumulus_pallet_speculative_outbox::Pallet as SpeculativeOutbox;
 use cumulus_primitives_core::ParaId;
 use frame_support::{assert_noop, assert_ok, traits::Hooks};
-use polkadot_primitives::v9::{MessageBatch, OutgoingMessage, SpeculativeIngress};
-use sp_core::H256;
+use polkadot_primitives::v9::{
+	MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage, SpeculativeIngress,
+};
 use sp_runtime::traits::{Hash as _, Keccak256};
 
 fn build_valid_batch(source: ParaId, destination: ParaId, messages: Vec<Vec<u8>>) -> MessageBatch {
@@ -43,15 +44,15 @@ fn build_valid_batch(source: ParaId, destination: ParaId, messages: Vec<Vec<u8>>
 
 	MessageBatch {
 		source,
-		source_block: H256::from_low_u64_be(1),
 		source_relay_parent_number: 1,
 		provides_root: provides.root,
 		subtree_root,
-		subtree_mmr_size,
-		messages_proof,
-		subtree_inclusion_proof,
-		number_of_destinations,
-		leaf_index,
+		messages_proof: MmrInclusionProof { mmr_size: subtree_mmr_size, proof: messages_proof },
+		subtree_inclusion_proof: MerkleSubtreeProof {
+			proof: subtree_inclusion_proof,
+			number_of_leaves: number_of_destinations,
+			leaf_index,
+		},
 		messages: returned_msgs
 			.into_iter()
 			.map(|(position, payload)| OutgoingMessage { position, payload })
@@ -83,7 +84,7 @@ fn ingest_rejects_invalid_subtree_proof() {
 		let source = ParaId::new(1000);
 		let destination = SelfParaId::get();
 		let mut batch = build_valid_batch(source, destination, vec![b"xcm-msg".to_vec()]);
-		batch.leaf_index = batch.number_of_destinations;
+		batch.subtree_inclusion_proof.leaf_index = batch.subtree_inclusion_proof.number_of_leaves;
 
 		assert_noop!(
 			SpeculativeInbox::<Test>::ingest_verified_messages(

@@ -174,9 +174,9 @@ pub mod pallet {
 				let leaf = (T::SelfParaId::get(), batch.subtree_root).encode();
 				let valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
 					&batch.provides_root,
-					batch.subtree_inclusion_proof.iter().copied(),
-					batch.number_of_destinations,
-					batch.leaf_index,
+					batch.subtree_inclusion_proof.proof.iter().copied(),
+					batch.subtree_inclusion_proof.number_of_leaves,
+					batch.subtree_inclusion_proof.leaf_index,
 					&leaf,
 				);
 				if !valid {
@@ -218,8 +218,8 @@ pub mod pallet {
 				// 5. Verify the combined MMR inclusion proof against subtree_root.
 				if !leaves.is_empty() {
 					let proof = MerkleProof::<H256, Keccak256Merge>::new(
-						batch.subtree_mmr_size,
-						batch.messages_proof.clone(),
+						batch.messages_proof.mmr_size,
+						batch.messages_proof.proof.clone(),
 					);
 					let verified =
 						proof.verify(batch.subtree_root, leaves).unwrap_or(false);

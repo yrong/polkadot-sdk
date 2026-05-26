@@ -351,16 +351,20 @@ impl<T: Config> Pallet<T> {
 
 		Some(polkadot_primitives::v9::LateBlockProof {
 			source: dest,
-			old_number_of_destinations: old_roots.len() as u32,
-			old_leaf_index: old_leaf_idx as u32,
-			number_of_destinations: num_dest,
-			leaf_index: leaf_idx,
 			old_provides_root,
 			old_subtree_root,
-			old_subtree_proof: old_proof.proof,
+			old_subtree_proof: polkadot_primitives::v9::MerkleSubtreeProof {
+				proof: old_proof.proof,
+				number_of_leaves: old_roots.len() as u32,
+				leaf_index: old_leaf_idx as u32,
+			},
 			new_provides_root: current_provides.root,
 			new_subtree_root: current_subtree_root,
-			new_subtree_proof: current_subtree_proof,
+			new_subtree_proof: polkadot_primitives::v9::MerkleSubtreeProof {
+				proof: current_subtree_proof,
+				number_of_leaves: num_dest,
+				leaf_index: leaf_idx,
+			},
 			subtree_extension,
 		})
 	}

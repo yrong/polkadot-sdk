@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use cumulus_primitives_core::{ParaId, SpeculativeOutboxApi};
 use polkadot_primitives::{
-	v9::{MessageBatch, OutgoingMessage, SpeculativeIngress},
+	v9::{MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage, SpeculativeIngress},
 	BlockNumber, Hash,
 };
 use sp_api::ProvideRuntimeApi;
@@ -61,7 +61,6 @@ pub fn build_message_batch<Block, Client>(
 	at: <Block as BlockT>::Hash,
 	source: ParaId,
 	destination: ParaId,
-	source_block: Hash,
 	source_relay_parent_number: BlockNumber,
 	from_position: u64,
 	max_messages: u32,
@@ -85,15 +84,15 @@ where
 
 	let batch = MessageBatch {
 		source,
-		source_block,
 		source_relay_parent_number,
 		provides_root: provides.root,
 		subtree_root,
-		subtree_mmr_size,
-		messages_proof,
-		subtree_inclusion_proof,
-		number_of_destinations,
-		leaf_index,
+		messages_proof: MmrInclusionProof { mmr_size: subtree_mmr_size, proof: messages_proof },
+		subtree_inclusion_proof: MerkleSubtreeProof {
+			proof: subtree_inclusion_proof,
+			number_of_leaves: number_of_destinations,
+			leaf_index,
+		},
 		messages: messages
 			.into_iter()
 			.map(|(position, payload)| OutgoingMessage { position, payload })
@@ -120,13 +119,11 @@ where
 {
 	let mut batches = Vec::new();
 	for (source, client, at, relay_parent_number, from_position) in sources {
-		let source_block = *at;
 		if let Some(batch) = build_message_batch::<Block, Client>(
 			client,
 			*at,
 			*source,
 			destination,
-			source_block,
 			*relay_parent_number,
 			*from_position,
 			max_messages_per_source,
