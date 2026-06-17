@@ -51,9 +51,10 @@ pub fn ancestor_relay_parent_info<T: shared::Config>(
 	shared::Pallet::<T>::get_relay_parent_info(session_index, relay_parent)
 }
 
-/// Implementation of `provides_root` runtime API.
+/// Implementation of `provides_root` runtime API. Returns the parachain's flat
+/// provides commitment (the `(destination, subtree_root)` set), if any.
 pub fn provides_root<T: crate::inclusion::Config>(
 	para_id: ParaId,
-) -> Option<polkadot_primitives::Hash> {
-	crate::inclusion::Pallet::<T>::provides_root(&para_id)
+) -> Option<polkadot_primitives::v9::ProvidesCommitment> {
+	crate::inclusion::Pallet::<T>::provides(&para_id)
 }

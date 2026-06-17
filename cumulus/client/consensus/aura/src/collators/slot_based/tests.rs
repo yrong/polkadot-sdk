@@ -228,7 +228,11 @@ impl RelayChainInterface for TestRelayClient {
 		unimplemented!("Not needed for test")
 	}
 
-	async fn provides_root(&self, _: ParaId, _: RelayHash) -> RelayChainResult<Option<RelayHash>> {
+	async fn provides_root(
+		&self,
+		_: ParaId,
+		_: RelayHash,
+	) -> RelayChainResult<Option<cumulus_primitives_core::relay_chain::v9::ProvidesCommitment>> {
 		unimplemented!("Not needed for test")
 	}
 

@@ -34,6 +34,7 @@ polkadot-primitives = { workspace = true }
 
 # Cumulus
 cumulus-primitives-core = { workspace = true }
+cumulus-primitives-spec-messaging = { workspace = true }
 
 # Node-only (client module)
 sp-api = { workspace = true, optional = true }
@@ -48,6 +49,7 @@ sp-io = { workspace = true, default-features = true }
 default = ["std"]
 std = [
 	"binary-merkle-tree/std",
+	"cumulus-primitives-spec-messaging/std",
 	"codec/std",
 	"cumulus-primitives-core/std",
 	"frame-support/std",

@@ -445,10 +445,12 @@ pub struct Collation<BlockNumber = polkadot_primitives::BlockNumber> {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: BlockNumber,
-	/// The provides commitment (None if no outbox state exists yet).
+	/// The provides commitment: the flat `(destination, subtree_root)` set
+	/// (None if no outbox state exists yet).
 	pub provides: Option<polkadot_primitives::v9::ProvidesCommitment>,
-	/// The requires commitments, sorted by source: ParaId, at most one per source.
-	pub requires: Vec<polkadot_primitives::v9::RequiresCommitment>,
+	/// The requires commitment: the flat `(source, expected_subtree_root)` set
+	/// (empty if nothing consumed).
+	pub requires: polkadot_primitives::v9::RequiresCommitment,
 }
 
 /// Signal that is being returned when a collation was seconded by a validator.

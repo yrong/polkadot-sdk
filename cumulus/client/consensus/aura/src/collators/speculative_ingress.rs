@@ -126,29 +126,31 @@ where
 
 		let sender_best = sender.best_block_hash();
 
-		// Fetch the relay's committed provides_root for this source.
-		// None / default means the sender has not yet been relay-enacted.
-		let relay_provides_root: Option<Hash> = relay_client
+		// Fetch the relay's committed provides commitment for this source and look up
+		// our (the receiver's) subtree root in it. `None` means the sender has not
+		// yet been relay-enacted, or has not committed messages to us.
+		let relay_subtree_root: Option<Hash> = relay_client
 			.provides_root(*source, relay_parent)
 			.await
 			.ok()
 			.flatten()
+			.and_then(|set| set.get(destination).copied())
 			.filter(|r| *r != Hash::default());
 
 		// Pick a sender block for batch fetch. Prefer the block matching the relay's
-		// committed root so the batch lands on a relay-known root; otherwise fall back
-		// to the sender's best, which may have advanced past the relay.
+		// committed subtree root so the batch lands on a relay-known root; otherwise
+		// fall back to the sender's best, which may have advanced past the relay.
 		let mut fetch_at = sender_best;
 		let mut fetch_at_root: Option<Hash> = None;
-		if let Some(relay_root) = relay_provides_root {
+		if let Some(relay_root) = relay_subtree_root {
 			tracing::debug!(
 				target: "aura::cumulus",
 				source = ?source,
 				?relay_root,
-				"looking up sender block for relay provides_root",
+				"looking up sender block for relay-committed subtree root",
 			);
 			if let Some(at_relay) =
-				sender.block_hash_for_provides_root(sender_best, relay_root).await
+				sender.block_hash_for_subtree_root(sender_best, destination, relay_root).await
 			{
 				fetch_at = at_relay;
 				fetch_at_root = Some(relay_root);
@@ -157,7 +159,7 @@ where
 					target: "aura::cumulus",
 					source = ?source,
 					?relay_root,
-					"could not find sender block for relay provides_root; using sender best",
+					"could not find sender block for relay subtree root; using sender best",
 				);
 			}
 		}
@@ -186,33 +188,33 @@ where
 		};
 
 		// Determine whether the batch needs a late block proof. The PVF requires an
-		// LBP whenever the batch's provides_root differs from the relay-committed
-		// current root for this source: the LBP authorizes the runtime-side
-		// `requires[source].expected_root` to be transformed from `old → new` so
-		// the relay's `requires_satisfied` check passes at enactment.
-		match (relay_provides_root, fetch_at_root) {
-			(Some(relay_root), Some(matched)) if matched == batch.provides_root => {
-				// Batch is built against the relay-current root. No LBP needed.
+		// LBP whenever the batch's `subtree_root` differs from the relay-committed
+		// current subtree root for this receiver: the LBP authorizes the runtime-side
+		// `requires[source]` entry to be transformed from `old → new` so the relay's
+		// `requires_satisfied` check passes at enactment.
+		match (relay_subtree_root, fetch_at_root) {
+			(Some(relay_root), Some(matched)) if matched == batch.subtree_root => {
+				// Batch is built against the relay-current subtree root. No LBP needed.
 				let _ = relay_root;
 				tracing::debug!(
 					target: "aura::cumulus",
 					source = ?source,
 					messages = batch.messages.len(),
-					provides_root = ?batch.provides_root,
+					subtree_root = ?batch.subtree_root,
 					"fetched speculative batch (no LBP required)",
 				);
 				batches.push(batch);
 			},
 			(Some(relay_root), _) => {
-				// Batch is built against an older root than the relay knows about.
+				// Batch is built against an older subtree root than the relay knows about.
 				// Fetch an LBP from the sender at the block that produced the relay's
 				// current root, proving the batch's root is an ancestor of relay_root.
 				let lbp_at = sender
-					.block_hash_for_provides_root(sender_best, relay_root)
+					.block_hash_for_subtree_root(sender_best, destination, relay_root)
 					.await
 					.unwrap_or(sender_best);
 				match sender
-					.generate_late_block_proof(lbp_at, destination, batch.provides_root)
+					.generate_late_block_proof(lbp_at, destination, batch.subtree_root)
 					.await
 				{
 					Some(proof) => {
@@ -220,7 +222,7 @@ where
 							target: "aura::cumulus",
 							source = ?source,
 							messages = batch.messages.len(),
-							batch_provides_root = ?batch.provides_root,
+							batch_subtree_root = ?batch.subtree_root,
 							?relay_root,
 							"fetched speculative batch + late block proof",
 						);
@@ -231,7 +233,7 @@ where
 						tracing::warn!(
 							target: "aura::cumulus",
 							source = ?source,
-							batch_provides_root = ?batch.provides_root,
+							batch_subtree_root = ?batch.subtree_root,
 							?relay_root,
 							"could not generate late block proof; skipping batch",
 						);
@@ -239,15 +241,15 @@ where
 				}
 			},
 			(None, _) => {
-				// Relay has no committed root for this source yet (sender hasn't been
-				// relay-enacted). Without a relay anchor, the receiver cannot pass
-				// requires_satisfied at inclusion time. Skip this batch — see the
-				// root guard discussion in the design doc.
+				// Relay has no committed subtree root for this receiver yet (sender
+				// hasn't been relay-enacted, or hasn't sent to us). Without a relay
+				// anchor, the receiver cannot pass requires_satisfied at inclusion
+				// time. Skip this batch — see the root guard discussion in the design doc.
 				tracing::debug!(
 					target: "aura::cumulus",
 					source = ?source,
-					batch_provides_root = ?batch.provides_root,
-					"root guard: relay has not committed any provides_root; skipping batch",
+					batch_subtree_root = ?batch.subtree_root,
+					"root guard: relay has not committed a subtree root for us; skipping batch",
 				);
 			},
 		}

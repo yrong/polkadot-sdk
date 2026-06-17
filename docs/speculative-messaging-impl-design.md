@@ -21,6 +21,36 @@ rejected, the collator fetches fresh data and retries. Full eventual-delivery
 guarantees (bounded catch-up, persistent queues, production retry policy) are
 deferred to section 12.
 
+> **Design revision (2026-06-17).** Two decisions supersede earlier drafts of
+> this doc and are now canonical:
+>
+> 1. **Hashing is `blake2_256`, not Keccak256.** Speculative-messaging leaf,
+>    inner, peak and empty hashes all use `blake2_256` (Substrate-native). Any
+>    remaining "Keccak256" mention below is legacy and should be read as
+>    `blake2_256`.
+> 2. **The top-level commitment is flat, not a two-level Merkle tree.** A
+>    sender's `provides` commitment is a canonical, sorted
+>    `CommitmentSet` of `(destination, subtree_root)` entries — there is no
+>    Merkle root bagging the per-destination subtree roots. The per-destination
+>    MMR (messages → `subtree_root`) is unchanged. This removes top-level
+>    inclusion proofs everywhere: `MessageBatch` loses `subtree_inclusion_proof`,
+>    `LateBlockProof` loses its `*_subtree_proof` fields, and relay matching
+>    becomes a lookup (`provides.get(receiver) == expected_root`) instead of a
+>    hash comparison against a single root. Rationale and tradeoff analysis:
+>    [paritytech/polkadot-sdk#10449 (discussion r3275189534)](https://github.com/paritytech/polkadot-sdk/pull/10449#discussion_r3275189534).
+>
+> The canonical primitives live in the `cumulus-primitives-spec-messaging` crate
+> ([paritytech/polkadot-sdk#12368](https://github.com/paritytech/polkadot-sdk/pull/12368),
+> closes #12346): `CommitmentSet`, `OutgoingMessage::hash_leaf`, the domain tags,
+> and `SpecMerge` (the `mmr_lib::Merge` that backs the per-destination MMR).
+>
+> 3. **The per-destination MMR reuses `mmr_lib`** (`polkadot-ckb-merkle-mountain-range`)
+>    with the crate's domain-tagged `SpecMerge`, rather than a hand-rolled
+>    accumulator. Inclusion proofs (`gen_proof`/`verify`) and append-only
+>    extension proofs (ancestry proofs) come from `mmr_lib`. PR #12368's
+>    standalone `Mmr`/`MmrAccumulator`/`merge_peaks`/`empty_root` are superseded
+>    by `SpecMerge` + `mmr_lib`.
+
 ---
 
 ## 1. Core Concept and End-to-End Workflow
@@ -281,44 +311,56 @@ candidate commitments hashes.
 
 ### 3.1 Commitment Types
 
-```rust
-/// A commitment that a parachain provides a set of outbound messages.
-/// The root is the top-level Merkle root over all per-destination MMR roots.
-#[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
-pub struct ProvidesCommitment {
-    /// Top-level Merkle root over all per-destination MMR roots.
-    pub root: Hash,
-}
+Both commitments are expressed as a `CommitmentSet` — a canonical, sorted,
+bounded set of `(ParaId, Hash)` entries from `cumulus-primitives-spec-messaging`.
+`CommitmentSet` keeps entries sorted by `ParaId` and rejects out-of-order or
+duplicate entries **on decode**, so collator, PVF, and relay chain always produce
+and accept the same bytes for the same logical set.
 
-/// A commitment that a parachain requires messages from a source parachain.
-#[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
-pub struct RequiresCommitment {
-    /// The source parachain whose provides root we expect.
-    pub source: ParaId,
-    /// The provides root we built against (the source chain's top-level root at the
-    /// block from which we received messages).
-    pub expected_root: Hash,
-}
+```rust
+use cumulus_primitives_spec_messaging::commitment_set::CommitmentSet;
+
+/// A parachain's outbound commitments for one block.
+///
+/// One `(destination, subtree_root)` entry per destination that received
+/// messages this block, where `subtree_root` is the root of that destination's
+/// per-destination MMR (§5.1). This flat set **is** the top-level commitment —
+/// there is no second-level Merkle root bagging the subtree roots.
+pub type ProvidesCommitment = CommitmentSet<MAX_DESTINATIONS_PER_BLOCK>;
+
+/// A parachain's inbound dependencies for one block.
+///
+/// One `(source, expected_root)` entry per source parachain we consumed messages
+/// from, where `expected_root` is the source's per-destination subtree root *for
+/// this receiver* (the MMR root over the messages the source sent to us, in the
+/// source block we built against). The relay chain matches each entry by looking
+/// it up in the source's persisted `ProvidesCommitment`.
+pub type RequiresCommitment = CommitmentSet<MAX_SOURCES_PER_BLOCK>;
 ```
 
-This split is intentional: subtree roots remain internal runtime state used for
-message-batch verification, while `RequiresCommitment.expected_root` always
-refers to the sender's top-level `ProvidesCommitment.root`, which is the value
-matched by the relay chain.
+`CandidateCommitments` carries `provides: Option<ProvidesCommitment>` (None when
+the block sends nothing) and `requires: RequiresCommitment` (empty when the block
+consumes nothing).
 
-Two invariants are implicit and should be treated as part of the Phase 1 design:
+This shape is intentional: subtree roots are no longer hidden behind a top-level
+Merkle root. Each `(destination, subtree_root)` entry is directly observable in
+the sender's `provides` set, so the relay chain — and any future light-client —
+can match a receiver's `expected_root` against the sender's committed subtree
+root for that receiver by a simple lookup, with **no inclusion proof**.
 
-1. **Canonicalization of `requires`** — sort entries by `source: ParaId`
-   ascending, allow at most one entry per source, reject duplicates before
-   hashing. Semantically equivalent dependency sets must produce identical
-   `CandidateCommitments` hashes.
+Two invariants are now enforced by the `CommitmentSet` type itself rather than by
+convention:
 
-2. **Exact top-level root construction** — gather `(destination_para_id,
-   subtree_root)` pairs from the sender's per-destination outbox state, sort by
-   `destination_para_id`, compute each leaf as `keccak256(SCALE(destination_para_id,
-   subtree_root))`, and compute the Merkle root over that ordered leaf list. All
-   proof generation, proof verification, and relay-visible commitment matching
-   must use this exact same keyed-leaf encoding.
+1. **Canonicalization** — entries are sorted by `ParaId` ascending with at most
+   one entry per `ParaId`; the manual `Decode` impl rejects any other ordering.
+   Semantically equivalent sets therefore produce identical `CandidateCommitments`
+   hashes. (Subsumes the old "canonicalization of `requires`" rule.)
+
+2. **No top-level root construction.** There is no keyed-leaf Merkle tree over the
+   subtree roots anymore. The only hashing on the provides side is (a) the
+   per-message leaf hash (`OutgoingMessage::hash_leaf`, §3.4) and (b) the
+   per-destination MMR root (`mmr_lib` + `SpecMerge`, §5.1). Both use
+   `blake2_256` with domain tags.
 
 ### 3.2 Off-Chain Types
 
@@ -337,71 +379,77 @@ pub struct MessageBatch {
     /// block executed — available in the sender runtime as
     /// `frame_system::Pallet::<T>::parent_number()` or equivalent.
     pub source_relay_parent_number: RelayChainBlockNumber,
-    /// The top-level provides root for this block
-    pub provides_root: Hash,
-    /// The per-destination MMR root for the receiver
+    /// The per-destination MMR root for the receiver. This is the value the
+    /// receiver puts in `RequiresCommitment.expected_root`; the relay chain
+    /// matches it directly against the source's committed `(receiver, root)`
+    /// entry — no top-level inclusion proof (flat commitment, §3.1).
     pub subtree_root: Hash,
     /// Total number of MMR nodes (positions, not leaves) in the per-destination
     /// subtree at the moment this batch was generated. Required to reconstruct
     /// the `mmr_lib::MerkleProof` for `messages_proof` verification.
     pub subtree_mmr_size: u64,
     /// Combined MMR inclusion proof over every leaf in `messages`, against
-    /// `subtree_root`. Generated by `mmr_lib::MMR::gen_proof` over the leaf
-    /// positions of all included messages and verified by
-    /// `MerkleProof::verify(subtree_root, leaves)` where `leaves` is
-    /// `(leaf_index_to_pos(position), Keccak256(payload))` for each message.
+    /// `subtree_root`, using `mmr_lib` with the crate's domain-tagged `SpecMerge`
+    /// (§5.1). Generated by `mmr_lib::MMR::gen_proof` and verified by
+    /// `MerkleProof::<Hash, SpecMerge>::new(subtree_mmr_size, messages_proof)
+    /// .verify(subtree_root, leaves)` where each leaf is
+    /// `(mmr_lib::leaf_index_to_pos(msg.position), msg.hash_leaf())`.
     pub messages_proof: Vec<Hash>,
-    /// Merkle proof that subtree_root is in provides_root.
-    /// Length: O(log D) where D = number of destinations.
-    pub subtree_inclusion_proof: Vec<Hash>,
-    /// Total number of destinations in the top-level Merkle tree.
-    /// Required by `binary_merkle_tree::verify_proof` as an explicit parameter.
-    pub number_of_destinations: u32,
-    /// The 0-based index of the receiver's leaf in the top-level Merkle tree
-    /// (leaves sorted by destination ParaId).
-    /// Required by `binary_merkle_tree::verify_proof` as an explicit parameter.
-    pub leaf_index: u32,
     /// The messages, sorted by `position` ascending. Verified collectively by
     /// `messages_proof` against `subtree_root`.
     pub messages: Vec<OutgoingMessage>,
 }
+```
 
-#[derive(Clone, Encode, Decode, Debug)]
-pub struct OutgoingMessage {
-    /// Zero-based leaf index in the source's per-destination MMR.
+`OutgoingMessage` is the canonical type from
+`cumulus-primitives-spec-messaging`:
+
+```rust
+pub struct OutgoingMessage<MaxMsgLen: Get<u32>> {
+    /// The parachain that sent this message.
+    pub source: ParaId,
+    /// The parachain this message is addressed to.
+    pub destination: ParaId,
+    /// Zero-based sequence number within the `(source, destination)` channel —
+    /// the leaf index in the source's per-destination MMR.
     pub position: u64,
-    /// Raw XCM message bytes (what gets passed to `handle_xcmp_messages`).
-    pub payload: Vec<u8>,
+    /// Raw XCM message bytes, bounded to `MaxMsgLen`.
+    pub payload: BoundedVec<u8, MaxMsgLen>,
 }
 ```
 
-For the minimal POC, this shape is sufficient. It contains everything the
-receiver needs to verify that the destination-specific subtree is included in the
-sender's top-level `provides_root`, verify per-source ordered continuity of
-messages against local receiver state, verify each message is in the sender's
-subtree via `messages_proof`, and dispatch the verified payloads through the
-existing XCMP batch handler.
+`source`/`destination` are carried explicitly because they are bound into the
+leaf preimage by `hash_leaf()` (§3.4), which is what cryptographically ties a
+message to its `(source, destination, position)` and prevents cross-channel
+replay/forgery.
+
+For the minimal POC, this shape is sufficient. The flat commitment means the
+batch no longer carries a top-level `provides_root` or a `subtree_inclusion_proof`
+— the receiver's `subtree_root` is matched directly by the relay chain (§4). The
+batch still lets the receiver verify per-source ordered continuity against local
+state, verify each message is in the sender's subtree via `messages_proof`, and
+dispatch the verified payloads through the existing XCMP batch handler.
 
 Invariants:
 
-1. **Canonical subtree proof leaf** — `subtree_inclusion_proof` must always prove
-   inclusion of `keccak256(SCALE(destination_para_id, subtree_root))` into
-   `provides_root`. The destination parachain is not carried explicitly in
+1. **Subtree root is the commitment.** `subtree_root` is exactly what the source
+   committed as its `(receiver, subtree_root)` entry in `provides` and what the
+   relay chain looks up. The destination parachain is not carried in
    `MessageBatch` because the receiver already knows "this batch is for me," but
-   both sides must use the same keyed leaf format.
+   it *is* bound into each message's `hash_leaf()`.
 
 2. **Canonical message ordering** — `messages` must be ordered by ascending
    `position` with no duplicates. During verification, the receiver expects them
    to advance continuously from `last_processed + 1`.
 
-3. **Batch-to-root consistency** — `provides_root` commits to `subtree_root`,
-   which commits via `messages_proof` to each `(position, Keccak256(payload))`
-   leaf. The receiver checks both links.
+3. **Batch-to-root consistency** — `subtree_root` commits via `messages_proof` to
+   each message's `hash_leaf()` leaf. The receiver checks this link, then checks
+   `subtree_root` against the relay-persisted provides entry (via `requires`).
 
-4. **Practical bounds** — `subtree_inclusion_proof`, `messages_proof`, `messages`,
-   and each `payload` should have explicit bounds in a production implementation.
-   The POC pseudocode can leave them as `Vec`, but the implementation should
-   define concrete maxima.
+4. **Practical bounds** — `messages_proof` and `messages` should have explicit
+   bounds in a production implementation; `payload` is already bounded by
+   `MaxMsgLen`. The POC pseudocode can leave the proof/list as `Vec`, but the
+   implementation should define concrete maxima.
 
 ### 3.3 Deterministic Ingress Types
 
@@ -486,9 +534,25 @@ verified messages into the aggregate XCMP wire format expected by the configured
 trait is introduced for Phase 1; speculative ingress adapts to the existing XCMP
 batch handler shape.
 
+**Leaf hashing (`hash_leaf`).** A message becomes an MMR leaf via
+`OutgoingMessage::hash_leaf`, which `blake2_256`-hashes a domain-tagged,
+versioned preimage:
+
+```text
+LEAF_TAG ++ LEAF_VERSION ++ source ++ destination ++ position.to_le_bytes()
+         ++ (payload.len() as u32).to_le_bytes() ++ payload
+```
+
+The `LEAF_TAG` (distinct from `INNER_TAG`/`PEAK_TAG`/`EMPTY_TAG` used by the MMR
+merges) prevents a leaf hash from being reinterpreted as an inner/peak node, and
+`LEAF_VERSION` lets the leaf format evolve. Binding `source`/`destination`/
+`position` into the preimage ties each message to its channel and ordinal,
+guarding against cross-channel forgery and reorder/replay. All tags, the version,
+and `hash_leaf` live in `cumulus-primitives-spec-messaging`.
+
 For empty blocks (no outbound messages, no inbound messages):
 - `provides: None`
-- `requires: vec![]`
+- `requires: empty CommitmentSet`
 
 ### 3.5 Late Block Proof Types
 
@@ -499,103 +563,82 @@ transformed root in the candidate commitments. The PVF independently verifies
 the proof and transforms the `RequiresCommitment` during `validate_block`, before
 the relay chain sees it.
 
+With the flat commitment, a `LateBlockProof` collapses to just the
+per-destination MMR extension: both the old and the new subtree roots are
+directly observable as `(receiver, root)` entries in the source's old/new
+`ProvidesCommitment`, so no top-level inclusion proof is carried. The proof only
+needs to show that the source's per-destination MMR for this receiver was
+**append-only** extended from `old_subtree_root` to `new_subtree_root`.
+
 ```rust
 /// Included in the receiver candidate's PoV when the block was built against
-/// an older source root than what's persisted in ProvidesRoots.
+/// an older source subtree root than what's persisted in ProvidesRoots.
 #[derive(Clone, Encode, Decode, Debug)]
 pub struct LateBlockProof {
     /// The source parachain this proof covers.
     pub source: ParaId,
 
-    /// Number of destinations in the OLD provides root's Merkle tree.
-    /// Required to verify old_subtree_proof.
-    pub old_number_of_destinations: u32,
-    /// Leaf index of the receiver in the OLD provides root's Merkle tree.
-    pub old_leaf_index: u32,
-
-    /// Number of destinations in the NEW (current) provides root's Merkle tree.
-    /// Required to verify new_subtree_proof.
-    pub number_of_destinations: u32,
-    /// Leaf index of the receiver in the NEW provides root's Merkle tree.
-    pub leaf_index: u32,
-
-    /// The provides root the receiver block was built against (the old root
-    /// from the batch). This is the root that would appear in
-    /// RequiresCommitment.expected_root without the proof.
-    pub old_provides_root: Hash,
-    /// The subtree root the receiver built against (from the old source block).
+    /// The per-destination subtree root the receiver block was built against
+    /// (from the old source block). Without the proof, this is what would
+    /// appear in `RequiresCommitment.expected_root`.
     pub old_subtree_root: Hash,
-    /// Merkle proof that old_subtree_root was in old_provides_root.
-    pub old_subtree_proof: Vec<Hash>,
-
-    /// The current provides root of the source (what's now in ProvidesRoots).
-    pub new_provides_root: Hash,
-    /// The subtree root under the new provides root.
+    /// The source's current per-destination subtree root for this receiver —
+    /// must match the source's persisted `ProvidesCommitment.get(receiver)`.
     pub new_subtree_root: Hash,
-    /// Merkle proof that new_subtree_root is in new_provides_root.
-    pub new_subtree_proof: Vec<Hash>,
 
-    /// If the source produced additional messages to this receiver since the
-    /// block was built, this proof shows the old subtree is a valid prefix of
-    /// the new subtree.
-    pub subtree_extension: Option<MMRExtensionProof>,
-}
-
-/// Proves that an MMR root R_old is an ancestor of R_new, i.e. the MMR was
-/// only appended to, not mutated.
-#[derive(Clone, Encode, Decode, Debug)]
-pub struct MMRExtensionProof {
-    /// The peaks of the old MMR.
-    pub old_peaks: Vec<Hash>,
-    /// Number of leaves in the old MMR. Required to replay appends correctly.
-    pub old_leaf_count: u64,
-    /// The peaks of the new (larger) MMR.
-    pub new_peaks: Vec<Hash>,
-    /// Leaf hashes of messages appended between old and new state, in order.
-    /// Replaying these appends starting from `old_peaks` at `old_leaf_count`
-    /// must reproduce `new_peaks`.
-    pub connecting_nodes: Vec<Hash>,
+    /// Proof that the receiver's per-destination MMR was only appended to
+    /// between the old and new state. This is an `mmr_lib` **ancestry proof**:
+    /// verified by `proof.verify_ancestor(new_subtree_root, old_subtree_root)`
+    /// (or `verify_incremental` with the appended leaf hashes). `None` only when
+    /// `old_subtree_root == new_subtree_root` (no new messages for this receiver,
+    /// just other-destination churn).
+    pub subtree_extension: Option<AncestryProof<Hash, SpecMerge>>,
 }
 ```
 
-The canonical leaf format for top-level proofs matches section 3.1:
-`keccak256(SCALE(destination_para_id, subtree_root))`. Subtree extension proofs
-are per-destination MMR proofs — they follow the standard MMR append-only
-verification semantics of `sp-mmr-primitives`.
+`AncestryProof` is `mmr_lib`'s append-only proof type (re-exported via
+`sp-mmr-primitives`), parameterised with the crate's `SpecMerge` (§5.1). There is
+no top-level proof leaf format anymore (the commitment is flat, §3.1); the only
+proof here is the per-destination MMR ancestry proof, which `mmr_lib` generates
+(`gen_ancestry_proof`) and verifies natively. This replaces the previously
+hand-rolled `MMRExtensionProof` + `verify_mmr_extension`.
 
 ---
 
-## 3.6 Issue #12346 Alignment Tracker (primitives hardening)
+## 3.6 Primitives crate & integration tracker
 
-[paritytech/polkadot-sdk#12346](https://github.com/paritytech/polkadot-sdk/issues/12346)
-specifies a hardened, security-focused shape for the speculative-messaging
-primitives. The current POC proves the end-to-end data flow but predates this
-spec and does **not** yet adopt its hardening requirements. The checklist below
-maps each requirement to the file(s) that must change. No urgency to implement —
-this is a tracking artifact, not an active work item.
+The hardened primitives from issue
+[#12346](https://github.com/paritytech/polkadot-sdk/issues/12346) are **done** in
+the `cumulus-primitives-spec-messaging` crate
+([PR #12368](https://github.com/paritytech/polkadot-sdk/pull/12368)):
+`CommitmentSet` (canonical sorted decode), `OutgoingMessage::hash_leaf`
+(domain-tagged, versioned, `blake2_256`), and the domain tags. The MMR itself
+reuses **`mmr_lib`** with the crate's `SpecMerge` (see the revision note at the
+top); PR #12368's standalone `Mmr`/`merge_peaks`/`empty_root` are superseded and
+removed during integration. The crate types are `no_std` and unit tested.
+
+What remains is **integrating** the POC onto that crate and onto the three design
+revisions at the top of this doc (blake2_256 + flat commitment + `mmr_lib`/
+`SpecMerge`). The POC code still uses Keccak256, a two-level Merkle tree, and the
+old `polkadot-primitives::v9::speculative` types. Integration checklist:
 
 Legend: ☐ not started · ◐ partial · ☑ done
 
-| # | Requirement (issue #12346) | Current state | Status | File(s) to change |
-|---|---|---|---|---|
-| 1 | Extract a dedicated **`cumulus-primitives-spec-messaging`** crate (`no_std`); today the types live in a `polkadot-primitives` module | Types in a v9 module, not a standalone crate | ◐ | new crate `cumulus/primitives/spec-messaging/{Cargo.toml,src/lib.rs}`; move out of `polkadot/primitives/src/v9/speculative.rs`; update `Cargo.toml` workspace members and all importers |
-| 2 | **`CommitmentSet<const N: u32>(BoundedVec<(ParaId, Hash), ConstU32<N>>)`** with custom `Decode` enforcing strictly-increasing ParaIds (sorted + unique) and `try_from_iter` | `requires` is a plain `Vec<RequiresCommitment>`; ordering only a doc claim, not decode-enforced | ☐ | `polkadot/primitives/src/v9/speculative.rs` (define type); `polkadot/primitives/src/v9/mod.rs:574` (`CandidateCommitments.requires` field type) |
-| 3 | **Domain-tagged + versioned leaf hashing**: `LEAF_TAG`/`INNER_TAG`/`PEAK_TAG`/`EMPTY_TAG`, `LEAF_VERSION = 0`, preimage `LEAF_TAG ++ LEAF_VERSION ++ source ++ destination ++ position ++ len ++ payload` | Leaf = `Keccak256::hash(&payload)`; inner = `Keccak256(lhs ++ rhs)` with no leaf/inner separation; top-level leaf = `(dest, root).encode()` | ☐ | `cumulus/pallets/speculative-outbox/src/lib.rs:174,210` (leaf + top-level leaf); `cumulus/pallets/parachain-system/src/validate_block/implementation.rs` (`Keccak256Merge`, `bag_mmr_peaks`, `append_mmr_leaf`); ideally a single `hash_leaf`/tags module in the new crate |
-| 4 | Stable **`merge_inner` / `merge_peaks` / `empty_root`** + generic **`MmrAccumulator`** trait (`append`/`root`/`size`, post-MVP `extension_proof`) | Ad-hoc helpers duplicated across outbox pallet and validate_block ("Identical to …"); no shared trait, no `empty_root` | ☐ | new crate `src/mmr.rs` (trait + ops); dedupe `cumulus/pallets/speculative-outbox/src/lib.rs` and `cumulus/pallets/parachain-system/src/validate_block/implementation.rs` to call it |
-| 5 | **`OutgoingMessage { destination: ParaId, position: u64, payload: BoundedVec<u8, MaxMsgLen> }`** | `{ position: u64, payload: Vec<u8> }` — no `destination`, unbounded payload | ◐ | `polkadot/primitives/src/v9/speculative.rs:113` (add `destination`, bound `payload`) |
-| 6 | Constants for **max destinations per block** and **max sources per block** | Only `MAX_REQUIRES_PER_BLOCK = 32` (sources); not type-enforced; no max-destinations const | ◐ | `polkadot/primitives/src/v9/speculative.rs:32` (add max-destinations; wire both into BoundedVec bounds) |
-| 7 | Tests: **decode-rejection**, **frontier append/bag property tests**, **cross-domain isolation** | Inbox has 11 unit tests; no `CommitmentSet` decode-rejection or cross-domain isolation (those types/domains don't exist yet) | ☐ | new crate `src/tests.rs` (decode rejection + property + cross-domain); follows items 2–4 |
+| # | Integration step | Status | File(s) to change |
+|---|---|---|---|
+| 1 | Depend on `cumulus-primitives-spec-messaging`; drop the duplicate types in `polkadot/primitives/src/v9/speculative.rs` (keep only the relay-facing `ProvidesCommitment`/`RequiresCommitment` aliases over `CommitmentSet`, `MessageBatch`, `LateBlockProof`, `SpeculativeIngress`, `SourceState`) | ☑ | `polkadot/primitives/src/v9/speculative.rs`, `polkadot/primitives/src/v9/mod.rs`, workspace `Cargo.toml` |
+| 2 | `provides`/`requires` in `CandidateCommitments` become `Option<CommitmentSet<MAX_DESTINATIONS_PER_BLOCK>>` / `CommitmentSet<MAX_SOURCES_PER_BLOCK>` | ☑ | `polkadot/primitives/src/v9/mod.rs` |
+| 3 | Outbox pallet: replace `Keccak256` leaf/merge with `OutgoingMessage::hash_leaf` + `SpecMerge`; keep peaks-only append but root via `spec_mmr::root_from_peaks`; `compute_provides` returns a `CommitmentSet` (no top-level merkle root). Added `Config::SelfParaId`; dropped top-level-root storage/APIs; `generate_late_block_proof(dest, old_subtree_root)` builds a `SubtreeExtension`. | ☑ | `cumulus/pallets/speculative-outbox/src/lib.rs` |
+| 4 | Inbox pallet: drop `subtree_inclusion_proof` verification; hash leaves with `hash_leaf`; verify `messages_proof` via `mmr_lib::MerkleProof::<_, SpecMerge>`; `requires_commitments` returns a `CommitmentSet`. Also updated `client.rs` batch builder + the `SpeculativeOutboxApi`/`SpeculativeInboxApi` traits (`compute_provides`, dropped `subtree_inclusion_proof`, `generate_late_block_proof(dest, old_subtree_root)`, `block_hash_for_subtree_root`). 8/8 tests pass. | ☑ | `cumulus/pallets/speculative-inbox/src/{lib,client,mock,integration_tests}.rs`, `cumulus/primitives/core/src/lib.rs` |
+| 5 | `validate_block`: replaced `Keccak256Merge`/`bag_mmr_peaks`/`append_mmr_leaf`/`verify_mmr_extension` with `SpecMerge` + `mmr_lib` `MerkleProof::verify_incremental`; dropped top-level inclusion verification + the `self_para_id` capture; rewrote the unit tests. Verified: cumulus-test-runtime WASM builds (compiles `implementation.rs`) and `validate_block_works` passes end-to-end. | ☑ | `cumulus/pallets/parachain-system/src/validate_block/implementation.rs` |
+| 6 | Relay enactment: `ProvidesRoots` stores `ProvidesCommitment` (the set); `requires_satisfied` becomes a per-receiver `get()` lookup; `update_provides`. Also `provides_root` runtime API returns the set. | ☑ | `polkadot/runtime/parachains/src/inclusion/mod.rs`, `runtime_api_impl/vstaging.rs`, `primitives/src/runtime_api.rs`, rococo/westend |
+| 7 | `ValidationResultExtension::V4` carries the flat `provides` set; candidate-validation rebuilds `CommitmentSet`s and reconstructs `CandidateCommitments` | ☑ | `polkadot/parachain/src/primitives.rs`, `polkadot/node/core/candidate-validation/src/lib.rs` |
+| 8 | `MessageBatch`/`LateBlockProof` lost the top-level proof fields (§3.2/§3.5); off-chain batch builders, `OutboxQuery` trait + `RpcOutboxClient`, `RelayChainInterface::provides_root` (→ `ProvidesCommitment` set), lookahead/speculative_ingress collation patching, penpal + `cumulus/test/runtime` + `fake_runtime_api` API impls + `speculative_extension` all updated. | ☑ | `polkadot/primitives/src/v9/speculative.rs`, `cumulus/pallets/speculative-inbox/src/client.rs`, `cumulus/client/consensus/aura/src/collators/*`, `cumulus/client/relay-chain-*-interface`, penpal, omni-node `fake_runtime_api` |
 
-**Aligned already (no action):** type coverage (provides/requires, `MessageBatch`,
-`OutgoingMessage`, MMR/late-block proofs, `SourceState`), Keccak256 as the hash,
-`no_std` compatibility, and all five consumers named in the issue (collator
-attachment, PVF `validate_block`, relay matching, sender pallet, receiver pallet).
-
-> Load-bearing items are **2, 3, 4** — canonical `CommitmentSet` encoding,
-> domain-tagged/versioned leaf hashing, and the shared MMR trait. These are the
-> requirements the issue frames as security-critical (encoding malleability,
-> cross-destination forgery, leaf↔inner second-preimage confusion, and
-> collator-vs-PVF divergence from duplicated merge logic).
+> Load-bearing correctness points carried over from #12346, now guaranteed by the
+> crate: canonical `CommitmentSet` encoding, domain-tagged/versioned leaf hashing,
+> and a single shared MMR implementation (no collator-vs-PVF drift from duplicated
+> merge logic).
 
 ---
 
@@ -617,22 +660,33 @@ separate `speculative_messaging.rs` module for independent testability.
 // Production target: polkadot/runtime/parachains/src/speculative_messaging.rs
 ```
 
+With the flat commitment the relay chain persists the source's whole
+`ProvidesCommitment` (the sorted `(destination, subtree_root)` set), not a single
+root, so a receiver's `expected_root` can be matched by looking up its own
+destination entry.
+
 ```rust
-/// Latest provides root per parachain.
+/// Latest provides commitment per parachain.
 /// Updated each time a v4 candidate with a provides commitment is included.
-/// Only the most recent root is stored — old roots are overwritten.
+/// Only the most recent set is stored — old sets are overwritten.
 #[pallet::storage]
-pub type ProvidesRoots<T: Config> = StorageMap<_, Twox64Concat, ParaId, Hash>;
+pub type ProvidesRoots<T: Config> =
+    StorageMap<_, Twox64Concat, ParaId, ProvidesCommitment>;
 
 impl<T: Config> Pallet<T> {
-    /// Read the latest provides root for a parachain.
-    pub fn provides_root(para_id: &ParaId) -> Option<Hash> {
+    /// Read the latest provides commitment for a parachain.
+    pub fn provides(para_id: &ParaId) -> Option<ProvidesCommitment> {
         ProvidesRoots::<T>::get(para_id)
     }
 
-    /// Update the provides root after a candidate is included.
-    pub fn update_provides_root(para_id: ParaId, root: Hash) {
-        ProvidesRoots::<T>::insert(para_id, root);
+    /// The source's committed subtree root for a specific destination, if any.
+    pub fn provided_subtree_root(source: &ParaId, dest: ParaId) -> Option<Hash> {
+        ProvidesRoots::<T>::get(source)?.get(dest).copied()
+    }
+
+    /// Update the provides commitment after a candidate is included.
+    pub fn update_provides(para_id: ParaId, provides: ProvidesCommitment) {
+        ProvidesRoots::<T>::insert(para_id, provides);
     }
 }
 ```
@@ -687,19 +741,29 @@ if candidate.availability_votes.count_ones() >= threshold {
 fn enact_candidate(receipt: CommittedCandidateReceipt, ...) {
     // Read provides/requires directly from the commitments stored in
     // CandidatePendingAvailability — no separate storage lookup needed.
-    if !requires_satisfied(&commitments.requires) {
+    let receiver = receipt.descriptor.para_id();
+    if !requires_satisfied(receiver, &commitments.requires) {
         defensive!("requirements no longer satisfied at enactment");
     }
     if let Some(ref p) = commitments.provides {
-        update_provides_root(receipt.descriptor.para_id(), p.root);
+        update_provides(receiver, p.clone());
     }
+}
+
+// Matching is now a per-source lookup in the source's persisted provides set,
+// keyed by the *receiver's* ParaId, instead of a single-hash comparison.
+fn requires_satisfied(receiver: ParaId, requires: &RequiresCommitment) -> bool {
+    requires.iter().all(|(source, expected_root)| {
+        Pallet::<T>::provided_subtree_root(source, receiver) == Some(*expected_root)
+    })
 }
 ```
 
 The relay chain is not asked to verify message proofs again. It only needs to
-inspect the already-validated `provides` / `requires` fields, check dependency
-satisfaction, and persist the newest provides root. This is a relay-runtime
-inclusion rule change, not a new protocol stage.
+inspect the already-validated `provides` / `requires` fields, look up each
+required source's committed subtree root for this receiver, and persist the
+newest provides set. This is a relay-runtime inclusion rule change, not a new
+protocol stage.
 
 **Simplification versus the original design.** The original high-level proposal
 included a same-block enacted matching path (checking against in-block candidate
@@ -712,9 +776,9 @@ chain accepts, not how the collator builds candidates.
 **Relation to late block proofs.** When the source root has advanced beyond what
 the receiver built against, Late Block Proofs (§6.2) transform the
 `RequiresCommitment` to reference the current root before the relay chain sees
-it. From the relay chain's perspective, the rule is always "the expected_root
-must match the latest persisted `ProvidesRoots[source]`" — the PVF handles the
-transformation.
+it. From the relay chain's perspective, the rule is always "the `expected_root`
+must equal the source's committed subtree root for this receiver, i.e.
+`ProvidesRoots[source].get(receiver)`" — the PVF handles the transformation.
 
 Note that this problem is asymmetric: LateBlockProofs are only needed when the
 source chain outpaces the destination (i.e., the source produces more blocks, or
@@ -724,15 +788,17 @@ stable across multiple destination blocks, and each can match against the
 unchanged `ProvidesRoots[source]` without a proof. Faster destination production
 is not a problem; slower destination *inclusion* is.
 
-**What causes `ProvidesRoots[source]` to change.** Because the provides root is
-the top-level Merkle root over all per-destination subtree roots (see §5.1),
-it changes whenever the source produces outbound messages to **any** destination,
-not just this receiver. If the source sends messages to other parachains, the
-root advances even though this receiver has no new messages. In that case the
-receiver collator simply skips the source — no new batches to fetch, no proof
-needed. LateBlockProofs are only needed when there *are* new messages for this
-receiver *and* the root has advanced between the batch being built and the
-receiver's candidate reaching enactment.
+**What causes a mismatch.** The source's `ProvidesCommitment` set changes
+whenever the source produces outbound messages to **any** destination. But
+because matching is now a per-destination lookup (`get(receiver)`), churn from
+*other* destinations no longer disturbs this receiver: this receiver's entry only
+changes when the source sends new messages **to this receiver**. If the source
+sends only to other parachains, `get(receiver)` is unchanged and the receiver's
+candidate still matches — no LateBlockProof needed. A LateBlockProof is required
+only when the source produced new messages *for this receiver* between the batch
+being built and the receiver's candidate reaching enactment, advancing this
+receiver's committed subtree root. (This is strictly better than the old
+single-root scheme, where any-destination churn forced a proof.)
 
 ### 4.3 New Error
 
@@ -752,18 +818,19 @@ It does not. The division of labor is:
 - **No message storage.** Message payloads never touch relay chain state. They
   flow off-chain via the relayer/provider, are embedded in the receiver's block
   body as `SpeculativeIngress`, and are verified by the receiver runtime.
-- **No history.** `ProvidesRoots` stores one hash per parachain, overwritten each
-  time a candidate with a new provides root is enacted. There is no per-block
-  root history, no MMR of roots, no retention of old values. The relay chain only
-  needs the latest root for dependency matching.
+- **No history.** `ProvidesRoots` stores one `ProvidesCommitment` set per
+  parachain (the current `(destination, subtree_root)` entries), overwritten each
+  time a candidate with a new provides commitment is enacted. There is no
+  per-block history, no MMR of roots, no retention of old values. The relay chain
+  only needs the latest set for dependency matching.
 - **No new protocol stage.** The relay chain still backs candidates, admits them
   to pending availability, and enacts them. Speculative messaging adds one
-  inclusion-time check: `RequiresCommitment.expected_root` must match the latest
-  persisted `ProvidesRoots[source]`. That check is a
-  hash comparison, not a cryptographic verification.
+  inclusion-time check: for each `(source, expected_root)` in `requires`,
+  `ProvidesRoots[source].get(receiver)` must equal `expected_root`. That check is
+  a sorted-set lookup plus hash comparison, not a cryptographic verification.
 
 In short: all cryptographic work lives in the PVF; the relay chain only adds
-hash-equality checks on already-validated commitment fields.
+lookup-and-compare checks on already-validated commitment fields.
 
 **Forward-looking: JAM 48KB refine→accumulate budget.** In the JAM protocol,
 the data flowing from refine (PVF) to accumulate (enactment) is capped at ~48KB
@@ -853,60 +920,64 @@ pub type OutgoingMessages<T: Config> = StorageDoubleMap<
 
 The important distinction: `OutgoingMMRs[destination].leaf_count` is the
 authoritative leaf count for that destination's subtree MMR,
-`OutgoingMessage.position` refers to that per-destination counter,
-`ProvidesCommitment.root` is derived from the set of current subtree roots, and a
-single sender-wide counter does **not** define the proof/position space used by
-receivers.
+`OutgoingMessage.position` refers to that per-destination counter, the
+`ProvidesCommitment` set holds one `(destination, subtree_root)` entry per
+destination, and a single sender-wide counter does **not** define the
+proof/position space used by receivers.
 
 **MMR implementation approach.** The hierarchical accumulator structure uses two
 different constructions:
 
-- **Per-destination subtrees** are MMRs that grow over time. The codebase ships
-  `sp-mmr-primitives` (at `substrate/primitives/merkle-mountain-range/`) with
-  append, prove, and peek operations. Per-destination subtrees can be implemented
-  as instances of `sp_mmr_primitives::MMR` stored in `OutgoingMMRs` and
-  `IncomingState`.
-- **The top level** is rebuilt every block from the current set of
-  `(destination_para_id, subtree_root)` pairs. Since it never needs append-only
-  proofs connecting historical roots, a plain binary Merkle tree (not an MMR) is
-  sufficient. The canonical construction: sort leaves by `destination_para_id`,
-  compute each leaf as `keccak256(SCALE(key))`, and build a standard binary
-  Merkle tree.
+- **Per-destination subtrees** are MMRs that grow over time, built on **`mmr_lib`**
+  (`polkadot-ckb-merkle-mountain-range`, already a workspace dependency,
+  `no_std`) parameterised with the crate's `SpecMerge`. `SpecMerge` is an
+  `mmr_lib::Merge<Item = Hash>` whose `merge` hashes inner nodes as
+  `blake2_256(INNER_TAG ‖ l ‖ r)` and whose overridable `merge_peaks` hashes
+  peak-bagging as `blake2_256(PEAK_TAG ‖ l ‖ r)`; leaves are
+  `OutgoingMessage::hash_leaf` (LEAF_TAG). So `subtree_root` is `mmr_lib`'s bagged
+  root. The outbox stores peaks-only state (`leaf_count` + `peaks`) in
+  `OutgoingMMRs` and computes the root with the crate's
+  `mmr::root_from_peaks(&peaks)` (equivalent to, but reachable unlike,
+  `mmr_lib`'s internal peak bagging); inclusion and ancestry proofs are generated
+  offchain by rebuilding the subtree from stored payloads into an `mmr_lib::MMR`. We reuse `mmr_lib`'s audited inclusion proofs
+  (`gen_proof`/`verify`) and ancestry proofs (`gen_ancestry_proof`/
+  `verify_ancestor`) rather than hand-rolling any proof code.
+- **The top level** is just the current set of `(destination_para_id,
+  subtree_root)` pairs, gathered into a `CommitmentSet` (sorted by
+  `destination_para_id`). There is **no** top-level Merkle tree: the flat set is
+  the commitment, and the relay chain looks up a receiver's entry directly (§4).
 
-The top-level tree uses **Keccak256** rather than the Substrate-default Blake2.
-Two reasons: (a) the keyed-leaf pattern `keccak256(SCALE(para_id, root))`
-prevents second-preimage attacks where an attacker could interpret a leaf hash as
-an internal node hash, a known concern with unbalanced or non-padded Merkle
-trees; (b) Keccak256 is the EVM-native hash, which simplifies interop with
-EVM-side light-client or bridge verifiers that may need to check subtree
-inclusion against a top-level provides root in the future.
+The per-destination MMR roots and message leaves use **`blake2_256`** with the
+domain tags from `cumulus-primitives-spec-messaging` (`LEAF`/`INNER`/`PEAK`).
+The domain tags supply the second-preimage separation that the old keyed-leaf
+Merkle scheme relied on (a leaf hash can never be reinterpreted as an inner/peak
+node); flattening the top level removes the only place the old design needed an
+EVM-native top-level hash.
 
-**Computing the provides root** — called by the collator after block execution to
-populate `CandidateCommitments.provides`. Phase 1 uses **cumulative latest-root
-semantics**: the root commits to the sender's full current speculative outbox
-state after executing this block, not merely "the delta produced by this block."
+**Computing the provides commitment** — called by the collator after block
+execution to populate `CandidateCommitments.provides`. Phase 1 uses **cumulative
+latest-root semantics**: the set commits to the sender's full current speculative
+outbox state after executing this block, not merely "the delta produced by this
+block."
 
 ```rust
-pub fn compute_provides_root() -> Option<ProvidesCommitment> {
-    let mut roots: Vec<(ParaId, H256)> = OutgoingMMRs::<T>::iter()
+pub fn compute_provides() -> Option<ProvidesCommitment> {
+    let entries = OutgoingMMRs::<T>::iter()
         .filter(|(_, state)| state.leaf_count > 0)
         .map(|(dest, state)| {
-            let root = bag_peaks(&state.peaks).unwrap_or_default();
+            let root = spec_mmr::root_from_peaks(&state.peaks)
+                .expect("non-empty peaks bag to a root; qed");
             (dest, root)
-        })
-        .collect();
+        });
 
-    if roots.is_empty() {
-        return None;
+    // try_from_iter sorts by ParaId and rejects duplicates; an empty input
+    // yields an empty set, which we treat as "nothing to provide".
+    let set = CommitmentSet::try_from_iter(entries).ok()?;
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
     }
-
-    roots.sort_by_key(|(id, _)| *id);
-    let leaves: Vec<Vec<u8>> = roots.iter()
-        .map(|(dest, root)| (dest, root).encode())
-        .collect();
-    Some(ProvidesCommitment {
-        root: binary_merkle_tree::merkle_root::<Keccak256, _>(leaves),
-    })
 }
 ```
 
@@ -915,10 +986,10 @@ pub fn compute_provides_root() -> Option<ProvidesCommitment> {
 ```rust
 /// Per-source tracking (defined in `polkadot-primitives::v9::speculative`).
 ///
-/// Only `last_processed` is required: subtree authentication flows through
-/// `subtree_inclusion_proof` against the batch's `provides_root` (verified
-/// upstream against the relay-chain `ProvidesRoots[source]`), and message
-/// authentication flows through the per-batch MMR inclusion proof
+/// Only `last_processed` is required: subtree authentication flows through the
+/// relay chain matching `batch.subtree_root` against the source's committed
+/// `ProvidesRoots[source].get(receiver)` entry (the flat commitment, §3.1/§4),
+/// and message authentication flows through the per-batch MMR inclusion proof
 /// (`MessageBatch::messages_proof`) against `batch.subtree_root`. The receiver
 /// runtime never reconstructs the sender's MMR — it only verifies proofs.
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo, Default)]
@@ -939,7 +1010,7 @@ pub type IncomingState<T: Config> = StorageMap<
 #[pallet::storage]
 pub type ConsumedSourcesThisBlock<T: Config> = StorageValue<
     _,
-    Vec<(ParaId, H256)>, // (source, expected top-level provides root)
+    Vec<(ParaId, H256)>, // (source, expected per-receiver subtree root)
     ValueQuery,
 >;
 ```
@@ -965,15 +1036,12 @@ pub fn precheck_message_batch(
     snapshot: &mut LocalIncomingSnapshot,
     batch: &MessageBatch,
 ) -> Result<(), VerificationError> {
-    // 1. Verify subtree_inclusion_proof against provides_root.
-    let leaf = (LOCAL_PARA_ID, batch.subtree_root).encode();
-    binary_merkle_tree::verify_proof::<Keccak256, _, _>(
-        &batch.provides_root,
-        batch.subtree_inclusion_proof.iter().copied(),
-        batch.number_of_destinations,
-        batch.leaf_index,
-        &leaf,
-    ).then_some(()).ok_or(VerificationError::InvalidSubtreeProof)?;
+    // 1. (Flat commitment) No subtree-inclusion proof: `batch.subtree_root` is
+    //    matched directly by the relay chain against the source's committed
+    //    `ProvidesRoots[source].get(LOCAL_PARA_ID)` entry. The collator only
+    //    needs to confirm the messages hash up to `batch.subtree_root` (step 3)
+    //    and that the relay has committed this root for the source (root guard,
+    //    §7.4) — there is nothing to verify against a top-level root here.
 
     // 2. Verify message continuity against collator-local state.
     let mut local_state = snapshot.per_source
@@ -991,14 +1059,13 @@ pub fn precheck_message_batch(
             msg.position == next_expected,
             VerificationError::NonConsecutiveMessage,
         );
-        let leaf_hash = Keccak256::hash(&msg.payload);
-        leaves.push((mmr_lib::leaf_index_to_pos(msg.position), leaf_hash));
+        leaves.push((mmr_lib::leaf_index_to_pos(msg.position), msg.hash_leaf()));
         next_expected = next_expected.saturating_add(1);
     }
 
-    // 3. Verify the combined MMR inclusion proof against subtree_root.
+    // 3. Verify the combined inclusion proof against subtree_root (mmr_lib + SpecMerge).
     if !leaves.is_empty() {
-        let proof = mmr_lib::MerkleProof::<H256, Keccak256Merge>::new(
+        let proof = mmr_lib::MerkleProof::<Hash, SpecMerge>::new(
             batch.subtree_mmr_size,
             batch.messages_proof.clone(),
         );
@@ -1036,25 +1103,21 @@ impl<T: Config> Pallet<T> {
         let mut consumed: Vec<(ParaId, H256)> = Vec::new();
 
         for batch in ingress.batches {
-            // 1. Verify subtree_inclusion_proof against provides_root.
-            let leaf = (T::SelfParaId::get(), batch.subtree_root).encode();
-            let valid = binary_merkle_tree::verify_proof::<Keccak256, _, _>(
-                &batch.provides_root,
-                batch.subtree_inclusion_proof.iter().copied(),
-                batch.number_of_destinations,
-                batch.leaf_index,
-                &leaf,
-            );
-            ensure!(valid, Error::<T>::InvalidSubtreeProof);
+            // 1. (Flat commitment) No subtree-inclusion proof to verify here:
+            //    `batch.subtree_root` is what the receiver records in `requires`
+            //    and the relay chain matches it against the source's committed
+            //    `ProvidesRoots[source].get(SelfParaId)` entry at enactment. The
+            //    runtime authenticates messages against `batch.subtree_root`
+            //    (steps 4–5); the root→source binding is the relay's job.
 
             // 2. Intra-block dedup: same source must not appear with two
-            // different provides_roots in the same block. Use the local
+            // different subtree_roots in the same block. Use the local
             // `consumed` list — no cross-block state needed.
             if let Some((_, prior_root)) =
                 consumed.iter().find(|(source, _)| source == &batch.source)
             {
                 ensure!(
-                    *prior_root == batch.provides_root,
+                    *prior_root == batch.subtree_root,
                     Error::<T>::MultipleRootsPerSourceInOneBlock,
                 );
             }
@@ -1069,14 +1132,14 @@ impl<T: Config> Pallet<T> {
             let mut leaves: Vec<(u64, H256)> = Vec::with_capacity(batch.messages.len());
             for msg in &batch.messages {
                 ensure!(msg.position == next_expected, Error::<T>::NonConsecutiveMessage);
-                let leaf_hash = Keccak256::hash(&msg.payload);
+                let leaf_hash = msg.hash_leaf();
                 leaves.push((mmr_lib::leaf_index_to_pos(msg.position), leaf_hash));
                 next_expected = next_expected.saturating_add(1);
             }
 
-            // 5. Verify the combined MMR inclusion proof against subtree_root.
+            // 5. Verify the combined inclusion proof against subtree_root (mmr_lib + SpecMerge).
             if !leaves.is_empty() {
-                let proof = mmr_lib::MerkleProof::<H256, Keccak256Merge>::new(
+                let proof = mmr_lib::MerkleProof::<H256, SpecMerge>::new(
                     batch.subtree_mmr_size,
                     batch.messages_proof.clone(),
                 );
@@ -1091,7 +1154,7 @@ impl<T: Config> Pallet<T> {
                     SourceState { last_processed: last.position },
                 );
             }
-            consumed.push((batch.source, batch.provides_root));
+            consumed.push((batch.source, batch.subtree_root));
 
             // 7. Dispatch each payload directly through the existing XCMP
             // handler. Each payload is already a full XCMP page from
@@ -1150,15 +1213,12 @@ are unchanged from the non-speculative baseline — they set `provides: None` an
 collator's post-build patch. No `CollationInfo` fields or pipeline changes needed.
 
 ```rust
-pub fn requires_commitments() -> Vec<RequiresCommitment> {
-    let mut consumed = ConsumedSourcesThisBlock::<T>::get();
-    consumed.sort_by_key(|(source, _)| *source);
-    consumed.dedup_by_key(|(source, _)| *source);
-
-    consumed.into_iter().map(|(source, provides_root)| RequiresCommitment {
-        source,
-        expected_root: provides_root,
-    }).collect()
+pub fn requires_commitments() -> RequiresCommitment {
+    // (source, expected per-receiver subtree root) pairs consumed this block.
+    // try_from_iter sorts by source and rejects duplicate sources, producing
+    // the canonical `CommitmentSet` encoding.
+    let consumed = ConsumedSourcesThisBlock::<T>::get();
+    CommitmentSet::try_from_iter(consumed).unwrap_or_default()
 }
 
 If late block proofs are needed (§6.2), the collator does **not** override
@@ -1201,10 +1261,14 @@ The extension enum:
 /// Encoded as `TrailingOption<ValidationResultExtension>` — the trailing field
 /// of `ValidationResult`. Old decoders see zero bytes and return None.
 pub enum ValidationResultExtension {
-    /// V4: speculative messaging provides root and requires commitments.
+    /// V4: speculative messaging provides/requires commitments (both flat sets).
     V4 {
-        provides_root: Option<Hash>,           // top-level MMR root (sender side)
-        requires: Vec<(ParaId, Hash)>,         // (source, expected_root) pairs (receiver side)
+        // Flat provides set: (destination, subtree_root) pairs (sender side).
+        // None when the block sent nothing. Carries the whole set, not a single
+        // root — the relay chain looks up entries by destination (§4).
+        provides: Option<Vec<(ParaId, Hash)>>,
+        // (source, expected per-receiver subtree root) pairs (receiver side).
+        requires: Vec<(ParaId, Hash)>,
     },
 }
 
@@ -1232,7 +1296,7 @@ ignoring the trailing extension for pre-speculative candidates.
 1. In `polkadot/parachain/src/primitives.rs`: `ValidationResultExtension` and `TrailingOption` defined; `speculative` field added as last field of `ValidationResult`. Note: the same file also defines `ValidationParamsExtension::V4` (the *input* side, carrying `relay_parent`/`scheduling_parent`) — this is a separate enum with the same variant index `4` but a different purpose. When reading the file, search for `ValidationResultExtension` specifically.
 2. In `cumulus/pallets/parachain-system/src/validate_block/implementation.rs`: after block execution, call `PSC::speculative_extension()` to read `ValidationResultExtension::V4` from runtime state; pass to `apply_messaging_proofs`; set `speculative` field in the returned `ValidationResult`.
 3. In `polkadot/parachain/src/wasm_api.rs`: no separate entrypoint needed — `validate_block` returns `ValidationResult` with the speculative extension populated.
-4. In `polkadot/node/core/candidate-validation`: decode `speculative` field; extract `provides_root`/`requires` from `ValidationResultExtension::V4`; reconstruct `CandidateCommitments` for v4 candidates.
+4. In `polkadot/node/core/candidate-validation`: decode `speculative` field; extract `provides`/`requires` from `ValidationResultExtension::V4` (rebuilding each as a `CommitmentSet`); reconstruct `CandidateCommitments` for v4 candidates.
 5. Keep older descriptor versions on the legacy path (extension is `None`).
 
 ```rust
@@ -1485,30 +1549,25 @@ never sees `LateBlockProof` data and performs no verification of it. The PVF
 is the consensus-critical path; the receiver runtime's `SourceState` carries
 only `last_processed` and is not used for proof verification.
 
+With the flat commitment there is **no top-level inclusion proof** to verify —
+both subtree roots are directly observable as `(receiver, root)` entries in the
+source's old/new `ProvidesCommitment`. The PVF only checks the append-only MMR
+extension, then transforms the requires entry to reference the current subtree
+root (which the relay chain will match by lookup).
+
 ```rust
 fn verify_and_transform(
-    block_requires: &[RequiresCommitment],
+    block_requires: &RequiresCommitment, // CommitmentSet of (source, expected_root)
     proof: &LateBlockProof,
-) -> Result<RequiresCommitment, ValidationError> {
-    // 1. Verify old subtree was in the old provides root
-    let old_leaf = (proof.source, proof.old_subtree_root).encode();
-    let old_leaf_hash = keccak_256(&old_leaf);
-    verify_merkle_proof(
-        proof.old_provides_root,
-        &proof.old_subtree_proof,
-        old_leaf_hash,
-    )?;
+) -> Result<(ParaId, Hash), ValidationError> {
+    // 1. Old root must equal what the block actually built against for this
+    //    source (the entry already in `requires`).
+    ensure!(
+        block_requires.get(proof.source) == Some(&proof.old_subtree_root),
+        ValidationError::LateProofOldRootMismatch,
+    );
 
-    // 2. Verify new subtree is in the current root
-    let new_leaf = (proof.source, proof.new_subtree_root).encode();
-    let new_leaf_hash = keccak_256(&new_leaf);
-    verify_merkle_proof(
-        proof.new_provides_root,
-        &proof.new_subtree_proof,
-        new_leaf_hash,
-    )?;
-
-    // 3. Subtrees must be identical or old must be a valid prefix
+    // 2. Subtrees must be identical, or old must be an append-only prefix of new.
     if proof.old_subtree_root != proof.new_subtree_root {
         let ext = proof.subtree_extension
             .as_ref()
@@ -1520,36 +1579,33 @@ fn verify_and_transform(
         )?;
     }
 
-    // 4. Return transformed commitment — references the current root
-    Ok(RequiresCommitment {
-        source: proof.source,
-        expected_root: proof.new_provides_root,
-    })
+    // 3. Transformed entry references the current subtree root; the relay chain
+    //    confirms it equals ProvidesRoots[source].get(receiver) at enactment.
+    Ok((proof.source, proof.new_subtree_root))
 }
 ```
 
 **How the collator pre-transforms commitments.** The collator's precheck
 produces the same transformed root. When building commitments (§5.3), the
-collator uses the transformed root directly — `ConsumedSourcesThisBlock` still
-stores the original root from batch processing, but the collator overrides it
-with the proof-verified root when constructing `CandidateCommitments`. The PVF
+collator uses the transformed subtree root directly — `ConsumedSourcesThisBlock`
+still stores the original root from batch processing, but the collator overrides
+it with the proof-verified root when constructing `CandidateCommitments`. The PVF
 confirms this override independently.
 
 **What the relay chain sees.** No change from section 4.2. The relay chain always
-matches `RequiresCommitment.expected_root` against `ProvidesRoots[source]`. The
+matches each `requires` entry against `ProvidesRoots[source].get(receiver)`. The
 transformation happens before commitments are finalized, so the relay chain never
 knows whether a proof was needed.
 
-**Proof size.** For a sender with D destinations and m messages to this receiver:
-the two top-level Merkle proofs are O(log D) each (~14 hashes for 100
-destinations), and the subtree extension is O(log m) (~10 hashes for 1000
-messages). Total: well under 2 KB in typical cases. The PoV size budget should
+**Proof size.** No top-level proofs at all now. For a sender with m messages to
+this receiver, the only cost is the subtree extension, O(log m) (~10 hashes for
+1000 messages) — well under 1 KB in typical cases. The PoV size budget should
 reserve a small allowance for these proofs (e.g., 50 KB).
 
 **Serving extension proofs.** The provider serves `LateBlockProof` data via the
 same HTTP endpoint (section 7.3), returning proofs alongside or instead of
-batches when the source's provides_root has advanced beyond the receiver's
-last-seen root.
+batches when the source's committed subtree root for this receiver has advanced
+beyond the receiver's last-seen root.
 
 ---
 
@@ -1610,9 +1666,10 @@ reading this data:
 ```rust
 #[runtime_api]
 pub trait SpeculativeOutboxApi {
-    /// Top-level Merkle root over all per-destination MMR roots, or None if
-    /// no destinations have outbound messages yet.
-    fn compute_provides_root() -> Option<ProvidesCommitment>;
+    /// The sender's flat provides commitment: the sorted set of
+    /// `(destination, subtree_root)` entries, or None if no destination has
+    /// outbound messages yet. (Flat commitment — no top-level Merkle root.)
+    fn compute_provides() -> Option<ProvidesCommitment>;
     /// (subtree_root, leaf_count) for a single destination.
     fn destination_state(dest: ParaId) -> Option<(Hash, u64)>;
     /// Read payload bytes from on-chain storage for a destination starting at
@@ -1624,28 +1681,27 @@ pub trait SpeculativeOutboxApi {
         max_messages: u32,
     ) -> Vec<(u64, Vec<u8>)>;
     /// Read a slice of outbound messages with a combined MMR inclusion proof
-    /// against the per-destination subtree root. Returns
-    /// `(messages, subtree_mmr_size, messages_proof)`. Used by collators to
-    /// build a self-contained `MessageBatch`.
+    /// against the per-destination subtree root. Rebuilds the subtree from
+    /// stored payloads into an `mmr_lib::MMR<_, SpecMerge, _>` (the peaks-only
+    /// on-chain state cannot generate proofs) and calls `gen_proof`. Returns
+    /// `(messages, subtree_mmr_size, messages_proof)`. Used by collators to build
+    /// a self-contained `MessageBatch`.
     fn outbound_messages_with_proof(
         dest: ParaId,
         from_position: u64,
         max_messages: u32,
     ) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<Hash>)>;
-    /// Inclusion proof for `(dest, subtree_root)` in the top-level provides
-    /// root: returns `(proof, number_of_destinations, leaf_index)`.
-    fn subtree_inclusion_proof(
-        dest: ParaId,
-        subtree_root: Hash,
-    ) -> Option<(Vec<Hash>, u32, u32)>;
-    /// Generate a late block proof connecting the receiver's old root to the
-    /// sender's current root. See §6.2 and §10.7.
+    // (Flat commitment) `subtree_inclusion_proof` is gone — the destination's
+    // subtree root is directly observable in `compute_provides()`, so no
+    // top-level inclusion proof is ever generated or verified.
+    /// Generate a late block proof connecting the receiver's old subtree root to
+    /// the sender's current subtree root for that receiver. See §6.2 and §10.7.
     fn generate_late_block_proof(
         dest: ParaId,
-        old_provides_root: Hash,
+        old_subtree_root: Hash,
     ) -> Option<LateBlockProof>;
-    /// Reverse lookup: which sender block produced this top-level root.
-    fn block_hash_for_provides_root(provides_root: Hash) -> Option<Hash>;
+    /// Reverse lookup: which sender block produced this destination's subtree root.
+    fn block_hash_for_subtree_root(dest: ParaId, subtree_root: Hash) -> Option<Hash>;
 }
 ```
 
@@ -1657,8 +1713,8 @@ queried by any RPC client that knows the source chain's endpoint.
 messages, the MMR size at proof generation time, and a combined inclusion
 proof — exactly the three fields needed to populate `MessageBatch`. The
 receiver verifies all messages in one call to
-`mmr_lib::MerkleProof::verify(subtree_root, leaves)`. No re-derivation of the
-sender's MMR happens on the receiver side.
+`MerkleProof::<Hash, SpecMerge>::new(subtree_mmr_size, proof).verify(subtree_root,
+leaves)`. No re-derivation of the sender's MMR happens on the receiver side.
 
 **Optional caching layer (provider).** A future provider process could monitor
 the sender chain, query these runtime APIs, and cache pre-assembled
@@ -1668,6 +1724,12 @@ the POC, the receiver collator queries the sender chain directly via
 logic — it would just be a third `OutboxQuery` implementation.
 
 ### 7.3 Transport: HTTP API
+
+> **Pre-revision (as-built).** The cursor/JSON below still reference the
+> top-level `provides_root` and `subtree_inclusion_proof`. Under the flat
+> commitment the cursor becomes the receiver's last-seen **subtree root** and the
+> `subtree_inclusion_proof`/`provides_root` fields drop out (§3.2). Shown as-is
+> for the current POC.
 
 For the POC, a simple HTTP endpoint:
 
@@ -2072,6 +2134,11 @@ Target one contained parachain runtime (Penpal, Rococo parachain, or similar).
 
 ## 10.11 POC Status Tracker
 
+> **Pre-revision (as-built).** "✅ done" here means done in the **current POC**,
+> which still uses Keccak256 and a two-level Merkle commitment. Migration onto
+> `blake2_256` + the flat commitment + the `cumulus-primitives-spec-messaging`
+> crate is tracked separately in the §3.6 integration checklist.
+
 Legend: ✅ done · 🔶 partial · ❌ not started
 
 | Step | Description | Status | Notes |
@@ -2212,27 +2279,27 @@ Legend: ✅ done · 🔶 partial · ❌ not started
   **Fix plan (pre-production):** add a `RefundWeight`-style annotation or
   explicit `batch_count * per_batch_weight + message_count * per_message_weight`
   so the block author pays proportionally to the data submitted.
-- **Duplicated `Keccak256Merge` across crates.**
-  `Keccak256Merge` is defined identically in `speculative-inbox`,
-  `speculative-outbox`, and `parachain-system/src/validate_block`. The
-  outbox keeps `bag_peaks` / `append_leaf_to_peaks` for its peak-only MMR
-  storage; the PVF keeps the same helpers plus `verify_mmr_extension` for
-  late block proof replay. The receiver inbox does not maintain a local MMR
-  any more — it verifies per-batch MMR inclusion proofs via
-  `mmr_lib::MerkleProof::verify`, so it carries only the merge type. For the
-  POC this is acceptable, but production should extract the merge type and
-  the outbox/PVF helpers into a shared crate.
+- **Duplicated `Keccak256Merge` across crates — resolved by the primitives
+  crate.** `Keccak256Merge` was defined identically in `speculative-inbox`,
+  `speculative-outbox`, and `parachain-system/src/validate_block`. The shared
+  `cumulus-primitives-spec-messaging` crate now provides the single domain-tagged
+  `blake2_256` `SpecMerge` (an `mmr_lib::Merge`); the §3.6 integration checklist
+  (steps 3–5) tracks pointing all three call sites at it. The receiver inbox
+  carries no local MMR — it verifies per-batch inclusion proofs via
+  `mmr_lib::MerkleProof::<Hash, SpecMerge>::verify`.
 - **`HistoricalProvidesRoots` / `HistoricalSubtreeState` storage growth.**
   The 256-block retention window prunes per-block entries in `on_finalize`,
   but `HistoricalSubtreeState` stores `(root, peaks, leaf_count)` per block
   *per destination* — with many parachains this could accumulate significant
   on-chain state within the window. Confirm worst-case storage under full load.
   Consider reducing retention or pruning more aggressively.
-- **`subtree_inclusion_proof` rebuilds sorted root list on every call.**
-  `speculative-outbox/src/lib.rs` iterates all `OutgoingMMRState` entries,
-  sorts by ParaId, and builds a Merkle proof on every RPC query. For chains
-  with many active destinations this is O(D log D) per call. Cache the sorted
-  list (or the top-level Merkle tree) once per block in `on_finalize`.
+- **`subtree_inclusion_proof` removed by the flat commitment.** The old
+  `speculative-outbox` RPC rebuilt a sorted root list and a top-level Merkle
+  proof on every call (O(D log D)). Under the flat commitment there is no
+  top-level tree and no inclusion proof: `compute_provides()` returns the sorted
+  `CommitmentSet` directly and the relay looks up entries by destination. The
+  remaining optimization is just caching the `CommitmentSet` once per block in
+  `on_finalize` rather than re-iterating `OutgoingMMRs`.
 - **`ParachainHost` API version bumped 16→17 without migration guard.**
   Adding `provides_root` to the vstaging runtime API increments the
   `ParachainHost` version. Older nodes calling API v16 get an
@@ -2263,6 +2330,12 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 ---
 
 ## 14. Appendix: Collator-Side Code Walkthrough
+
+> **Pre-revision (as-built).** This appendix traces the **current POC code**,
+> which still uses Keccak256, a two-level Merkle commitment, and the old
+> `provides_root` runtime API. It documents what exists today, not the target.
+> The §3.6 integration checklist tracks migrating it onto `blake2_256` + the flat
+> commitment (see the revision note at the top of this doc).
 
 End-to-end trace of how speculative messaging fields flow through the collator
 pipeline on each slot, with file and line references.

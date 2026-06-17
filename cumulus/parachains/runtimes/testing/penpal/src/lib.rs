@@ -618,11 +618,11 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	fn speculative_extension(
 	) -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
 		Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
-			provides_root: SpeculativeOutbox::compute_provides_root().map(|p| p.root),
-			requires: SpeculativeInbox::get_requires_commitments()
-				.into_iter()
-				.map(|r| (r.source, r.expected_root))
-				.collect(),
+			// Flatten the canonical `CommitmentSet`s into `(ParaId, Hash)` lists for
+			// the validation extension; the node side rebuilds the `CommitmentSet`s.
+			provides: SpeculativeOutbox::compute_provides()
+				.map(|set| set.iter().copied().collect()),
+			requires: SpeculativeInbox::get_requires_commitments().iter().copied().collect(),
 		})
 	}
 }
@@ -686,6 +686,7 @@ impl cumulus_pallet_xcmp_queue::Config for Runtime {
 
 impl cumulus_pallet_speculative_outbox::Config for Runtime {
 	type InnerXcmpMessageSource = XcmpQueue;
+	type SelfParaId = ParachainInfo;
 }
 
 impl cumulus_pallet_speculative_inbox::Config for Runtime {
@@ -1213,8 +1214,8 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 	}
 
 	impl cumulus_primitives_core::SpeculativeOutboxApi<Block> for Runtime {
-		fn compute_provides_root() -> Option<polkadot_primitives::v9::ProvidesCommitment> {
-			SpeculativeOutbox::compute_provides_root()
+		fn compute_provides() -> Option<polkadot_primitives::v9::ProvidesCommitment> {
+			SpeculativeOutbox::compute_provides()
 		}
 		fn destination_state(dest: ParaId) -> Option<(polkadot_primitives::Hash, u64)> {
 			SpeculativeOutbox::destination_state(dest)
@@ -1229,16 +1230,11 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)> {
 			SpeculativeOutbox::outbound_messages_with_proof(dest, from_position, max_messages)
 		}
-		fn subtree_inclusion_proof(dest: ParaId, subtree_root: polkadot_primitives::Hash) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)> {
-			SpeculativeOutbox::subtree_inclusion_proof(dest, subtree_root)
+		fn generate_late_block_proof(dest: ParaId, old_subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v9::LateBlockProof> {
+			SpeculativeOutbox::generate_late_block_proof(dest, old_subtree_root)
 		}
-		fn generate_late_block_proof(dest: ParaId, old_provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v9::LateBlockProof> {
-			let mut proof = SpeculativeOutbox::generate_late_block_proof(dest, old_provides_root)?;
-			proof.source = ParachainInfo::parachain_id();
-			Some(proof)
-		}
-		fn block_hash_for_provides_root(provides_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
-			let number = SpeculativeOutbox::block_number_for_provides_root(provides_root)?;
+		fn block_hash_for_subtree_root(dest: ParaId, subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
+			let number = SpeculativeOutbox::block_number_for_subtree_root(dest, subtree_root)?;
 			// frame_system stores block N's hash during block N+1's on_initialize,
 			// so block_hash(N) at block N's state is always zero. Use N-1 instead,
 			// whose hash is guaranteed to be in storage. The outbox state is the
@@ -1253,7 +1249,7 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		}
 		}
 	impl cumulus_primitives_core::SpeculativeInboxApi<Block> for Runtime {
-		fn requires_commitments() -> Vec<polkadot_primitives::v9::RequiresCommitment> {
+		fn requires_commitments() -> polkadot_primitives::v9::RequiresCommitment {
 			SpeculativeInbox::get_requires_commitments()
 		}
 		fn next_expected_message_position(source: ParaId) -> u64 {

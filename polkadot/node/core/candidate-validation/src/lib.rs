@@ -1308,25 +1308,49 @@ async fn validate_candidate(
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
 				let (provides, requires) = match res.speculative.0 {
-					Some(ValidationResultExtension::V4 { provides_root, requires }) => {
+					Some(ValidationResultExtension::V4 { provides, requires }) => {
 						gum::debug!(
 							target: LOG_TARGET,
 							?para_id,
 							?candidate_hash,
-							?provides_root,
+							n_provides = provides.as_ref().map(|p| p.len()).unwrap_or(0),
 							n_requires = requires.len(),
 							"validation result has V4 speculative extension",
 						);
-						(
-							provides_root.map(|root| ProvidesCommitment { root }),
-							requires
-								.into_iter()
-								.map(|(source, expected_root)| RequiresCommitment {
-									source,
-									expected_root,
-								})
-								.collect(),
-						)
+						// Rebuild the canonical (sorted, deduplicated) commitment
+						// sets. A malformed set (out-of-order, duplicate, or
+						// over-capacity) cannot equal what the receipt committed,
+						// so treat it as a commitments mismatch.
+						let provides = match provides {
+							Some(entries) => match ProvidesCommitment::try_from_iter(entries) {
+								Ok(set) => Some(set),
+								Err(e) => {
+									gum::debug!(
+										target: LOG_TARGET,
+										?para_id, ?candidate_hash, ?e,
+										"invalid V4 provides set",
+									);
+									return Ok(ValidationResult::Invalid(
+										InvalidCandidate::CommitmentsHashMismatch,
+									));
+								},
+							},
+							None => None,
+						};
+						let requires = match RequiresCommitment::try_from_iter(requires) {
+							Ok(set) => set,
+							Err(e) => {
+								gum::debug!(
+									target: LOG_TARGET,
+									?para_id, ?candidate_hash, ?e,
+									"invalid V4 requires set",
+								);
+								return Ok(ValidationResult::Invalid(
+									InvalidCandidate::CommitmentsHashMismatch,
+								));
+							},
+						};
+						(provides, requires)
 					},
 					None => {
 						gum::debug!(
@@ -1335,7 +1359,7 @@ async fn validate_candidate(
 							?candidate_hash,
 							"validation result has no speculative extension",
 						);
-						(None, Vec::new())
+						(None, RequiresCommitment::default())
 					},
 				};
 

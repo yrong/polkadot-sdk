@@ -48,8 +48,8 @@ use polkadot_primitives::{
 	BackedCandidate, CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
 	CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex, HeadData,
-	Id as ParaId, RequiresCommitment, SignedAvailabilityBitfields, SigningContext, UpwardMessage,
-	ValidatorId, ValidatorIndex, ValidityAttestation,
+	Id as ParaId, ProvidesCommitment, RequiresCommitment, SignedAvailabilityBitfields,
+	SigningContext, UpwardMessage, ValidatorId, ValidatorIndex, ValidityAttestation,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{traits::One, DispatchError, SaturatedConversion, Saturating};
@@ -371,10 +371,12 @@ pub mod pallet {
 	//                  are overwritten. No history is kept.
 	// ─────────────────────────────────────────────────────────────────────────────
 
-	/// Latest provides root per parachain for speculative messaging (Phase 1).
+	/// Latest provides commitment per parachain for speculative messaging (Phase 1).
+	/// The flat `(destination, subtree_root)` set; the relay chain looks up a
+	/// receiver's entry by ParaId to match a `requires` commitment.
 	#[pallet::storage]
 	pub(crate) type ProvidesRoots<T: Config> =
-		StorageMap<_, Twox64Concat, polkadot_primitives::Id, polkadot_primitives::Hash>;
+		StorageMap<_, Twox64Concat, polkadot_primitives::Id, ProvidesCommitment>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
@@ -589,8 +591,10 @@ impl<T: Config> Pallet<T> {
 							// dropping immediately lets the collator retry on the next slot.
 							if can_enact &&
 								candidate.descriptor.version() == CandidateDescriptorVersion::V4 &&
-								!Self::requires_satisfied(&candidate.commitments.requires)
-							{
+								!Self::requires_satisfied(
+									paraid,
+									&candidate.commitments.requires,
+								) {
 								log::debug!(
 									target: LOG_TARGET,
 									"dropping v4 candidate {:?} (para {:?}): unsatisfied requires",
@@ -908,24 +912,33 @@ impl<T: Config> Pallet<T> {
 
 	// ── Phase 1 Speculative Messaging helpers ────────────────────────────────────
 
-	/// Read the latest provides root for a parachain.
-	pub(crate) fn provides_root(
-		para_id: &polkadot_primitives::Id,
-	) -> Option<polkadot_primitives::Hash> {
+	/// Read the latest provides commitment (flat set) for a parachain.
+	pub(crate) fn provides(para_id: &polkadot_primitives::Id) -> Option<ProvidesCommitment> {
 		ProvidesRoots::<T>::get(para_id)
 	}
 
-	/// Returns true when every requirement matches the persisted provides root.
-	pub(crate) fn requires_satisfied(requires: &[RequiresCommitment]) -> bool {
-		requires.iter().all(|r| Self::provides_root(&r.source) == Some(r.expected_root))
+	/// The source's committed subtree root for a specific destination, if any.
+	pub(crate) fn provided_subtree_root(
+		source: &polkadot_primitives::Id,
+		destination: polkadot_primitives::Id,
+	) -> Option<polkadot_primitives::Hash> {
+		ProvidesRoots::<T>::get(source)?.get(destination).copied()
 	}
 
-	/// Update the provides root after a candidate is enacted.
-	pub(crate) fn update_provides_root(
-		para_id: polkadot_primitives::Id,
-		root: polkadot_primitives::Hash,
-	) {
-		ProvidesRoots::<T>::insert(para_id, root);
+	/// Returns true when every requirement of `receiver` matches the source's
+	/// persisted `(receiver, subtree_root)` entry.
+	pub(crate) fn requires_satisfied(
+		receiver: polkadot_primitives::Id,
+		requires: &RequiresCommitment,
+	) -> bool {
+		requires.iter().all(|(source, expected_root)| {
+			Self::provided_subtree_root(source, receiver) == Some(*expected_root)
+		})
+	}
+
+	/// Update the provides commitment after a candidate is enacted.
+	pub(crate) fn update_provides(para_id: polkadot_primitives::Id, provides: ProvidesCommitment) {
+		ProvidesRoots::<T>::insert(para_id, provides);
 	}
 
 	fn enact_candidate(
@@ -989,7 +1002,8 @@ impl<T: Config> Pallet<T> {
 		);
 
 		// Finalize speculative messaging: check requirements and update ProvidesRoots.
-		if !Self::requires_satisfied(&commitments.requires) {
+		let receiver = receipt.descriptor.para_id();
+		if !Self::requires_satisfied(receiver, &commitments.requires) {
 			defensive!(
 				"Candidate {:?} requirements no longer satisfied at enactment",
 				candidate_hash
@@ -997,10 +1011,10 @@ impl<T: Config> Pallet<T> {
 		} else if let Some(ref p) = commitments.provides {
 			log::debug!(
 				target: LOG_TARGET,
-				"updating ProvidesRoots[{:?}] = {:?} after enactment",
-				receipt.descriptor.para_id(), p.root,
+				"updating ProvidesRoots[{:?}] (= {} entries) after enactment",
+				receiver, p.len(),
 			);
-			Self::update_provides_root(receipt.descriptor.para_id(), p.root);
+			Self::update_provides(receiver, p.clone());
 		}
 
 		Self::deposit_event(Event::<T>::CandidateIncluded(

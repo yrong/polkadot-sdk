@@ -548,15 +548,14 @@ where
 						// newly built block, so the collation's provides/requires match what
 						// validate_block will recompute via speculative_extension().
 						let runtime_api = para_client.runtime_api();
-						let provides =
-							runtime_api.compute_provides_root(new_block_hash).unwrap_or(None);
+						let provides = runtime_api.compute_provides(new_block_hash).unwrap_or(None);
 						let requires =
 							runtime_api.requires_commitments(new_block_hash).unwrap_or_default();
 
 						tracing::debug!(
 							target: crate::LOG_TARGET,
 							?new_block_hash,
-							provides_root = ?provides.as_ref().map(|p| p.root),
+							n_provides = provides.as_ref().map(|p| p.len()).unwrap_or(0),
 							n_requires = requires.len(),
 							"patching speculative fields onto collation from runtime state",
 						);
@@ -569,7 +568,7 @@ where
 							?parent_hash,
 							?new_block_hash,
 							block_number = %new_block_header.number(),
-							provides = ?collation.provides.as_ref().map(|p| p.root),
+							n_provides = collation.provides.as_ref().map(|p| p.len()).unwrap_or(0),
 							n_requires = collation.requires.len(),
 							n_horiz = collation.horizontal_messages.len(),
 							n_ump = collation.upward_messages.len(),

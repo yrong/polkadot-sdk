@@ -37,7 +37,8 @@ pub trait OutboxQuery: Send + Sync + 'static {
 	/// Best known block hash on the sender chain. Used as the default fetch point.
 	fn best_block_hash(&self) -> Hash;
 
-	async fn compute_provides_root(&self, at: Hash) -> Option<ProvidesCommitment>;
+	/// The sender's flat provides commitment (the `(destination, subtree_root)` set).
+	async fn compute_provides(&self, at: Hash) -> Option<ProvidesCommitment>;
 
 	async fn destination_state(&self, at: Hash, dest: ParaId) -> Option<(Hash, u64)>;
 
@@ -49,26 +50,22 @@ pub trait OutboxQuery: Send + Sync + 'static {
 		max: u32,
 	) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<Hash>)>;
 
-	async fn subtree_inclusion_proof(
-		&self,
-		at: Hash,
-		dest: ParaId,
-		root: Hash,
-	) -> Option<(Vec<Hash>, u32, u32)>;
+	/// Block hash at which `dest`'s subtree root was `root`.
+	async fn block_hash_for_subtree_root(&self, at: Hash, dest: ParaId, root: Hash)
+		-> Option<Hash>;
 
-	async fn block_hash_for_provides_root(&self, at: Hash, root: Hash) -> Option<Hash>;
-
-	/// Generate a late block proof connecting `old_provides_root` (the root the receiver
-	/// built against in its batch) to the sender's current root at `at`.
+	/// Generate a late block proof connecting `old_subtree_root` (the per-destination
+	/// subtree root the receiver built against in its batch) to the sender's current
+	/// subtree root for `dest` at `at`.
 	///
 	/// The receiver attaches the returned proof to `ParachainBlockData::V2.late_block_proofs`
-	/// so the PVF's `apply_messaging_proofs` can transform `requires[source].expected_root`
-	/// at validation time.
+	/// so the PVF's `apply_messaging_proofs` can transform the `requires` entry at
+	/// validation time.
 	async fn generate_late_block_proof(
 		&self,
 		at: Hash,
 		dest: ParaId,
-		old_provides_root: Hash,
+		old_subtree_root: Hash,
 	) -> Option<LateBlockProof>;
 }
 
@@ -145,9 +142,9 @@ impl OutboxQuery for RpcOutboxClient {
 		})
 	}
 
-	async fn compute_provides_root(&self, at: Hash) -> Option<ProvidesCommitment> {
+	async fn compute_provides(&self, at: Hash) -> Option<ProvidesCommitment> {
 		self.state_call::<Option<ProvidesCommitment>>(
-			"SpeculativeOutboxApi_compute_provides_root",
+			"SpeculativeOutboxApi_compute_provides",
 			at,
 			vec![],
 		)
@@ -181,26 +178,16 @@ impl OutboxQuery for RpcOutboxClient {
 		.flatten()
 	}
 
-	async fn subtree_inclusion_proof(
+	async fn block_hash_for_subtree_root(
 		&self,
 		at: Hash,
 		dest: ParaId,
 		root: Hash,
-	) -> Option<(Vec<Hash>, u32, u32)> {
-		self.state_call::<Option<(Vec<Hash>, u32, u32)>>(
-			"SpeculativeOutboxApi_subtree_inclusion_proof",
+	) -> Option<Hash> {
+		self.state_call::<Option<Hash>>(
+			"SpeculativeOutboxApi_block_hash_for_subtree_root",
 			at,
 			(dest, root).encode(),
-		)
-		.await
-		.flatten()
-	}
-
-	async fn block_hash_for_provides_root(&self, at: Hash, root: Hash) -> Option<Hash> {
-		self.state_call::<Option<Hash>>(
-			"SpeculativeOutboxApi_block_hash_for_provides_root",
-			at,
-			root.encode(),
 		)
 		.await
 		.flatten()
@@ -210,12 +197,12 @@ impl OutboxQuery for RpcOutboxClient {
 		&self,
 		at: Hash,
 		dest: ParaId,
-		old_provides_root: Hash,
+		old_subtree_root: Hash,
 	) -> Option<LateBlockProof> {
 		self.state_call::<Option<LateBlockProof>>(
 			"SpeculativeOutboxApi_generate_late_block_proof",
 			at,
-			(dest, old_provides_root).encode(),
+			(dest, old_subtree_root).encode(),
 		)
 		.await
 		.flatten()
@@ -235,11 +222,11 @@ pub async fn build_message_batch_from_query(
 	from_position: u64,
 	max_messages: u32,
 ) -> Option<polkadot_primitives::v9::MessageBatch> {
-	use polkadot_primitives::v9::{
-		MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage,
-	};
+	use polkadot_primitives::v9::{MessageBatch, OutgoingMessage};
+	use sp_runtime::BoundedVec;
 
-	let provides = source.compute_provides_root(at).await?;
+	// Flat commitment: the relay chain matches `subtree_root` directly, so the
+	// batch carries no top-level provides root or subtree-inclusion proof.
 	let (subtree_root, _) = source.destination_state(at, destination).await?;
 	let (messages, subtree_mmr_size, messages_proof) = match source
 		.outbound_messages_with_proof(at, destination, from_position, max_messages)
@@ -263,41 +250,22 @@ pub async fn build_message_batch_from_query(
 		source = ?source_para_id,
 		dest = ?destination,
 		count = messages.len(),
-		provides_root = ?provides.root,
 		?subtree_root,
 		"building message batch",
 	);
 
-	let (subtree_inclusion_proof, number_of_destinations, leaf_index) =
-		match source.subtree_inclusion_proof(at, destination, subtree_root).await {
-			Some(p) => p,
-			None => {
-				tracing::warn!(
-					target: "aura::cumulus",
-					source = ?source_para_id,
-					dest = ?destination,
-					?subtree_root,
-					provides_root = ?provides.root,
-					"subtree_inclusion_proof returned None — batch dropped",
-				);
-				return None;
-			},
-		};
-
 	Some(MessageBatch {
 		source: source_para_id,
 		source_relay_parent_number,
-		provides_root: provides.root,
 		subtree_root,
-		messages_proof: MmrInclusionProof { mmr_size: subtree_mmr_size, proof: messages_proof },
-		subtree_inclusion_proof: MerkleSubtreeProof {
-			proof: subtree_inclusion_proof,
-			number_of_leaves: number_of_destinations,
-			leaf_index,
-		},
+		subtree_mmr_size,
+		messages_proof,
 		messages: messages
 			.into_iter()
-			.map(|(position, payload)| OutgoingMessage { position, payload })
+			.map(|(position, payload)| {
+				let payload = BoundedVec::try_from(payload).unwrap_or_default();
+				OutgoingMessage::new(source_para_id, destination, position, payload)
+			})
 			.collect(),
 	})
 }

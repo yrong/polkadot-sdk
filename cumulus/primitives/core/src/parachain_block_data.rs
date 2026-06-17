@@ -315,16 +315,8 @@ mod tests {
 			proof: CompactProof { encoded_nodes: vec![vec![10u8; 200], vec![20u8; 30]] },
 			late_block_proofs: vec![polkadot_primitives::v9::LateBlockProof {
 				source: 2000.into(),
-				old_number_of_destinations: 1,
-				old_leaf_index: 0,
-				number_of_destinations: 1,
-				leaf_index: 0,
-				old_provides_root: Default::default(),
 				old_subtree_root: Default::default(),
-				old_subtree_proof: vec![],
-				new_provides_root: Default::default(),
 				new_subtree_root: Default::default(),
-				new_subtree_proof: vec![],
 				subtree_extension: None,
 			}],
 		};

@@ -105,8 +105,8 @@ use polkadot_node_subsystem_util::{
 use polkadot_primitives::{
 	node_features::FeatureIndex, transpose_claim_queue, CandidateCommitments,
 	CandidateDescriptorV2, CommittedCandidateReceiptV2, CoreIndex, Hash, Id as ParaId,
-	OccupiedCoreAssumption, PersistedValidationData, ProvidesCommitment, RequiresCommitment,
-	SessionIndex, TransposedClaimQueue, ValidationCodeHash,
+	OccupiedCoreAssumption, PersistedValidationData, SessionIndex, TransposedClaimQueue,
+	ValidationCodeHash,
 };
 use schnellru::{ByLength, LruMap};
 use std::{collections::HashSet, sync::Arc};
@@ -617,12 +617,10 @@ async fn construct_and_distribute_receipt(
 
 	let erasure_root = erasure_root(n_validators, validation_data, pov.clone())?;
 
-	let provides = collation.provides.map(|p| ProvidesCommitment { root: p.root });
-	let requires: Vec<RequiresCommitment> = collation
-		.requires
-		.into_iter()
-		.map(|r| RequiresCommitment { source: r.source, expected_root: r.expected_root })
-		.collect();
+	// `provides`/`requires` are already canonical `CommitmentSet`s on the
+	// collation (flat commitment), so they map straight into the candidate.
+	let provides = collation.provides;
+	let requires = collation.requires;
 	let has_speculative = provides.is_some() || !requires.is_empty();
 
 	gum::debug!(
@@ -630,7 +628,7 @@ async fn construct_and_distribute_receipt(
 		?para_id,
 		?relay_parent,
 		?has_speculative,
-		provides_root = ?provides.as_ref().map(|p| p.root),
+		n_provides = provides.as_ref().map(|p| p.len()).unwrap_or(0),
 		n_requires = requires.len(),
 		"speculative commitment fields for collation",
 	);

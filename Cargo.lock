@@ -5178,6 +5178,7 @@ dependencies = [
  "cumulus-primitives-core",
  "cumulus-primitives-parachain-inherent",
  "cumulus-primitives-proof-size-hostfunction",
+ "cumulus-primitives-spec-messaging",
  "cumulus-test-client",
  "cumulus-test-relay-sproof-builder",
  "derive-where",
@@ -5267,6 +5268,7 @@ dependencies = [
  "cumulus-pallet-parachain-system",
  "cumulus-pallet-speculative-outbox",
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "frame-support",
  "frame-system",
  "log",
@@ -5291,6 +5293,7 @@ dependencies = [
  "binary-merkle-tree 13.0.0",
  "cumulus-pallet-parachain-system",
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "frame-support",
  "frame-system",
  "log",
@@ -5446,6 +5449,20 @@ dependencies = [
  "sp-runtime-interface 24.0.0",
  "sp-state-machine 0.35.0",
  "sp-trie 29.0.0",
+]
+
+[[package]]
+name = "cumulus-primitives-spec-messaging"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "polkadot-ckb-merkle-mountain-range",
+ "polkadot-core-primitives",
+ "polkadot-parachain-primitives",
+ "scale-info",
+ "sp-core 28.0.0",
+ "sp-io 30.0.0",
+ "sp-runtime 31.0.1",
 ]
 
 [[package]]
@@ -17174,6 +17191,7 @@ version = "7.0.0"
 dependencies = [
  "bitvec",
  "bounded-collections 0.3.2",
+ "cumulus-primitives-spec-messaging",
  "hex-literal",
  "log",
  "parity-scale-codec",

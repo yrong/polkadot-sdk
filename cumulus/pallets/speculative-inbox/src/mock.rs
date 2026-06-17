@@ -37,7 +37,11 @@ frame_support::construct_runtime!(
 );
 
 parameter_types! {
+	/// Receiver / inbox para id.
 	pub const SelfParaId: ParaId = ParaId::new(2000);
+	/// Sender / outbox para id — distinct so the `hash_leaf` source binding is
+	/// meaningful (the outbox binds messages to *its* para id).
+	pub const OutboxParaId: ParaId = ParaId::new(1000);
 	pub ReservedXcmpWeight: Weight = Weight::from_parts(1_000_000, 0);
 }
 
@@ -73,6 +77,7 @@ impl frame_system::Config for Test {
 
 impl speculative_outbox::Config for Test {
 	type InnerXcmpMessageSource = NoopXcmpSource;
+	type SelfParaId = OutboxParaId;
 }
 
 impl speculative_inbox::Config for Test {

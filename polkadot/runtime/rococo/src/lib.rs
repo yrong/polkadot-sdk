@@ -2189,7 +2189,7 @@ sp_api::impl_runtime_apis! {
 			parachains_staging_runtime_api_impl::ancestor_relay_parent_info::<Runtime>(session_index, relay_parent)
 		}
 
-		fn provides_root(para_id: ParaId) -> Option<Hash> {
+		fn provides_root(para_id: ParaId) -> Option<polkadot_primitives::v9::ProvidesCommitment> {
 			parachains_staging_runtime_api_impl::provides_root::<Runtime>(para_id)
 		}
 	}

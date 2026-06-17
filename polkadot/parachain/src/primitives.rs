@@ -435,12 +435,14 @@ pub enum ValidationParamsExtension {
 #[derive(Clone, Encode, Decode, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum ValidationResultExtension {
-	/// V4 extension — speculative messaging provides root and requires commitments.
+	/// V4 extension — speculative messaging provides/requires commitments (flat sets).
 	#[codec(index = 4)]
 	V4 {
-		/// The provides root (top-level Merkle tree over per-destination MMR roots).
-		provides_root: Option<Hash>,
-		/// The requires commitments (source parachain → expected provides root).
+		/// The flat provides set: `(destination, subtree_root)` entries. `None`
+		/// when the block sent nothing. The whole set is carried (not a single
+		/// root) so the relay chain can look up entries by destination.
+		provides: Option<Vec<(Id, Hash)>>,
+		/// The requires commitments: `(source, expected_subtree_root)` entries.
 		requires: Vec<(Id, Hash)>,
 	},
 }

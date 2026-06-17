@@ -88,7 +88,7 @@ impl RelayChainInterface for RelayChainRpcInterface {
 		&self,
 		para_id: ParaId,
 		relay_parent: RelayHash,
-	) -> RelayChainResult<Option<RelayHash>> {
+	) -> RelayChainResult<Option<cumulus_primitives_core::relay_chain::v9::ProvidesCommitment>> {
 		let payload = para_id.encode();
 		let response = self
 			.call_runtime_api("ParachainHost_provides_root", relay_parent, &payload)

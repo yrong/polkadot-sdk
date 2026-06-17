@@ -378,7 +378,7 @@ pub fn dummy_candidate_commitments(head_data: impl Into<Option<HeadData>>) -> Ca
 		processed_downward_messages: 0,
 		hrmp_watermark: 0_u32,
 		provides: None,
-		requires: vec![],
+		requires: Default::default(),
 	}
 }
 
@@ -537,7 +537,7 @@ pub fn make_candidate(
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
 		provides: None,
-		requires: vec![],
+		requires: Default::default(),
 	};
 
 	let mut candidate =
@@ -570,7 +570,7 @@ pub fn make_candidate_v2(
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
 		provides: None,
-		requires: vec![],
+		requires: Default::default(),
 	};
 
 	let mut descriptor = dummy_candidate_descriptor_v2(relay_parent_hash);
@@ -601,7 +601,7 @@ pub fn make_candidate_v3(
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
 		provides: None,
-		requires: vec![],
+		requires: Default::default(),
 	};
 
 	let descriptor = CandidateDescriptorV2::new_v3(
@@ -737,18 +737,19 @@ pub fn dummy_candidate_commitments_speculative(
 		processed_downward_messages: 0,
 		hrmp_watermark: 0_u32,
 		provides: None,
-		requires: vec![],
+		requires: Default::default(),
 	}
 }
 
-/// Create a dummy provides commitment.
+/// Create a dummy (empty) provides commitment.
 pub fn dummy_provides_commitment() -> ProvidesCommitment {
-	ProvidesCommitment { root: Hash::zero() }
+	ProvidesCommitment::default()
 }
 
-/// Create a dummy requires commitment.
+/// Create a single-entry requires commitment for `(source, expected_root)`.
 pub fn dummy_requires_commitment(source: ParaId, expected_root: Hash) -> RequiresCommitment {
-	RequiresCommitment { source, expected_root }
+	RequiresCommitment::try_from_iter([(source, expected_root)])
+		.expect("single entry is a valid commitment set; qed")
 }
 
 /// After manually modifying the candidate descriptor, resign with a defined collator key.

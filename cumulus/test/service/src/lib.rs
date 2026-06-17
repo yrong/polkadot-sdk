@@ -475,7 +475,6 @@ where
 				spawner: task_manager.spawn_essential_handle(),
 				export_pov: None,
 				max_pov_percentage: None,
-				speculative_sources: Default::default(),
 				collator_peer_id,
 			};
 

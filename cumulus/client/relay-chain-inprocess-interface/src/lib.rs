@@ -112,7 +112,7 @@ impl RelayChainInterface for RelayChainInProcessInterface {
 		&self,
 		para_id: ParaId,
 		relay_parent: PHash,
-	) -> RelayChainResult<Option<PHash>> {
+	) -> RelayChainResult<Option<cumulus_primitives_core::relay_chain::v9::ProvidesCommitment>> {
 		Ok(self.full_client.runtime_api().provides_root(relay_parent, para_id)?)
 	}
 

@@ -256,7 +256,7 @@ impl TestCandidateBuilder {
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
 				provides: None,
-				requires: vec![],
+				requires: Default::default(),
 			},
 		}
 	}
@@ -311,7 +311,7 @@ async fn assert_validate_from_exhaustive(
 					new_validation_code: None,
 					processed_downward_messages: 0,
 					hrmp_watermark: 0,
-					provides: None, requires: vec![],
+					provides: None, requires: Default::default(),
 				}.into(),
 				result_validation_data,
 			)))
@@ -664,7 +664,7 @@ async fn assert_validate_seconded_candidate(
 					new_validation_code: None,
 					processed_downward_messages: 0,
 					hrmp_watermark: 0,
-					provides: None, requires: vec![],
+					provides: None, requires: Default::default(),
 				}.into(),
 				assert_pvd.clone(),
 			)))
@@ -3865,7 +3865,7 @@ fn concurrent_dependent_candidates() {
 								processed_downward_messages: 0,
 								hrmp_watermark: 0,
 								provides: None,
-								requires: vec![],
+								requires: Default::default(),
 							}
 							.into(),
 							pvd.clone(),
@@ -4114,7 +4114,7 @@ fn v3_capable_validator_backs_v1_descriptor() {
 				processed_downward_messages: 0,
 				hrmp_watermark: 0_u32,
 				provides: None,
-				requires: vec![],
+				requires: Default::default(),
 			},
 		};
 

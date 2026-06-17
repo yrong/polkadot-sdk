@@ -76,9 +76,10 @@ pub mod executor_params;
 pub mod slashing;
 pub mod speculative;
 pub use speculative::{
-	LateBlockProof, MMRExtensionProof, MerkleSubtreeProof, MessageBatch, MmrInclusionProof,
-	OutgoingMessage, ProvidesCommitment, RequiresCommitment, SourceState, SpeculativeIngress,
-	MAX_REQUIRES_PER_BLOCK, SPECULATIVE_API_VERSION,
+	LateBlockProof, MaxSpeculativeMessageLen, MessageBatch, OutgoingMessage, ProvidesCommitment,
+	RequiresCommitment, SourceState, SpeculativeIngress, SubtreeExtension,
+	MAX_DESTINATIONS_PER_BLOCK, MAX_SOURCES_PER_BLOCK, MAX_SPECULATIVE_MESSAGE_LEN,
+	SPECULATIVE_API_VERSION,
 };
 
 pub use async_backing::AsyncBackingParams;
@@ -571,8 +572,9 @@ pub struct CandidateCommitments<N = BlockNumber> {
 	pub hrmp_watermark: N,
 	/// The provides commitment for speculative messaging (None if no outbox state exists).
 	pub provides: Option<ProvidesCommitment>,
-	/// The requires commitments for speculative messaging, sorted by source ParaId.
-	pub requires: Vec<RequiresCommitment>,
+	/// The requires commitment for speculative messaging: a canonical, sorted set
+	/// of `(source, expected_subtree_root)` entries (empty if nothing consumed).
+	pub requires: RequiresCommitment,
 }
 
 impl CandidateCommitments {

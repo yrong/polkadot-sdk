@@ -3214,12 +3214,16 @@ fn check_validation_outputs_for_runtime_api_rejects_oversized_new_validation_cod
 fn speculative_requires_satisfied_when_persisted_root_matches() {
 	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
 		let source = ParaId::from(1000u32);
-		let root = Hash::from_low_u64_be(42);
-		ParaInclusion::update_provides_root(source, root);
-		assert!(ParaInclusion::requires_satisfied(&[RequiresCommitment {
+		let receiver = ParaId::from(2000u32);
+		let subtree_root = Hash::from_low_u64_be(42);
+		// Source commits `(receiver -> subtree_root)`.
+		ParaInclusion::update_provides(
 			source,
-			expected_root: root,
-		}]));
+			ProvidesCommitment::try_from_iter([(receiver, subtree_root)]).unwrap(),
+		);
+		// Receiver requires `(source -> subtree_root)`.
+		let requires = RequiresCommitment::try_from_iter([(source, subtree_root)]).unwrap();
+		assert!(ParaInclusion::requires_satisfied(receiver, &requires));
 	});
 }
 
@@ -3227,21 +3231,24 @@ fn speculative_requires_satisfied_when_persisted_root_matches() {
 fn speculative_requires_unsatisfied_when_persisted_root_differs() {
 	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
 		let source = ParaId::from(1000u32);
-		ParaInclusion::update_provides_root(source, Hash::from_low_u64_be(1));
-		assert!(!ParaInclusion::requires_satisfied(&[RequiresCommitment {
+		let receiver = ParaId::from(2000u32);
+		ParaInclusion::update_provides(
 			source,
-			expected_root: Hash::from_low_u64_be(2),
-		}]));
+			ProvidesCommitment::try_from_iter([(receiver, Hash::from_low_u64_be(1))]).unwrap(),
+		);
+		let requires =
+			RequiresCommitment::try_from_iter([(source, Hash::from_low_u64_be(2))]).unwrap();
+		assert!(!ParaInclusion::requires_satisfied(receiver, &requires));
 	});
 }
 
 #[test]
 fn speculative_requires_unsatisfied_when_source_has_no_persisted_root() {
 	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
-		let source = ParaId::from(2000u32);
-		assert!(!ParaInclusion::requires_satisfied(&[RequiresCommitment {
-			source,
-			expected_root: Hash::from_low_u64_be(99),
-		}]));
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+		let requires =
+			RequiresCommitment::try_from_iter([(source, Hash::from_low_u64_be(99))]).unwrap();
+		assert!(!ParaInclusion::requires_satisfied(receiver, &requires));
 	});
 }

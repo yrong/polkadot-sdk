@@ -393,7 +393,7 @@ where
 			head_data: head_data?,
 			proof_of_validity: MaybeCompressedPoV::Compressed(pov),
 			provides: None,
-			requires: Vec::new(),
+			requires: Default::default(),
 		};
 
 		Some((collation, block_data))

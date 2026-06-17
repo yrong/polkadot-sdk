@@ -673,8 +673,9 @@ sp_api::decl_runtime_apis! {
 	///
 	/// Called by the provider to query outbound message data.
 	pub trait SpeculativeOutboxApi {
-		/// Compute the cumulative provides root over all per-destination MMRs.
-		fn compute_provides_root()
+		/// The flat provides commitment: the sorted `(destination, subtree_root)`
+		/// set over all per-destination MMRs.
+		fn compute_provides()
 			-> Option<polkadot_primitives::v9::ProvidesCommitment>;
 		/// Get the subtree root and leaf count for a destination.
 		fn destination_state(dest: ParaId)
@@ -693,31 +694,27 @@ sp_api::decl_runtime_apis! {
 			from_position: u64,
 			max_messages: u32,
 		) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)>;
-		/// Generate a subtree inclusion proof for `(dest, subtree_root)` in the
-		/// top-level provides root. Returns (proof, num_destinations, leaf_index).
-		fn subtree_inclusion_proof(
-			dest: ParaId,
-			subtree_root: polkadot_primitives::Hash,
-		) -> Option<(Vec<polkadot_primitives::Hash>, u32, u32)>;
 
-		/// Generate a late block proof for a receiver that built against an older root.
+		/// Generate a late block proof for a receiver `dest` that built against an
+		/// older per-destination subtree root.
 		fn generate_late_block_proof(
 			dest: ParaId,
-			old_provides_root: polkadot_primitives::Hash,
+			old_subtree_root: polkadot_primitives::Hash,
 		) -> Option<polkadot_primitives::v9::LateBlockProof>;
 
-		/// Find the best block hash that has the given provides root.
-		fn block_hash_for_provides_root(
-			provides_root: polkadot_primitives::Hash,
+		/// Find the block hash at which `dest`'s subtree root was `subtree_root`.
+		fn block_hash_for_subtree_root(
+			dest: ParaId,
+			subtree_root: polkadot_primitives::Hash,
 		) -> Option<polkadot_primitives::Hash>;
 	}
 
 	/// API for the speculative messaging inbox (receiver side).
 	///
-	/// Called by the collator after block execution to get the requires commitments.
+	/// Called by the collator after block execution to get the requires commitment.
 	pub trait SpeculativeInboxApi {
-		/// Get the requires commitments for this block.
-		fn requires_commitments() -> Vec<polkadot_primitives::v9::RequiresCommitment>;
+		/// Get the flat requires commitment for this block.
+		fn requires_commitments() -> polkadot_primitives::v9::RequiresCommitment;
 
 		/// Next expected message position from `source` for speculative ingress fetch.
 		fn next_expected_message_position(source: ParaId) -> u64;

@@ -36,6 +36,10 @@ sp-std = { workspace = true, optional = true }
 
 polkadot-core-primitives = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
+# Speculative messaging primitives. NOTE: this is the first `polkadot -> cumulus`
+# dependency in the tree (accepted for the speculative-messaging POC). See the
+# spec-messaging design doc; revisit for productionization.
+cumulus-primitives-spec-messaging = { workspace = true }
 
 [features]
 default = ["std"]
@@ -43,6 +47,7 @@ std = [
 	"bitvec/std",
 	"bounded-collections/std",
 	"codec/std",
+	"cumulus-primitives-spec-messaging/std",
 	"log/std",
 	"polkadot-core-primitives/std",
 	"polkadot-parachain-primitives/std",

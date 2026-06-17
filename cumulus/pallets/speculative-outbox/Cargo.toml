@@ -34,6 +34,7 @@ polkadot-primitives = { workspace = true }
 
 # Cumulus
 cumulus-primitives-core = { workspace = true }
+cumulus-primitives-spec-messaging = { workspace = true }
 
 [dev-dependencies]
 cumulus-pallet-parachain-system = { workspace = true, default-features = true }
@@ -45,6 +46,7 @@ std = [
 	"binary-merkle-tree/std",
 	"codec/std",
 	"cumulus-primitives-core/std",
+	"cumulus-primitives-spec-messaging/std",
 	"frame-support/std",
 	"frame-system/std",
 	"log/std",

@@ -25,14 +25,12 @@ use alloc::vec::Vec;
 
 use cumulus_primitives_core::{ParaId, SpeculativeOutboxApi};
 use polkadot_primitives::{
-	v9::{
-		MerkleSubtreeProof, MessageBatch, MmrInclusionProof, OutgoingMessage, SpeculativeIngress,
-	},
+	v9::{MessageBatch, OutgoingMessage, SpeculativeIngress},
 	BlockNumber, Hash,
 };
 use sp_api::ProvideRuntimeApi;
 use sp_inherents::{InherentData, InherentIdentifier};
-use sp_runtime::traits::Block as BlockT;
+use sp_runtime::{traits::Block as BlockT, BoundedVec};
 
 /// The inherent identifier for speculative ingress — matches the constant
 /// in the pallet runtime.
@@ -73,7 +71,8 @@ where
 	Client::Api: SpeculativeOutboxApi<Block>,
 {
 	let api = client.runtime_api();
-	let provides = api.compute_provides_root(at).ok()??;
+	// Flat commitment: the relay chain matches `subtree_root` directly, so the
+	// batch carries no top-level provides root or subtree-inclusion proof.
 	let (subtree_root, _) = api.destination_state(at, destination).ok()??;
 	let (messages, subtree_mmr_size, messages_proof) = api
 		.outbound_messages_with_proof(at, destination, from_position, max_messages)
@@ -82,23 +81,18 @@ where
 		return None;
 	}
 
-	let (subtree_inclusion_proof, number_of_destinations, leaf_index) =
-		api.subtree_inclusion_proof(at, destination, subtree_root).ok()??;
-
 	let batch = MessageBatch {
 		source,
 		source_relay_parent_number,
-		provides_root: provides.root,
 		subtree_root,
-		messages_proof: MmrInclusionProof { mmr_size: subtree_mmr_size, proof: messages_proof },
-		subtree_inclusion_proof: MerkleSubtreeProof {
-			proof: subtree_inclusion_proof,
-			number_of_leaves: number_of_destinations,
-			leaf_index,
-		},
+		subtree_mmr_size,
+		messages_proof,
 		messages: messages
 			.into_iter()
-			.map(|(position, payload)| OutgoingMessage { position, payload })
+			.map(|(position, payload)| {
+				let payload = BoundedVec::try_from(payload).unwrap_or_default();
+				OutgoingMessage::new(source, destination, position, payload)
+			})
 			.collect(),
 	};
 

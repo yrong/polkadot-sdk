@@ -1183,7 +1183,7 @@ mod tests {
 				processed_downward_messages: 0,
 				hrmp_watermark: relay_parent.number,
 				provides: None,
-				requires: vec![],
+				requires: Default::default(),
 			},
 			persisted_validation_data: PersistedValidationData {
 				parent_head: constraints.required_parent.clone(),
