@@ -233,6 +233,39 @@ impl_runtime_apis! {
 		}
 	}
 
+	// Speculative messaging APIs — stubbed (this template does not run the
+	// speculative outbox/inbox pallets). Required because the lookahead collator
+	// bounds the runtime by these APIs.
+	impl cumulus_primitives_core::SpeculativeOutboxApi<Block> for Runtime {
+		fn compute_provides() -> Option<polkadot_primitives::v9::ProvidesCommitment> {
+			None
+		}
+		fn destination_state(_dest: cumulus_primitives_core::ParaId) -> Option<(polkadot_primitives::Hash, u64)> {
+			None
+		}
+		fn outbound_messages(_dest: cumulus_primitives_core::ParaId, _from_position: u64, _max_messages: u32) -> Vec<(u64, Vec<u8>)> {
+			Vec::new()
+		}
+		fn outbound_messages_with_proof(_dest: cumulus_primitives_core::ParaId, _from_position: u64, _max_messages: u32) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)> {
+			None
+		}
+		fn generate_late_block_proof(_dest: cumulus_primitives_core::ParaId, _old_subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v9::LateBlockProof> {
+			None
+		}
+		fn block_hash_for_subtree_root(_dest: cumulus_primitives_core::ParaId, _subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {
+			None
+		}
+	}
+
+	impl cumulus_primitives_core::SpeculativeInboxApi<Block> for Runtime {
+		fn requires_commitments() -> polkadot_primitives::v9::RequiresCommitment {
+			Default::default()
+		}
+		fn next_expected_message_position(_source: cumulus_primitives_core::ParaId) -> u64 {
+			0
+		}
+	}
+
 	#[cfg(feature = "try-runtime")]
 	impl frame_try_runtime::TryRuntime<Block> for Runtime {
 		fn on_runtime_upgrade(checks: frame_try_runtime::UpgradeCheckSelect) -> (Weight, Weight) {

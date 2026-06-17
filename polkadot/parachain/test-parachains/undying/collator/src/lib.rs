@@ -322,6 +322,8 @@ impl Collator {
 				proof_of_validity: MaybeCompressedPoV::Raw(pov.clone()),
 				processed_downward_messages: 0,
 				hrmp_watermark: validation_data.relay_parent_number,
+				provides: None,
+				requires: Default::default(),
 			};
 
 			log::info!(
