@@ -565,6 +565,40 @@ verification semantics of `sp-mmr-primitives`.
 
 ---
 
+## 3.6 Issue #12346 Alignment Tracker (primitives hardening)
+
+[paritytech/polkadot-sdk#12346](https://github.com/paritytech/polkadot-sdk/issues/12346)
+specifies a hardened, security-focused shape for the speculative-messaging
+primitives. The current POC proves the end-to-end data flow but predates this
+spec and does **not** yet adopt its hardening requirements. The checklist below
+maps each requirement to the file(s) that must change. No urgency to implement —
+this is a tracking artifact, not an active work item.
+
+Legend: ☐ not started · ◐ partial · ☑ done
+
+| # | Requirement (issue #12346) | Current state | Status | File(s) to change |
+|---|---|---|---|---|
+| 1 | Extract a dedicated **`cumulus-primitives-spec-messaging`** crate (`no_std`); today the types live in a `polkadot-primitives` module | Types in a v9 module, not a standalone crate | ◐ | new crate `cumulus/primitives/spec-messaging/{Cargo.toml,src/lib.rs}`; move out of `polkadot/primitives/src/v9/speculative.rs`; update `Cargo.toml` workspace members and all importers |
+| 2 | **`CommitmentSet<const N: u32>(BoundedVec<(ParaId, Hash), ConstU32<N>>)`** with custom `Decode` enforcing strictly-increasing ParaIds (sorted + unique) and `try_from_iter` | `requires` is a plain `Vec<RequiresCommitment>`; ordering only a doc claim, not decode-enforced | ☐ | `polkadot/primitives/src/v9/speculative.rs` (define type); `polkadot/primitives/src/v9/mod.rs:574` (`CandidateCommitments.requires` field type) |
+| 3 | **Domain-tagged + versioned leaf hashing**: `LEAF_TAG`/`INNER_TAG`/`PEAK_TAG`/`EMPTY_TAG`, `LEAF_VERSION = 0`, preimage `LEAF_TAG ++ LEAF_VERSION ++ source ++ destination ++ position ++ len ++ payload` | Leaf = `Keccak256::hash(&payload)`; inner = `Keccak256(lhs ++ rhs)` with no leaf/inner separation; top-level leaf = `(dest, root).encode()` | ☐ | `cumulus/pallets/speculative-outbox/src/lib.rs:174,210` (leaf + top-level leaf); `cumulus/pallets/parachain-system/src/validate_block/implementation.rs` (`Keccak256Merge`, `bag_mmr_peaks`, `append_mmr_leaf`); ideally a single `hash_leaf`/tags module in the new crate |
+| 4 | Stable **`merge_inner` / `merge_peaks` / `empty_root`** + generic **`MmrAccumulator`** trait (`append`/`root`/`size`, post-MVP `extension_proof`) | Ad-hoc helpers duplicated across outbox pallet and validate_block ("Identical to …"); no shared trait, no `empty_root` | ☐ | new crate `src/mmr.rs` (trait + ops); dedupe `cumulus/pallets/speculative-outbox/src/lib.rs` and `cumulus/pallets/parachain-system/src/validate_block/implementation.rs` to call it |
+| 5 | **`OutgoingMessage { destination: ParaId, position: u64, payload: BoundedVec<u8, MaxMsgLen> }`** | `{ position: u64, payload: Vec<u8> }` — no `destination`, unbounded payload | ◐ | `polkadot/primitives/src/v9/speculative.rs:113` (add `destination`, bound `payload`) |
+| 6 | Constants for **max destinations per block** and **max sources per block** | Only `MAX_REQUIRES_PER_BLOCK = 32` (sources); not type-enforced; no max-destinations const | ◐ | `polkadot/primitives/src/v9/speculative.rs:32` (add max-destinations; wire both into BoundedVec bounds) |
+| 7 | Tests: **decode-rejection**, **frontier append/bag property tests**, **cross-domain isolation** | Inbox has 11 unit tests; no `CommitmentSet` decode-rejection or cross-domain isolation (those types/domains don't exist yet) | ☐ | new crate `src/tests.rs` (decode rejection + property + cross-domain); follows items 2–4 |
+
+**Aligned already (no action):** type coverage (provides/requires, `MessageBatch`,
+`OutgoingMessage`, MMR/late-block proofs, `SourceState`), Keccak256 as the hash,
+`no_std` compatibility, and all five consumers named in the issue (collator
+attachment, PVF `validate_block`, relay matching, sender pallet, receiver pallet).
+
+> Load-bearing items are **2, 3, 4** — canonical `CommitmentSet` encoding,
+> domain-tagged/versioned leaf hashing, and the shared MMR trait. These are the
+> requirements the issue frames as security-critical (encoding malleability,
+> cross-destination forgery, leaf↔inner second-preimage confusion, and
+> collator-vs-PVF divergence from duplicated merge logic).
+
+---
+
 ## 4. Relay Chain Runtime Changes
 
 ### 4.1 Speculative Messaging Storage and Helpers
