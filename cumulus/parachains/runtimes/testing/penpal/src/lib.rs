@@ -1230,7 +1230,7 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)> {
 			SpeculativeOutbox::outbound_messages_with_proof(dest, from_position, max_messages)
 		}
-		fn generate_late_block_proof(dest: ParaId, old_subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v9::LateBlockProof> {
+		fn generate_late_block_proof(dest: ParaId, old_subtree_root: polkadot_primitives::Hash) -> Option<cumulus_primitives_core::LateBlockProof> {
 			SpeculativeOutbox::generate_late_block_proof(dest, old_subtree_root)
 		}
 		fn block_hash_for_subtree_root(dest: ParaId, subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {

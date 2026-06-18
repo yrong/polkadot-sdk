@@ -41,8 +41,14 @@
 extern crate alloc;
 
 pub mod commitment_set;
+pub mod message;
 pub mod mmr;
 pub mod outgoing_message;
+
+pub use message::{
+	LateBlockProof, MaxSpeculativeMessageLen, MessageBatch, OutgoingMessage, SourceState,
+	SpecHasher, SpeculativeIngress, SubtreeExtension, MAX_SPECULATIVE_MESSAGE_LEN,
+};
 
 // Domain Tags to ensure that the same message structure used in different
 // contexts (e.g. leaf vs inner node) do not collide on the same hash.

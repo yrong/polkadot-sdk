@@ -34,6 +34,13 @@ pub const REF_TIME_PER_CORE_IN_SECS: u64 = 2;
 pub mod parachain_block_data;
 
 pub use parachain_block_data::ParachainBlockData;
+// Parachain-side speculative-messaging off-chain types, surfaced here as the
+// parachain primitives hub (the relay-visible commitments stay in
+// `polkadot-primitives::v9`).
+pub use cumulus_primitives_spec_messaging::{
+	LateBlockProof, MaxSpeculativeMessageLen, MessageBatch, OutgoingMessage, SourceState,
+	SpecHasher, SpeculativeIngress, SubtreeExtension,
+};
 pub use polkadot_core_primitives::InboundDownwardMessage;
 pub use polkadot_parachain_primitives::primitives::{
 	DmpMessageHandler, Id as ParaId, IsSystem, UpwardMessage, ValidationParams, XcmpMessageFormat,
@@ -700,7 +707,7 @@ sp_api::decl_runtime_apis! {
 		fn generate_late_block_proof(
 			dest: ParaId,
 			old_subtree_root: polkadot_primitives::Hash,
-		) -> Option<polkadot_primitives::v9::LateBlockProof>;
+		) -> Option<cumulus_primitives_spec_messaging::LateBlockProof>;
 
 		/// Find the block hash at which `dest`'s subtree root was `subtree_root`.
 		fn block_hash_for_subtree_root(

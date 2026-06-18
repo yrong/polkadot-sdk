@@ -21,12 +21,9 @@ use std::sync::Arc;
 
 use super::outbox_client::{build_message_batch_from_query, OutboxQuery};
 use cumulus_pallet_speculative_inbox::client::empty_speculative_ingress;
-use cumulus_primitives_core::{ParaId, SpeculativeInboxApi};
+use cumulus_primitives_core::{LateBlockProof, ParaId, SpeculativeInboxApi, SpeculativeIngress};
 use cumulus_relay_chain_interface::RelayChainInterface;
-use polkadot_primitives::{
-	v9::{LateBlockProof, SpeculativeIngress},
-	BlockNumber, Hash,
-};
+use polkadot_primitives::{BlockNumber, Hash};
 use sc_client_api::UsageProvider;
 use sp_api::ProvideRuntimeApi;
 use sp_runtime::traits::Block as BlockT;

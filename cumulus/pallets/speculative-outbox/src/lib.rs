@@ -46,21 +46,21 @@ use frame_support::pallet_prelude::*;
 use frame_system::pallet_prelude::BlockNumberFor;
 
 use cumulus_primitives_core::{ParaId, XcmpMessageSource};
-use cumulus_primitives_spec_messaging::mmr::{root_from_peaks, SpecMerge};
-use polkadot_primitives::v9::{
-	LateBlockProof, MaxSpeculativeMessageLen, OutgoingMessage, ProvidesCommitment, SubtreeExtension,
+use cumulus_primitives_spec_messaging::{
+	mmr::{root_from_peaks, Mmr, MmrAccumulator, SpecMerge},
+	LateBlockProof, MaxSpeculativeMessageLen, OutgoingMessage, SpecHasher, SubtreeExtension,
 };
+use polkadot_primitives::v9::ProvidesCommitment;
 
 use mmr_lib::{
 	leaf_index_to_pos,
 	util::{MemMMR, MemStore},
-	Merge,
 };
 
 /// MMR state for a single destination's subtree (peaks-only representation).
 #[derive(Clone, Encode, Decode, TypeInfo, Default)]
 pub struct MMRState {
-	/// Number of leaves inserted so far (used as `size` in `append_leaf_to_peaks`).
+	/// Number of leaves inserted so far (the MMR `size`).
 	pub leaf_count: u64,
 	/// MMR peaks — O(log n) hashes sufficient to reconstruct the subtree root.
 	pub peaks: Vec<H256>,
@@ -129,13 +129,8 @@ pub mod pallet {
 				if state.leaf_count == 0 {
 					continue;
 				}
-				if let Some(root) = root_from_peaks(&state.peaks) {
-					HistoricalSubtreeState::<T>::insert(
-						n,
-						dest,
-						(root, state.peaks, state.leaf_count),
-					);
-				}
+				let root = root_from_peaks::<SpecHasher>(&state.peaks);
+				HistoricalSubtreeState::<T>::insert(n, dest, (root, state.peaks, state.leaf_count));
 			}
 		}
 	}
@@ -147,12 +142,16 @@ pub mod pallet {
 			let mut state = OutgoingMMRState::<T>::get(&dest);
 			let position_before = state.leaf_count;
 
+			let mut mmr = Mmr::<SpecHasher>::from_parts(state.peaks, state.leaf_count);
 			for payload in payloads {
-				let leaf_hash = message_leaf::<T>(dest, state.leaf_count, &payload);
-				OutgoingMessages::<T>::insert(dest, state.leaf_count, &payload);
-				state.peaks = append_leaf_to_peaks(state.peaks, state.leaf_count, leaf_hash);
-				state.leaf_count += 1;
+				let position = mmr.size();
+				let leaf = message_leaf::<T>(dest, position, &payload);
+				OutgoingMessages::<T>::insert(dest, position, &payload);
+				mmr.append(leaf);
 			}
+			let (peaks, size) = mmr.into_parts();
+			state.peaks = peaks;
+			state.leaf_count = size;
 
 			OutgoingMMRState::<T>::insert(dest, state);
 			log::debug!(
@@ -171,7 +170,7 @@ impl<T: Config> Pallet<T> {
 	pub fn compute_provides() -> Option<ProvidesCommitment> {
 		let entries = OutgoingMMRState::<T>::iter()
 			.filter(|(_, state)| state.leaf_count > 0)
-			.filter_map(|(dest, state)| root_from_peaks(&state.peaks).map(|root| (dest, root)));
+			.map(|(dest, state)| (dest, root_from_peaks::<SpecHasher>(&state.peaks)));
 
 		let set = ProvidesCommitment::try_from_iter(entries).ok()?;
 		if set.is_empty() {
@@ -187,7 +186,7 @@ impl<T: Config> Pallet<T> {
 		if state.leaf_count == 0 {
 			return None;
 		}
-		let root = root_from_peaks(&state.peaks)?;
+		let root = root_from_peaks::<SpecHasher>(&state.peaks);
 		Some((root, state.leaf_count))
 	}
 
@@ -229,7 +228,7 @@ impl<T: Config> Pallet<T> {
 		// Replay every stored payload through a MemMMR to derive node positions
 		// and the gen_proof witness items for the requested slice.
 		let store = MemStore::<H256>::default();
-		let mut mmr = MemMMR::<H256, SpecMerge>::new(0, &store);
+		let mut mmr = MemMMR::<H256, SpecMerge<SpecHasher>>::new(0, &store);
 		let mut messages: Vec<(u64, Vec<u8>)> = Vec::new();
 		for leaf_idx in 0..leaf_count {
 			let payload = OutgoingMessages::<T>::get(dest, leaf_idx)?;
@@ -259,12 +258,12 @@ impl<T: Config> Pallet<T> {
 		let (_, _old_peaks, old_leaf_count) = historical_state_for::<T>(dest, old_subtree_root)?;
 
 		let current = OutgoingMMRState::<T>::get(&dest);
-		let new_subtree_root = root_from_peaks(&current.peaks)?;
+		let new_subtree_root = root_from_peaks::<SpecHasher>(&current.peaks);
 
 		let subtree_extension = if current.leaf_count > old_leaf_count {
 			// Rebuild the full subtree MMR and prove the appended leaves against it.
 			let store = MemStore::<H256>::default();
-			let mut mmr = MemMMR::<H256, SpecMerge>::new(0, &store);
+			let mut mmr = MemMMR::<H256, SpecMerge<SpecHasher>>::new(0, &store);
 			let mut incremental: Vec<H256> = Vec::new();
 			for pos in 0..current.leaf_count {
 				let payload = OutgoingMessages::<T>::get(dest, pos)?;
@@ -331,7 +330,7 @@ impl<T: Config> XcmpMessageSource for Pallet<T> {
 fn message_leaf<T: Config>(dest: ParaId, position: u64, payload: &[u8]) -> H256 {
 	let bounded: BoundedVec<u8, MaxSpeculativeMessageLen> =
 		BoundedVec::try_from(payload.to_vec()).unwrap_or_default();
-	OutgoingMessage::new(T::SelfParaId::get(), dest, position, bounded).hash_leaf()
+	OutgoingMessage::new(T::SelfParaId::get(), dest, position, bounded).hash_leaf::<SpecHasher>()
 }
 
 /// Find the `(block_number, peaks, leaf_count)` historical entry whose subtree root
@@ -345,52 +344,33 @@ fn historical_state_for<T: Config>(
 	})
 }
 
-/// Append a leaf hash to the peaks list, merging equal-height peaks via `SpecMerge`
-/// (matching `mmr_lib`'s internal node construction). `size` is the number of leaves
-/// already in the MMR (0-based leaf count).
-fn append_leaf_to_peaks(mut peaks: Vec<H256>, size: u64, leaf: H256) -> Vec<H256> {
-	let mut current = leaf;
-	let mut current_size = size;
-	while current_size % 2 == 1 {
-		if let Some(last_peak) = peaks.pop() {
-			current = SpecMerge::merge(&last_peak, &current).unwrap_or(current);
-		}
-		current_size /= 2;
-	}
-	peaks.push(current);
-	peaks
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	fn leaf(source: u32, dest: u32, position: u64, payload: &[u8]) -> H256 {
 		let bounded = BoundedVec::try_from(payload.to_vec()).unwrap();
-		OutgoingMessage::new(source.into(), dest.into(), position, bounded).hash_leaf()
+		OutgoingMessage::new(source.into(), dest.into(), position, bounded)
+			.hash_leaf::<SpecHasher>()
 	}
 
 	#[test]
 	fn peaks_root_matches_mmr_lib() {
-		let l1 = leaf(1, 2, 0, b"msg1");
-		let l2 = leaf(1, 2, 1, b"msg2");
-		let l3 = leaf(1, 2, 2, b"msg3");
+		let leaves = [leaf(1, 2, 0, b"msg1"), leaf(1, 2, 1, b"msg2"), leaf(1, 2, 2, b"msg3")];
 
-		// Build using the peaks-only approach (same as the pallet).
-		let mut peaks = Vec::new();
-		for (i, l) in [l1, l2, l3].iter().enumerate() {
-			peaks = append_leaf_to_peaks(peaks, i as u64, *l);
+		// Build using the peaks-only accumulator (same as the pallet).
+		let mut acc = Mmr::<SpecHasher>::new();
+		for l in &leaves {
+			acc.append(*l);
 		}
-		let peaks_root = root_from_peaks(&peaks).unwrap();
 
 		// Reference: mmr_lib in-memory MMR with the same SpecMerge.
 		let store = MemStore::<H256>::default();
-		let mut mmr = MemMMR::<H256, SpecMerge>::new(0, &store);
-		mmr.push(l1).unwrap();
-		mmr.push(l2).unwrap();
-		mmr.push(l3).unwrap();
-		let mmr_root = mmr.get_root().unwrap();
+		let mut mmr = MemMMR::<H256, SpecMerge<SpecHasher>>::new(0, &store);
+		for l in &leaves {
+			mmr.push(*l).unwrap();
+		}
 
-		assert_eq!(peaks_root, mmr_root);
+		assert_eq!(acc.root(), mmr.get_root().unwrap());
 	}
 }

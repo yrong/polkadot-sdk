@@ -24,10 +24,8 @@
 use alloc::vec::Vec;
 
 use cumulus_primitives_core::{ParaId, SpeculativeOutboxApi};
-use polkadot_primitives::{
-	v9::{MessageBatch, OutgoingMessage, SpeculativeIngress},
-	BlockNumber, Hash,
-};
+use cumulus_primitives_spec_messaging::{MessageBatch, OutgoingMessage, SpeculativeIngress};
+use polkadot_primitives::{BlockNumber, Hash};
 use sp_api::ProvideRuntimeApi;
 use sp_inherents::{InherentData, InherentIdentifier};
 use sp_runtime::{traits::Block as BlockT, BoundedVec};

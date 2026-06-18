@@ -226,7 +226,7 @@ where
 		timestamp: impl Into<Option<Timestamp>>,
 		relay_proof_request: RelayProofRequest,
 		collator_peer_id: PeerId,
-		speculative_ingress: Option<polkadot_primitives::v9::SpeculativeIngress>,
+		speculative_ingress: Option<cumulus_primitives_core::SpeculativeIngress>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
 		let (paras_inherent_data, mut other_inherent_data) = self
 			.create_inherent_data_with_rp_offset(
@@ -387,7 +387,7 @@ where
 		inherent_data: (ParachainInherentData, InherentData),
 		proposal_duration: Duration,
 		max_pov_size: usize,
-		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+		late_block_proofs: Vec<cumulus_primitives_core::LateBlockProof>,
 	) -> Result<Option<(Collation, ParachainBlockData<Block>)>, Box<dyn Error + Send + 'static>> {
 		let maybe_candidate = self
 			.build_block_and_import(BuildBlockAndImportParams {

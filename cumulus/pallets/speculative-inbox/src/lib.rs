@@ -53,9 +53,11 @@ use frame_system::{
 };
 
 use cumulus_primitives_core::ParaId;
-use cumulus_primitives_spec_messaging::mmr::SpecMerge;
+use cumulus_primitives_spec_messaging::{
+	mmr::SpecMerge, SourceState, SpecHasher, SpeculativeIngress,
+};
 use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
-use polkadot_primitives::v9::{RequiresCommitment, SourceState, SpeculativeIngress};
+use polkadot_primitives::v9::RequiresCommitment;
 
 use mmr_lib::{leaf_index_to_pos, MerkleProof};
 
@@ -177,13 +179,13 @@ pub mod pallet {
 				let mut leaves: Vec<(u64, H256)> = Vec::with_capacity(batch.messages.len());
 				for msg in &batch.messages {
 					ensure!(msg.position == next_expected, Error::<T>::NonConsecutiveMessage);
-					leaves.push((leaf_index_to_pos(msg.position), msg.hash_leaf()));
+					leaves.push((leaf_index_to_pos(msg.position), msg.hash_leaf::<SpecHasher>()));
 					next_expected = next_expected.saturating_add(1);
 				}
 
 				// 5. Verify the combined MMR inclusion proof against subtree_root.
 				if !leaves.is_empty() {
-					let proof = MerkleProof::<H256, SpecMerge>::new(
+					let proof = MerkleProof::<H256, SpecMerge<SpecHasher>>::new(
 						batch.subtree_mmr_size,
 						batch.messages_proof.clone(),
 					);

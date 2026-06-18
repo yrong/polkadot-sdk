@@ -17,8 +17,10 @@
 use crate::{mock::*, Error, Pallet as SpeculativeInbox};
 use cumulus_pallet_speculative_outbox::Pallet as SpeculativeOutbox;
 use cumulus_primitives_core::ParaId;
+use cumulus_primitives_spec_messaging::{
+	MessageBatch, OutgoingMessage, SpecHasher, SpeculativeIngress,
+};
 use frame_support::{assert_noop, assert_ok, traits::Hooks};
-use polkadot_primitives::v9::{MessageBatch, OutgoingMessage, SpeculativeIngress};
 use sp_core::H256;
 use sp_runtime::BoundedVec;
 
@@ -32,7 +34,7 @@ fn msg_leaf(destination: ParaId, position: u64, payload: &[u8]) -> H256 {
 		position,
 		BoundedVec::try_from(payload.to_vec()).unwrap(),
 	)
-	.hash_leaf()
+	.hash_leaf::<SpecHasher>()
 }
 
 /// Build a batch from the outbox state for `messages` just appended to `destination`.

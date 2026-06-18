@@ -52,7 +52,7 @@ use trie_recorder::{SeenNodes, SizeOnlyRecorderProvider};
 /// (`mmr_lib` `verify_incremental` with `SpecMerge`).
 fn apply_messaging_proofs(
 	extension: &mut Option<polkadot_parachain_primitives::primitives::ValidationResultExtension>,
-	proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+	proofs: Vec<cumulus_primitives_spec_messaging::LateBlockProof>,
 ) {
 	if let Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
 		ref mut requires,
@@ -68,10 +68,10 @@ fn apply_messaging_proofs(
 						true
 					} else {
 						proof.subtree_extension.as_ref().map_or(false, |ext| {
-							MerkleProof::<polkadot_primitives::Hash, SpecMerge>::new(
-								ext.new_mmr_size,
-								ext.proof.clone(),
-							)
+							MerkleProof::<
+								polkadot_primitives::Hash,
+								SpecMerge<cumulus_primitives_spec_messaging::SpecHasher>,
+							>::new(ext.new_mmr_size, ext.proof.clone())
 							.verify_incremental(
 								proof.new_subtree_root,
 								proof.old_subtree_root,
@@ -707,12 +707,12 @@ fn host_transaction_index_renew(_extrinsic: u32, _context_hash: [u8; 32]) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use cumulus_primitives_spec_messaging::{LateBlockProof, SpecHasher, SubtreeExtension};
 	use mmr_lib::{
 		leaf_index_to_pos,
 		util::{MemMMR, MemStore},
 	};
 	use polkadot_parachain_primitives::primitives::ValidationResultExtension;
-	use polkadot_primitives::v9::{LateBlockProof, SubtreeExtension};
 	use sp_core::H256;
 
 	/// Build a `LateBlockProof` whose subtree MMR (under `SpecMerge`) was extended
@@ -723,7 +723,7 @@ mod tests {
 		new_count: u64,
 	) -> (H256, H256, LateBlockProof) {
 		let store = MemStore::<H256>::default();
-		let mut mmr = MemMMR::<H256, SpecMerge>::new(0, &store);
+		let mut mmr = MemMMR::<H256, SpecMerge<SpecHasher>>::new(0, &store);
 		let leaves: Vec<H256> =
 			(0..new_count).map(|i| H256::repeat_byte((i as u8).wrapping_add(1))).collect();
 

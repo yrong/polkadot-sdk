@@ -80,7 +80,7 @@ pub enum ParachainBlockData<Block> {
 	V2 {
 		blocks: Vec<Block>,
 		proof: CompactProof,
-		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+		late_block_proofs: Vec<cumulus_primitives_spec_messaging::LateBlockProof>,
 	},
 }
 
@@ -124,7 +124,7 @@ impl<Block: Decode> Decode for ParachainBlockData<Block> {
 					let blocks = Vec::<Block>::decode(input)?;
 					let proof = CompactProof::decode(input)?;
 					let late_block_proofs =
-						Vec::<polkadot_primitives::v9::LateBlockProof>::decode(input)?;
+						Vec::<cumulus_primitives_spec_messaging::LateBlockProof>::decode(input)?;
 
 					Ok(Self::V2 { blocks, proof, late_block_proofs })
 				},
@@ -150,7 +150,7 @@ impl<Block> ParachainBlockData<Block> {
 	pub fn new_v2(
 		blocks: Vec<Block>,
 		proof: CompactProof,
-		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+		late_block_proofs: Vec<cumulus_primitives_spec_messaging::LateBlockProof>,
 	) -> Self {
 		Self::V2 { blocks, proof, late_block_proofs }
 	}
@@ -187,7 +187,7 @@ impl<Block> ParachainBlockData<Block> {
 	}
 
 	/// Returns a reference to the stored late block proofs, if any.
-	pub fn late_block_proofs(&self) -> &[polkadot_primitives::v9::LateBlockProof] {
+	pub fn late_block_proofs(&self) -> &[cumulus_primitives_spec_messaging::LateBlockProof] {
 		match self {
 			Self::V2 { late_block_proofs, .. } => &late_block_proofs,
 			_ => &[],
@@ -313,7 +313,7 @@ mod tests {
 				],
 			)],
 			proof: CompactProof { encoded_nodes: vec![vec![10u8; 200], vec![20u8; 30]] },
-			late_block_proofs: vec![polkadot_primitives::v9::LateBlockProof {
+			late_block_proofs: vec![cumulus_primitives_spec_messaging::LateBlockProof {
 				source: 2000.into(),
 				old_subtree_root: Default::default(),
 				new_subtree_root: Default::default(),

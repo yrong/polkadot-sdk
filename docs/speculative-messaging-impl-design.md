@@ -24,10 +24,13 @@ deferred to section 12.
 > **Design revision (2026-06-17).** Two decisions supersede earlier drafts of
 > this doc and are now canonical:
 >
-> 1. **Hashing is `blake2_256`, not Keccak256.** Speculative-messaging leaf,
->    inner, peak and empty hashes all use `blake2_256` (Substrate-native). Any
+> 1. **Hashing is a type parameter `H`, instantiated to `blake2_256`.** The crate
+>    primitives (`hash_leaf::<H>`, `SpecMerge<H>`, `root_from_peaks::<H>`,
+>    `empty_root::<H>`) are generic over the hash function; the protocol's single
+>    concrete choice is `polkadot_primitives::v9::SpecHasher = BlakeTwo256`
+>    (Substrate-native), so a future switch (e.g. to Keccak256) is one line. Any
 >    remaining "Keccak256" mention below is legacy and should be read as
->    `blake2_256`.
+>    `SpecHasher`/`blake2_256`.
 > 2. **The top-level commitment is flat, not a two-level Merkle tree.** A
 >    sender's `provides` commitment is a canonical, sorted
 >    `CommitmentSet` of `(destination, subtree_root)` entries — there is no
@@ -44,12 +47,16 @@ deferred to section 12.
 > closes #12346): `CommitmentSet`, `OutgoingMessage::hash_leaf`, the domain tags,
 > and `SpecMerge` (the `mmr_lib::Merge` that backs the per-destination MMR).
 >
-> 3. **The per-destination MMR reuses `mmr_lib`** (`polkadot-ckb-merkle-mountain-range`)
->    with the crate's domain-tagged `SpecMerge`, rather than a hand-rolled
->    accumulator. Inclusion proofs (`gen_proof`/`verify`) and append-only
->    extension proofs (ancestry proofs) come from `mmr_lib`. PR #12368's
->    standalone `Mmr`/`MmrAccumulator`/`merge_peaks`/`empty_root` are superseded
->    by `SpecMerge` + `mmr_lib`.
+> 3. **The per-destination MMR is built on `mmr_lib`** (`polkadot-ckb-merkle-mountain-range`)
+>    via the crate's domain-tagged `SpecMerge<H>`: **inclusion** proofs
+>    (`gen_proof`/`verify`) and append-only **extension** proofs (ancestry /
+>    `verify_incremental`) come from `mmr_lib`. The crate retains a thin
+>    `MmrAccumulator` trait (`append`/`root`/`size`, post-MVP `extension_proof`)
+>    and a peaks-only `Mmr<H>` impl (used by the sender's on-chain state), plus
+>    `root_from_peaks::<H>` and `empty_root::<H>` — these match issue #12346 and
+>    are kept consistent with `mmr_lib` (the `Mmr` root equals `mmr_lib`'s and its
+>    proofs verify against it). PR #12368's single-shot `merge_peaks` bagging is
+>    replaced by `mmr_lib`-consistent pairwise bagging.
 
 ---
 
@@ -611,11 +618,13 @@ The hardened primitives from issue
 [#12346](https://github.com/paritytech/polkadot-sdk/issues/12346) are **done** in
 the `cumulus-primitives-spec-messaging` crate
 ([PR #12368](https://github.com/paritytech/polkadot-sdk/pull/12368)):
-`CommitmentSet` (canonical sorted decode), `OutgoingMessage::hash_leaf`
-(domain-tagged, versioned, `blake2_256`), and the domain tags. The MMR itself
-reuses **`mmr_lib`** with the crate's `SpecMerge` (see the revision note at the
-top); PR #12368's standalone `Mmr`/`merge_peaks`/`empty_root` are superseded and
-removed during integration. The crate types are `no_std` and unit tested.
+`CommitmentSet` (canonical sorted decode), `OutgoingMessage::hash_leaf::<H>`
+(domain-tagged, versioned, generic over the hasher), the domain tags, the
+`MmrAccumulator` trait + peaks-only `Mmr<H>`, and `SpecMerge<H>`/`root_from_peaks`/
+`empty_root`. Inclusion and extension proofs come from **`mmr_lib`** (the `Mmr`
+accumulator is kept consistent with it); PR #12368's single-shot `merge_peaks`
+bagging is replaced by `mmr_lib`-consistent pairwise bagging. The crate types are
+`no_std` and unit tested.
 
 What remains is **integrating** the POC onto that crate and onto the three design
 revisions at the top of this doc (blake2_256 + flat commitment + `mmr_lib`/
@@ -626,7 +635,7 @@ Legend: ☐ not started · ◐ partial · ☑ done
 
 | # | Integration step | Status | File(s) to change |
 |---|---|---|---|
-| 1 | Depend on `cumulus-primitives-spec-messaging`; drop the duplicate types in `polkadot/primitives/src/v9/speculative.rs` (keep only the relay-facing `ProvidesCommitment`/`RequiresCommitment` aliases over `CommitmentSet`, `MessageBatch`, `LateBlockProof`, `SpeculativeIngress`, `SourceState`) | ☑ | `polkadot/primitives/src/v9/speculative.rs`, `polkadot/primitives/src/v9/mod.rs`, workspace `Cargo.toml` |
+| 1 | Layered type homes: **relay-visible** commitments (`ProvidesCommitment`/`RequiresCommitment` aliases over `CommitmentSet` + bounding constants) stay in `polkadot/primitives/src/v9/speculative.rs` (next to `CandidateCommitments`); the **parachain off-chain** types (`MessageBatch`, `LateBlockProof`, `SubtreeExtension`, `SpeculativeIngress`, `SourceState`, the `OutgoingMessage` alias, `MaxSpeculativeMessageLen`, `SpecHasher`) live in `cumulus-primitives-spec-messaging::message` and are re-exported from `cumulus-primitives-core` (the parachain hub). Consumers import off-chain types from the crate / `cumulus-primitives-core`, not `polkadot-primitives`. | ☑ | `cumulus/primitives/spec-messaging/src/message.rs`, `cumulus/primitives/core/src/lib.rs`, `polkadot/primitives/src/v9/{speculative,mod}.rs` |
 | 2 | `provides`/`requires` in `CandidateCommitments` become `Option<CommitmentSet<MAX_DESTINATIONS_PER_BLOCK>>` / `CommitmentSet<MAX_SOURCES_PER_BLOCK>` | ☑ | `polkadot/primitives/src/v9/mod.rs` |
 | 3 | Outbox pallet: replace `Keccak256` leaf/merge with `OutgoingMessage::hash_leaf` + `SpecMerge`; keep peaks-only append but root via `spec_mmr::root_from_peaks`; `compute_provides` returns a `CommitmentSet` (no top-level merkle root). Added `Config::SelfParaId`; dropped top-level-root storage/APIs; `generate_late_block_proof(dest, old_subtree_root)` builds a `SubtreeExtension`. | ☑ | `cumulus/pallets/speculative-outbox/src/lib.rs` |
 | 4 | Inbox pallet: drop `subtree_inclusion_proof` verification; hash leaves with `hash_leaf`; verify `messages_proof` via `mmr_lib::MerkleProof::<_, SpecMerge>`; `requires_commitments` returns a `CommitmentSet`. Also updated `client.rs` batch builder + the `SpeculativeOutboxApi`/`SpeculativeInboxApi` traits (`compute_provides`, dropped `subtree_inclusion_proof`, `generate_late_block_proof(dest, old_subtree_root)`, `block_hash_for_subtree_root`). 8/8 tests pass. | ☑ | `cumulus/pallets/speculative-inbox/src/{lib,client,mock,integration_tests}.rs`, `cumulus/primitives/core/src/lib.rs` |

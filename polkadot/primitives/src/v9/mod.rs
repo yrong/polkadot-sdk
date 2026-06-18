@@ -76,9 +76,7 @@ pub mod executor_params;
 pub mod slashing;
 pub mod speculative;
 pub use speculative::{
-	LateBlockProof, MaxSpeculativeMessageLen, MessageBatch, OutgoingMessage, ProvidesCommitment,
-	RequiresCommitment, SourceState, SpeculativeIngress, SubtreeExtension,
-	MAX_DESTINATIONS_PER_BLOCK, MAX_SOURCES_PER_BLOCK, MAX_SPECULATIVE_MESSAGE_LEN,
+	ProvidesCommitment, RequiresCommitment, MAX_DESTINATIONS_PER_BLOCK, MAX_SOURCES_PER_BLOCK,
 	SPECULATIVE_API_VERSION,
 };
 

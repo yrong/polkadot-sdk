@@ -24,12 +24,9 @@
 use std::sync::Arc;
 
 use codec::{Decode, Encode};
-use cumulus_primitives_core::ParaId;
+use cumulus_primitives_core::{LateBlockProof, ParaId};
 use jsonrpsee::{core::client::ClientT, rpc_params, ws_client::WsClientBuilder};
-use polkadot_primitives::{
-	v9::{LateBlockProof, ProvidesCommitment},
-	BlockNumber, Hash,
-};
+use polkadot_primitives::{v9::ProvidesCommitment, BlockNumber, Hash};
 
 /// Abstracts over RPC access to a sender chain's speculative outbox.
 #[async_trait::async_trait]
@@ -221,8 +218,8 @@ pub async fn build_message_batch_from_query(
 	source_relay_parent_number: BlockNumber,
 	from_position: u64,
 	max_messages: u32,
-) -> Option<polkadot_primitives::v9::MessageBatch> {
-	use polkadot_primitives::v9::{MessageBatch, OutgoingMessage};
+) -> Option<cumulus_primitives_core::MessageBatch> {
+	use cumulus_primitives_core::{MessageBatch, OutgoingMessage};
 	use sp_runtime::BoundedVec;
 
 	// Flat commitment: the relay chain matches `subtree_root` directly, so the

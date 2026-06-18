@@ -249,7 +249,7 @@ impl_runtime_apis! {
 		fn outbound_messages_with_proof(_dest: cumulus_primitives_core::ParaId, _from_position: u64, _max_messages: u32) -> Option<(Vec<(u64, Vec<u8>)>, u64, Vec<polkadot_primitives::Hash>)> {
 			None
 		}
-		fn generate_late_block_proof(_dest: cumulus_primitives_core::ParaId, _old_subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::v9::LateBlockProof> {
+		fn generate_late_block_proof(_dest: cumulus_primitives_core::ParaId, _old_subtree_root: polkadot_primitives::Hash) -> Option<cumulus_primitives_core::LateBlockProof> {
 			None
 		}
 		fn block_hash_for_subtree_root(_dest: cumulus_primitives_core::ParaId, _subtree_root: polkadot_primitives::Hash) -> Option<polkadot_primitives::Hash> {

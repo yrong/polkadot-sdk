@@ -72,8 +72,6 @@ pub use v9::{
 	PARACHAIN_KEY_TYPE_ID, RELAY_CHAIN_SLOT_DURATION_MILLIS, UMP_SEPARATOR,
 };
 
-pub use v9::LateBlockProof;
-
 /// Alias for `CandidateCommitments` used by v10 callers.
 /// Since v9 `CandidateCommitments` now includes the speculative fields,
 /// v10 no longer needs a separate type.

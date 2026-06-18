@@ -79,7 +79,7 @@ pub trait ServiceInterface<Block: BlockT> {
 		parent_header: &Block::Header,
 		blocks: Vec<Block>,
 		proof: StorageProof,
-		_late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+		_late_block_proofs: Vec<cumulus_primitives_core::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		self.build_multi_block_collation(parent_header, blocks, proof)
 	}
@@ -266,7 +266,7 @@ where
 		parent_header: &Block::Header,
 		blocks: Vec<Block>,
 		proof: StorageProof,
-		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+		late_block_proofs: Vec<cumulus_primitives_core::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		let compact_proof =
 			match proof.into_compact_proof::<HashingFor<Block>>(*parent_header.state_root()) {
@@ -461,7 +461,7 @@ where
 		parent_header: &<Block as BlockT>::Header,
 		blocks: Vec<Block>,
 		proof: StorageProof,
-		late_block_proofs: Vec<polkadot_primitives::v9::LateBlockProof>,
+		late_block_proofs: Vec<cumulus_primitives_core::LateBlockProof>,
 	) -> Option<(Collation, ParachainBlockData<Block>)> {
 		CollatorService::build_multi_block_collation_with_late_block_proofs(
 			self,
