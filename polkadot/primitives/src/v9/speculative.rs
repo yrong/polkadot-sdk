@@ -16,9 +16,11 @@
 
 //! Relay-visible speculative-messaging commitments (Phase 1).
 //!
-//! The relay chain only sees the **commitments** embedded in `CandidateCommitments`
-//! — a sender's flat `provides` set and a receiver's `requires` set, both canonical
-//! sorted `CommitmentSet`s of `(ParaId, Hash)`. Those are defined here.
+//! The relay chain only sees the **commitments** carried in the
+//! `UMPSignal::ProvidesRoots`/`RequiresRoots` signals (inside
+//! `CandidateCommitments.upward_messages`) — a sender's flat `provides` set and a
+//! receiver's `requires` set, both canonical sorted `CommitmentSet`s of
+//! `(ParaId, Hash)`. The aliases for those are defined here.
 //!
 //! Everything else — the low-level primitives (`CommitmentSet`, `OutgoingMessage`,
 //! `hash_leaf`, the MMR `SpecMerge`) and the parachain-side off-chain types

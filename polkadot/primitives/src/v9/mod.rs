@@ -2429,8 +2429,8 @@ impl<H: Copy + AsRef<[u8]>> CandidateDescriptorV2<H> {
 	/// Constructor for V4 candidate descriptor (speculative messaging).
 	///
 	/// V4 descriptors are identified by `version == 2`. They use the same scheduling-parent
-	/// layout as V3 but do not require UMP signals; speculative commitments are carried in
-	/// `CandidateCommitments::speculative` instead.
+	/// layout as V3. Speculative commitments are carried as `ProvidesRoots`/`RequiresRoots`
+	/// UMP signals in `upward_messages` (read via [`CandidateCommitments::ump_signals`]).
 	pub fn new_v4(
 		para_id: Id,
 		relay_parent: H,

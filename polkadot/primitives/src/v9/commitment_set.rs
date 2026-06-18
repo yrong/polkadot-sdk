@@ -16,12 +16,17 @@
 
 //! The canonical commitment set used by speculative messaging.
 //!
-//! `CommitmentSet` is *relay-visible*: it is embedded in `CandidateCommitments`
-//! (as `provides`/`requires`) and matched by the relay chain, so it lives here in
-//! `polkadot-primitives` (rather than in the parachain-side
-//! `cumulus-primitives-spec-messaging`, which would otherwise force a
-//! `polkadot -> cumulus` dependency). The parachain off-chain types and the MMR
-//! primitives that *build* these commitments live in that crate.
+//! `CommitmentSet` is *relay-visible*: it is carried in the
+//! [`UMPSignal::ProvidesRoots`](super::UMPSignal)/`RequiresRoots` signals (as
+//! `ProvidesCommitment`/`RequiresCommitment`) and matched by the relay chain. Because
+//! the `UMPSignal` enum is defined here in `polkadot-primitives::v9`, the type must
+//! live here too — putting it in the parachain-side `cumulus-primitives-spec-messaging`
+//! would force a `polkadot -> cumulus` dependency. The parachain off-chain types and
+//! the MMR primitives that *build* these commitments live in that crate.
+//!
+//! Note: the signals travel inside `CandidateCommitments.upward_messages` (so they are
+//! covered by the commitments hash), but `CommitmentSet` is *not* a dedicated field of
+//! `CandidateCommitments` — the relay reads it via `CandidateCommitments::ump_signals()`.
 
 use alloc::vec::Vec;
 use polkadot_core_primitives::Hash;
