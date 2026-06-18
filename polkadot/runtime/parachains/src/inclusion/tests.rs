@@ -3289,7 +3289,10 @@ fn speculative_provides_window_is_bounded_and_evicts_oldest() {
 	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
 		let source = ParaId::from(1000u32);
 		let receiver = ParaId::from(2000u32);
-		let window = SPECULATIVE_PROVIDES_WINDOW;
+		// The operational window is the `HostConfiguration` value (capped at the static max).
+		let window = configuration::ActiveConfig::<Test>::get()
+			.provides_window_size
+			.min(MAX_PROVIDES_WINDOW_SIZE);
 
 		// Push `window + 2` distinct roots, one per block.
 		for i in 1..=(window + 2) {
@@ -3307,6 +3310,44 @@ fn speculative_provides_window_is_bounded_and_evicts_oldest() {
 			receiver,
 			&Hash::from_low_u64_be((window + 2) as u64)
 		));
+	});
+}
+
+#[test]
+fn speculative_provides_window_respects_configured_size() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		// Shrink the operational window to 3 via `HostConfiguration`.
+		configuration::ActiveConfig::<Test>::mutate(|c| c.provides_window_size = 3);
+
+		// Push 5 roots, one per block; only the newest 3 should remain.
+		for i in 1..=5 {
+			frame_system::Pallet::<Test>::set_block_number(i);
+			commit_provides(source, receiver, Hash::from_low_u64_be(i as u64));
+		}
+
+		assert!(!ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(2)));
+		assert!(ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(3)));
+		assert!(ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(5)));
+	});
+}
+
+#[test]
+fn speculative_provides_window_size_zero_disables_window() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		// A configured size of 0 keeps nothing — the feature is effectively off.
+		configuration::ActiveConfig::<Test>::mutate(|c| c.provides_window_size = 0);
+
+		frame_system::Pallet::<Test>::set_block_number(1);
+		commit_provides(source, receiver, Hash::from_low_u64_be(7));
+
+		assert!(!ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(7)));
+		assert!(ParaInclusion::provides(&source).is_none());
 	});
 }
 

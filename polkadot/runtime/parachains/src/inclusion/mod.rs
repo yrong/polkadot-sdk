@@ -377,8 +377,10 @@ pub mod pallet {
 	// ─────────────────────────────────────────────────────────────────────────────
 
 	/// Provides window per `(source, destination)` for speculative messaging.
-	/// Newest entry last; capped at [`SPECULATIVE_PROVIDES_WINDOW`]. A receiver's
-	/// `requires` root matches when it is *present* in the window.
+	/// Newest entry last; the operational length is
+	/// [`configuration::HostConfiguration::provides_window_size`], statically bounded by
+	/// [`MAX_PROVIDES_WINDOW_SIZE`]. A receiver's `requires` root matches when it is
+	/// *present* in the window.
 	#[pallet::storage]
 	pub(crate) type LatestProvides<T: Config> = StorageDoubleMap<
 		_,
@@ -386,7 +388,7 @@ pub mod pallet {
 		polkadot_primitives::Id,
 		Twox64Concat,
 		polkadot_primitives::Id,
-		BoundedVec<ProvidesEntry<BlockNumberFor<T>>, ConstU32<SPECULATIVE_PROVIDES_WINDOW>>,
+		BoundedVec<ProvidesEntry<BlockNumberFor<T>>, ConstU32<MAX_PROVIDES_WINDOW_SIZE>>,
 		ValueQuery,
 	>;
 
@@ -396,13 +398,19 @@ pub mod pallet {
 
 const LOG_TARGET: &str = "runtime::inclusion";
 
-/// Size of the relay-side provides window kept per `(source, destination)` pair.
+/// Static upper bound on the relay-side provides window kept per `(source, destination)`
+/// pair — the compile-time bound of the [`pallet::LatestProvides`] `BoundedVec`. The
+/// *operational* size is [`configuration::HostConfiguration::provides_window_size`],
+/// which is clamped to this maximum when applied.
 ///
-/// The relay chain remembers the most recent `SPECULATIVE_PROVIDES_WINDOW` provides
-/// roots so a receiver's `requires` can match a slightly-stale-but-recent root
-/// without a Late Block Proof (issue #12349). Larger windows tolerate more lag
-/// between sender and receiver at the cost of more storage per pair.
-pub const SPECULATIVE_PROVIDES_WINDOW: u32 = 8;
+/// The relay chain remembers the most recent provides roots so a receiver's `requires`
+/// can match a slightly-stale-but-recent root without a Late Block Proof (issue #12349).
+/// Larger windows tolerate more lag between sender and receiver at the cost of more
+/// storage per pair.
+pub const MAX_PROVIDES_WINDOW_SIZE: u32 = 16;
+
+/// Default operational provides-window size (the `HostConfiguration` default).
+pub const DEFAULT_PROVIDES_WINDOW_SIZE: u32 = 8;
 
 /// One recorded provides root in the relay-side window, tagged with the relay block
 /// at which it was enacted. The block tag lets [`Pallet::evict_provides_after`]
@@ -989,17 +997,27 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
-	/// Append a source's provides commitment to the window after a candidate is
-	/// enacted, evicting the oldest entry of each `(source, destination)` pair when
-	/// the window is full. Entries are tagged with the current relay block number.
+	/// Append a source's provides commitment to the window after a candidate is enacted,
+	/// evicting the oldest entries of each `(source, destination)` pair so the window
+	/// holds at most [`configuration::HostConfiguration::provides_window_size`] entries
+	/// (clamped to [`MAX_PROVIDES_WINDOW_SIZE`]). Entries are tagged with the current
+	/// relay block number. A configured size of `0` disables the window (nothing kept).
 	pub(crate) fn update_provides(source: polkadot_primitives::Id, provides: ProvidesCommitment) {
+		let window_size = configuration::ActiveConfig::<T>::get()
+			.provides_window_size
+			.min(MAX_PROVIDES_WINDOW_SIZE) as usize;
+		if window_size == 0 {
+			return;
+		}
+
 		let block = <frame_system::Pallet<T>>::block_number();
 		for (destination, root) in provides.iter() {
 			LatestProvides::<T>::mutate(source, destination, |window| {
-				if window.is_full() {
+				// Drop oldest entries until there is room for one more within `window_size`.
+				while window.len() >= window_size {
 					window.remove(0);
 				}
-				// The window was just made non-full above, so the push cannot fail.
+				// `window.len() < window_size <= MAX_PROVIDES_WINDOW_SIZE`, so the push fits.
 				let _ = window.try_push(ProvidesEntry { root: *root, block });
 			});
 		}

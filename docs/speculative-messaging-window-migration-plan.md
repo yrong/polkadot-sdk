@@ -65,7 +65,8 @@ Status: ☐ not started · ◐ in progress · ☑ done
 
 ### Phase B — Provides window + dispute eviction (#12349)
 - **B1 (#18)** ☑ — `LatestProvides: StorageDoubleMap<source, dest,
-  BoundedVec<ProvidesEntry<BlockNumber>, ConstU32<SPECULATIVE_PROVIDES_WINDOW=8>>>`
+  BoundedVec<ProvidesEntry<BlockNumber>, ConstU32<MAX_PROVIDES_WINDOW_SIZE=16>>>`
+  (operational size = `HostConfiguration::provides_window_size`, default 8, clamped to the max)
   with `ProvidesEntry { root, block }`, replacing the single-root `ProvidesRoots`.
   Helpers reworked to window semantics: `provides_contains` (membership),
   `requires_satisfied` (all-present-in-window), `update_provides` (push + evict
@@ -112,7 +113,8 @@ Status: ☐ not started · ◐ in progress · ☑ done
 
 ### Phase D/E — Tests + docs
 - **D1 (#25)** ☑ — Added relay isolation tests: `inclusion/tests.rs` — window matches
-  any recent root, bounded eviction at `SPECULATIVE_PROVIDES_WINDOW`,
+  any recent root, bounded eviction at the configured `provides_window_size`
+  (+ a zero-disables and a custom-size test),
   `evict_provides_after` drops reverted blocks + removes emptied windows;
   `v9/mod.rs` tests — `ump_signals()` extracts `ProvidesRoots`/`RequiresRoots`
   round-trip and rejects `> MAX_UMP_SIGNALS`. (9 tests, all green.) Feature-off drop

@@ -84,7 +84,9 @@ deferred to section 12.
 > 5. **The relay keeps a bounded provides *window***
 >    ([#12349](https://github.com/paritytech/polkadot-sdk/issues/12349)).
 >    `LatestProvides: (source, dest) → BoundedVec<ProvidesEntry{root, block},
->    SPECULATIVE_PROVIDES_WINDOW>` replaces the single latest root. A `requires`
+>    MAX_PROVIDES_WINDOW_SIZE>` replaces the single latest root (operational length =
+>    `HostConfiguration::provides_window_size`, default 8, clamped to the static max;
+>    added via configuration migration v13→v14). A `requires`
 >    matches if its root is **present anywhere in the window** (membership), so a
 >    slightly-stale-but-recent root matches with no proof. The window is populated
 >    at enactment from the `ProvidesRoots` signal, matched in

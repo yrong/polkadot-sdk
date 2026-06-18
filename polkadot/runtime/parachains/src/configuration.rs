@@ -230,6 +230,11 @@ pub struct HostConfiguration<BlockNumber> {
 	pub scheduler_params: SchedulerParams<BlockNumber>,
 	/// The maximum session age of a relay parent that a parachain block can build upon.
 	pub max_relay_parent_session_age: u32,
+	/// Speculative messaging: the number of recent `provides` roots the relay chain keeps
+	/// per `(source, destination)` pair. A receiver's `requires` matches if its root is
+	/// within this window. Effective value is capped by
+	/// [`crate::inclusion::MAX_PROVIDES_WINDOW_SIZE`] (the static storage bound).
+	pub provides_window_size: u32,
 }
 
 impl<BlockNumber: Default + From<u32>> Default for HostConfiguration<BlockNumber> {
@@ -274,6 +279,7 @@ impl<BlockNumber: Default + From<u32>> Default for HostConfiguration<BlockNumber
 			node_features: NodeFeatures::EMPTY,
 			scheduler_params: Default::default(),
 			max_relay_parent_session_age: 0,
+			provides_window_size: crate::inclusion::DEFAULT_PROVIDES_WINDOW_SIZE,
 		};
 
 		#[cfg(feature = "runtime-benchmarks")]
@@ -525,7 +531,7 @@ pub mod pallet {
 	/// v10-11: <https://github.com/paritytech/polkadot-sdk/pull/1191>
 	/// v11-12: <https://github.com/paritytech/polkadot-sdk/pull/3181>
 	/// v12-13: added max_relay_parent_session_age to SchedulerParams
-	const STORAGE_VERSION: StorageVersion = StorageVersion::new(13);
+	const STORAGE_VERSION: StorageVersion = StorageVersion::new(14);
 
 	#[pallet::pallet]
 	#[pallet::storage_version(STORAGE_VERSION)]
@@ -1254,6 +1260,20 @@ pub mod pallet {
 			ensure_root(origin)?;
 			Self::schedule_config_update(|config| {
 				config.max_relay_parent_session_age = new;
+			})
+		}
+
+		/// Set the speculative-messaging provides window size (capped at
+		/// [`crate::inclusion::MAX_PROVIDES_WINDOW_SIZE`] when applied).
+		#[pallet::call_index(57)]
+		#[pallet::weight((
+			T::WeightInfo::set_config_with_u32(),
+			DispatchClass::Operational,
+		))]
+		pub fn set_provides_window_size(origin: OriginFor<T>, new: u32) -> DispatchResult {
+			ensure_root(origin)?;
+			Self::schedule_config_update(|config| {
+				config.provides_window_size = new;
 			})
 		}
 	}

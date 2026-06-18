@@ -328,6 +328,7 @@ fn setting_pending_config_members() {
 				on_demand_target_queue_utilization: Perbill::from_percent(25),
 			},
 			max_relay_parent_session_age: 5,
+			provides_window_size: 6,
 		};
 
 		Configuration::set_validation_upgrade_cooldown(
@@ -374,6 +375,11 @@ fn setting_pending_config_members() {
 		Configuration::set_max_relay_parent_session_age(
 			RuntimeOrigin::root(),
 			new_config.max_relay_parent_session_age,
+		)
+		.unwrap();
+		Configuration::set_provides_window_size(
+			RuntimeOrigin::root(),
+			new_config.provides_window_size,
 		)
 		.unwrap();
 		Configuration::set_scheduling_lookahead(

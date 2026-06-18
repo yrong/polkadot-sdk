@@ -1774,6 +1774,7 @@ pub mod migrations {
 		parachains_scheduler::migration::MigrateV3ToV4<Runtime>,
 
 		parachains_configuration::migration::v13::MigrateToV13<Runtime>,
+		parachains_configuration::migration::v14::MigrateToV14<Runtime>,
 		parachains_shared::migration::MigrateToV2<Runtime>,
 
         // permanent

@@ -1998,6 +1998,7 @@ pub mod migrations {
 		parachains_on_demand::migration::MigrateV1ToV2<Runtime>,
 		parachains_scheduler::migration::MigrateV3ToV4<Runtime>,
 		parachains_configuration::migration::v13::MigrateToV13<Runtime>,
+		parachains_configuration::migration::v14::MigrateToV14<Runtime>,
 		parachains_shared::migration::MigrateToV2<Runtime>,
 		// #11705: drain residual relay-treasury balance into the accumulation account, then
 		// clear orphaned storage. Idempotent. No further activity on the legacy `py/trsry`

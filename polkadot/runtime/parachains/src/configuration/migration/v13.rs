@@ -32,7 +32,10 @@ use polkadot_primitives::vstaging::SchedulerParams;
 use sp_core::Get;
 use sp_staking::SessionIndex;
 
-type V13HostConfiguration<BlockNumber> = configuration::HostConfiguration<BlockNumber>;
+// Once `v14` added a field to the live `HostConfiguration`, this migration's *output*
+// shape must be frozen to the v13 layout (not the current struct), so the v12→v13→v14
+// chain stays decode-consistent. The frozen struct lives in `v14` (its input type).
+type V13HostConfiguration<BlockNumber> = super::v14::V13HostConfiguration<BlockNumber>;
 
 /// The v12 `SchedulerParams`, before the `max_relay_parent_session_age` field was added.
 /// This is identical to `polkadot_primitives::v9::SchedulerParams`.
