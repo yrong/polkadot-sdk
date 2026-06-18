@@ -93,13 +93,22 @@ Status: ☐ not started · ◐ in progress · ☑ done
   (prevents window population at enactment with matching off).
 
 ### Phase C — LBP as beyond-window fallback
-- **C1 (#23)** ☐ ← A3, B3 — Rework `validate_block::apply_messaging_proofs` to
-  transform the `RequiresRoots` UMP signal (not the V4 field); applies only when
-  the root is outside the window. Keep `SpecMerge`/`SubtreeExtension` +
-  `verify_incremental`.
-- **C2 (#24)** ☐ ← B3 — `speculative_ingress.rs`: fetch a `LateBlockProof` only
-  when the batch root is **not in** the relay window for `(source, receiver)`
-  (needs a window-read runtime API). Within-window → no LBP.
+- **C1 (#23)** ☑ ← A3, B3 — New shared `cumulus_primitives_spec_messaging::
+  apply_late_block_proofs(signals, proofs)` transforms the `RequiresRoots` UMP
+  signal in `upward_messages` (old root → proven new root) using
+  `SpecMerge`/`verify_incremental`. `validate_block` calls it before committing the
+  signals (removed the old extension-based `apply_messaging_proofs`). Removed the
+  dead `ValidationResult.speculative` field + `TrailingOption` plumbing; tests
+  rewritten against the UMP-signal entry point. `ValidationResultExtension` is kept
+  only as the `speculative_extension()` hook's carrier (emits the signals in A3).
+- **C2 (#24)** ◐ ← C1 — **Done:** the collator (`collator/src/service.rs`) calls the
+  identical `apply_late_block_proofs` on its signals before computing commitments, so
+  the PVF and collator produce byte-for-byte equal `upward_messages` (bad proof →
+  hash mismatch → rejected). **Deferred (follow-up):** window-aware *fetch* — only
+  skip an LBP when the batch root is anywhere in the window (not just the latest);
+  needs a `provides_window` runtime API threaded through `RelayChainInterface`
+  (RPC/in-process/mocks). Current `speculative_ingress` targets the relay's latest
+  provides root and remains correct under the window.
 
 ### Phase D/E — Tests + docs
 - **D1 (#25)** ☐ — Relay isolation tests: window advances/bounds at `WINDOW_SIZE`,

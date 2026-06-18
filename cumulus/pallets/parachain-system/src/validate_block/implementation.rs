@@ -25,12 +25,10 @@ use cumulus_primitives_core::{
 	},
 	ClaimQueueOffset, CoreSelector, CumulusDigestItem, ParachainBlockData, PersistedValidationData,
 };
-use cumulus_primitives_spec_messaging::mmr::SpecMerge;
 use frame_support::{
 	traits::{ExecuteBlock, Get, IsSubType},
 	BoundedVec,
 };
-use mmr_lib::MerkleProof;
 use polkadot_parachain_primitives::primitives::{HeadData, ValidationResult};
 use sp_core::storage::{well_known_keys, ChildInfo, StateVersion};
 use sp_externalities::{set_and_run_with_externalities, Externalities};
@@ -41,54 +39,6 @@ use sp_runtime::traits::{
 use sp_state_machine::OverlayedChanges;
 use sp_trie::{HashDBT, ProofSizeProvider, EMPTY_PREFIX};
 use trie_recorder::{SeenNodes, SizeOnlyRecorderProvider};
-
-/// Transform `requires` commitments that reference an older source subtree root
-/// into commitments referencing the current source subtree root, given a valid
-/// append-only (ancestry) proof in the PoV.
-///
-/// Flat commitment: there is no top-level inclusion proof — the relay chain
-/// matches each `subtree_root` directly. So the proof only needs to show the
-/// receiver's per-destination MMR was extended `old_subtree_root → new_subtree_root`
-/// (`mmr_lib` `verify_incremental` with `SpecMerge`).
-fn apply_messaging_proofs(
-	extension: &mut Option<polkadot_parachain_primitives::primitives::ValidationResultExtension>,
-	proofs: Vec<cumulus_primitives_spec_messaging::LateBlockProof>,
-) {
-	if let Some(polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
-		ref mut requires,
-		..
-	}) = extension
-	{
-		for proof in proofs {
-			for req in requires.iter_mut() {
-				if req.0 == proof.source && req.1 == proof.old_subtree_root {
-					// Identical roots need no proof; otherwise verify the
-					// append-only extension from old → new subtree root.
-					let valid = if proof.old_subtree_root == proof.new_subtree_root {
-						true
-					} else {
-						proof.subtree_extension.as_ref().map_or(false, |ext| {
-							MerkleProof::<
-								polkadot_primitives::Hash,
-								SpecMerge<cumulus_primitives_spec_messaging::SpecHasher>,
-							>::new(ext.new_mmr_size, ext.proof.clone())
-							.verify_incremental(
-								proof.new_subtree_root,
-								proof.old_subtree_root,
-								ext.incremental.clone(),
-							)
-							.unwrap_or(false)
-						})
-					};
-
-					if valid {
-						req.1 = proof.new_subtree_root;
-					}
-				}
-			}
-		}
-	}
-}
 
 type Ext<'a, Block, Backend> = sp_state_machine::Ext<'a, HashingFor<Block>, Backend>;
 
@@ -208,10 +158,6 @@ where
 	let mut hrmp_watermark = Default::default();
 	let mut head_data = None;
 	let mut new_validation_code = None;
-	// Captured inside the last block's externalities context so storage APIs are available.
-	let mut speculative_ext: Option<
-		polkadot_parachain_primitives::primitives::ValidationResultExtension,
-	> = None;
 	let num_blocks = blocks.len();
 
 	// Create the db
@@ -335,9 +281,6 @@ where
 						crate::CustomValidationHeadData::<PSC>::get()
 							.map_or_else(|| HeadData(parent_header.encode()), HeadData),
 					);
-					// Must be called here while externalities are still active; storage
-					// iteration in `compute_provides` panics outside this context.
-					speculative_ext = PSC::speculative_extension();
 				}
 			},
 		);
@@ -363,6 +306,18 @@ where
 				}
 			});
 		}
+	}
+
+	// Speculative messaging: apply any late block proofs to the `RequiresRoots` signal
+	// before the signals are committed to `upward_messages`, so the relay chain matches
+	// the proven (current) source subtree root against its provides window. The collator
+	// performs the identical transform, so the resulting commitments hash agrees
+	// (issues #12347/#12349).
+	if let Some(proofs) = &messaging_proofs {
+		cumulus_primitives_spec_messaging::apply_late_block_proofs(
+			&mut upward_message_signals,
+			proofs,
+		);
 	}
 
 	if !upward_message_signals.is_empty() {
@@ -412,11 +367,6 @@ where
 
 	horizontal_messages.sort_by(|a, b| a.recipient.cmp(&b.recipient));
 
-	let mut extension = speculative_ext;
-	if let Some(proofs) = messaging_proofs {
-		apply_messaging_proofs(&mut extension, proofs);
-	}
-
 	ValidationResult {
 		head_data: head_data.expect("HeadData not set"),
 		new_validation_code: new_validation_code.map(Into::into),
@@ -424,7 +374,6 @@ where
 		processed_downward_messages,
 		horizontal_messages,
 		hrmp_watermark,
-		speculative: polkadot_primitives::TrailingOption(extension),
 	}
 }
 
@@ -711,13 +660,31 @@ fn host_transaction_index_renew(_extrinsic: u32, _context_hash: [u8; 32]) {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cumulus_primitives_spec_messaging::{LateBlockProof, SpecHasher, SubtreeExtension};
+	use codec::{Decode, Encode};
+	use cumulus_primitives_spec_messaging::{
+		apply_late_block_proofs, mmr::SpecMerge, LateBlockProof, SpecHasher, SubtreeExtension,
+	};
 	use mmr_lib::{
 		leaf_index_to_pos,
 		util::{MemMMR, MemStore},
 	};
-	use polkadot_parachain_primitives::primitives::ValidationResultExtension;
+	use polkadot_primitives::{Id, RequiresCommitment, UMPSignal};
 	use sp_core::H256;
+
+	/// Encode a `RequiresRoots` UMP signal blob carrying `entries`.
+	fn requires_signal(entries: &[(Id, H256)]) -> Vec<u8> {
+		let set =
+			RequiresCommitment::try_from_iter(entries.iter().copied()).expect("valid requires set");
+		UMPSignal::RequiresRoots(set).encode()
+	}
+
+	/// Decode the `(source, root)` entries from a `RequiresRoots` UMP signal blob.
+	fn decode_requires(blob: &[u8]) -> Vec<(Id, H256)> {
+		match UMPSignal::decode(&mut &blob[..]).expect("decodes as UMPSignal") {
+			UMPSignal::RequiresRoots(set) => set.iter().copied().collect(),
+			other => panic!("expected RequiresRoots, got {other:?}"),
+		}
+	}
 
 	/// Build a `LateBlockProof` whose subtree MMR (under `SpecMerge`) was extended
 	/// from `old_count` to `new_count` leaves, with a real `mmr_lib` incremental proof.
@@ -760,30 +727,23 @@ mod tests {
 	}
 
 	#[test]
-	fn apply_messaging_proofs_transforms_requires_on_valid_proof() {
-		let source: polkadot_primitives::Id = 1000u32.into();
+	fn late_block_proof_transforms_requires_on_valid_proof() {
+		let source: Id = 1000u32.into();
 		let (old_root, new_root, proof) = build_late_block_proof(source, 2, 3);
 
-		let mut ext = Some(ValidationResultExtension::V4 {
-			provides: None,
-			requires: alloc::vec![(source, old_root)],
-		});
+		let mut signals = alloc::vec![requires_signal(&[(source, old_root)])];
+		apply_late_block_proofs(&mut signals, &[proof]);
 
-		apply_messaging_proofs(&mut ext, alloc::vec![proof]);
-
-		if let Some(ValidationResultExtension::V4 { ref requires, .. }) = ext {
-			assert_eq!(
-				requires[0].1, new_root,
-				"requires should be updated to the new subtree root"
-			);
-		} else {
-			panic!("extension should remain V4");
-		}
+		assert_eq!(
+			decode_requires(&signals[0])[0].1,
+			new_root,
+			"requires should be updated to the new subtree root"
+		);
 	}
 
 	#[test]
-	fn apply_messaging_proofs_does_not_transform_on_invalid_extension() {
-		let source: polkadot_primitives::Id = 1000u32.into();
+	fn late_block_proof_does_not_transform_on_invalid_proof() {
+		let source: Id = 1000u32.into();
 		let (old_root, _, mut proof) = build_late_block_proof(source, 2, 3);
 
 		// Tamper an appended leaf so `verify_incremental` fails.
@@ -791,23 +751,15 @@ mod tests {
 			ext.incremental[0] = H256::repeat_byte(0xAB);
 		}
 
-		let mut ext = Some(ValidationResultExtension::V4 {
-			provides: None,
-			requires: alloc::vec![(source, old_root)],
-		});
+		let mut signals = alloc::vec![requires_signal(&[(source, old_root)])];
+		apply_late_block_proofs(&mut signals, &[proof]);
 
-		apply_messaging_proofs(&mut ext, alloc::vec![proof]);
-
-		if let Some(ValidationResultExtension::V4 { ref requires, .. }) = ext {
-			assert_eq!(requires[0].1, old_root, "requires should NOT be updated");
-		} else {
-			panic!("extension should remain V4");
-		}
+		assert_eq!(decode_requires(&signals[0])[0].1, old_root, "requires should NOT be updated");
 	}
 
 	#[test]
-	fn apply_messaging_proofs_identical_roots_need_no_extension() {
-		let source: polkadot_primitives::Id = 1000u32.into();
+	fn late_block_proof_identical_roots_need_no_extension() {
+		let source: Id = 1000u32.into();
 		let root = H256::repeat_byte(7);
 		let proof = LateBlockProof {
 			source,
@@ -816,17 +768,9 @@ mod tests {
 			subtree_extension: None,
 		};
 
-		let mut ext = Some(ValidationResultExtension::V4 {
-			provides: None,
-			requires: alloc::vec![(source, root)],
-		});
+		let mut signals = alloc::vec![requires_signal(&[(source, root)])];
+		apply_late_block_proofs(&mut signals, &[proof]);
 
-		apply_messaging_proofs(&mut ext, alloc::vec![proof]);
-
-		if let Some(ValidationResultExtension::V4 { ref requires, .. }) = ext {
-			assert_eq!(requires[0].1, root);
-		} else {
-			panic!("extension should remain V4");
-		}
+		assert_eq!(decode_requires(&signals[0])[0].1, root);
 	}
 }

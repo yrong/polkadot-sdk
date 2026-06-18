@@ -38,8 +38,8 @@ pub use parachain_block_data::ParachainBlockData;
 // parachain primitives hub (the relay-visible commitments stay in
 // `polkadot-primitives::v9`).
 pub use cumulus_primitives_spec_messaging::{
-	LateBlockProof, MaxSpeculativeMessageLen, MessageBatch, OutgoingMessage, SourceState,
-	SpecHasher, SpeculativeIngress, SubtreeExtension,
+	apply_late_block_proofs, LateBlockProof, MaxSpeculativeMessageLen, MessageBatch,
+	OutgoingMessage, SourceState, SpecHasher, SpeculativeIngress, SubtreeExtension,
 };
 pub use polkadot_core_primitives::InboundDownwardMessage;
 pub use polkadot_parachain_primitives::primitives::{

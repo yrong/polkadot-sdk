@@ -536,7 +536,6 @@ fn candidate_validation_ok_is_ok(#[case] v2_descriptor: bool) {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 
 	if v2_descriptor {
@@ -631,7 +630,6 @@ fn invalid_session_or_ump_signals() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 
 	validation_result.upward_messages.force_push(UMP_SEPARATOR);
@@ -942,7 +940,6 @@ fn v3_ump_signal_enforcement() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 	result_with_signals.upward_messages.force_push(UMP_SEPARATOR);
 	result_with_signals
@@ -957,7 +954,6 @@ fn v3_ump_signal_enforcement() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 
 	let mut cq = BTreeMap::new();
@@ -1133,7 +1129,6 @@ fn candidate_validation_one_ambiguous_error_is_valid() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 
 	let commitments = CandidateCommitments {
@@ -1414,7 +1409,6 @@ fn candidate_validation_commitment_hash_mismatch_is_invalid() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 12345,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 
 	let result = executor::block_on(validate_candidate(
@@ -1469,7 +1463,6 @@ fn compressed_code_works() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 
 	let commitments = CandidateCommitments {
@@ -2722,7 +2715,6 @@ fn pre_validation_scheduling_session_check() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 	let commitments = CandidateCommitments {
 		head_data: validation_result.head_data.clone(),
@@ -2838,7 +2830,6 @@ fn pre_validation_v3_scheduling_offset_mismatch() {
 			horizontal_messages: Default::default(),
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			speculative: polkadot_primitives::TrailingOption(None),
 		}));
 	let (response_tx, response_rx) = oneshot::channel();
 
@@ -3034,7 +3025,6 @@ fn pre_validation_relay_parent_session_check() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 	let commitments = CandidateCommitments {
 		head_data: validation_result.head_data.clone(),
@@ -3201,7 +3191,6 @@ fn pre_validation_relay_parent_session_check_v3_ancestor_query() {
 		horizontal_messages: Default::default(),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		speculative: polkadot_primitives::TrailingOption(None),
 	};
 	let commitments = CandidateCommitments {
 		head_data: validation_result.head_data.clone(),

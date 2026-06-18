@@ -22,6 +22,7 @@ sp-runtime = { workspace = true }
 # Polkadot
 polkadot-core-primitives = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
+polkadot-primitives = { workspace = true }
 
 [features]
 default = ["std"]
@@ -30,6 +31,7 @@ std = [
 	"mmr-lib/std",
 	"polkadot-core-primitives/std",
 	"polkadot-parachain-primitives/std",
+	"polkadot-primitives/std",
 	"sp-core/std",
 	"sp-io/std",
 	"sp-runtime/std",

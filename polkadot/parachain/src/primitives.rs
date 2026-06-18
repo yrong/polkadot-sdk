@@ -571,8 +571,6 @@ pub struct ValidationResult {
 	/// The mark which specifies the block number up to which all inbound HRMP messages are
 	/// processed.
 	pub hrmp_watermark: RelayChainBlockNumber,
-	/// Speculative messaging extension (v10+). Wrapped in TrailingOption for compatibility.
-	pub speculative: TrailingOption<ValidationResultExtension>,
 }
 
 #[cfg(test)]

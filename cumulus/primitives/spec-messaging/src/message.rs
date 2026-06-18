@@ -29,12 +29,14 @@
 
 use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode};
+use mmr_lib::MerkleProof;
 use polkadot_core_primitives::{BlockNumber, Hash};
 use polkadot_parachain_primitives::primitives::Id;
+use polkadot_primitives::{RequiresCommitment, UMPSignal};
 use scale_info::TypeInfo;
 use sp_core::ConstU32;
 
-use crate::outgoing_message::OutgoingMessage as GenericOutgoingMessage;
+use crate::{mmr::SpecMerge, outgoing_message::OutgoingMessage as GenericOutgoingMessage};
 
 /// Maximum size in bytes of a single speculative message payload.
 pub const MAX_SPECULATIVE_MESSAGE_LEN: u32 = 102_400;
@@ -123,6 +125,79 @@ pub struct SubtreeExtension {
 	pub proof: Vec<Hash>,
 	/// The appended leaf hashes (`hash_leaf` values), in append order.
 	pub incremental: Vec<Hash>,
+}
+
+/// Apply late block proofs to the `RequiresRoots` UMP signal embedded in `signals`.
+///
+/// Each `(source, old_root)` requirement for which `proofs` supplies a valid
+/// append-only extension `old_root → new_root` is rewritten to `(source, new_root)`,
+/// so the relay chain matches the *current* source subtree root against its provides
+/// window (issue #12349). Identical old/new roots need no proof.
+///
+/// **Symmetry contract.** Both the collator (before computing the candidate
+/// commitments) and the PVF (during `validate_block`) call this on the identical
+/// post-execution signal blobs. Since the transform is deterministic, the resulting
+/// `upward_messages` — and therefore the commitments hash — are byte-for-byte equal;
+/// a collator that submits a bad proof produces a different hash and is rejected.
+///
+/// Signals that are not `RequiresRoots` (or do not decode as a [`UMPSignal`]) are left
+/// untouched.
+pub fn apply_late_block_proofs(signals: &mut [Vec<u8>], proofs: &[LateBlockProof]) {
+	if proofs.is_empty() {
+		return;
+	}
+
+	for blob in signals.iter_mut() {
+		if let Ok(UMPSignal::RequiresRoots(requires)) = UMPSignal::decode(&mut &blob[..]) {
+			let transformed = transform_requires(requires, proofs);
+			*blob = UMPSignal::RequiresRoots(transformed).encode();
+		}
+	}
+}
+
+/// Rewrite each `requires` entry to the proven new subtree root, where a valid proof
+/// is supplied; otherwise leave it unchanged.
+fn transform_requires(
+	requires: RequiresCommitment,
+	proofs: &[LateBlockProof],
+) -> RequiresCommitment {
+	let entries: Vec<(Id, Hash)> = requires
+		.iter()
+		.map(|(source, root)| {
+			for proof in proofs {
+				if proof.source == *source &&
+					proof.old_subtree_root == *root &&
+					late_block_proof_valid(proof)
+				{
+					return (*source, proof.new_subtree_root);
+				}
+			}
+			(*source, *root)
+		})
+		.collect();
+
+	// Only the hash of each entry can change; ParaIds (hence their order and
+	// uniqueness) are preserved, so reconstruction cannot fail. Fall back to the
+	// untransformed set if it somehow does.
+	RequiresCommitment::try_from_iter(entries).unwrap_or(requires)
+}
+
+/// Verify a single late block proof: an append-only extension of the source's
+/// per-destination MMR from `old_subtree_root` to `new_subtree_root`.
+fn late_block_proof_valid(proof: &LateBlockProof) -> bool {
+	if proof.old_subtree_root == proof.new_subtree_root {
+		return true;
+	}
+
+	proof.subtree_extension.as_ref().map_or(false, |ext| {
+		MerkleProof::<Hash, SpecMerge<SpecHasher>>::new(ext.new_mmr_size, ext.proof.clone())
+			.verify_incremental(
+				proof.new_subtree_root,
+				proof.old_subtree_root,
+				ext.incremental.clone(),
+			)
+			.unwrap_or(false)
+	})
 }
 
 /// Per-source tracking for incoming speculative messages.

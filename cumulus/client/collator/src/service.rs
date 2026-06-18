@@ -336,6 +336,15 @@ where
 		// Sort by recipient as required by the relay chain rules.
 		horizontal_messages.sort_by(|a, b| a.recipient.cmp(&b.recipient));
 
+		// Speculative messaging: apply the late block proofs to the `RequiresRoots`
+		// signal before committing the signals, mirroring the PVF's transform so the
+		// candidate commitments hash matches what `validate_block` recomputes
+		// (issues #12347/#12349).
+		cumulus_primitives_core::apply_late_block_proofs(
+			&mut upward_message_signals,
+			&late_block_proofs,
+		);
+
 		let block_data =
 			ParachainBlockData::<Block>::new_v2(blocks, compact_proof, late_block_proofs);
 
