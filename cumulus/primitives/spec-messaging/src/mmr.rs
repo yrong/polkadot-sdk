@@ -23,10 +23,10 @@
 //!
 //! Domain separation: leaves are hashed by
 //! [`crate::outgoing_message::OutgoingMessage::hash_leaf`] (`LEAF_TAG`), inner
-//! nodes by [`SpecMerge::merge`] (`INNER_TAG`), peak-bagging by
-//! [`SpecMerge::merge_peaks`] (`PEAK_TAG`), and the empty root by [`empty_root`]
-//! (`EMPTY_TAG`). `mmr_lib` calls `merge` for tree nodes and the overridable
-//! `merge_peaks` when bagging peaks, so no two roles collide on the same hash.
+//! nodes by [`SpecMerge::merge`] (`INNER_TAG`), and peak-bagging by
+//! [`SpecMerge::merge_peaks`] (`PEAK_TAG`). `mmr_lib` calls `merge` for tree nodes
+//! and the overridable `merge_peaks` when bagging peaks, so no two roles collide on
+//! the same hash.
 //!
 //! [`SpecMerge`] is the `mmr_lib::Merge` used for inclusion proofs (`gen_proof`/
 //! `MerkleProof::verify`) and append-only ancestry proofs (`gen_ancestry_proof`/
@@ -39,7 +39,7 @@ use mmr_lib::{Error as MmrError, Merge};
 use polkadot_core_primitives::Hash;
 use sp_runtime::traits::Hash as HashT;
 
-use crate::{EMPTY_TAG, INNER_TAG, PEAK_TAG};
+use crate::{INNER_TAG, PEAK_TAG};
 
 /// Domain-tagged merge for the speculative-messaging MMR, generic over the hash
 /// function `H`. Used as the `mmr_lib::Merge` implementation for the subtree.
@@ -69,24 +69,25 @@ fn tagged_node<H: HashT<Output = Hash>>(tag: u8, left: &Hash, right: &Hash) -> H
 	<H as HashT>::hash(&preimage)
 }
 
-/// The canonical root of an MMR with no leaves: `H(EMPTY_TAG)`.
-pub fn empty_root<H: HashT<Output = Hash>>() -> Hash {
-	<H as HashT>::hash(&[EMPTY_TAG])
-}
-
-/// Compute the MMR root from its peaks (highest to lowest), matching `mmr_lib`'s
-/// bagging (`merge_peaks(right, left)` folded right-to-left). Returns
-/// [`empty_root`] for an empty peak list.
+/// Compute the MMR root from its non-empty peaks (highest to lowest), matching
+/// `mmr_lib`'s bagging (`merge_peaks(right, left)` folded right-to-left).
 ///
-/// This lets the on-chain outbox keep only the O(log n) peaks and still derive
-/// the same `subtree_root` that `mmr_lib`'s `MMR::get_root` and
-/// `MerkleProof::verify` produce.
+/// This lets the on-chain outbox keep only the O(log n) peaks and still derive the
+/// same `subtree_root` that `mmr_lib`'s `MMR::get_root` and `MerkleProof::verify`
+/// produce.
+///
+/// # Panics
+///
+/// Panics on an empty `peaks` slice. An empty MMR has no root (`mmr_lib::MMR::
+/// get_root` itself errors on empty), and the protocol never commits one: a
+/// per-destination outbox state only exists after at least one append, and empty
+/// destinations are omitted from the flat `CommitmentSet`. So callers always pass a
+/// non-empty slice.
 pub fn root_from_peaks<H: HashT<Output = Hash>>(peaks: &[Hash]) -> Hash {
 	let mut iter = peaks.iter().rev();
-	let mut acc = match iter.next() {
-		Some(p) => *p,
-		None => return empty_root::<H>(),
-	};
+	let mut acc = *iter
+		.next()
+		.expect("root_from_peaks called on empty peaks; an empty MMR has no root; qed");
 	for left in iter {
 		// mmr_lib bags as merge_peaks(right, left); `acc` carries the right side.
 		acc =
@@ -107,11 +108,6 @@ pub trait MmrAccumulator {
 
 	/// The number of leaves appended so far.
 	fn size(&self) -> u64;
-
-	/// Post-MVP: produce a proof that the structure was validly extended.
-	fn extension_proof(&self) -> Result<(), &'static str> {
-		Err("Not implemented yet")
-	}
 }
 
 /// Peaks-only MMR accumulator (O(log n) state), generic over the hash function.
@@ -202,14 +198,11 @@ mod tests {
 	fn merge_and_merge_peaks_are_domain_separated() {
 		let a = h(1);
 		let b = h(2);
-		// Inner-node merge, peak-bagging, and the empty root of the same inputs
-		// must all differ (domain tags).
+		// Inner-node merge and peak-bagging of the same inputs must differ (domain tags).
 		assert_ne!(
 			<SpecMerge<H> as Merge>::merge(&a, &b).unwrap(),
 			<SpecMerge<H> as Merge>::merge_peaks(&a, &b).unwrap()
 		);
-		assert_ne!(<SpecMerge<H> as Merge>::merge(&a, &b).unwrap(), empty_root::<H>());
-		assert_ne!(<SpecMerge<H> as Merge>::merge_peaks(&a, &b).unwrap(), empty_root::<H>());
 	}
 
 	#[test]
@@ -220,15 +213,6 @@ mod tests {
 			<SpecMerge<H> as Merge>::merge(&a, &b).unwrap(),
 			<SpecMerge<H> as Merge>::merge(&b, &a).unwrap()
 		);
-	}
-
-	#[test]
-	fn empty_accumulator_root_is_empty_root() {
-		let mmr = Mmr::<H>::new();
-		assert_eq!(mmr.size(), 0);
-		assert_eq!(mmr.root(), empty_root::<H>());
-		assert_eq!(root_from_peaks::<H>(&[]), empty_root::<H>());
-		assert!(mmr.extension_proof().is_err());
 	}
 
 	#[test]

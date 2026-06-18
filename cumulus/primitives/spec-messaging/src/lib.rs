@@ -51,10 +51,9 @@ pub use message::{
 };
 
 // Domain Tags to ensure that the same message structure used in different
-// contexts (e.g. leaf vs inner node) do not collide on the same hash.
-
-/// Tag for an empty MMR.
-pub const EMPTY_TAG: u8 = 0x1;
+// contexts (e.g. leaf vs inner node) do not collide on the same hash. Tag values
+// are part of the hash preimages, so they are kept stable (the now-removed
+// `EMPTY_TAG = 0x1` slot is intentionally left unused rather than renumbering).
 
 /// Tag for a leaf node.
 pub const LEAF_TAG: u8 = 0x2;

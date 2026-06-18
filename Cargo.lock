@@ -5724,6 +5724,7 @@ dependencies = [
  "pallet-transaction-payment",
  "pallet-utility",
  "parity-scale-codec",
+ "polkadot-parachain-primitives",
  "polkadot-primitives",
  "scale-info",
  "serde_json",

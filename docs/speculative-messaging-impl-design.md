@@ -25,8 +25,8 @@ deferred to section 12.
 > this doc and are now canonical:
 >
 > 1. **Hashing is a type parameter `H`, instantiated to `blake2_256`.** The crate
->    primitives (`hash_leaf::<H>`, `SpecMerge<H>`, `root_from_peaks::<H>`,
->    `empty_root::<H>`) are generic over the hash function; the protocol's single
+>    primitives (`hash_leaf::<H>`, `SpecMerge<H>`, `root_from_peaks::<H>`) are
+>    generic over the hash function; the protocol's single
 >    concrete choice is `polkadot_primitives::v9::SpecHasher = BlakeTwo256`
 >    (Substrate-native), so a future switch (e.g. to Keccak256) is one line. Any
 >    remaining "Keccak256" mention below is legacy and should be read as
@@ -53,12 +53,15 @@ deferred to section 12.
 >    via the crate's domain-tagged `SpecMerge<H>`: **inclusion** proofs
 >    (`gen_proof`/`verify`) and append-only **extension** proofs (ancestry /
 >    `verify_incremental`) come from `mmr_lib`. The crate retains a thin
->    `MmrAccumulator` trait (`append`/`root`/`size`, post-MVP `extension_proof`)
->    and a peaks-only `Mmr<H>` impl (used by the sender's on-chain state), plus
->    `root_from_peaks::<H>` and `empty_root::<H>` — these match issue #12346 and
->    are kept consistent with `mmr_lib` (the `Mmr` root equals `mmr_lib`'s and its
->    proofs verify against it). PR #12368's single-shot `merge_peaks` bagging is
->    replaced by `mmr_lib`-consistent pairwise bagging.
+>    `MmrAccumulator` trait (`append`/`root`/`size`) and a peaks-only `Mmr<H>` impl
+>    (used by the sender's on-chain state), plus `root_from_peaks::<H>` — kept
+>    consistent with `mmr_lib` (the `Mmr` root equals `mmr_lib`'s and its proofs
+>    verify against it). PR #12368's single-shot `merge_peaks` bagging is replaced by
+>    `mmr_lib`-consistent pairwise bagging. (The empty-MMR sentinel `empty_root` /
+>    `EMPTY_TAG` and the `extension_proof` stub were **removed** — `mmr_lib` errors on
+>    an empty MMR rather than producing a root, so a committed "empty root" is an
+>    unverifiable value the protocol never emits; `root_from_peaks` requires a
+>    non-empty peak set.)
 
 > **Design revision (2026-06-18) — UMP-signal transport + provides window.**
 > The relay side was migrated to the parity-team design. **Full task breakdown,
@@ -97,6 +100,49 @@ deferred to section 12.
 >    byte-for-byte (a bad proof is rejected by the hash check). This keeps §6.2's
 >    two-phase model; only the transform *target* changed (UMP signal, not the
 >    removed extension).
+
+### Why UMP signals, not a `CandidateCommitments` field?
+
+Both approaches end up covered by the same `commitments_hash`, so the benefit is
+**not** integrity — it is **migration safety and blast radius**:
+
+1. **No change to the `CandidateCommitments` wire format.** That type is consensus
+   core — it is in the candidate receipt that is gossiped, backed, included, and
+   stored for disputes, and every validator decodes it. Adding fields is a hard
+   format change requiring a lockstep runtime+node upgrade. UMP signals ride inside
+   `upward_messages` (an existing field) after the established `UMP_SEPARATOR`, so the
+   struct layout is unchanged; code that doesn't understand the new signals just sees
+   extra upward messages instead of failing to decode the candidate.
+2. **Clean feature-gating, no descriptor/commitments version bump.** Because the data
+   lives in an existing field, rollout is a `node_features` flag plus the feature-off
+   drop guard (B5): ship the signal-aware code, wait until ≥⅔ of validators run it,
+   then enable. The only compat concern is older validators rejecting extra signals
+   with `TooManyUMPSignals` — handled by that threshold. A dedicated field can't be
+   feature-gated this cleanly.
+3. **Reuses the existing UMP-signal channel.** `UMPSignal::SelectCore`/`ApprovedPeer`
+   already establish "a parachain signals the relay about a candidate via
+   `upward_messages`". provides/requires are the same kind of thing — two more
+   variants, not a parallel field-based channel.
+4. **The data is produced by block execution anyway.** provides/requires come from
+   running the runtime (outbox/inbox state); the signals are emitted *during* that
+   execution (`send_ump_signals` in `on_finalize`) straight into `upward_messages`, so
+   `validate_block`'s re-execution reproduces them for free — no side-channel out of
+   the PVF that has to be reconciled.
+5. **Concretely smaller blast radius.** The field path required a
+   `ValidationResultExtension::V4` side-channel out of the PVF, candidate-validation
+   reconstructing the field and re-hashing it, collation-generation mapping, the node
+   `Collation` fields, and ~14 construction sites — **all deleted in A4**. The signal
+   path is "the runtime emits it during execution; the relay reads it with
+   `CandidateCommitments::ump_signals()`." It also made the LBP rework (C1) cleaner:
+   the transform rewrites the signal *in* `upward_messages`, and the existing
+   commitments hash enforces collator↔PVF symmetry — no separate field to keep in sync.
+
+**Trade-off:** the relay decodes `UMPSignal`s out of `upward_messages` (bounded by
+`MAX_UMP_SIGNALS`) rather than reading a typed field, and older validators must be
+upgraded past the `TooManyUMPSignals` rejection before the feature is enabled — cheap
+and bounded, which is why the design accepts it. In one line: **UMP signals let
+speculative messaging ship as a feature-gated, backward-compatible addition instead of
+a consensus-breaking change to the candidate-receipt format.**
 
 ---
 
@@ -590,7 +636,7 @@ LEAF_TAG ++ LEAF_VERSION ++ source ++ destination ++ position.to_le_bytes()
          ++ (payload.len() as u32).to_le_bytes() ++ payload
 ```
 
-The `LEAF_TAG` (distinct from `INNER_TAG`/`PEAK_TAG`/`EMPTY_TAG` used by the MMR
+The `LEAF_TAG` (distinct from `INNER_TAG`/`PEAK_TAG` used by the MMR
 merges) prevents a leaf hash from being reinterpreted as an inner/peak node, and
 `LEAF_VERSION` lets the leaf format evolve. Binding `source`/`destination`/
 `position` into the preimage ties each message to its channel and ordinal,
@@ -660,8 +706,8 @@ the `cumulus-primitives-spec-messaging` crate
 ([PR #12368](https://github.com/paritytech/polkadot-sdk/pull/12368)):
 `CommitmentSet` (canonical sorted decode), `OutgoingMessage::hash_leaf::<H>`
 (domain-tagged, versioned, generic over the hasher), the domain tags, the
-`MmrAccumulator` trait + peaks-only `Mmr<H>`, and `SpecMerge<H>`/`root_from_peaks`/
-`empty_root`. Inclusion and extension proofs come from **`mmr_lib`** (the `Mmr`
+`MmrAccumulator` trait + peaks-only `Mmr<H>`, and `SpecMerge<H>`/`root_from_peaks`.
+Inclusion and extension proofs come from **`mmr_lib`** (the `Mmr`
 accumulator is kept consistent with it); PR #12368's single-shot `merge_peaks`
 bagging is replaced by `mmr_lib`-consistent pairwise bagging. The crate types are
 `no_std` and unit tested.

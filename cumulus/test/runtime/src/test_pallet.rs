@@ -72,6 +72,13 @@ pub mod pallet {
 	pub type PendingOutboundHrmpMessages<T: Config> =
 		StorageValue<_, alloc::vec::Vec<(ParaId, alloc::vec::Vec<u8>)>, ValueQuery>;
 
+	/// Pending speculative-messaging `requires` set. When non-empty, the runtime's
+	/// `speculative_extension()` override returns it, so block execution emits a
+	/// `RequiresRoots` UMP signal. Used by the late-block-proof `validate_block` test.
+	#[pallet::storage]
+	pub type PendingSpeculativeRequires<T: Config> =
+		StorageValue<_, alloc::vec::Vec<(ParaId, sp_core::H256)>, ValueQuery>;
+
 	impl<T: Config> XcmpMessageSource for Pallet<T> {
 		fn take_outbound_messages(
 			maximum_channels: usize,
@@ -232,6 +239,17 @@ pub mod pallet {
 		#[pallet::weight(0)]
 		pub fn remove_value_from_map(_: OriginFor<T>, key: u32) -> DispatchResult {
 			TestMap::<T>::remove(key);
+			Ok(())
+		}
+
+		/// Set the pending speculative `requires` set, emitted as a `RequiresRoots`
+		/// UMP signal during the next block's `on_finalize`.
+		#[pallet::weight(0)]
+		pub fn set_speculative_requires(
+			_: OriginFor<T>,
+			requires: alloc::vec::Vec<(ParaId, sp_core::H256)>,
+		) -> DispatchResult {
+			PendingSpeculativeRequires::<T>::put(requires);
 			Ok(())
 		}
 

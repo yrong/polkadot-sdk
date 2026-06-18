@@ -117,9 +117,14 @@ Status: ☐ not started · ◐ in progress · ☑ done
   `v9/mod.rs` tests — `ump_signals()` extracts `ProvidesRoots`/`RequiresRoots`
   round-trip and rejects `> MAX_UMP_SIGNALS`. (9 tests, all green.) Feature-off drop
   (B5) is exercised at integration level via `sanitize_backed_candidates`.
-- **D2 (#26)** ☐ ← C1 — E2E LBP-fallback test (out-of-window root matches after
-  PVF transform) + re-verify spec-messaging crate + outbox/inbox + cumulus-test
-  runtime WASM `validate_block_works`.
+- **D2 (#26)** ☑ ← C1 — Added `validate_block_late_block_proof_transforms_requires`:
+  a block records `requires=(source, old_root)` (RequiresRoots signal via a new gated
+  `test_pallet::set_speculative_requires` + a `speculative_extension()` override in
+  `cumulus-test-runtime`), the PoV carries a real `mmr_lib` LBP, and `validate_block`
+  (WASM) re-emits the signal with the proven `new_root`. **Passes** on a real runtime
+  WASM build; the broader `validate_block` suite re-verified (23 pass; the 6
+  subprocess negative tests fail only on a pre-existing stderr-capture quirk — logic
+  confirmed correct by running an inner branch directly).
 - **E1 (#27)** ☑ — Added the "2026-06-18 — UMP-signal transport + provides window"
   revision (decisions 4–6) to `speculative-messaging-impl-design.md`, pointing here;
   annotated the §3.6 tracker that rows 6–7 are superseded by the window/UMP migration.

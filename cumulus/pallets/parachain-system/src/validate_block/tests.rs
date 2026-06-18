@@ -672,6 +672,102 @@ fn validate_block_handles_ump_signal() {
 	);
 }
 
+/// Build a `LateBlockProof` whose subtree MMR (under `SpecMerge`) was extended from
+/// `old_count` to `new_count` leaves, with a real `mmr_lib` incremental proof.
+fn build_late_block_proof(
+	source: ParaId,
+	old_count: u64,
+	new_count: u64,
+) -> (H256, H256, cumulus_primitives_core::LateBlockProof) {
+	use cumulus_primitives_core::{SpecHasher, SubtreeExtension};
+	use cumulus_primitives_spec_messaging::mmr::SpecMerge;
+	use mmr_lib::{
+		leaf_index_to_pos,
+		util::{MemMMR, MemStore},
+	};
+
+	let store = MemStore::<H256>::default();
+	let mut mmr = MemMMR::<H256, SpecMerge<SpecHasher>>::new(0, &store);
+	let leaves: Vec<H256> =
+		(0..new_count).map(|i| H256::repeat_byte((i as u8).wrapping_add(1))).collect();
+
+	for &l in leaves.iter().take(old_count as usize) {
+		mmr.push(l).unwrap();
+	}
+	let old_subtree_root = mmr.get_root().unwrap();
+
+	let mut incremental = Vec::new();
+	for &l in leaves.iter().take(new_count as usize).skip(old_count as usize) {
+		mmr.push(l).unwrap();
+		incremental.push(l);
+	}
+	let new_subtree_root = mmr.get_root().unwrap();
+
+	let positions: Vec<u64> = (old_count..new_count).map(leaf_index_to_pos).collect();
+	let proof = mmr.gen_proof(positions).unwrap();
+
+	let lbp = cumulus_primitives_core::LateBlockProof {
+		source,
+		old_subtree_root,
+		new_subtree_root,
+		subtree_extension: Some(SubtreeExtension {
+			new_mmr_size: mmr.mmr_size(),
+			proof: proof.proof_items().to_vec(),
+			incremental,
+		}),
+	};
+	(old_subtree_root, new_subtree_root, lbp)
+}
+
+/// End-to-end Late Block Proof: a block records `requires = (source, old_root)` (as a
+/// `RequiresRoots` UMP signal), the PoV carries a proof extending `old_root → new_root`,
+/// and `validate_block` rewrites the signal to the proven `new_root` — what the relay
+/// chain matches against its provides window.
+#[test]
+fn validate_block_late_block_proof_transforms_requires() {
+	sp_tracing::try_init_simple();
+
+	let (client, parent_head) = create_test_client();
+	let source = ParaId::from(2000u32);
+	let (old_root, new_root, lbp) = build_late_block_proof(source, 2, 3);
+
+	// The receiver block records `requires = (source, old_root)`.
+	let set_requires = generate_extrinsic(
+		&client,
+		Alice,
+		TestPalletCall::set_speculative_requires { requires: vec![(source, old_root)] },
+	);
+
+	let TestBlockData { block, validation_data } = build_block_with_witness(
+		&client,
+		vec![set_requires],
+		parent_head.clone(),
+		Default::default(),
+		Default::default(),
+	);
+
+	// Re-wrap the PoV as `V2` carrying the late block proof.
+	let (blocks, proof) = block.into_inner();
+	let block_v2 = ParachainBlockData::new_v2(blocks, proof, vec![lbp]);
+
+	let upward_messages = call_validate_block_validation_result(
+		WASM_BINARY.expect("You need to build the WASM binaries to run the tests!"),
+		parent_head,
+		block_v2,
+		validation_data.relay_parent_storage_root,
+	)
+	.expect("Calls `validate_block`")
+	.upward_messages;
+
+	// Sanity: without the proof the signal would still carry `old_root`; with it, the
+	// emitted `RequiresRoots` signal carries the proven `new_root`.
+	let transformed = relay_chain::RequiresCommitment::try_from_iter([(source, new_root)]).unwrap();
+	assert!(
+		upward_messages.contains(&UMPSignal::RequiresRoots(transformed).encode()),
+		"upward_messages should carry the transformed RequiresRoots signal: {upward_messages:?}",
+	);
+}
+
 #[test]
 fn ensure_we_only_like_blockchains() {
 	sp_tracing::try_init_simple();

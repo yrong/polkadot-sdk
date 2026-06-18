@@ -45,6 +45,7 @@ sp-version = { workspace = true }
 
 # Polkadot
 polkadot-primitives = { workspace = true }
+polkadot-parachain-primitives = { workspace = true }
 
 # Cumulus
 cumulus-pallet-aura-ext = { workspace = true }
@@ -83,6 +84,7 @@ std = [
 	"pallet-transaction-payment/std",
 	"pallet-utility/std",
 	"parachain-info/std",
+	"polkadot-parachain-primitives/std",
 	"polkadot-primitives/std",
 	"scale-info/std",
 	"serde_json/std",

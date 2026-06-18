@@ -411,6 +411,18 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	type SelfParaId = parachain_info::Pallet<Runtime>;
 	type RuntimeEvent = RuntimeEvent;
 	type OnSystemEvent = TestPallet;
+	// Emit a `RequiresRoots` UMP signal from the pending test requires set (if any),
+	// so the late-block-proof `validate_block` test can exercise the transform.
+	fn speculative_extension(
+	) -> Option<polkadot_parachain_primitives::primitives::ValidationResultExtension> {
+		let requires = test_pallet::PendingSpeculativeRequires::<Runtime>::get();
+		(!requires.is_empty()).then(|| {
+			polkadot_parachain_primitives::primitives::ValidationResultExtension::V4 {
+				provides: None,
+				requires,
+			}
+		})
+	}
 	type OutboundXcmpMessageSource = TestPallet;
 	// Ignore all DMP messages by enqueueing them into `()`:
 	type DmpQueue = frame_support::traits::EnqueueWithOrigin<(), sp_core::ConstU8<0>>;
