@@ -27,7 +27,7 @@
 //! since the relay chain never decodes them. See
 //! `docs/speculative-messaging-impl-design.md`.
 
-use cumulus_primitives_spec_messaging::commitment_set::CommitmentSet;
+use super::commitment_set::CommitmentSet;
 
 /// The API version at which speculative messaging support was introduced.
 /// Collators and runtimes use this to gate speculative field population.

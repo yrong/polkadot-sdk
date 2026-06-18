@@ -19,28 +19,27 @@
 //! Speculative Messaging lets parachains exchange messages without waiting for
 //! full relay-chain confirmation. Each sender parachain accumulates its outgoing
 //! messages per destination into a Merkle Mountain Range (MMR) and commits the
-//! per-destination roots into a [`CommitmentSet`]. The relay chain then matches
-//! sender commitments against receiver expectations, allowing both sides to
-//! process messages speculatively and confirm them after the fact.
+//! per-destination roots into a commitment set (`polkadot_primitives::v9::
+//! CommitmentSet` — relay-visible, so it lives in `polkadot-primitives`). The relay
+//! chain then matches sender commitments against receiver expectations, allowing
+//! both sides to process messages speculatively and confirm them after the fact.
+//!
+//! This crate holds the **parachain-side** primitives that build those
+//! commitments and the off-chain wire types.
 //!
 //! # Key types
 //!
-//! - [`commitment_set::CommitmentSet`] — a sorted, bounded map from [`ParaId`] to MMR-root
-//!   [`Hash`], representing one block's worth of commitments.
 //! - [`outgoing_message::OutgoingMessage`] — a single outgoing message; call
 //!   [`outgoing_message::OutgoingMessage::hash_leaf`] to obtain the MMR leaf hash.
 //! - [`mmr::SpecMerge`] — the domain-tagged `mmr_lib::Merge` that backs the per-destination MMR;
 //!   [`mmr::root_from_peaks`] derives a subtree root from peaks-only state. Inclusion and ancestry
 //!   proofs come from `mmr_lib` itself.
-//!
-//! [`ParaId`]: polkadot_parachain_primitives::primitives::Id
-//! [`Hash`]: polkadot_core_primitives::Hash
+//! - [`message`] — the off-chain wire types (`MessageBatch`, `LateBlockProof`, …).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-pub mod commitment_set;
 pub mod message;
 pub mod mmr;
 pub mod outgoing_message;

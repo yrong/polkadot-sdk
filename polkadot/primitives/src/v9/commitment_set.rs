@@ -1,18 +1,27 @@
 // Copyright (C) Parity Technologies (UK) Ltd.
-// This file is part of Cumulus.
-// SPDX-License-Identifier: Apache-2.0
+// This file is part of Polkadot.
 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Polkadot is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// Polkadot is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
+
+//! The canonical commitment set used by speculative messaging.
+//!
+//! `CommitmentSet` is *relay-visible*: it is embedded in `CandidateCommitments`
+//! (as `provides`/`requires`) and matched by the relay chain, so it lives here in
+//! `polkadot-primitives` (rather than in the parachain-side
+//! `cumulus-primitives-spec-messaging`, which would otherwise force a
+//! `polkadot -> cumulus` dependency). The parachain off-chain types and the MMR
+//! primitives that *build* these commitments live in that crate.
 
 use alloc::vec::Vec;
 use polkadot_core_primitives::Hash;
@@ -58,6 +67,7 @@ impl<const N: u32> codec::Decode for CommitmentSet<N> {
 }
 
 impl<const N: u32> CommitmentSet<N> {
+	/// The committed hash for `para_id`, if present (O(log n) lookup).
 	pub fn get(&self, para_id: ParaId) -> Option<&Hash> {
 		self.0
 			.binary_search_by_key(&para_id, |(id, _)| *id)
@@ -65,14 +75,17 @@ impl<const N: u32> CommitmentSet<N> {
 			.map(|idx| &self.0[idx].1)
 	}
 
+	/// The number of entries in the set.
 	pub fn len(&self) -> usize {
 		self.0.len()
 	}
 
+	/// Whether the set has no entries.
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()
 	}
 
+	/// Iterate the `(ParaId, Hash)` entries in ascending `ParaId` order.
 	pub fn iter(&self) -> impl Iterator<Item = &(ParaId, Hash)> {
 		self.0.iter()
 	}

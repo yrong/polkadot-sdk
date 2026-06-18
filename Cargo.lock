@@ -17192,7 +17192,6 @@ version = "7.0.0"
 dependencies = [
  "bitvec",
  "bounded-collections 0.3.2",
- "cumulus-primitives-spec-messaging",
  "hex-literal",
  "log",
  "parity-scale-codec",

@@ -72,9 +72,11 @@ mod signed;
 pub use signed::{EncodeAs, Signed, UncheckedSigned};
 
 pub mod async_backing;
+pub mod commitment_set;
 pub mod executor_params;
 pub mod slashing;
 pub mod speculative;
+pub use commitment_set::{CommitmentError, CommitmentSet};
 pub use speculative::{
 	ProvidesCommitment, RequiresCommitment, MAX_DESTINATIONS_PER_BLOCK, MAX_SOURCES_PER_BLOCK,
 	SPECULATIVE_API_VERSION,
