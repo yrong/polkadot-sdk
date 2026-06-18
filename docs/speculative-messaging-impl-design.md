@@ -64,8 +64,8 @@ deferred to section 12.
 >    non-empty peak set.)
 
 > **Design revision (2026-06-18) — UMP-signal transport + provides window.**
-> The relay side was migrated to the parity-team design. **Full task breakdown,
-> dependencies, and status: [speculative-messaging-window-migration-plan.md](speculative-messaging-window-migration-plan.md).**
+> The relay side was migrated to the parity-team design (issues #12347/#12349); the
+> migration is complete and the decisions below capture the final model.
 > The sections below that describe `CandidateCommitments.provides/requires`,
 > a single `ProvidesRoots[source]` entry, or `apply_messaging_proofs` mutating a
 > `ValidationResultExtension` are **superseded** by:
@@ -746,9 +746,8 @@ Legend: ☐ not started · ◐ partial · ☑ done
 > replaced by the UMP-signal transport (`ProvidesRoots`/`RequiresRoots` signals,
 > fields removed) and the bounded provides **window** (`LatestProvides`, membership
 > matching, `evict_provides_after`). LBP now transforms the `RequiresRoots` signal
-> via the shared `apply_late_block_proofs`. Live status, per-task files, and
-> remaining items (C2 fetch optimization, D2 e2e) are tracked in
-> [speculative-messaging-window-migration-plan.md](speculative-messaging-window-migration-plan.md).
+> via the shared `apply_late_block_proofs`, and the collator fetches a proof only
+> when its batch root is outside the relay window (`provides_window` runtime API).
 > `ValidationResultExtension` is retained only as the `speculative_extension()`
 > hook's carrier (it emits the UMP signals during block execution).
 
