@@ -102,14 +102,16 @@ Status: ☐ not started · ◐ in progress · ☑ done
   dead `ValidationResult.speculative` field + `TrailingOption` plumbing; tests
   rewritten against the UMP-signal entry point. `ValidationResultExtension` is kept
   only as the `speculative_extension()` hook's carrier (emits the signals in A3).
-- **C2 (#24)** ◐ ← C1 — **Done:** the collator (`collator/src/service.rs`) calls the
-  identical `apply_late_block_proofs` on its signals before computing commitments, so
-  the PVF and collator produce byte-for-byte equal `upward_messages` (bad proof →
-  hash mismatch → rejected). **Deferred (follow-up):** window-aware *fetch* — only
-  skip an LBP when the batch root is anywhere in the window (not just the latest);
-  needs a `provides_window` runtime API threaded through `RelayChainInterface`
-  (RPC/in-process/mocks). Current `speculative_ingress` targets the relay's latest
-  provides root and remains correct under the window.
+- **C2 (#24)** ☑ ← C1 — Two parts, both done: (a) the collator
+  (`collator/src/service.rs`) calls the identical `apply_late_block_proofs` on its
+  signals before computing commitments, so the PVF and collator produce byte-for-byte
+  equal `upward_messages` (bad proof → hash mismatch → rejected); (b) **window-aware
+  fetch** — added a `provides_window(source, dest) -> Vec<Hash>` runtime API (inclusion
+  helper + `vstaging` impl + rococo/westend) threaded through `RelayChainInterface`
+  (trait + blanket + in-process + RPC + 4 mocks). `speculative_ingress` now fetches the
+  window and skips the LBP whenever the batch root is **anywhere in the window** (builds
+  at the newest window root by preference), only fetching an LBP when the batch root is
+  older than the whole window.
 
 ### Phase D/E — Tests + docs
 - **D1 (#25)** ☑ — Added relay isolation tests: `inclusion/tests.rs` — window matches

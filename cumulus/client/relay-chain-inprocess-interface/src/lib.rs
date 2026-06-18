@@ -116,6 +116,18 @@ impl RelayChainInterface for RelayChainInProcessInterface {
 		Ok(self.full_client.runtime_api().provides_root(relay_parent, para_id)?)
 	}
 
+	async fn provides_window(
+		&self,
+		source: ParaId,
+		destination: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Vec<PHash>> {
+		Ok(self
+			.full_client
+			.runtime_api()
+			.provides_window(relay_parent, source, destination)?)
+	}
+
 	async fn header(&self, block_id: BlockId) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,

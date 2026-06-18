@@ -96,6 +96,19 @@ impl RelayChainInterface for RelayChainRpcInterface {
 		Ok(Decode::decode(&mut &response[..])?)
 	}
 
+	async fn provides_window(
+		&self,
+		source: ParaId,
+		destination: ParaId,
+		relay_parent: RelayHash,
+	) -> RelayChainResult<Vec<RelayHash>> {
+		let payload = (source, destination).encode();
+		let response = self
+			.call_runtime_api("ParachainHost_provides_window", relay_parent, &payload)
+			.await?;
+		Ok(Decode::decode(&mut &response[..])?)
+	}
+
 	async fn header(&self, block_id: BlockId) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,

@@ -348,5 +348,12 @@ sp_api::decl_runtime_apis! {
 		/// set) for a parachain (Phase 1).
 		#[api_version(17)]
 		fn provides_root(para_id: ppp::Id) -> Option<ProvidesCommitment>;
+
+		/// Read the provides window — the recent subtree roots `source` committed for
+		/// `destination` (Phase 1). A receiver's `requires` matches if its root is
+		/// present in this window, so the collator only needs a Late Block Proof when its
+		/// batch root is absent here.
+		#[api_version(17)]
+		fn provides_window(source: ppp::Id, destination: ppp::Id) -> Vec<Hash>;
 	}
 }

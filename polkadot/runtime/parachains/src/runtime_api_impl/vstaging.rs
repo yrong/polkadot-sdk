@@ -58,3 +58,12 @@ pub fn provides_root<T: crate::inclusion::Config>(
 ) -> Option<polkadot_primitives::v9::ProvidesCommitment> {
 	crate::inclusion::Pallet::<T>::provides(&para_id)
 }
+
+/// Implementation of `provides_window` runtime API. Returns the recent subtree roots
+/// `source` committed for `destination` (oldest first).
+pub fn provides_window<T: crate::inclusion::Config>(
+	source: ParaId,
+	destination: ParaId,
+) -> Vec<polkadot_primitives::Hash> {
+	crate::inclusion::Pallet::<T>::provides_window(source, destination)
+}

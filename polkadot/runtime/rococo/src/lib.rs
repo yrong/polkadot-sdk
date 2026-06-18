@@ -2193,6 +2193,10 @@ sp_api::impl_runtime_apis! {
 		fn provides_root(para_id: ParaId) -> Option<polkadot_primitives::v9::ProvidesCommitment> {
 			parachains_staging_runtime_api_impl::provides_root::<Runtime>(para_id)
 		}
+
+		fn provides_window(source: ParaId, destination: ParaId) -> Vec<Hash> {
+			parachains_staging_runtime_api_impl::provides_window::<Runtime>(source, destination)
+		}
 	}
 
 	#[api_version(6)]

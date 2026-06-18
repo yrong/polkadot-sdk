@@ -132,6 +132,15 @@ impl RelayChainInterface for DummyRelayChainInterface {
 		unimplemented!("Not needed for test")
 	}
 
+	async fn provides_window(
+		&self,
+		_: ParaId,
+		_: ParaId,
+		_: PHash,
+	) -> RelayChainResult<Vec<PHash>> {
+		unimplemented!("Not needed for test")
+	}
+
 	async fn retrieve_dmq_contents(
 		&self,
 		_: ParaId,

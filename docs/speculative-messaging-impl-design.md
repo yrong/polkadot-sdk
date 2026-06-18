@@ -101,7 +101,10 @@ deferred to section 12.
 >    so the resulting `upward_messages` — and the commitments hash — agree
 >    byte-for-byte (a bad proof is rejected by the hash check). This keeps §6.2's
 >    two-phase model; only the transform *target* changed (UMP signal, not the
->    removed extension).
+>    removed extension). The collator is **window-aware**: a `provides_window(source,
+>    dest)` runtime API (threaded through `RelayChainInterface`) lets
+>    `speculative_ingress` skip the LBP whenever the batch root is already in the
+>    relay window, fetching a proof only when it is older than the whole window.
 
 ### Why UMP signals, not a `CandidateCommitments` field?
 

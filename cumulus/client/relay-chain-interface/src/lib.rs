@@ -160,6 +160,16 @@ pub trait RelayChainInterface: Send + Sync {
 		relay_parent: PHash,
 	) -> RelayChainResult<Option<cumulus_primitives_core::relay_chain::v9::ProvidesCommitment>>;
 
+	/// Fetch the relay-side provides window — the recent subtree roots `source`
+	/// committed for `destination`. A receiver's batch root only needs a Late Block
+	/// Proof when it is absent from this window.
+	async fn provides_window(
+		&self,
+		source: ParaId,
+		destination: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Vec<PHash>>;
+
 	/// Yields the persisted validation data for the given `ParaId` along with an assumption that
 	/// should be used if the para currently occupies a core.
 	///
@@ -296,6 +306,15 @@ where
 		relay_parent: PHash,
 	) -> RelayChainResult<Option<cumulus_primitives_core::relay_chain::v9::ProvidesCommitment>> {
 		(**self).provides_root(para_id, relay_parent).await
+	}
+
+	async fn provides_window(
+		&self,
+		source: ParaId,
+		destination: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Vec<PHash>> {
+		(**self).provides_window(source, destination, relay_parent).await
 	}
 
 	async fn persisted_validation_data(

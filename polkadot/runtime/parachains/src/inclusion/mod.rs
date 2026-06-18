@@ -986,6 +986,19 @@ impl<T: Config> Pallet<T> {
 			.any(|entry| entry.root == *root)
 	}
 
+	/// The provides window (recent subtree roots, oldest first) that `source` committed
+	/// for `destination`. Used by the `provides_window` runtime API so collators can skip
+	/// a Late Block Proof when their batch root is already in the window.
+	pub(crate) fn provides_window(
+		source: polkadot_primitives::Id,
+		destination: polkadot_primitives::Id,
+	) -> Vec<polkadot_primitives::Hash> {
+		LatestProvides::<T>::get(source, destination)
+			.iter()
+			.map(|entry| entry.root)
+			.collect()
+	}
+
 	/// Returns true when every requirement of `receiver` is present in the
 	/// corresponding source's provides window for `receiver`.
 	pub(crate) fn requires_satisfied(

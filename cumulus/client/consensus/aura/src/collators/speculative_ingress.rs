@@ -123,40 +123,37 @@ where
 
 		let sender_best = sender.best_block_hash();
 
-		// Fetch the relay's committed provides commitment for this source and look up
-		// our (the receiver's) subtree root in it. `None` means the sender has not
-		// yet been relay-enacted, or has not committed messages to us.
-		let relay_subtree_root: Option<Hash> = relay_client
-			.provides_root(*source, relay_parent)
+		// Fetch the relay's provides *window* for this `(source -> us)` pair: the recent
+		// subtree roots the relay will accept (issue #12349). An empty window means the
+		// sender has not yet been relay-enacted, or has not committed messages to us.
+		let window: Vec<Hash> = relay_client
+			.provides_window(*source, destination, relay_parent)
 			.await
-			.ok()
-			.flatten()
-			.and_then(|set| set.get(destination).copied())
-			.filter(|r| *r != Hash::default());
+			.unwrap_or_default()
+			.into_iter()
+			.filter(|r| *r != Hash::default())
+			.collect();
 
-		// Pick a sender block for batch fetch. Prefer the block matching the relay's
-		// committed subtree root so the batch lands on a relay-known root; otherwise
-		// fall back to the sender's best, which may have advanced past the relay.
+		// The newest window root is the preferred build/transform target — it is the
+		// most recent root the relay knows and the most likely to still be in the window
+		// at enactment.
+		let newest_root = window.last().copied();
+
+		// Prefer building the batch at the sender block that produced the newest window
+		// root, so it lands on a relay-known root (no proof needed). Otherwise fall back
+		// to the sender's best, which may be behind or ahead of the window.
 		let mut fetch_at = sender_best;
-		let mut fetch_at_root: Option<Hash> = None;
-		if let Some(relay_root) = relay_subtree_root {
-			tracing::debug!(
-				target: "aura::cumulus",
-				source = ?source,
-				?relay_root,
-				"looking up sender block for relay-committed subtree root",
-			);
-			if let Some(at_relay) =
-				sender.block_hash_for_subtree_root(sender_best, destination, relay_root).await
+		if let Some(target) = newest_root {
+			if let Some(at_target) =
+				sender.block_hash_for_subtree_root(sender_best, destination, target).await
 			{
-				fetch_at = at_relay;
-				fetch_at_root = Some(relay_root);
+				fetch_at = at_target;
 			} else {
 				tracing::debug!(
 					target: "aura::cumulus",
 					source = ?source,
-					?relay_root,
-					"could not find sender block for relay subtree root; using sender best",
+					?target,
+					"no sender block for newest window root; using sender best",
 				);
 			}
 		}
@@ -184,71 +181,58 @@ where
 			},
 		};
 
-		// Determine whether the batch needs a late block proof. The PVF requires an
-		// LBP whenever the batch's `subtree_root` differs from the relay-committed
-		// current subtree root for this receiver: the LBP authorizes the runtime-side
-		// `requires[source]` entry to be transformed from `old → new` so the relay's
-		// `requires_satisfied` check passes at enactment.
-		match (relay_subtree_root, fetch_at_root) {
-			(Some(relay_root), Some(matched)) if matched == batch.subtree_root => {
-				// Batch is built against the relay-current subtree root. No LBP needed.
-				let _ = relay_root;
-				tracing::debug!(
-					target: "aura::cumulus",
-					source = ?source,
-					messages = batch.messages.len(),
-					subtree_root = ?batch.subtree_root,
-					"fetched speculative batch (no LBP required)",
-				);
-				batches.push(batch);
-			},
-			(Some(relay_root), _) => {
-				// Batch is built against an older subtree root than the relay knows about.
-				// Fetch an LBP from the sender at the block that produced the relay's
-				// current root, proving the batch's root is an ancestor of relay_root.
-				let lbp_at = sender
-					.block_hash_for_subtree_root(sender_best, destination, relay_root)
-					.await
-					.unwrap_or(sender_best);
-				match sender
-					.generate_late_block_proof(lbp_at, destination, batch.subtree_root)
-					.await
-				{
-					Some(proof) => {
-						tracing::debug!(
-							target: "aura::cumulus",
-							source = ?source,
-							messages = batch.messages.len(),
-							batch_subtree_root = ?batch.subtree_root,
-							?relay_root,
-							"fetched speculative batch + late block proof",
-						);
-						batches.push(batch);
-						late_block_proofs.push(proof);
-					},
-					None => {
-						tracing::warn!(
-							target: "aura::cumulus",
-							source = ?source,
-							batch_subtree_root = ?batch.subtree_root,
-							?relay_root,
-							"could not generate late block proof; skipping batch",
-						);
-					},
-				}
-			},
-			(None, _) => {
-				// Relay has no committed subtree root for this receiver yet (sender
-				// hasn't been relay-enacted, or hasn't sent to us). Without a relay
-				// anchor, the receiver cannot pass requires_satisfied at inclusion
-				// time. Skip this batch — see the root guard discussion in the design doc.
-				tracing::debug!(
-					target: "aura::cumulus",
-					source = ?source,
-					batch_subtree_root = ?batch.subtree_root,
-					"root guard: relay has not committed a subtree root for us; skipping batch",
-				);
-			},
+		// Window-aware Late Block Proof decision (issue #12349):
+		// - batch root already in the window → the relay matches it directly, no proof.
+		// - batch root older than the window → fetch an LBP proving it extends to the newest window
+		//   root, so the relay transforms `requires` and matches (§6.2).
+		// - empty window → no relay anchor; skip (root guard).
+		if window.contains(&batch.subtree_root) {
+			tracing::debug!(
+				target: "aura::cumulus",
+				source = ?source,
+				messages = batch.messages.len(),
+				subtree_root = ?batch.subtree_root,
+				"fetched speculative batch (root in window, no LBP required)",
+			);
+			batches.push(batch);
+		} else if let Some(target) = newest_root {
+			let lbp_at = sender
+				.block_hash_for_subtree_root(sender_best, destination, target)
+				.await
+				.unwrap_or(sender_best);
+			match sender.generate_late_block_proof(lbp_at, destination, batch.subtree_root).await {
+				Some(proof) => {
+					tracing::debug!(
+						target: "aura::cumulus",
+						source = ?source,
+						messages = batch.messages.len(),
+						batch_subtree_root = ?batch.subtree_root,
+						?target,
+						"fetched speculative batch + late block proof (out of window)",
+					);
+					batches.push(batch);
+					late_block_proofs.push(proof);
+				},
+				None => {
+					tracing::warn!(
+						target: "aura::cumulus",
+						source = ?source,
+						batch_subtree_root = ?batch.subtree_root,
+						?target,
+						"could not generate late block proof; skipping batch",
+					);
+				},
+			}
+		} else {
+			// Empty window: the relay has no committed subtree root for us yet, so the
+			// receiver cannot pass `requires_satisfied` at inclusion. Skip the batch —
+			// see the root guard discussion in the design doc.
+			tracing::debug!(
+				target: "aura::cumulus",
+				source = ?source,
+				batch_subtree_root = ?batch.subtree_root,
+				"root guard: relay window is empty; skipping batch",
+			);
 		}
 	}
 
