@@ -3397,6 +3397,52 @@ pub mod tests {
 	}
 
 	#[test]
+	fn ump_signals_extracts_provides_and_requires_roots() {
+		let provides =
+			ProvidesCommitment::try_from_iter([(Id::from(1u32), Hash::repeat_byte(1))]).unwrap();
+		let requires =
+			RequiresCommitment::try_from_iter([(Id::from(2u32), Hash::repeat_byte(2))]).unwrap();
+
+		let upward_messages = alloc::vec![
+			UMP_SEPARATOR,
+			UMPSignal::ProvidesRoots(provides.clone()).encode(),
+			UMPSignal::RequiresRoots(requires.clone()).encode(),
+		];
+
+		let commitments = CandidateCommitments {
+			upward_messages: upward_messages.try_into().unwrap(),
+			..Default::default()
+		};
+
+		let signals = commitments.ump_signals().expect("valid signals");
+		assert_eq!(signals.provides_roots(), Some(&provides));
+		assert_eq!(signals.requires_roots(), Some(&requires));
+	}
+
+	#[test]
+	fn ump_signals_rejects_more_than_max_signals() {
+		// One of every variant (== `MAX_UMP_SIGNALS`) plus one extra is rejected.
+		let upward_messages = alloc::vec![
+			UMP_SEPARATOR,
+			UMPSignal::SelectCore(CoreSelector(0), ClaimQueueOffset(0)).encode(),
+			UMPSignal::ApprovedPeer(Default::default()).encode(),
+			UMPSignal::ProvidesRoots(ProvidesCommitment::default()).encode(),
+			UMPSignal::RequiresRoots(RequiresCommitment::default()).encode(),
+			UMPSignal::SelectCore(CoreSelector(1), ClaimQueueOffset(1)).encode(),
+		];
+
+		let commitments = CandidateCommitments {
+			upward_messages: upward_messages.try_into().unwrap(),
+			..Default::default()
+		};
+
+		assert_eq!(
+			commitments.ump_signals(),
+			Err(CommittedCandidateReceiptError::TooManyUMPSignals)
+		);
+	}
+
+	#[test]
 	fn group_for_core_is_core_for_group() {
 		for cores in 1..=256 {
 			for rotations in 0..(cores * 2) {

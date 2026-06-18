@@ -60,6 +60,44 @@ deferred to section 12.
 >    proofs verify against it). PR #12368's single-shot `merge_peaks` bagging is
 >    replaced by `mmr_lib`-consistent pairwise bagging.
 
+> **Design revision (2026-06-18) — UMP-signal transport + provides window.**
+> The relay side was migrated to the parity-team design. **Full task breakdown,
+> dependencies, and status: [speculative-messaging-window-migration-plan.md](speculative-messaging-window-migration-plan.md).**
+> The sections below that describe `CandidateCommitments.provides/requires`,
+> a single `ProvidesRoots[source]` entry, or `apply_messaging_proofs` mutating a
+> `ValidationResultExtension` are **superseded** by:
+>
+> 4. **Provides/requires travel as UMP signals, not `CandidateCommitments` fields**
+>    ([#12347](https://github.com/paritytech/polkadot-sdk/issues/12347)). Block
+>    execution emits `UMPSignal::ProvidesRoots(CommitmentSet)` /
+>    `RequiresRoots(CommitmentSet)` into `upward_messages` (so they are covered by
+>    the commitments hash); the relay reads them via `CandidateCommitments::
+>    ump_signals()`. The `provides`/`requires` fields and the
+>    `ValidationResult.speculative` extension field are **removed**. Migration
+>    safety: a candidate carrying speculative UMP signals is dropped while the
+>    `SpeculativeMessaging` node-feature is off, and the feature must reach ⅔ of
+>    validators before enabling (older validators reject extra signals with
+>    `TooManyUMPSignals`).
+> 5. **The relay keeps a bounded provides *window***
+>    ([#12349](https://github.com/paritytech/polkadot-sdk/issues/12349)).
+>    `LatestProvides: (source, dest) → BoundedVec<ProvidesEntry{root, block},
+>    SPECULATIVE_PROVIDES_WINDOW>` replaces the single latest root. A `requires`
+>    matches if its root is **present anywhere in the window** (membership), so a
+>    slightly-stale-but-recent root matches with no proof. The window is populated
+>    at enactment from the `ProvidesRoots` signal, matched in
+>    `sanitize_backed_candidates`, and `evict_provides_after(revert_to)` drops
+>    entries from dispute-reverted blocks.
+> 6. **Late Block Proofs transform the `RequiresRoots` UMP signal** (kept as a
+>    *beyond-window* fallback). The shared
+>    `cumulus_primitives_spec_messaging::apply_late_block_proofs(signals, proofs)`
+>    rewrites `(source, old_root) → (source, new_root)` via
+>    `SpecMerge`/`verify_incremental`. Both the collator (before computing
+>    commitments) and the PVF (`validate_block`) call it on the identical signals,
+>    so the resulting `upward_messages` — and the commitments hash — agree
+>    byte-for-byte (a bad proof is rejected by the hash check). This keeps §6.2's
+>    two-phase model; only the transform *target* changed (UMP signal, not the
+>    removed extension).
+
 ---
 
 ## 1. Core Concept and End-to-End Workflow
@@ -650,6 +688,18 @@ Legend: ☐ not started · ◐ partial · ☑ done
 > crate: canonical `CommitmentSet` encoding, domain-tagged/versioned leaf hashing,
 > and a single shared MMR implementation (no collator-vs-PVF drift from duplicated
 > merge logic).
+
+> **Superseded by the 2026-06-18 window/UMP migration** (revisions 4–6 above):
+> rows **6** (single `ProvidesRoots[source]` + `get()` lookup) and **7**
+> (`ValidationResultExtension::V4` reconstruction into `CandidateCommitments`) are
+> replaced by the UMP-signal transport (`ProvidesRoots`/`RequiresRoots` signals,
+> fields removed) and the bounded provides **window** (`LatestProvides`, membership
+> matching, `evict_provides_after`). LBP now transforms the `RequiresRoots` signal
+> via the shared `apply_late_block_proofs`. Live status, per-task files, and
+> remaining items (C2 fetch optimization, D2 e2e) are tracked in
+> [speculative-messaging-window-migration-plan.md](speculative-messaging-window-migration-plan.md).
+> `ValidationResultExtension` is retained only as the `speculative_extension()`
+> hook's carrier (it emits the UMP signals during block execution).
 
 ---
 

@@ -3252,3 +3252,95 @@ fn speculative_requires_unsatisfied_when_source_has_no_persisted_root() {
 		assert!(!ParaInclusion::requires_satisfied(receiver, &requires));
 	});
 }
+
+/// Commit a single `(receiver -> root)` provides entry for `source` at the current block.
+fn commit_provides(source: ParaId, receiver: ParaId, root: Hash) {
+	ParaInclusion::update_provides(
+		source,
+		ProvidesCommitment::try_from_iter([(receiver, root)]).unwrap(),
+	);
+}
+
+#[test]
+fn speculative_provides_window_matches_any_recent_root() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+		let (old, new) = (Hash::from_low_u64_be(1), Hash::from_low_u64_be(2));
+
+		// Two roots committed in consecutive blocks; both remain in the window.
+		frame_system::Pallet::<Test>::set_block_number(1);
+		commit_provides(source, receiver, old);
+		frame_system::Pallet::<Test>::set_block_number(2);
+		commit_provides(source, receiver, new);
+
+		// A requirement matches the older *or* the newer root (window membership).
+		for root in [old, new] {
+			let requires = RequiresCommitment::try_from_iter([(source, root)]).unwrap();
+			assert!(ParaInclusion::requires_satisfied(receiver, &requires));
+		}
+		// `provides()` reconstructs the latest root per destination.
+		assert_eq!(ParaInclusion::provides(&source).unwrap().get(receiver), Some(&new));
+	});
+}
+
+#[test]
+fn speculative_provides_window_is_bounded_and_evicts_oldest() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+		let window = SPECULATIVE_PROVIDES_WINDOW;
+
+		// Push `window + 2` distinct roots, one per block.
+		for i in 1..=(window + 2) {
+			frame_system::Pallet::<Test>::set_block_number(i);
+			commit_provides(source, receiver, Hash::from_low_u64_be(i as u64));
+		}
+
+		// The two oldest roots fell out of the window.
+		assert!(!ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(1)));
+		assert!(!ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(2)));
+		// The newest `window` roots are still present.
+		assert!(ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(3)));
+		assert!(ParaInclusion::provides_contains(
+			source,
+			receiver,
+			&Hash::from_low_u64_be((window + 2) as u64)
+		));
+	});
+}
+
+#[test]
+fn speculative_evict_provides_after_drops_reverted_blocks() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		for i in 1..=3 {
+			frame_system::Pallet::<Test>::set_block_number(i);
+			commit_provides(source, receiver, Hash::from_low_u64_be(i as u64));
+		}
+
+		// Revert to block 2: the root enacted at block 3 is evicted, blocks 1–2 remain.
+		ParaInclusion::evict_provides_after(2);
+		assert!(ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(1)));
+		assert!(ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(2)));
+		assert!(!ParaInclusion::provides_contains(source, receiver, &Hash::from_low_u64_be(3)));
+	});
+}
+
+#[test]
+fn speculative_evict_provides_after_removes_emptied_window() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		frame_system::Pallet::<Test>::set_block_number(5);
+		commit_provides(source, receiver, Hash::from_low_u64_be(42));
+
+		// Reverting before the only entry empties the window entirely.
+		ParaInclusion::evict_provides_after(4);
+		assert!(ParaInclusion::provides(&source).is_none());
+		assert!(!LatestProvides::<Test>::contains_key(source, receiver));
+	});
+}

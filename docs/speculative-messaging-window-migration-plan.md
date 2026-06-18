@@ -111,14 +111,18 @@ Status: ☐ not started · ◐ in progress · ☑ done
   provides root and remains correct under the window.
 
 ### Phase D/E — Tests + docs
-- **D1 (#25)** ☐ — Relay isolation tests: window advances/bounds at `WINDOW_SIZE`,
-  `evict_provides_after` rolls back on revert, membership match (in/out-of-window),
-  feature-off drop, `UMPSignal` provides/requires encode/extract round-trip.
+- **D1 (#25)** ☑ — Added relay isolation tests: `inclusion/tests.rs` — window matches
+  any recent root, bounded eviction at `SPECULATIVE_PROVIDES_WINDOW`,
+  `evict_provides_after` drops reverted blocks + removes emptied windows;
+  `v9/mod.rs` tests — `ump_signals()` extracts `ProvidesRoots`/`RequiresRoots`
+  round-trip and rejects `> MAX_UMP_SIGNALS`. (9 tests, all green.) Feature-off drop
+  (B5) is exercised at integration level via `sanitize_backed_candidates`.
 - **D2 (#26)** ☐ ← C1 — E2E LBP-fallback test (out-of-window root matches after
   PVF transform) + re-verify spec-messaging crate + outbox/inbox + cumulus-test
   runtime WASM `validate_block_works`.
-- **E1 (#27)** ☐ — Update `docs/speculative-messaging-impl-design.md` to the
-  UMP/window model + the #12347 migration caveat; refresh the §3.6 tracker.
+- **E1 (#27)** ☑ — Added the "2026-06-18 — UMP-signal transport + provides window"
+  revision (decisions 4–6) to `speculative-messaging-impl-design.md`, pointing here;
+  annotated the §3.6 tracker that rows 6–7 are superseded by the window/UMP migration.
 
 ## Critical path
 `A1 → A3 → A4`; `A1,B1 → B2`; `B1 → B3 → C1 → D2`.
