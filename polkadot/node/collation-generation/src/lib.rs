@@ -617,22 +617,6 @@ async fn construct_and_distribute_receipt(
 
 	let erasure_root = erasure_root(n_validators, validation_data, pov.clone())?;
 
-	// `provides`/`requires` are already canonical `CommitmentSet`s on the
-	// collation (flat commitment), so they map straight into the candidate.
-	let provides = collation.provides;
-	let requires = collation.requires;
-	let has_speculative = provides.is_some() || !requires.is_empty();
-
-	gum::debug!(
-		target: LOG_TARGET,
-		?para_id,
-		?relay_parent,
-		?has_speculative,
-		n_provides = provides.as_ref().map(|p| p.len()).unwrap_or(0),
-		n_requires = requires.len(),
-		"speculative commitment fields for collation",
-	);
-
 	let commitments = CandidateCommitments {
 		upward_messages: collation.upward_messages,
 		horizontal_messages: collation.horizontal_messages,
@@ -640,9 +624,24 @@ async fn construct_and_distribute_receipt(
 		head_data: collation.head_data,
 		processed_downward_messages: collation.processed_downward_messages,
 		hrmp_watermark: collation.hrmp_watermark,
-		provides,
-		requires,
 	};
+
+	// Speculative messaging (issue #12347): a candidate participates if block
+	// execution emitted `ProvidesRoots`/`RequiresRoots` UMP signals into
+	// `upward_messages`. A malformed signal set is treated as non-speculative; it is
+	// rejected later by `parse_ump_signals`.
+	let has_speculative = commitments
+		.ump_signals()
+		.map(|s| s.provides_roots().is_some() || s.requires_roots().is_some())
+		.unwrap_or(false);
+
+	gum::debug!(
+		target: LOG_TARGET,
+		?para_id,
+		?relay_parent,
+		?has_speculative,
+		"speculative commitment detection for collation",
+	);
 
 	let node_features = request_node_features(relay_parent, session_index, sender).await.await??;
 	let speculative_enabled = FeatureIndex::SpeculativeMessaging.is_set(&node_features);

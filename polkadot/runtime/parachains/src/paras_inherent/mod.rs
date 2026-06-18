@@ -428,6 +428,7 @@ impl<T: Config> Pallet<T> {
 		// We don't care about fresh or not disputes
 		// this writes them to storage, so let's query it via those means
 		// if this fails for whatever reason, that's ok.
+		let was_frozen = T::DisputesHandler::is_frozen();
 		if let Err(e) =
 			T::DisputesHandler::process_checked_multi_dispute_data(&checked_disputes_sets)
 		{
@@ -436,6 +437,18 @@ impl<T: Config> Pallet<T> {
 		METRICS.on_disputes_imported(checked_disputes_sets.len() as u64);
 
 		set_scrapable_on_chain_disputes::<T>(current_session, checked_disputes_sets.clone());
+
+		// Speculative messaging: if importing the disputes above just froze the chain
+		// (a dispute concluded invalid against an included candidate), the relay chain
+		// reverts to `frozen_block()`. Evict provides-window entries enacted in the
+		// reverted blocks so they cannot satisfy a `requires` (issue #12349). The node
+		// also rolls this storage back via the state revert; this keeps the runtime's
+		// in-block view consistent.
+		if !was_frozen {
+			if let Some(revert_to) = T::DisputesHandler::frozen_block() {
+				inclusion::Pallet::<T>::evict_provides_after(revert_to);
+			}
+		}
 
 		if T::DisputesHandler::is_frozen() {
 			// Relay chain freeze, at this point we will not include any parachain blocks.
@@ -1028,6 +1041,24 @@ fn check_descriptor_version_and_signals<T: crate::inclusion::Config>(
 		return false;
 	}
 
+	// Speculative messaging migration safety (issue #12347): while the feature is
+	// disabled, reject any candidate that carries `ProvidesRoots`/`RequiresRoots` UMP
+	// signals. Otherwise such a candidate would silently populate the provides window
+	// at enactment even though no matching is performed.
+	if !speculative_enabled {
+		if let Ok(signals) = candidate.candidate().commitments.ump_signals() {
+			if signals.provides_roots().is_some() || signals.requires_roots().is_some() {
+				log::debug!(
+					target: LOG_TARGET,
+					"Dropping candidate {:?} for paraid {:?}: speculative UMP signals while feature disabled.",
+					candidate.candidate().hash(),
+					candidate.descriptor().para_id(),
+				);
+				return false;
+			}
+		}
+	}
+
 	if descriptor_version == CandidateDescriptorVersion::V1 {
 		// Nothing more to check for v1 descriptors.
 		return true;
@@ -1060,6 +1091,31 @@ fn check_descriptor_version_and_signals<T: crate::inclusion::Config>(
 	}
 
 	true
+}
+
+/// Speculative messaging (issue #12349): a V4 candidate's `requires` commitment —
+/// carried as the `RequiresRoots` UMP signal (issue #12347) — must be present in the
+/// relay-side provides window of each referenced source parachain. Returns `true`
+/// for non-V4 candidates and for candidates that carry no requirements.
+///
+/// Backing a candidate whose requirements are not in the window would just stall it
+/// until the availability timeout, so we drop it here and let the collator retry.
+fn speculative_requires_satisfied<T: crate::inclusion::Config>(
+	candidate: &BackedCandidate<T::Hash>,
+) -> bool {
+	if candidate.descriptor().version() != CandidateDescriptorVersion::V4 {
+		return true;
+	}
+
+	let receiver = candidate.descriptor().para_id();
+	match candidate.candidate().commitments.ump_signals() {
+		// `requires_roots()` borrows from the parsed signals; check it inline.
+		Ok(signals) => signals.requires_roots().map_or(true, |requires| {
+			crate::inclusion::Pallet::<T>::requires_satisfied(receiver, requires)
+		}),
+		// Malformed signal sets are already rejected by `parse_ump_signals` above.
+		Err(_) => true,
+	}
 }
 
 /// Performs various filtering on the backed candidates inherent data.
@@ -1123,6 +1179,19 @@ fn sanitize_backed_candidates<T: crate::inclusion::Config>(
 			v3_enabled,
 			speculative_enabled,
 		) {
+			continue;
+		}
+
+		// Speculative messaging: drop a V4 candidate whose `requires` are not in the
+		// relay-side provides window (issue #12349). Only enforced when the feature is
+		// enabled; with it off, V4 candidates are already rejected by version gating.
+		if speculative_enabled && !speculative_requires_satisfied::<T>(&candidate) {
+			log::debug!(
+				target: LOG_TARGET,
+				"Dropping V4 candidate {:?} for paraid {:?}: requires not in provides window.",
+				candidate.candidate().hash(),
+				candidate.descriptor().para_id(),
+			);
 			continue;
 		}
 

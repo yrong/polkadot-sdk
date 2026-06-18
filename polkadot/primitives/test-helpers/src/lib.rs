@@ -24,7 +24,6 @@
 //! contain randomness based data.
 use codec::{Decode, Encode};
 use polkadot_primitives::{
-	v9::{ProvidesCommitment, RequiresCommitment},
 	AppVerify, CandidateCommitments, CandidateDescriptorV2, CandidateHash, CandidateReceiptV2,
 	CollatorId, CollatorSignature, CommittedCandidateReceiptV2, CoreIndex, Hash, HashT, HeadData,
 	Id, Id as ParaId, MutateDescriptorV2, PersistedValidationData, SessionIndex, ValidationCode,
@@ -377,8 +376,6 @@ pub fn dummy_candidate_commitments(head_data: impl Into<Option<HeadData>>) -> Ca
 		horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0_u32,
-		provides: None,
-		requires: Default::default(),
 	}
 }
 
@@ -536,8 +533,6 @@ pub fn make_candidate(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
-		provides: None,
-		requires: Default::default(),
 	};
 
 	let mut candidate =
@@ -569,8 +564,6 @@ pub fn make_candidate_v2(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
-		provides: None,
-		requires: Default::default(),
 	};
 
 	let mut descriptor = dummy_candidate_descriptor_v2(relay_parent_hash);
@@ -600,8 +593,6 @@ pub fn make_candidate_v3(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: relay_parent_number,
-		provides: None,
-		requires: Default::default(),
 	};
 
 	let descriptor = CandidateDescriptorV2::new_v3(
@@ -736,20 +727,7 @@ pub fn dummy_candidate_commitments_speculative(
 		horizontal_messages: vec![].try_into().expect("empty vec fits within bounds"),
 		processed_downward_messages: 0,
 		hrmp_watermark: 0_u32,
-		provides: None,
-		requires: Default::default(),
 	}
-}
-
-/// Create a dummy (empty) provides commitment.
-pub fn dummy_provides_commitment() -> ProvidesCommitment {
-	ProvidesCommitment::default()
-}
-
-/// Create a single-entry requires commitment for `(source, expected_root)`.
-pub fn dummy_requires_commitment(source: ParaId, expected_root: Hash) -> RequiresCommitment {
-	RequiresCommitment::try_from_iter([(source, expected_root)])
-		.expect("single entry is a valid commitment set; qed")
 }
 
 /// After manually modifying the candidate descriptor, resign with a defined collator key.

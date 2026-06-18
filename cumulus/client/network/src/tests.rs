@@ -82,8 +82,6 @@ fn dummy_candidate() -> CommittedCandidateReceiptV2 {
 			head_data: HeadData(Vec::new()),
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		},
 	}
 }

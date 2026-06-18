@@ -361,28 +361,59 @@ pub mod pallet {
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
-	// ── Phase 1 Speculative Messaging (POC) ─────────────────────────────────────
+	// ── Phase 1 Speculative Messaging ───────────────────────────────────────────
 	//
 	// These storage items implement the relay-chain side of inclusion-based
-	// speculative messaging (design doc: docs/speculative-messaging-impl-design.md).
+	// speculative messaging (design doc: docs/speculative-messaging-impl-design.md
+	// and docs/speculative-messaging-window-migration-plan.md).
 	//
-	// ProvidesRoots  — one hash per parachain, updated at enactment. The relay
-	//                  chain only ever stores the latest provides root; old roots
-	//                  are overwritten. No history is kept.
+	// LatestProvides — a bounded *window* of recent provides roots per
+	//                  `(source, destination)` pair (issue #12349). A receiver's
+	//                  `requires` root matches when it is present anywhere in the
+	//                  window, so a slightly-stale-but-recent provides root still
+	//                  matches without a Late Block Proof. Entries are tagged with
+	//                  the relay block at which they were enacted so they can be
+	//                  evicted on dispute-driven reverts.
 	// ─────────────────────────────────────────────────────────────────────────────
 
-	/// Latest provides commitment per parachain for speculative messaging (Phase 1).
-	/// The flat `(destination, subtree_root)` set; the relay chain looks up a
-	/// receiver's entry by ParaId to match a `requires` commitment.
+	/// Provides window per `(source, destination)` for speculative messaging.
+	/// Newest entry last; capped at [`SPECULATIVE_PROVIDES_WINDOW`]. A receiver's
+	/// `requires` root matches when it is *present* in the window.
 	#[pallet::storage]
-	pub(crate) type ProvidesRoots<T: Config> =
-		StorageMap<_, Twox64Concat, polkadot_primitives::Id, ProvidesCommitment>;
+	pub(crate) type LatestProvides<T: Config> = StorageDoubleMap<
+		_,
+		Twox64Concat,
+		polkadot_primitives::Id,
+		Twox64Concat,
+		polkadot_primitives::Id,
+		BoundedVec<ProvidesEntry<BlockNumberFor<T>>, ConstU32<SPECULATIVE_PROVIDES_WINDOW>>,
+		ValueQuery,
+	>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
 }
 
 const LOG_TARGET: &str = "runtime::inclusion";
+
+/// Size of the relay-side provides window kept per `(source, destination)` pair.
+///
+/// The relay chain remembers the most recent `SPECULATIVE_PROVIDES_WINDOW` provides
+/// roots so a receiver's `requires` can match a slightly-stale-but-recent root
+/// without a Late Block Proof (issue #12349). Larger windows tolerate more lag
+/// between sender and receiver at the cost of more storage per pair.
+pub const SPECULATIVE_PROVIDES_WINDOW: u32 = 8;
+
+/// One recorded provides root in the relay-side window, tagged with the relay block
+/// at which it was enacted. The block tag lets [`Pallet::evict_provides_after`]
+/// drop entries that came from blocks reverted by a dispute.
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen, PartialEq, Eq, Debug)]
+pub struct ProvidesEntry<BlockNumber> {
+	/// The committed per-destination subtree root.
+	pub root: polkadot_primitives::Hash,
+	/// The relay block number at which this provides root was enacted.
+	pub block: BlockNumber,
+}
 
 /// The reason that a candidate's outputs were rejected for.
 #[derive(Debug)]
@@ -589,12 +620,18 @@ impl<T: Config> Pallet<T> {
 							// drop this candidate and all its descendants rather than stalling.
 							// Stalling would block the core until the availability timeout;
 							// dropping immediately lets the collator retry on the next slot.
-							if can_enact &&
-								candidate.descriptor.version() == CandidateDescriptorVersion::V4 &&
-								!Self::requires_satisfied(
-									paraid,
-									&candidate.commitments.requires,
-								) {
+							// `requires` are read from the candidate's `RequiresRoots` UMP
+							// signal (issue #12347); a malformed signal set is treated as
+							// "no requirements".
+							let requires_unsatisfied = candidate.descriptor.version() ==
+								CandidateDescriptorVersion::V4 &&
+								candidate
+									.commitments
+									.ump_signals()
+									.ok()
+									.and_then(|s| s.requires_roots().cloned())
+									.map_or(false, |r| !Self::requires_satisfied(paraid, &r));
+							if can_enact && requires_unsatisfied {
 								log::debug!(
 									target: LOG_TARGET,
 									"dropping v4 candidate {:?} (para {:?}): unsatisfied requires",
@@ -912,33 +949,80 @@ impl<T: Config> Pallet<T> {
 
 	// ── Phase 1 Speculative Messaging helpers ────────────────────────────────────
 
-	/// Read the latest provides commitment (flat set) for a parachain.
-	pub(crate) fn provides(para_id: &polkadot_primitives::Id) -> Option<ProvidesCommitment> {
-		ProvidesRoots::<T>::get(para_id)
+	/// Reconstruct the latest provides commitment (flat `(destination, root)` set)
+	/// for `source` from the window — the newest root of each destination's window.
+	/// Used by the `provides_root` runtime API.
+	pub(crate) fn provides(source: &polkadot_primitives::Id) -> Option<ProvidesCommitment> {
+		let entries: Vec<_> = LatestProvides::<T>::iter_prefix(source)
+			.filter_map(|(dest, window)| window.last().map(|e| (dest, e.root)))
+			.collect();
+
+		if entries.is_empty() {
+			return None;
+		}
+
+		// `try_from_iter` sorts by `ParaId`; the iterator yields distinct destinations,
+		// so it cannot fail on duplicates and only fails if it exceeds the bound.
+		ProvidesCommitment::try_from_iter(entries).ok()
 	}
 
-	/// The source's committed subtree root for a specific destination, if any.
-	pub(crate) fn provided_subtree_root(
-		source: &polkadot_primitives::Id,
+	/// Whether `source` committed `root` for `destination` anywhere in the current
+	/// window (membership match — issue #12349).
+	pub(crate) fn provides_contains(
+		source: polkadot_primitives::Id,
 		destination: polkadot_primitives::Id,
-	) -> Option<polkadot_primitives::Hash> {
-		ProvidesRoots::<T>::get(source)?.get(destination).copied()
+		root: &polkadot_primitives::Hash,
+	) -> bool {
+		LatestProvides::<T>::get(source, destination)
+			.iter()
+			.any(|entry| entry.root == *root)
 	}
 
-	/// Returns true when every requirement of `receiver` matches the source's
-	/// persisted `(receiver, subtree_root)` entry.
+	/// Returns true when every requirement of `receiver` is present in the
+	/// corresponding source's provides window for `receiver`.
 	pub(crate) fn requires_satisfied(
 		receiver: polkadot_primitives::Id,
 		requires: &RequiresCommitment,
 	) -> bool {
 		requires.iter().all(|(source, expected_root)| {
-			Self::provided_subtree_root(source, receiver) == Some(*expected_root)
+			Self::provides_contains(*source, receiver, expected_root)
 		})
 	}
 
-	/// Update the provides commitment after a candidate is enacted.
-	pub(crate) fn update_provides(para_id: polkadot_primitives::Id, provides: ProvidesCommitment) {
-		ProvidesRoots::<T>::insert(para_id, provides);
+	/// Append a source's provides commitment to the window after a candidate is
+	/// enacted, evicting the oldest entry of each `(source, destination)` pair when
+	/// the window is full. Entries are tagged with the current relay block number.
+	pub(crate) fn update_provides(source: polkadot_primitives::Id, provides: ProvidesCommitment) {
+		let block = <frame_system::Pallet<T>>::block_number();
+		for (destination, root) in provides.iter() {
+			LatestProvides::<T>::mutate(source, destination, |window| {
+				if window.is_full() {
+					window.remove(0);
+				}
+				// The window was just made non-full above, so the push cannot fail.
+				let _ = window.try_push(ProvidesEntry { root: *root, block });
+			});
+		}
+	}
+
+	/// Evict every provides-window entry that was enacted *after* `revert_to`, i.e. in
+	/// a block that a concluded dispute has reverted (issue #12349). Windows left empty
+	/// are removed. This keeps the runtime's own view consistent within the reverting
+	/// block; the node additionally rolls back this storage via the state revert.
+	pub(crate) fn evict_provides_after(revert_to: BlockNumberFor<T>) {
+		// Collect first to avoid mutating the map while iterating it.
+		let keys: Vec<(polkadot_primitives::Id, polkadot_primitives::Id)> =
+			LatestProvides::<T>::iter_keys().collect();
+		for (source, destination) in keys {
+			LatestProvides::<T>::mutate_exists(source, destination, |maybe_window| {
+				if let Some(window) = maybe_window {
+					window.retain(|entry| entry.block <= revert_to);
+					if window.is_empty() {
+						*maybe_window = None;
+					}
+				}
+			});
+		}
 	}
 
 	fn enact_candidate(
@@ -953,6 +1037,11 @@ impl<T: Config> Pallet<T> {
 		let plain = receipt.to_plain();
 		let commitments = receipt.commitments;
 		let config = configuration::ActiveConfig::<T>::get();
+
+		// Speculative-messaging commitments are carried as UMP signals in
+		// `upward_messages` (issue #12347). Parse them up front, before any field of
+		// `commitments` is moved out below. A malformed signal set is treated as absent.
+		let speculative_signals = commitments.ump_signals().ok();
 
 		T::RewardValidators::reward_backing(
 			backers
@@ -1001,20 +1090,24 @@ impl<T: Config> Pallet<T> {
 			commitments.horizontal_messages,
 		);
 
-		// Finalize speculative messaging: check requirements and update ProvidesRoots.
+		// Finalize speculative messaging: re-check requirements (defensively — the
+		// real gate is in `sanitize_backed_candidates`) and push the candidate's
+		// `provides` UMP signal into the relay-side window.
 		let receiver = receipt.descriptor.para_id();
-		if !Self::requires_satisfied(receiver, &commitments.requires) {
+		let requires = speculative_signals.as_ref().and_then(|s| s.requires_roots());
+		if requires.map_or(false, |r| !Self::requires_satisfied(receiver, r)) {
 			defensive!(
 				"Candidate {:?} requirements no longer satisfied at enactment",
 				candidate_hash
 			);
-		} else if let Some(ref p) = commitments.provides {
+		} else if let Some(provides) = speculative_signals.as_ref().and_then(|s| s.provides_roots())
+		{
 			log::debug!(
 				target: LOG_TARGET,
-				"updating ProvidesRoots[{:?}] (= {} entries) after enactment",
-				receiver, p.len(),
+				"appending provides window[{:?}] (= {} entries) after enactment",
+				receiver, provides.len(),
 			);
-			Self::update_provides(receiver, p.clone());
+			Self::update_provides(receiver, provides.clone());
 		}
 
 		Self::deposit_event(Event::<T>::CandidateIncluded(

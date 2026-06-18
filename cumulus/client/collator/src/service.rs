@@ -392,8 +392,6 @@ where
 			hrmp_watermark: hrmp_watermark?,
 			head_data: head_data?,
 			proof_of_validity: MaybeCompressedPoV::Compressed(pov),
-			provides: None,
-			requires: Default::default(),
 		};
 
 		Some((collation, block_data))

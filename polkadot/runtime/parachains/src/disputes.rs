@@ -183,6 +183,11 @@ pub trait DisputesHandler<BlockNumber: Ord> {
 	/// any new parachain blocks for backing or inclusion.
 	fn is_frozen() -> bool;
 
+	/// The block number the chain has been reverted to as a result of a concluded
+	/// dispute (the highest still-valid block), or `None` if not frozen. Used by
+	/// speculative messaging to evict provides-window entries from reverted blocks.
+	fn frozen_block() -> Option<BlockNumber>;
+
 	/// Remove dispute statement duplicates and sort the non-duplicates based on
 	/// local (lower indices) vs remotes (higher indices) and age (older with lower indices).
 	///
@@ -254,6 +259,10 @@ impl<BlockNumber: Ord> DisputesHandler<BlockNumber> for () {
 		false
 	}
 
+	fn frozen_block() -> Option<BlockNumber> {
+		None
+	}
+
 	fn deduplicate_and_sort_dispute_data(
 		statement_sets: &mut MultiDisputeStatementSet,
 	) -> Result<(), ()> {
@@ -307,6 +316,10 @@ where
 {
 	fn is_frozen() -> bool {
 		pallet::Pallet::<T>::is_frozen()
+	}
+
+	fn frozen_block() -> Option<BlockNumberFor<T>> {
+		Frozen::<T>::get()
 	}
 
 	fn filter_dispute_data(

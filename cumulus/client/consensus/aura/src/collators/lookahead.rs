@@ -534,7 +534,7 @@ where
 					)
 					.await
 				{
-					Ok(Some((mut collation, block_data))) => {
+					Ok(Some((collation, block_data))) => {
 						let Some(new_block_header) =
 							block_data.blocks().first().map(|b| b.header().clone())
 						else {
@@ -544,32 +544,22 @@ where
 
 						let new_block_hash = new_block_header.hash();
 
-						// Fetch speculative commitment fields from the runtime state of the
-						// newly built block, so the collation's provides/requires match what
-						// validate_block will recompute via speculative_extension().
+						// Whether this block consumed cross-chain messages (a speculative
+						// `requires`). The provides/requires commitments themselves travel to
+						// the relay as UMP signals inside `collation.upward_messages` (issue
+						// #12347); here we only need the flag to drive fork suppression below.
 						let runtime_api = para_client.runtime_api();
-						let provides = runtime_api.compute_provides(new_block_hash).unwrap_or(None);
-						let requires =
-							runtime_api.requires_commitments(new_block_hash).unwrap_or_default();
-
-						tracing::debug!(
-							target: crate::LOG_TARGET,
-							?new_block_hash,
-							n_provides = provides.as_ref().map(|p| p.len()).unwrap_or(0),
-							n_requires = requires.len(),
-							"patching speculative fields onto collation from runtime state",
-						);
-
-						collation.provides = provides;
-						collation.requires = requires;
+						let is_speculative = runtime_api
+							.requires_commitments(new_block_hash)
+							.map(|requires| !requires.is_empty())
+							.unwrap_or(false);
 
 						tracing::debug!(
 							target: crate::LOG_TARGET,
 							?parent_hash,
 							?new_block_hash,
 							block_number = %new_block_header.number(),
-							n_provides = collation.provides.as_ref().map(|p| p.len()).unwrap_or(0),
-							n_requires = collation.requires.len(),
+							?is_speculative,
 							n_horiz = collation.horizontal_messages.len(),
 							n_ump = collation.upward_messages.len(),
 							"collation built successfully",
@@ -579,7 +569,7 @@ where
 						// collation at this height. The relay has no preference for the richer
 						// candidate, so giving it a simpler alternative risks it backing the
 						// simpler fork and orphaning the delivery block.
-						if collation.requires.is_empty() &&
+						if !is_speculative &&
 							speculative_built_heights.contains(new_block_header.number())
 						{
 							tracing::debug!(
@@ -592,7 +582,7 @@ where
 							continue;
 						}
 
-						if !collation.requires.is_empty() {
+						if is_speculative {
 							speculative_built_heights.insert(*new_block_header.number());
 						}
 

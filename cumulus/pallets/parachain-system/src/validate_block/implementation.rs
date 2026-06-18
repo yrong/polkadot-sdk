@@ -394,6 +394,10 @@ where
 						approved_peer = Some(new_approved_peer);
 					},
 				},
+				// Speculative-messaging commitments (issue #12347) are produced
+				// deterministically by block execution and pass straight through to the
+				// relay chain in `upward_messages`; no cross-block consistency check here.
+				UMPSignal::ProvidesRoots(_) | UMPSignal::RequiresRoots(_) => {},
 			}
 		});
 

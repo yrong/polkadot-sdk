@@ -52,7 +52,7 @@ use parachain_inherent::{
 	deconstruct_parachain_inherent_data, AbridgedInboundDownwardMessages,
 	AbridgedInboundHrmpMessages, BasicParachainInherentData, InboundMessageId, InboundMessagesData,
 };
-use polkadot_parachain_primitives::primitives::RelayChainBlockNumber;
+use polkadot_parachain_primitives::primitives::{RelayChainBlockNumber, ValidationResultExtension};
 use polkadot_runtime_parachains::{FeeTracker, GetMinFeeFactor};
 use scale_info::TypeInfo;
 use sp_runtime::{
@@ -1687,6 +1687,26 @@ impl<T: Config> Pallet<T> {
 
 		if let Some(approved_peer) = PendingApprovedPeer::<T>::take() {
 			ump_signals.push(UMPSignal::ApprovedPeer(approved_peer).encode());
+		}
+
+		// Speculative messaging: emit the block's `provides`/`requires` commitments as
+		// UMP signals so the relay chain reads them out of `upward_messages` (issue
+		// #12347), rather than via a dedicated `CandidateCommitments` field.
+		if let Some(ValidationResultExtension::V4 { provides, requires }) =
+			T::speculative_extension()
+		{
+			if let Some(provides) = provides {
+				if let Ok(set) = relay_chain::ProvidesCommitment::try_from_iter(provides) {
+					if !set.is_empty() {
+						ump_signals.push(UMPSignal::ProvidesRoots(set).encode());
+					}
+				}
+			}
+			if let Ok(set) = relay_chain::RequiresCommitment::try_from_iter(requires) {
+				if !set.is_empty() {
+					ump_signals.push(UMPSignal::RequiresRoots(set).encode());
+				}
+			}
 		}
 
 		if !ump_signals.is_empty() {

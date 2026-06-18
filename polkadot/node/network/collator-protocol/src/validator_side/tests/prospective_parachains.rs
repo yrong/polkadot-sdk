@@ -495,8 +495,6 @@ fn create_dummy_candidate_and_commitments(
 		new_validation_code: None,
 		processed_downward_messages: 0,
 		hrmp_watermark: 0,
-		provides: None,
-		requires: Default::default(),
 	};
 	candidate.commitments_hash = commitments.hash();
 
@@ -622,8 +620,6 @@ fn v1_advertisement_accepted_and_seconded() {
 			new_validation_code: None,
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		};
 		candidate.commitments_hash = commitments.hash();
 		let candidate: CandidateReceipt = candidate.into();
@@ -1283,8 +1279,6 @@ fn fetched_collation_sanity_check() {
 			new_validation_code: None,
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		};
 		candidate.commitments_hash = commitments.hash();
 		let candidate: CandidateReceipt = candidate.into();
@@ -1388,8 +1382,6 @@ fn sanity_check_invalid_parent_head_data() {
 			new_validation_code: None,
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		};
 		candidate.commitments_hash = commitments.hash();
 
@@ -1620,8 +1612,6 @@ fn child_blocked_from_seconding_by_parent(#[case] valid_parent: bool) {
 			new_validation_code: None,
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		};
 		let mut candidate_b: CandidateReceipt = candidate_b.into();
 		candidate_b.commitments_hash = candidate_b_commitments.hash();
@@ -1697,8 +1687,6 @@ fn child_blocked_from_seconding_by_parent(#[case] valid_parent: bool) {
 			new_validation_code: None,
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		};
 		candidate_a.commitments_hash = candidate_a_commitments.hash();
 
@@ -2628,8 +2616,6 @@ fn v1_descriptor_version_detection_with_v3_enabled() {
 			new_validation_code: None,
 			processed_downward_messages: 0,
 			hrmp_watermark: 0,
-			provides: None,
-			requires: Default::default(),
 		};
 
 		// Non-zero collator: bytes 8..23 map to `reserved1[0..16]` in V2 layout,

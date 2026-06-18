@@ -43,9 +43,7 @@ use polkadot_node_subsystem_util::{
 	runtime::{fetch_scheduling_lookahead, ClaimQueueSnapshot},
 };
 use polkadot_overseer::{ActivatedLeaf, ActiveLeavesUpdate};
-use polkadot_parachain_primitives::primitives::{
-	ValidationResult as WasmValidationResult, ValidationResultExtension,
-};
+use polkadot_parachain_primitives::primitives::ValidationResult as WasmValidationResult;
 use polkadot_primitives::{
 	executor_params::{
 		DEFAULT_APPROVAL_EXECUTION_TIMEOUT, DEFAULT_BACKING_EXECUTION_TIMEOUT,
@@ -56,8 +54,8 @@ use polkadot_primitives::{
 	CandidateDescriptorV2 as CandidateDescriptor, CandidateEvent,
 	CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, ExecutorParams, Hash,
-	PersistedValidationData, ProvidesCommitment, PvfExecKind as RuntimePvfExecKind, PvfPrepKind,
-	RequiresCommitment, SessionIndex, ValidationCode, ValidationCodeHash, ValidatorId,
+	PersistedValidationData, PvfExecKind as RuntimePvfExecKind, PvfPrepKind, SessionIndex,
+	ValidationCode, ValidationCodeHash, ValidatorId,
 };
 use sp_application_crypto::{AppCrypto, ByteArray};
 use sp_keystore::KeystorePtr;
@@ -1307,62 +1305,9 @@ async fn validate_candidate(
 				gum::info!(target: LOG_TARGET, ?para_id, "Invalid candidate (para_head)");
 				Ok(ValidationResult::Invalid(InvalidCandidate::ParaHeadHashMismatch))
 			} else {
-				let (provides, requires) = match res.speculative.0 {
-					Some(ValidationResultExtension::V4 { provides, requires }) => {
-						gum::debug!(
-							target: LOG_TARGET,
-							?para_id,
-							?candidate_hash,
-							n_provides = provides.as_ref().map(|p| p.len()).unwrap_or(0),
-							n_requires = requires.len(),
-							"validation result has V4 speculative extension",
-						);
-						// Rebuild the canonical (sorted, deduplicated) commitment
-						// sets. A malformed set (out-of-order, duplicate, or
-						// over-capacity) cannot equal what the receipt committed,
-						// so treat it as a commitments mismatch.
-						let provides = match provides {
-							Some(entries) => match ProvidesCommitment::try_from_iter(entries) {
-								Ok(set) => Some(set),
-								Err(e) => {
-									gum::debug!(
-										target: LOG_TARGET,
-										?para_id, ?candidate_hash, ?e,
-										"invalid V4 provides set",
-									);
-									return Ok(ValidationResult::Invalid(
-										InvalidCandidate::CommitmentsHashMismatch,
-									));
-								},
-							},
-							None => None,
-						};
-						let requires = match RequiresCommitment::try_from_iter(requires) {
-							Ok(set) => set,
-							Err(e) => {
-								gum::debug!(
-									target: LOG_TARGET,
-									?para_id, ?candidate_hash, ?e,
-									"invalid V4 requires set",
-								);
-								return Ok(ValidationResult::Invalid(
-									InvalidCandidate::CommitmentsHashMismatch,
-								));
-							},
-						};
-						(provides, requires)
-					},
-					None => {
-						gum::debug!(
-							target: LOG_TARGET,
-							?para_id,
-							?candidate_hash,
-							"validation result has no speculative extension",
-						);
-						(None, RequiresCommitment::default())
-					},
-				};
-
+				// Speculative-messaging `provides`/`requires` are carried as UMP signals
+				// inside `upward_messages` (issue #12347), so they are covered by the
+				// standard commitments hash — no separate reconstruction is needed.
 				let commitments_v9 = CandidateCommitments {
 					head_data: res.head_data,
 					upward_messages: res.upward_messages,
@@ -1370,8 +1315,6 @@ async fn validate_candidate(
 					new_validation_code: res.new_validation_code,
 					processed_downward_messages: res.processed_downward_messages,
 					hrmp_watermark: res.hrmp_watermark,
-					provides,
-					requires,
 				};
 
 				let commitments_hash = commitments_v9.hash();

@@ -27,7 +27,7 @@ use polkadot_node_primitives::{
 use polkadot_node_subsystem::messages::CollatorProtocolMessage;
 use polkadot_primitives::{
 	CandidateCommitments, CandidateDescriptorV2, CandidateReceiptV2, ClaimQueueOffset, CollatorId,
-	CollatorPair, CoreIndex, Hash, Id as ParaId, OccupiedCoreAssumption, TrailingOption,
+	CollatorPair, CoreIndex, Hash, Id as ParaId, OccupiedCoreAssumption,
 	DEFAULT_CLAIM_QUEUE_OFFSET,
 };
 use polkadot_service::{Handle, NewFull, ParachainHost};
@@ -322,8 +322,6 @@ impl Collator {
 				proof_of_validity: MaybeCompressedPoV::Raw(pov.clone()),
 				processed_downward_messages: 0,
 				hrmp_watermark: validation_data.relay_parent_number,
-				provides: None,
-				requires: Default::default(),
 			};
 
 			log::info!(
@@ -608,8 +606,6 @@ impl Collator {
 						head_data: collation.head_data,
 						processed_downward_messages: collation.processed_downward_messages,
 						hrmp_watermark: collation.hrmp_watermark,
-						provides: None,
-						requires: Default::default(),
 					};
 
 					// Submit the same collation to all assigned cores.

@@ -1182,8 +1182,6 @@ mod tests {
 				head_data: HeadData::from(vec![1, 2, 3, 4, 5]),
 				processed_downward_messages: 0,
 				hrmp_watermark: relay_parent.number,
-				provides: None,
-				requires: Default::default(),
 			},
 			persisted_validation_data: PersistedValidationData {
 				parent_head: constraints.required_parent.clone(),
