@@ -50,7 +50,7 @@ use cumulus_primitives_spec_messaging::{
 	mmr::{root_from_peaks, Mmr, MmrAccumulator, SpecMerge},
 	LateBlockProof, MaxSpeculativeMessageLen, OutgoingMessage, SpecHasher, SubtreeExtension,
 };
-use polkadot_primitives::v9::ProvidesCommitment;
+use polkadot_primitives::v9::{ProvidesCommitment, MAX_DESTINATIONS_PER_BLOCK};
 
 use mmr_lib::{
 	leaf_index_to_pos,
@@ -113,8 +113,42 @@ pub mod pallet {
 	pub type OutgoingMessages<T: Config> =
 		StorageDoubleMap<_, Twox64Concat, ParaId, Twox64Concat, u64, Vec<u8>>;
 
+	/// Destinations whose subtree root changed since the last rotation. Filled by
+	/// [`Pallet::record_outbound_messages`] as messages are taken, then promoted into
+	/// [`ProvidesThisBlock`] at `on_initialize` of the following block. This is the
+	/// accumulator side of the delta-`provides` rotation; it is never read directly by
+	/// `compute_provides`.
+	#[pallet::storage]
+	pub type PendingProvides<T: Config> = StorageValue<
+		_,
+		frame_support::BoundedBTreeSet<ParaId, sp_core::ConstU32<MAX_DESTINATIONS_PER_BLOCK>>,
+		ValueQuery,
+	>;
+
+	/// Frozen snapshot of the destinations to commit in *this* block's `provides`. Rotated
+	/// in from [`PendingProvides`] at `on_initialize` so it is stable for the whole block
+	/// (both the on-chain `speculative_extension` read and the off-chain runtime API see the
+	/// same set), while `record_outbound_messages` fills a fresh accumulator for next block.
+	#[pallet::storage]
+	pub type ProvidesThisBlock<T: Config> = StorageValue<
+		_,
+		frame_support::BoundedBTreeSet<ParaId, sp_core::ConstU32<MAX_DESTINATIONS_PER_BLOCK>>,
+		ValueQuery,
+	>;
+
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
+			// Promote the destinations recorded during the previous block's
+			// `take_outbound_messages` into this block's provides snapshot, and reset the
+			// accumulator. `parachain-system` reads `compute_provides` (in its `on_finalize`)
+			// *before* it calls `take_outbound_messages`, so the delta we publish in block N is
+			// exactly what was recorded in block N-1 — the same one-block lag the cumulative
+			// implementation already had.
+			ProvidesThisBlock::<T>::put(PendingProvides::<T>::take());
+			T::DbWeight::get().reads_writes(1, 2)
+		}
+
 		fn on_finalize(n: BlockNumberFor<T>) {
 			// Prune the retention window first.
 			let retention_window: BlockNumberFor<T> = 256u32.into();
@@ -154,6 +188,20 @@ pub mod pallet {
 			state.leaf_count = size;
 
 			OutgoingMMRState::<T>::insert(dest, state);
+
+			// Mark this destination's root as changed so it is included in the next block's
+			// delta `provides`. Bounded by `MAX_DESTINATIONS_PER_BLOCK` (the same bound as
+			// `ProvidesCommitment`); a full set means more distinct destinations were touched
+			// in one block than the commitment can carry, so surface it rather than drop quietly.
+			PendingProvides::<T>::mutate(|set| {
+				if set.try_insert(dest).is_err() {
+					log::warn!(
+						target: "speculative::outbox",
+						"PendingProvides full ({} dests); dropping dest={:?} from provides",
+						MAX_DESTINATIONS_PER_BLOCK, dest,
+					);
+				}
+			});
 			log::debug!(
 				target: "speculative::outbox",
 				"recorded {} message(s) to dest={:?} positions {}..{}",
@@ -165,12 +213,17 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-	/// Compute the flat provides commitment: the sorted `(destination, subtree_root)`
-	/// set over all per-destination MMRs. `None` when nothing has been sent.
+	/// Compute the flat provides commitment for *this* block: the sorted
+	/// `(destination, subtree_root)` set over only the destinations whose root changed in the
+	/// previous block (the delta), read from the [`ProvidesThisBlock`] snapshot. Unchanged
+	/// destinations are not re-committed every block — the relay retains their last root in its
+	/// provides window (count-based eviction), and stale receivers bridge via a late-block proof.
+	/// `None` when no destination changed.
 	pub fn compute_provides() -> Option<ProvidesCommitment> {
-		let entries = OutgoingMMRState::<T>::iter()
-			.filter(|(_, state)| state.leaf_count > 0)
-			.map(|(dest, state)| (dest, root_from_peaks::<SpecHasher>(&state.peaks)));
+		let entries = ProvidesThisBlock::<T>::get().into_iter().filter_map(|dest| {
+			let state = OutgoingMMRState::<T>::get(&dest);
+			(state.leaf_count > 0).then(|| (dest, root_from_peaks::<SpecHasher>(&state.peaks)))
+		});
 
 		let set = ProvidesCommitment::try_from_iter(entries).ok()?;
 		if set.is_empty() {
@@ -342,6 +395,80 @@ fn historical_state_for<T: Config>(
 	HistoricalSubtreeState::<T>::iter().find_map(|(bn, d, (root, peaks, leaf_count))| {
 		(d == dest && root == subtree_root).then_some((bn, peaks, leaf_count))
 	})
+}
+
+#[cfg(test)]
+mod mock;
+
+#[cfg(test)]
+mod rotation_tests {
+	use crate::{
+		mock::{new_test_ext, SpeculativeOutbox, Test},
+		OutgoingMMRState, PendingProvides, ProvidesThisBlock,
+	};
+	use cumulus_primitives_core::ParaId;
+	use frame_support::traits::OnInitialize;
+
+	const DEST_A: u32 = 3000;
+	const DEST_B: u32 = 4000;
+
+	/// Advance to the next block by running the pallet's `on_initialize`, which performs the
+	/// `PendingProvides` -> `ProvidesThisBlock` rotation.
+	fn rotate_into(block: u64) {
+		SpeculativeOutbox::on_initialize(block);
+	}
+
+	#[test]
+	fn delta_provides_appears_next_block_then_clears() {
+		new_test_ext().execute_with(|| {
+			// Block 1: record a message to DEST_A. It is accumulated in `PendingProvides`
+			// but not yet visible in `provides` (nothing has been rotated in).
+			rotate_into(1);
+			SpeculativeOutbox::record_outbound_messages(ParaId::from(DEST_A), vec![b"a".to_vec()]);
+			assert!(PendingProvides::<Test>::get().contains(&ParaId::from(DEST_A)));
+			assert!(SpeculativeOutbox::compute_provides().is_none());
+
+			// Block 2 (N+1): rotation promotes DEST_A into the snapshot, so it shows up in
+			// `provides` exactly once, with the destination's current subtree root.
+			rotate_into(2);
+			assert!(ProvidesThisBlock::<Test>::get().contains(&ParaId::from(DEST_A)));
+			assert!(PendingProvides::<Test>::get().is_empty());
+			let provides = SpeculativeOutbox::compute_provides().expect("delta has one entry");
+			assert_eq!(provides.len(), 1);
+			let (expected_root, _) =
+				SpeculativeOutbox::destination_state(ParaId::from(DEST_A)).unwrap();
+			assert_eq!(provides.get(ParaId::from(DEST_A)), Some(&expected_root));
+
+			// Block 3 (N+2): no new records, so the destination is no longer re-committed —
+			// `provides` is empty even though the MMR state still exists.
+			rotate_into(3);
+			assert!(SpeculativeOutbox::compute_provides().is_none());
+			assert!(OutgoingMMRState::<Test>::get(ParaId::from(DEST_A)).leaf_count > 0);
+		});
+	}
+
+	#[test]
+	fn delta_dedups_and_batches_destinations_per_block() {
+		new_test_ext().execute_with(|| {
+			rotate_into(1);
+			// Two messages to DEST_A and one to DEST_B in the same block.
+			SpeculativeOutbox::record_outbound_messages(
+				ParaId::from(DEST_A),
+				vec![b"a1".to_vec(), b"a2".to_vec()],
+			);
+			SpeculativeOutbox::record_outbound_messages(ParaId::from(DEST_A), vec![b"a3".to_vec()]);
+			SpeculativeOutbox::record_outbound_messages(ParaId::from(DEST_B), vec![b"b1".to_vec()]);
+
+			// DEST_A appears once despite two record calls (set dedups).
+			assert_eq!(PendingProvides::<Test>::get().len(), 2);
+
+			rotate_into(2);
+			let provides = SpeculativeOutbox::compute_provides().expect("two entries");
+			assert_eq!(provides.len(), 2);
+			assert!(provides.get(ParaId::from(DEST_A)).is_some());
+			assert!(provides.get(ParaId::from(DEST_B)).is_some());
+		});
+	}
 }
 
 #[cfg(test)]

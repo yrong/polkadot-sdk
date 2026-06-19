@@ -39,6 +39,7 @@ cumulus-primitives-spec-messaging = { workspace = true }
 [dev-dependencies]
 cumulus-pallet-parachain-system = { workspace = true, default-features = true }
 pallet-balances = { workspace = true, default-features = true }
+sp-io = { workspace = true, default-features = true }
 
 [features]
 default = ["std"]
