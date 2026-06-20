@@ -61,7 +61,7 @@ use mmr_lib::{leaf_index_to_pos, MMRStoreReadOps, MMRStoreWriteOps, MMR};
 
 /// Maximum number of consumed payloads pruned in a single [`Pallet::apply_ack`] call. Bounds the
 /// weight of an ack; any remaining backlog drains in `on_idle` or on the next ack (follow-up to
-/// #12350, see `docs/speculative-messaging-watermark-plan.md`).
+/// #12350, see `docs/speculative-messaging-impl-design.md`).
 const MAX_PRUNE_PER_CALL: u64 = 100;
 
 /// Maximum total payloads pruned across all destinations in a single `on_idle` sweep.
@@ -196,19 +196,6 @@ pub mod pallet {
 	pub type OutgoingMMRState<T: Config> =
 		StorageMap<_, Twox64Concat, ParaId, MMRState, ValueQuery>;
 
-	/// Historical subtree roots, peaks, and leaf counts per (block, destination).
-	/// Stores `(subtree_root, peaks, leaf_count)` so late-block extension proofs can
-	/// be built without a full node store. Pruned to a 256-block retention window.
-	#[pallet::storage]
-	pub type HistoricalSubtreeState<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		BlockNumberFor<T>,
-		Twox64Concat,
-		ParaId,
-		(H256, Vec<H256>, u64),
-	>;
-
 	/// Payload bytes for outgoing messages.
 	#[pallet::storage]
 	pub type OutgoingMessages<T: Config> =
@@ -244,14 +231,22 @@ pub mod pallet {
 		ValueQuery,
 	>;
 
-	/// Durable index from a committed (end-of-block) subtree root to its leaf count, per
+	/// Durable index from a committed (end-of-block) subtree root to its `(leaf_count, block)`, per
 	/// destination. `apply_ack` maps a receiver's acknowledged `requires` root to a consumed
-	/// position through this map. Entries are pruned once fully consumed (below the watermark),
-	/// so unlike [`HistoricalSubtreeState`] it is not capped to a fixed block window — this is what
-	/// lets slow / on-demand receivers acknowledge an arbitrarily old root (follow-up to #12350).
+	/// position through this map; `block_number_for_subtree_root` reads the block tag. Entries are
+	/// pruned once fully consumed (below the watermark), so it is not capped to a fixed block window
+	/// — this is what lets slow / on-demand receivers acknowledge an arbitrarily old root, and it
+	/// subsumes the former `HistoricalSubtreeState` (follow-up to #12350).
 	#[pallet::storage]
-	pub type CommittedRootPosition<T: Config> =
-		StorageDoubleMap<_, Twox64Concat, ParaId, Identity, H256, u64, OptionQuery>;
+	pub type CommittedRootPosition<T: Config> = StorageDoubleMap<
+		_,
+		Twox64Concat,
+		ParaId,
+		Identity,
+		H256,
+		(u64, BlockNumberFor<T>),
+		OptionQuery,
+	>;
 
 	/// Per-destination consumed watermark: the leaf count the receiver has provably consumed up to
 	/// (monotonic). Payloads below it are eligible for pruning. Advanced by [`Pallet::apply_ack`].
@@ -263,6 +258,13 @@ pub mod pallet {
 	/// unbounded.
 	#[pallet::storage]
 	pub type PrunedUpTo<T: Config> = StorageMap<_, Twox64Concat, ParaId, u64, ValueQuery>;
+
+	/// Per-destination node-prune cursor: the leaf count up to whose completed left subtrees the
+	/// persistent MMR node store has been pruned. Only the prefix's peaks (the witness frontier) are
+	/// kept below this; everything strictly inside fully-consumed subtrees is deleted. Chases
+	/// [`ConsumedWatermark`] in capped steps.
+	#[pallet::storage]
+	pub type NodePrunedUpTo<T: Config> = StorageMap<_, Twox64Concat, ParaId, u64, ValueQuery>;
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
@@ -278,24 +280,15 @@ pub mod pallet {
 		}
 
 		fn on_finalize(n: BlockNumberFor<T>) {
-			// Prune the retention window first.
-			let retention_window: BlockNumberFor<T> = 256u32.into();
-			if n > retention_window {
-				let prune_at = n - retention_window;
-				let _ = HistoricalSubtreeState::<T>::clear_prefix(prune_at, 100, None);
-			}
-
-			// Record the current subtree state for every active destination so a
-			// late-block proof can later reconstruct an extension from any of them.
+			// Record each active destination's current (end-of-block) subtree root in the durable
+			// root index, tagged with this block. Used by `apply_ack` (root -> leaf count) and
+			// `block_number_for_subtree_root` (root -> block); pruned by the consumed watermark.
 			for (dest, state) in OutgoingMMRState::<T>::iter() {
 				if state.leaf_count == 0 {
 					continue;
 				}
 				let root = root_from_peaks::<SpecHasher>(&state.peaks);
-				// Durable root -> position index for `apply_ack` (not capped to the 256-block
-				// window).
-				CommittedRootPosition::<T>::insert(dest, root, state.leaf_count);
-				HistoricalSubtreeState::<T>::insert(n, dest, (root, state.peaks, state.leaf_count));
+				CommittedRootPosition::<T>::insert(dest, root, (state.leaf_count, n));
 			}
 		}
 
@@ -323,6 +316,18 @@ pub mod pallet {
 				let n = Self::prune_consumed(dest, budget);
 				budget = budget.saturating_sub(n);
 				deleted = deleted.saturating_add(n);
+			}
+
+			// Also reclaim persistent MMR nodes inside fully-consumed subtrees, keeping the witness
+			// frontier so proofs for un-consumed leaves still verify.
+			let node_dests: Vec<ParaId> = ConsumedWatermark::<T>::iter()
+				.filter(|(dest, watermark)| NodePrunedUpTo::<T>::get(dest) < *watermark)
+				.map(|(dest, _)| dest)
+				.take(MAX_DESTS_PER_IDLE)
+				.collect();
+			for dest in node_dests {
+				let removed = Self::prune_nodes(dest, MAX_PRUNE_PER_CALL);
+				deleted = deleted.saturating_add(removed);
 			}
 
 			unit.saturating_mul(deleted.saturating_add(1))
@@ -489,7 +494,7 @@ impl<T: Config> Pallet<T> {
 	/// watermark only advances and roots are sender-produced, a malicious receiver can at worst
 	/// under-report (pruning less) — never over-report.
 	pub fn apply_ack(dest: ParaId, acked_root: H256) -> bool {
-		let Some(position) = CommittedRootPosition::<T>::get(dest, acked_root) else {
+		let Some((position, _block)) = CommittedRootPosition::<T>::get(dest, acked_root) else {
 			return false;
 		};
 		if position <= ConsumedWatermark::<T>::get(dest) {
@@ -497,6 +502,7 @@ impl<T: Config> Pallet<T> {
 		}
 		ConsumedWatermark::<T>::insert(dest, position);
 		Self::prune_consumed(dest, MAX_PRUNE_PER_CALL);
+		Self::prune_nodes(dest, MAX_PRUNE_PER_CALL);
 		Self::deposit_event(Event::ConsumedWatermarkAdvanced { destination: dest, position });
 		true
 	}
@@ -521,7 +527,7 @@ impl<T: Config> Pallet<T> {
 		// the receiver's next late-block proof builds an extension from exactly that root. Capped
 		// to bound the scan.
 		let obsolete: Vec<H256> = CommittedRootPosition::<T>::iter_prefix(dest)
-			.filter(|(_, leaf_count)| *leaf_count < watermark)
+			.filter(|(_, (leaf_count, _))| *leaf_count < watermark)
 			.map(|(root, _)| root)
 			.take(max as usize)
 			.collect();
@@ -530,6 +536,56 @@ impl<T: Config> Pallet<T> {
 		}
 
 		end - start
+	}
+
+	/// Reclaim persistent MMR nodes inside fully-consumed subtrees for `dest`, advancing
+	/// [`NodePrunedUpTo`] by up to `max_leaves`. Keeps only the peaks of the consumed prefix (the
+	/// witness frontier) so inclusion / late-block proofs for un-consumed leaves still verify, and
+	/// keeps every node at or beyond the prefix. Returns the number of nodes removed.
+	///
+	/// Correctness: for leaves at index `>= W` the only witnesses from the consumed region `[0, W)`
+	/// are the peaks of the prefix MMR over `W` leaves (`get_peaks(leaf_index_to_mmr_size(W))`);
+	/// every other node there lies strictly inside a completed left subtree, summarised by its peak,
+	/// and is never read again by `gen_proof` or by `push` (which only touches current peaks).
+	pub(crate) fn prune_nodes(dest: ParaId, max_leaves: u64) -> u64 {
+		use mmr_lib::helper::{get_peaks, leaf_index_to_mmr_size};
+
+		let watermark = ConsumedWatermark::<T>::get(dest);
+		let pruned_to = NodePrunedUpTo::<T>::get(dest);
+		if pruned_to >= watermark {
+			return 0;
+		}
+		let target = watermark.min(pruned_to.saturating_add(max_leaves));
+		if target == 0 {
+			return 0;
+		}
+
+		// Size (node count) of the MMR over the first `leaves` leaves; `leaf_index_to_mmr_size` takes
+		// a 0-based leaf *index*, so `leaves - 1`. Positions `[0, prefix_size)` are exactly those
+		// leaves' nodes.
+		let prefix_size =
+			|leaves: u64| if leaves == 0 { 0 } else { leaf_index_to_mmr_size(leaves - 1) };
+		let old_prefix = prefix_size(pruned_to);
+		let new_prefix = prefix_size(target);
+		let keep: BTreeSet<u64> = get_peaks(new_prefix).into_iter().collect();
+
+		let mut removed = 0u64;
+		// Former prefix peaks that are no longer prefix peaks have merged into larger subtrees and
+		// are now summarised by a `keep` peak — drop them.
+		for pos in get_peaks(old_prefix) {
+			if !keep.contains(&pos) && OutgoingMmrNodes::<T>::take(dest, pos).is_some() {
+				removed = removed.saturating_add(1);
+			}
+		}
+		// Newly-completed prefix range: delete everything that is not a kept peak.
+		for pos in old_prefix..new_prefix {
+			if !keep.contains(&pos) && OutgoingMmrNodes::<T>::take(dest, pos).is_some() {
+				removed = removed.saturating_add(1);
+			}
+		}
+
+		NodePrunedUpTo::<T>::insert(dest, target);
+		removed
 	}
 
 	/// Get the MMR subtree root and leaf count for a destination.
@@ -603,10 +659,9 @@ impl<T: Config> Pallet<T> {
 		dest: ParaId,
 		old_subtree_root: H256,
 	) -> Option<LateBlockProof> {
-		// Map the old subtree root to its leaf count via the durable, watermark-pruned root index
-		// (not the 256-block `HistoricalSubtreeState` window), so a receiver building against an
-		// arbitrarily old — but not-yet-consumed — root can still be served.
-		let old_leaf_count = CommittedRootPosition::<T>::get(dest, old_subtree_root)?;
+		// Map the old subtree root to its leaf count via the durable, watermark-pruned root index, so
+		// a receiver building against an arbitrarily old — but not-yet-consumed — root can be served.
+		let (old_leaf_count, _) = CommittedRootPosition::<T>::get(dest, old_subtree_root)?;
 
 		let current = OutgoingMMRState::<T>::get(&dest);
 		let new_subtree_root = root_from_peaks::<SpecHasher>(&current.peaks);
@@ -646,12 +701,13 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
-	/// Find the block number at which `dest`'s subtree root was `subtree_root`.
+	/// Find the block number at which `dest`'s subtree root was `subtree_root` (from the durable root
+	/// index; available while the root is at or above the consumed watermark).
 	pub fn block_number_for_subtree_root(
 		dest: ParaId,
 		subtree_root: H256,
 	) -> Option<BlockNumberFor<T>> {
-		historical_state_for::<T>(dest, subtree_root).map(|(bn, _, _)| bn)
+		CommittedRootPosition::<T>::get(dest, subtree_root).map(|(_, block)| block)
 	}
 }
 
@@ -707,17 +763,6 @@ fn message_leaf<T: Config>(dest: ParaId, position: u64, payload: &[u8]) -> H256 
 	let bounded: BoundedVec<u8, MaxSpeculativeMessageLen> =
 		BoundedVec::try_from(payload.to_vec()).unwrap_or_default();
 	OutgoingMessage::new(T::SelfParaId::get(), dest, position, bounded).hash_leaf::<SpecHasher>()
-}
-
-/// Find the `(block_number, peaks, leaf_count)` historical entry whose subtree root
-/// for `dest` equals `subtree_root`.
-fn historical_state_for<T: Config>(
-	dest: ParaId,
-	subtree_root: H256,
-) -> Option<(BlockNumberFor<T>, Vec<H256>, u64)> {
-	HistoricalSubtreeState::<T>::iter().find_map(|(bn, d, (root, peaks, leaf_count))| {
-		(d == dest && root == subtree_root).then_some((bn, peaks, leaf_count))
-	})
 }
 
 #[cfg(test)]
@@ -833,7 +878,7 @@ mod watermark_tests {
 		new_test_ext().execute_with(|| {
 			let dest = ParaId::from(DEST);
 			let root = record_and_finalize(1, payloads(0..3));
-			assert_eq!(CommittedRootPosition::<Test>::get(dest, root), Some(3));
+			assert_eq!(CommittedRootPosition::<Test>::get(dest, root), Some((3, 1)));
 
 			assert!(SpeculativeOutbox::apply_ack(dest, root));
 			assert_eq!(ConsumedWatermark::<Test>::get(dest), 3);
@@ -923,8 +968,56 @@ mod watermark_tests {
 			assert!(mp.verify(root5, leaves).unwrap());
 
 			// And the frontier root (root3, at the watermark) is retained for the next late proof.
-			assert_eq!(CommittedRootPosition::<Test>::get(dest, root3), Some(3));
+			assert_eq!(CommittedRootPosition::<Test>::get(dest, root3), Some((3, 1)));
 		});
+	}
+
+	#[test]
+	fn node_pruning_keeps_proofs_verifiable() {
+		use crate::{NodePrunedUpTo, OutgoingMmrNodes};
+		// For a range of MMR sizes, advance the watermark step by step (pruning nodes each time) and
+		// assert that every un-consumed leaf is still provable against the current root — i.e. node
+		// pruning never removes a witness.
+		for n in [1u64, 2, 3, 5, 8, 13, 16] {
+			new_test_ext().execute_with(|| {
+				let dest = ParaId::from(DEST);
+				let mut roots = vec![H256::zero()]; // index 0 unused
+				for i in 1..=n {
+					SpeculativeOutbox::record_outbound_messages(dest, payloads(0..1));
+					SpeculativeOutbox::on_finalize(i);
+					roots.push(SpeculativeOutbox::destination_state(dest).unwrap().0);
+				}
+				let final_root = roots[n as usize];
+
+				for w in 1..n {
+					assert!(SpeculativeOutbox::apply_ack(dest, roots[w as usize]));
+					// Drain node pruning fully for this watermark.
+					while SpeculativeOutbox::prune_nodes(dest, 1000) > 0 {}
+					assert_eq!(NodePrunedUpTo::<Test>::get(dest), w);
+
+					for from in w..n {
+						let (msgs, mmr_size, proof) =
+							SpeculativeOutbox::outbound_messages_with_proof(dest, from, 1000)
+								.unwrap_or_else(|| panic!("proof missing: n={n} w={w} from={from}"));
+						let leaves: Vec<(u64, H256)> = msgs
+							.iter()
+							.map(|(pos, payload)| (leaf_index_to_pos(*pos), leaf_at(*pos, payload)))
+							.collect();
+						let mp = MerkleProof::<H256, SpecMerge<SpecHasher>>::new(mmr_size, proof);
+						assert!(
+							mp.verify(final_root, leaves).unwrap(),
+							"verify failed: n={n} w={w} from={from}"
+						);
+					}
+				}
+
+				// Sanity: pruning actually removed nodes for the larger sizes.
+				if n >= 8 {
+					let kept = OutgoingMmrNodes::<Test>::iter_prefix(dest).count() as u64;
+					assert!(kept < 2 * n, "expected node store to shrink: n={n} kept={kept}");
+				}
+			});
+		}
 	}
 
 	#[test]

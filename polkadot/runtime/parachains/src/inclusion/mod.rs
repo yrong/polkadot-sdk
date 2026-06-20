@@ -397,7 +397,7 @@ pub mod pallet {
 	/// latest is kept), tagged with the enacting relay block so the sender can apply a
 	/// K-deep finality gate and dispute reverts can evict it. Used by the sender's
 	/// consumed-watermark pruning (follow-up to #12350; see
-	/// `docs/speculative-messaging-watermark-plan.md`).
+	/// `docs/speculative-messaging-impl-design.md`).
 	#[pallet::storage]
 	pub(crate) type LatestRequires<T: Config> = StorageDoubleMap<
 		_,

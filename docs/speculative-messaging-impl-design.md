@@ -2267,6 +2267,110 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 
 ---
 
+## Consumed-Watermark Retention & Storage Bounds (follow-up to #12350)
+
+The sender's payload store (`OutgoingMessages`), persistent MMR node store
+(`OutgoingMmrNodes`), and root index grow with throughput. They cannot be aged out on a
+timer: a slow / on-demand receiver (authoring every few hours) may not have consumed yet,
+and a time-window prune would delete proofs it still needs. Retention is therefore
+**progress-based**, keyed on what the receiver has *provably and finally* consumed.
+
+### Key insight
+
+The acknowledgement already exists: the receiver commits `requires[source] =
+consumed_subtree_root`, which the relay verifies at enactment (`requires_satisfied`). The
+only missing piece is **routing** that already-verified root back to the sender so it can
+prune.
+
+### Trust model
+
+The ack originates from relay state (the only party that verified it). Griefing analysis:
+a receiver can only ack a root that satisfies `requires` (one the sender actually produced —
+forged/future roots are rejected); **under-reporting** an older root prunes less (harmless);
+**over-reporting** is impossible. The only residual risk is acting on an ack that later
+**reverts** (dispute), mitigated by finality gating.
+
+### Relay side
+
+- `LatestRequires<source, receiver> = (root, block)` — the latest consumed root per pair,
+  tagged with the enacting relay block. Written at receiver enactment alongside
+  `update_provides`; evicted on dispute reverts by `evict_requires_after` (mirrors
+  `evict_provides_after`).
+- Runtime API `latest_requires_for_source(source) -> Vec<(receiver, root, block)>`
+  (`ParachainHost` v17) so the sender's collator can pull all acks for its channels at once.
+
+### Finality gating — K-deep, not a GRANDPA light client
+
+Pruning is destructive, so it must not act on an ack a later dispute could revert. Rather
+than a GRANDPA light client (track relay authority set + verify justifications in-runtime),
+we use **K-deep**, inheriting the relay's own security: a relay block buried past the dispute
+period cannot be reverted. This needs no historical-root verification — `LatestRequires`
+carries the enactment `block`, the inherent proves the *current* value against the
+relay-parent state root (trusted via validation data), and the runtime gates on
+`relay_parent_number - block >= K` (`K` = dispute period, `Config::AckFinalityDepth`).
+
+### Ack channel — `note_consumed` inherent
+
+Collators cannot sign parachain extrinsics, so the relay proof is carried as an **optional
+inherent** (same mechanism as the inbox's `ingest_verified_messages`):
+`note_consumed(ConsumedAck { proof, receivers })`. The runtime verifies `proof` against the
+relay-parent state root (`RelayChainStateProof`), reads each
+`ParaInclusion::LatestRequires(self, receiver)`, applies the K-deep gate, then `apply_ack`.
+Permissionless and safe by construction: monotonic watermark + relay-verified, sender-produced
+roots ⇒ a malicious caller can only under-report.
+
+Collator side: `fetch_consumed_ack` calls `latest_requires_for_source`, builds the relay
+`prove_read` proof over the `latest_requires_key` keys, and injects the `ConsumedAck` via
+`create_inherent_data` / `client::inject_consumed_acks`. `RelayChainInterface` gains
+`latest_requires_for_source`. (End-to-end collator behaviour is compile-checked; live
+proof-key/`prove_read`/timing validation is pending a zombienet run.)
+
+### Sender pallet — watermark & pruning
+
+- `ConsumedWatermark<dest>` — monotonic consumed prefix length; `PrunedUpTo<dest>` — payload
+  prune cursor; `NodePrunedUpTo<dest>` — node prune cursor.
+- `CommittedRootPosition<dest, root> = (leaf_count, block)` — durable root index, pruned by
+  the watermark. This **subsumes the former `HistoricalSubtreeState`** (now retired, along
+  with its 256-block window): `apply_ack` reads the leaf count, `block_number_for_subtree_root`
+  reads the block tag. Not capped to a fixed block window, so a slow receiver can ack an
+  arbitrarily old — but not-yet-consumed — root.
+- `apply_ack(dest, root)` advances the watermark (rejecting regressions and unknown roots),
+  then prunes payloads, the root index, and MMR nodes in capped steps; `on_idle` drains any
+  remaining backlog. The root index entry *at* the watermark (the consumption frontier) is
+  retained so the receiver's next late-block proof can extend from it.
+
+### Pruning-safe proofs — persistent MMR node store
+
+Both proof generators (`outbound_messages_with_proof`, `generate_late_block_proof`) originally
+replayed payloads from position 0, which payload pruning would silently break. They now build
+proofs from a persistent `mmr_lib` node store (`OutgoingMmrNodes`, via an
+`MMRStoreReadOps`/`MMRStoreWriteOps` adapter; `MMRState.mmr_size` lets the MMR reopen as
+`MMR::new(mmr_size, store)`) in O(log n), reading payloads only for the requested/appended
+slice (all ≥ the watermark, hence retained).
+
+`prune_nodes` reclaims MMR nodes inside fully-consumed subtrees, keeping only the consumed
+prefix's peaks (`get_peaks(leaf_index_to_mmr_size(W - 1))`) as the witness frontier — for
+leaves at index ≥ W, the only witnesses from `[0, W)` are those peaks; every other node there
+is strictly inside a completed subtree (summarised by its peak) and is never read again by
+`gen_proof` or `push`.
+
+### Backlog cap
+
+The watermark bounds *consumed* data; a receiver that never consumes would still grow its
+channel. `Config::MaxBacklogPerDestination` caps the unconsumed (stored-but-not-pruned)
+payload count per destination — over-cap messages fall back to plain HRMP delivery and emit
+`BacklogCapReached`. This is the worst-case DoS guard, independent of acks.
+
+### Tests
+
+Watermark monotonicity; prune correctness (payloads below the watermark gone, at/above
+retained and still provable); slow-receiver retention (no ack ⇒ nothing pruned); revert safety
+(K-deep gate rejects too-recent acks); capped prune resumes across calls; relay `LatestRequires`
+overwrite + eviction; and a property test verifying every un-consumed leaf stays provable after
+node pruning across many MMR sizes and watermarks.
+
+---
+
 ## 11. What's NOT In This POC
 
 - **Speculative (acknowledged) delivery mode**: requires Low-Latency v2's collator acknowledgement signatures, which are not yet implemented in the codebase. The receiver cannot optimistically build on an un-included sender block without a signed canonicality commitment from the sender's collators.
@@ -2274,7 +2378,6 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 - **Trust domains**: a concept from the high-level design (§8) where parachains declare which peers' collators they trust for speculative (acknowledged) delivery. Trust domains require three things that don't exist yet: LLv2 collator acknowledgement signatures, a `TrustedPeers: Vec<ParaId>` runtime configuration, and collator logic for trust-domain-aware acknowledgement rules. The POC uses inclusion-based delivery only, which relies purely on relay chain enforcement of `ProvidesRoots` — no trust assumptions between chains.
 - **Low-Latency v2 integration**: LLv2 is the most invasive dependency in the speculative messaging design space — its core components touch consensus-critical code across the codebase. It requires: new `scheduling_parent` and `scheduling_session_index` fields in the candidate descriptor (decoupling scheduling from relay parent); backing group selection based on scheduling parent (relay chain runtime, security-critical); inclusion rules for candidates with relay parents up to ~14,400 blocks old; collator acknowledgement signatures (new primitives + gossip protocol); slashing rules for ACK'd-but-never-included blocks; and PVF header-chain proofs. The POC establishes the integration model (descriptor version gating, PVF validation ABI extension, relay-chain enactment-time rules) that LLv2 builds on, but does not reduce LLv2's own scope — it is a separate large project.
 - **Relaxed or unordered delivery semantics**: Phase 1 requires contiguous per-source subtree advancement
-- **Message pruning or MMR garbage collection**: leaves grow indefinitely
 - **Economic incentives**: no fee mechanism for relayers/collators
 - **Cycle prevention**: handled by "don't process messages from blocks that haven't been built yet"
 
@@ -2283,22 +2386,25 @@ Legend: ✅ done · 🔶 partial · ❌ not started
 ## 12. Follow-Up Roadmap
 
 ### Delivery Bounds and Pruning
-- Define what "eventual delivery" means operationally.
-- Bound maximum message age and maximum catch-up per block.
-- Define message retention windows and pruning triggers.
+- **Done** — sender storage is bounded by consumed-watermark pruning + a per-destination
+  backlog cap; see [Consumed-Watermark Retention & Storage Bounds](#consumed-watermark-retention--storage-bounds-follow-up-to-12350).
+- Still open: define what "eventual delivery" means operationally; bound maximum message age
+  and maximum catch-up per block.
 
 ### Rate Limiting and DoS Protection
-- Add per-channel message and byte limits.
-- Enforce limits on outbox and inbox paths.
+- **Partly done** — per-destination unconsumed-backlog cap (`MaxBacklogPerDestination`) with
+  HRMP fallback. Still open: per-channel byte limits and inbox-path limits.
 
 ### Proof and Storage Bounds
-- Define fallback behavior when late-block-proofs exceed PoV size limits.
-- Confirm relay-chain storage remains bounded to latest-per-para data only.
+- **Done** — relay storage is latest-per-pair only (provides window + `LatestRequires`); sender
+  proofs are O(log n) from the persistent MMR node store, which is itself pruned to the witness
+  frontier. Still open: fallback when late-block proofs exceed PoV size limits.
 
 ### Trust Domains and Acknowledgements
-- Define when speculative mode is allowed.
-- Clarify unilateral trust, revocation, and fallback behavior.
-- Integrate acknowledgements when Low-Latency v2 is available.
+- **Ack mechanism done** — relay-mediated, K-deep-gated consumed acknowledgements
+  (`note_consumed`) drive sender pruning; see the retention section above.
+- Still open (needs LLv2): trust-domain declaration, when *speculative* (acknowledged) delivery
+  mode is allowed, unilateral trust, and revocation.
 
 ### Migration and Coexistence
 - Define how HRMP and speculative messaging run in parallel.
