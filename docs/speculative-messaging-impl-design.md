@@ -149,6 +149,34 @@ and bounded, which is why the design accepts it. In one line: **UMP signals let
 speculative messaging ship as a feature-gated, backward-compatible addition instead of
 a consensus-breaking change to the candidate-receipt format.**
 
+### Deviations from the high-level design
+
+[speculative-messaging-design.md](speculative-messaging-design.md) is the canonical
+high-level vision, tracked from upstream [paritytech/polkadot-sdk#10449](https://github.com/paritytech/polkadot-sdk/pull/10449)
+(still open; the bulk of that PR's review discussion concerns the sibling LLv2 doc, now
+split to [#11413](https://github.com/paritytech/polkadot-sdk/pull/11413), which is out of
+this POC's scope). This POC preserves the design's **principles** — the relay sees only
+commitments, execute-first/match-later, late-block proofs, contiguous per-source
+advancement — but deviates in the commitment **representation** for a smaller, shippable
+slice. The deltas, all detailed in the revision notes above and the sections cited:
+
+| High-level design (#10449) | This POC | Where / why |
+|---|---|---|
+| Hierarchical MMR + **top-level Merkle root** bagging the per-destination roots; `ProvidesCommitment { root }`; `MessageBatch.subtree_inclusion_proof` | **Flat `CommitmentSet`** of `(destination, subtree_root)`; relay matches the pair by lookup; no top-level tree or inclusion proof | revision note 2; §3.1 |
+| `provides` / `requires` as **`CandidateCommitments` fields** | **UMP signals** (`UMPSignal::ProvidesRoots` / `RequiresRoots`) | revision note 4; "Why UMP signals" above |
+| Relay matching = **exact single-root** equality | **Provides window** membership (`LatestProvides`, configurable size) | revision note 5 (#12349) |
+| Hash unspecified in the design body | **`blake2_256`** via the generic `SpecHasher` | revision note 1 |
+| Custom MMR extension verification | **`mmr_lib`** inclusion + `verify_incremental` ancestry proofs | revision note 3 |
+| `SourceState.last_seen_subtree_root` (the open `// TODO: Why do we need this?`) | **Dropped** — receiver tracks only `last_processed` | matches upstream's removal of the same field |
+| "Message pruning… NOT in this POC"; the design's "Acknowledgement Extensions" are LLv2 collator acks | **Consumed-watermark retention** — relay-mediated, K-deep-gated acks (`note_consumed`) drive watermark + node-store pruning, plus a per-destination backlog cap | **Addition** beyond the design; see [Consumed-Watermark Retention & Storage Bounds](#consumed-watermark-retention--storage-bounds-follow-up-to-12350) (follow-up to #12350) |
+
+Because we made these concrete choices, the POC also **resolves several of the design
+doc's open `TODO`s**: `MessageBatch.subtree_root` is needed precisely because, under the
+flat commitment, it *is* the value the relay matches (no inclusion proof); the
+`position` field is retained as part of the `hash_leaf` binding; and
+`last_seen_subtree_root` is dropped (as upstream now does too). When #10449 merges, re-sync
+the design doc and revisit this table for any shifts.
+
 ---
 
 ## 1. Core Concept and End-to-End Workflow
