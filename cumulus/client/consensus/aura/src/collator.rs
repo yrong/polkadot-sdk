@@ -227,6 +227,7 @@ where
 		relay_proof_request: RelayProofRequest,
 		collator_peer_id: PeerId,
 		speculative_ingress: Option<cumulus_primitives_core::SpeculativeIngress>,
+		consumed_ack: Option<cumulus_pallet_speculative_outbox::ConsumedAck>,
 	) -> Result<(ParachainInherentData, InherentData), Box<dyn Error + Send + Sync + 'static>> {
 		let (paras_inherent_data, mut other_inherent_data) = self
 			.create_inherent_data_with_rp_offset(
@@ -244,6 +245,14 @@ where
 			cumulus_pallet_speculative_inbox::client::inject_speculative_ingress(
 				&mut other_inherent_data,
 				ingress,
+			)
+			.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+		}
+
+		if let Some(ack) = consumed_ack {
+			cumulus_pallet_speculative_outbox::client::inject_consumed_acks(
+				&mut other_inherent_data,
+				&ack,
 			)
 			.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
 		}

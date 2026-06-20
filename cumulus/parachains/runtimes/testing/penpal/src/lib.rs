@@ -687,6 +687,11 @@ impl cumulus_pallet_xcmp_queue::Config for Runtime {
 impl cumulus_pallet_speculative_outbox::Config for Runtime {
 	type InnerXcmpMessageSource = XcmpQueue;
 	type SelfParaId = ParachainInfo;
+	type MaxBacklogPerDestination = frame_support::traits::ConstU64<10_000>;
+	type RelayState = cumulus_pallet_parachain_system::RelaychainDataProvider<Runtime>;
+	// Conservative finality depth: an ack must be this many relay blocks deep before it is acted
+	// upon, so a dispute revert cannot strand a receiver. Should be >= the relay dispute period.
+	type AckFinalityDepth = frame_support::traits::ConstU32<10>;
 }
 
 impl cumulus_pallet_speculative_inbox::Config for Runtime {

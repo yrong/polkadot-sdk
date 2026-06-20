@@ -67,3 +67,13 @@ pub fn provides_window<T: crate::inclusion::Config>(
 ) -> Vec<polkadot_primitives::Hash> {
 	crate::inclusion::Pallet::<T>::provides_window(source, destination)
 }
+
+/// Implementation of `latest_requires_for_source` runtime API. Returns the latest consumed
+/// roots committed against `source` by all receivers, as `(receiver, consumed_root,
+/// enacted_block)` tuples, so the sender's collator can build `note_consumed` proofs (follow-up
+/// to #12350).
+pub fn latest_requires_for_source<T: crate::inclusion::Config>(
+	source: ParaId,
+) -> Vec<(ParaId, polkadot_primitives::Hash, BlockNumberFor<T>)> {
+	crate::inclusion::Pallet::<T>::latest_requires_for_source(source)
+}

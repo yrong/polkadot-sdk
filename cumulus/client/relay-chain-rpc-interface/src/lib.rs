@@ -109,6 +109,19 @@ impl RelayChainInterface for RelayChainRpcInterface {
 		Ok(Decode::decode(&mut &response[..])?)
 	}
 
+	async fn latest_requires_for_source(
+		&self,
+		source: ParaId,
+		relay_parent: RelayHash,
+	) -> RelayChainResult<Vec<(ParaId, RelayHash, cumulus_primitives_core::relay_chain::BlockNumber)>>
+	{
+		let payload = source.encode();
+		let response = self
+			.call_runtime_api("ParachainHost_latest_requires_for_source", relay_parent, &payload)
+			.await?;
+		Ok(Decode::decode(&mut &response[..])?)
+	}
+
 	async fn header(&self, block_id: BlockId) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,

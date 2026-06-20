@@ -355,5 +355,12 @@ sp_api::decl_runtime_apis! {
 		/// batch root is absent here.
 		#[api_version(17)]
 		fn provides_window(source: ppp::Id, destination: ppp::Id) -> Vec<Hash>;
+
+		/// Read the latest `requires` acks committed against `source` by all receivers — the
+		/// `(receiver, consumed_root, enacted_block)` tuples (follow-up to #12350). The sender's
+		/// collator uses this to build `note_consumed` proofs that advance its consumed watermark
+		/// and prune acknowledged payloads.
+		#[api_version(17)]
+		fn latest_requires_for_source(source: ppp::Id) -> Vec<(ppp::Id, Hash, BlockNumber)>;
 	}
 }

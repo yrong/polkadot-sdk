@@ -15,9 +15,14 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate as speculative_inbox;
+use cumulus_pallet_parachain_system::{RelayChainState, RelaychainStateProvider};
 use cumulus_pallet_speculative_outbox as speculative_outbox;
 use cumulus_primitives_core::ParaId;
-use frame_support::{derive_impl, parameter_types, traits::Everything, weights::Weight};
+use frame_support::{
+	derive_impl, parameter_types,
+	traits::{ConstU32, ConstU64, Everything},
+	weights::Weight,
+};
 use polkadot_parachain_primitives::primitives::XcmpMessageHandler;
 use sp_core::H256;
 use sp_runtime::{
@@ -75,9 +80,20 @@ impl frame_system::Config for Test {
 	type BaseCallFilter = Everything;
 }
 
+/// Stub relay-state provider; the inbox tests do not exercise the outbox's `note_consumed`.
+pub struct NoopRelayState;
+impl RelaychainStateProvider for NoopRelayState {
+	fn current_relay_chain_state() -> RelayChainState {
+		RelayChainState::default()
+	}
+}
+
 impl speculative_outbox::Config for Test {
 	type InnerXcmpMessageSource = NoopXcmpSource;
 	type SelfParaId = OutboxParaId;
+	type MaxBacklogPerDestination = ConstU64<10_000>;
+	type RelayState = NoopRelayState;
+	type AckFinalityDepth = ConstU32<2>;
 }
 
 impl speculative_inbox::Config for Test {

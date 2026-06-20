@@ -15,13 +15,18 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate as speculative_outbox;
+use cumulus_pallet_parachain_system::{RelayChainState, RelaychainStateProvider};
 use cumulus_primitives_core::ParaId;
-use frame_support::{derive_impl, parameter_types, traits::Everything};
+use frame_support::{
+	derive_impl, parameter_types,
+	traits::{ConstU32, ConstU64, Everything},
+};
 use sp_core::H256;
 use sp_runtime::{
 	traits::{BlakeTwo256, IdentityLookup},
 	BuildStorage,
 };
+use std::cell::RefCell;
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
@@ -59,9 +64,30 @@ impl frame_system::Config for Test {
 	type BaseCallFilter = Everything;
 }
 
+thread_local! {
+	/// Controllable relay-parent state for `note_consumed` tests.
+	static RELAY_STATE: RefCell<RelayChainState> = RefCell::new(RelayChainState::default());
+}
+
+/// Test relay-state provider backed by [`RELAY_STATE`]; set it with [`set_relay_state`].
+pub struct MockRelayState;
+impl RelaychainStateProvider for MockRelayState {
+	fn current_relay_chain_state() -> RelayChainState {
+		RELAY_STATE.with(|s| s.borrow().clone())
+	}
+}
+
+/// Set the relay-parent number and state root seen by [`MockRelayState`].
+pub fn set_relay_state(number: u32, state_root: H256) {
+	RELAY_STATE.with(|s| *s.borrow_mut() = RelayChainState { number, state_root });
+}
+
 impl speculative_outbox::Config for Test {
 	type InnerXcmpMessageSource = NoopXcmpSource;
 	type SelfParaId = OutboxParaId;
+	type MaxBacklogPerDestination = ConstU64<5>;
+	type RelayState = MockRelayState;
+	type AckFinalityDepth = ConstU32<2>;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {

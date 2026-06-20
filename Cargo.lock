@@ -4872,6 +4872,7 @@ dependencies = [
  "cumulus-client-parachain-inherent",
  "cumulus-client-proof-size-recording",
  "cumulus-pallet-speculative-inbox",
+ "cumulus-pallet-speculative-outbox",
  "cumulus-primitives-aura",
  "cumulus-primitives-core",
  "cumulus-relay-chain-interface",
@@ -5294,6 +5295,7 @@ dependencies = [
  "cumulus-pallet-parachain-system",
  "cumulus-primitives-core",
  "cumulus-primitives-spec-messaging",
+ "cumulus-test-relay-sproof-builder",
  "frame-support",
  "frame-system",
  "log",
@@ -5304,10 +5306,12 @@ dependencies = [
  "polkadot-primitives",
  "scale-info",
  "sp-core 28.0.0",
+ "sp-inherents 26.0.0",
  "sp-io 30.0.0",
  "sp-mmr-primitives",
  "sp-runtime 31.0.1",
  "sp-std 14.0.0",
+ "sp-trie 29.0.0",
 ]
 
 [[package]]

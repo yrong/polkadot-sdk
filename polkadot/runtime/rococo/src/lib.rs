@@ -2197,6 +2197,10 @@ sp_api::impl_runtime_apis! {
 		fn provides_window(source: ParaId, destination: ParaId) -> Vec<Hash> {
 			parachains_staging_runtime_api_impl::provides_window::<Runtime>(source, destination)
 		}
+
+		fn latest_requires_for_source(source: ParaId) -> Vec<(ParaId, Hash, BlockNumber)> {
+			parachains_staging_runtime_api_impl::latest_requires_for_source::<Runtime>(source)
+		}
 	}
 
 	#[api_version(6)]

@@ -3385,3 +3385,82 @@ fn speculative_evict_provides_after_removes_emptied_window() {
 		assert!(!LatestProvides::<Test>::contains_key(source, receiver));
 	});
 }
+
+/// Record a single `(source -> root)` requires ack for `receiver` at the current block.
+fn commit_requires(receiver: ParaId, source: ParaId, root: Hash) {
+	ParaInclusion::update_requires(
+		receiver,
+		&RequiresCommitment::try_from_iter([(source, root)]).unwrap(),
+	);
+}
+
+#[test]
+fn speculative_latest_requires_overwrites_per_pair() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		// Only the latest ack per `(source, receiver)` is kept, tagged with its enacting block.
+		frame_system::Pallet::<Test>::set_block_number(5);
+		commit_requires(receiver, source, Hash::from_low_u64_be(1));
+		frame_system::Pallet::<Test>::set_block_number(9);
+		commit_requires(receiver, source, Hash::from_low_u64_be(2));
+
+		let acks = ParaInclusion::latest_requires_for_source(source);
+		assert_eq!(acks, vec![(receiver, Hash::from_low_u64_be(2), 9)]);
+	});
+}
+
+#[test]
+fn speculative_latest_requires_for_source_returns_all_receivers() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let r1 = ParaId::from(2000u32);
+		let r2 = ParaId::from(3000u32);
+
+		frame_system::Pallet::<Test>::set_block_number(7);
+		commit_requires(r1, source, Hash::from_low_u64_be(1));
+		commit_requires(r2, source, Hash::from_low_u64_be(2));
+
+		let mut acks = ParaInclusion::latest_requires_for_source(source);
+		acks.sort_by_key(|(receiver, _, _)| *receiver);
+		assert_eq!(
+			acks,
+			vec![(r1, Hash::from_low_u64_be(1), 7), (r2, Hash::from_low_u64_be(2), 7)]
+		);
+	});
+}
+
+#[test]
+fn speculative_evict_requires_after_drops_reverted_ack() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		frame_system::Pallet::<Test>::set_block_number(5);
+		commit_requires(receiver, source, Hash::from_low_u64_be(5));
+
+		// Reverting to block 4 drops the block-5 ack entirely (only the latest is stored).
+		ParaInclusion::evict_requires_after(4);
+		assert!(ParaInclusion::latest_requires_for_source(source).is_empty());
+		assert!(!LatestRequires::<Test>::contains_key(source, receiver));
+	});
+}
+
+#[test]
+fn speculative_evict_requires_after_keeps_final_ack() {
+	new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+		let source = ParaId::from(1000u32);
+		let receiver = ParaId::from(2000u32);
+
+		frame_system::Pallet::<Test>::set_block_number(3);
+		commit_requires(receiver, source, Hash::from_low_u64_be(3));
+
+		// An ack enacted at/below `revert_to` survives.
+		ParaInclusion::evict_requires_after(4);
+		assert_eq!(
+			ParaInclusion::latest_requires_for_source(source),
+			vec![(receiver, Hash::from_low_u64_be(3), 3)]
+		);
+	});
+}

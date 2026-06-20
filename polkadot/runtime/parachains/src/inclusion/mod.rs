@@ -392,6 +392,23 @@ pub mod pallet {
 		ValueQuery,
 	>;
 
+	/// Latest `requires` root each `receiver` committed against each `source` — i.e. the
+	/// source subtree root the receiver has provably consumed up to. Overwrite (only the
+	/// latest is kept), tagged with the enacting relay block so the sender can apply a
+	/// K-deep finality gate and dispute reverts can evict it. Used by the sender's
+	/// consumed-watermark pruning (follow-up to #12350; see
+	/// `docs/speculative-messaging-watermark-plan.md`).
+	#[pallet::storage]
+	pub(crate) type LatestRequires<T: Config> = StorageDoubleMap<
+		_,
+		Twox64Concat,
+		polkadot_primitives::Id,
+		Twox64Concat,
+		polkadot_primitives::Id,
+		RequiresEntry<BlockNumberFor<T>>,
+		OptionQuery,
+	>;
+
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
 }
@@ -420,6 +437,18 @@ pub struct ProvidesEntry<BlockNumber> {
 	/// The committed per-destination subtree root.
 	pub root: polkadot_primitives::Hash,
 	/// The relay block number at which this provides root was enacted.
+	pub block: BlockNumber,
+}
+
+/// The latest `requires` root a receiver committed against a source, tagged with the relay
+/// block at which it was enacted. The block tag lets the sender apply a K-deep finality gate
+/// before pruning, and lets [`Pallet::evict_requires_after`] drop an ack from a block reverted
+/// by a dispute (follow-up to #12350).
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen, PartialEq, Eq, Debug)]
+pub struct RequiresEntry<BlockNumber> {
+	/// The source subtree root the receiver has consumed up to.
+	pub root: polkadot_primitives::Hash,
+	/// The relay block number at which this requires root was enacted.
 	pub block: BlockNumber,
 }
 
@@ -1056,6 +1085,48 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	/// Persist the `receiver`'s `requires` commitment as the latest consumed root per source,
+	/// tagged with the current relay block. Called at receiver enactment so the sender can later
+	/// learn how far the receiver has consumed and prune acknowledged payloads (follow-up to
+	/// #12350). Overwrites any previous entry — only the latest ack per `(source, receiver)` is
+	/// kept.
+	pub(crate) fn update_requires(
+		receiver: polkadot_primitives::Id,
+		requires: &RequiresCommitment,
+	) {
+		let block = <frame_system::Pallet<T>>::block_number();
+		for (source, root) in requires.iter() {
+			LatestRequires::<T>::insert(source, receiver, RequiresEntry { root: *root, block });
+		}
+	}
+
+	/// The latest `requires` acks committed against `source` by all receivers: the
+	/// `(receiver, consumed_root, enacted_block)` tuples. Used by the `latest_requires_for_source`
+	/// runtime API so the sender's collator can build `note_consumed` proofs (follow-up to #12350).
+	pub(crate) fn latest_requires_for_source(
+		source: polkadot_primitives::Id,
+	) -> Vec<(polkadot_primitives::Id, polkadot_primitives::Hash, BlockNumberFor<T>)> {
+		LatestRequires::<T>::iter_prefix(source)
+			.map(|(receiver, entry)| (receiver, entry.root, entry.block))
+			.collect()
+	}
+
+	/// Evict every `requires` ack that was enacted *after* `revert_to`, i.e. in a block reverted
+	/// by a concluded dispute. Mirrors [`Pallet::evict_provides_after`]. Losing an ack only delays
+	/// the sender's pruning until the receiver re-acks, so dropping the latest entry is safe.
+	pub(crate) fn evict_requires_after(revert_to: BlockNumberFor<T>) {
+		// Collect first to avoid mutating the map while iterating it.
+		let keys: Vec<(polkadot_primitives::Id, polkadot_primitives::Id)> =
+			LatestRequires::<T>::iter_keys().collect();
+		for (source, receiver) in keys {
+			LatestRequires::<T>::mutate_exists(source, receiver, |maybe_entry| {
+				if maybe_entry.as_ref().map_or(false, |entry| entry.block > revert_to) {
+					*maybe_entry = None;
+				}
+			});
+		}
+	}
+
 	fn enact_candidate(
 		relay_parent_number: BlockNumberFor<T>,
 		receipt: CommittedCandidateReceipt<T::Hash>,
@@ -1139,6 +1210,15 @@ impl<T: Config> Pallet<T> {
 				receiver, provides.len(),
 			);
 			Self::update_provides(receiver, provides.clone());
+		}
+
+		// Persist the receiver's consumed roots so the sender can prune acknowledged payloads
+		// (follow-up to #12350). Recorded whenever requires are present and satisfied — i.e. not
+		// in the defensive branch above.
+		if let Some(requires) = requires {
+			if Self::requires_satisfied(receiver, requires) {
+				Self::update_requires(receiver, requires);
+			}
 		}
 
 		Self::deposit_event(Event::<T>::CandidateIncluded(

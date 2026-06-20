@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use super::outbox_client::{build_message_batch_from_query, OutboxQuery};
 use cumulus_pallet_speculative_inbox::client::empty_speculative_ingress;
+use cumulus_pallet_speculative_outbox::{latest_requires_key, ConsumedAck};
 use cumulus_primitives_core::{LateBlockProof, ParaId, SpeculativeInboxApi, SpeculativeIngress};
 use cumulus_relay_chain_interface::RelayChainInterface;
 use polkadot_primitives::{BlockNumber, Hash};
@@ -68,6 +69,36 @@ impl SpeculativeMessageSources {
 	pub fn with_sources(sources: Vec<(ParaId, Arc<dyn OutboxQuery>)>) -> Self {
 		Self { sources, max_messages_per_source: DEFAULT_MAX_MESSAGES_PER_SOURCE }
 	}
+}
+
+/// Build the consumed-ack inherent for *this* parachain (`self_para_id`) as a sender: query the
+/// relay for receivers that have acknowledged consumption and prove their
+/// `ParaInclusion::LatestRequires(self, receiver)` entries against the relay parent.
+///
+/// Returns `None` when there are no acks or the relay query / proof fails (the collator then simply
+/// builds no consumed-ack inherent this block). The runtime applies the K-deep finality gate and
+/// re-verifies the proof, so this path only needs to be best-effort.
+pub async fn fetch_consumed_ack<RClient>(
+	relay_client: &RClient,
+	self_para_id: ParaId,
+	relay_parent: Hash,
+) -> Option<ConsumedAck>
+where
+	RClient: RelayChainInterface,
+{
+	let acks = relay_client.latest_requires_for_source(self_para_id, relay_parent).await.ok()?;
+	if acks.is_empty() {
+		return None;
+	}
+	// Bound the batch to the runtime's `MAX_ACKS_PER_CALL` (64); the runtime gates K-deep finality.
+	let receivers: Vec<ParaId> =
+		acks.into_iter().map(|(receiver, _, _)| receiver).take(64).collect();
+	let keys: Vec<Vec<u8>> = receivers
+		.iter()
+		.map(|receiver| latest_requires_key(self_para_id, *receiver))
+		.collect();
+	let proof = relay_client.prove_read(relay_parent, &keys).await.ok()?;
+	Some(ConsumedAck { proof, receivers })
 }
 
 /// Fetch speculative ingress (and any required late block proofs) for the block being

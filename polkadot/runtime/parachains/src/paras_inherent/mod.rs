@@ -447,6 +447,7 @@ impl<T: Config> Pallet<T> {
 		if !was_frozen {
 			if let Some(revert_to) = T::DisputesHandler::frozen_block() {
 				inclusion::Pallet::<T>::evict_provides_after(revert_to);
+				inclusion::Pallet::<T>::evict_requires_after(revert_to);
 			}
 		}
 

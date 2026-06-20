@@ -245,6 +245,15 @@ impl RelayChainInterface for TestRelayClient {
 		unimplemented!("Not needed for test")
 	}
 
+	async fn latest_requires_for_source(
+		&self,
+		_: ParaId,
+		_: RelayHash,
+	) -> RelayChainResult<Vec<(ParaId, RelayHash, cumulus_primitives_core::relay_chain::BlockNumber)>>
+	{
+		unimplemented!("Not needed for test")
+	}
+
 	async fn retrieve_dmq_contents(
 		&self,
 		_: ParaId,

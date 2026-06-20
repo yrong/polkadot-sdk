@@ -128,6 +128,18 @@ impl RelayChainInterface for RelayChainInProcessInterface {
 			.provides_window(relay_parent, source, destination)?)
 	}
 
+	async fn latest_requires_for_source(
+		&self,
+		source: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Vec<(ParaId, PHash, cumulus_primitives_core::relay_chain::BlockNumber)>>
+	{
+		Ok(self
+			.full_client
+			.runtime_api()
+			.latest_requires_for_source(relay_parent, source)?)
+	}
+
 	async fn header(&self, block_id: BlockId) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,

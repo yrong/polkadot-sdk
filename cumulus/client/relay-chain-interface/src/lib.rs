@@ -170,6 +170,15 @@ pub trait RelayChainInterface: Send + Sync {
 		relay_parent: PHash,
 	) -> RelayChainResult<Vec<PHash>>;
 
+	/// Fetch the latest `requires` acks committed against `source` by all receivers, as
+	/// `(receiver, consumed_root, enacted_block)` tuples. The sender's collator uses these to build
+	/// the `note_consumed` consumed-ack inherent (follow-up to #12350).
+	async fn latest_requires_for_source(
+		&self,
+		source: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Vec<(ParaId, PHash, cumulus_primitives_core::relay_chain::BlockNumber)>>;
+
 	/// Yields the persisted validation data for the given `ParaId` along with an assumption that
 	/// should be used if the para currently occupies a core.
 	///
@@ -315,6 +324,15 @@ where
 		relay_parent: PHash,
 	) -> RelayChainResult<Vec<PHash>> {
 		(**self).provides_window(source, destination, relay_parent).await
+	}
+
+	async fn latest_requires_for_source(
+		&self,
+		source: ParaId,
+		relay_parent: PHash,
+	) -> RelayChainResult<Vec<(ParaId, PHash, cumulus_primitives_core::relay_chain::BlockNumber)>>
+	{
+		(**self).latest_requires_for_source(source, relay_parent).await
 	}
 
 	async fn persisted_validation_data(

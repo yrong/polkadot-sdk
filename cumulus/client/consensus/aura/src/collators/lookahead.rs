@@ -478,6 +478,17 @@ where
 					"speculative ingress resolved before inherent data",
 				);
 
+				// As a *sender*, prune payloads receivers have acknowledged: build the
+				// consumed-ack inherent from the relay's `LatestRequires` (follow-up to #12350).
+				// `None` when there are no acks. (Production should gate this behind a
+				// "speculative enabled" flag to avoid a relay query on non-participating chains.)
+				let consumed_ack = crate::collators::speculative_ingress::fetch_consumed_ack(
+					&params.relay_client,
+					params.para_id,
+					relay_parent,
+				)
+				.await;
+
 				let (parachain_inherent_data, other_inherent_data) = match collator
 					.create_inherent_data(
 						relay_parent,
@@ -487,6 +498,7 @@ where
 						relay_proof_request,
 						params.collator_peer_id,
 						Some(speculative_ingress),
+						consumed_ack,
 					)
 					.await
 				{
