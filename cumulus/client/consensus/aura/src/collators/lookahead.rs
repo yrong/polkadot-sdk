@@ -450,12 +450,9 @@ where
 				let relay_proof_request =
 					super::get_relay_proof_request(&*params.para_client, parent_hash);
 
-				let (speculative_ingress, late_block_proofs) =
+				let speculative_ingress =
 					if params.speculative_sources.sources.is_empty() {
-						(
-							cumulus_pallet_speculative_inbox::client::empty_speculative_ingress(),
-							Vec::new(),
-						)
+						cumulus_pallet_speculative_inbox::client::empty_speculative_ingress()
 					} else {
 						crate::collators::speculative_ingress::fetch_ingress_for_block(
 							para_client,
@@ -474,7 +471,6 @@ where
 					?parent_hash,
 					n_sources = params.speculative_sources.sources.len(),
 					n_batches = speculative_ingress.batches.len(),
-					n_late_block_proofs = late_block_proofs.len(),
 					"speculative ingress resolved before inherent data",
 				);
 
@@ -542,7 +538,10 @@ where
 						(parachain_inherent_data, other_inherent_data),
 						params.authoring_duration,
 						allowed_pov_size,
-						late_block_proofs,
+						// Late Block Proofs are no longer produced by the collator (the build-time
+						// rewind + provides window cover staleness); the `collate`/`ParachainBlockData::V2`
+						// LBP carrier is retained for future use. See `speculative_ingress`.
+						Vec::new(),
 					)
 					.await
 				{

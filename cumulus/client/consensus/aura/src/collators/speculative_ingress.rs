@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::outbox_client::{build_message_batch_from_query, OutboxQuery};
 use cumulus_pallet_speculative_inbox::client::empty_speculative_ingress;
 use cumulus_pallet_speculative_outbox::{latest_requires_key, ConsumedAck};
-use cumulus_primitives_core::{LateBlockProof, ParaId, SpeculativeInboxApi, SpeculativeIngress};
+use cumulus_primitives_core::{ParaId, SpeculativeInboxApi, SpeculativeIngress};
 use cumulus_relay_chain_interface::RelayChainInterface;
 use polkadot_primitives::{BlockNumber, Hash};
 use sc_client_api::UsageProvider;
@@ -34,9 +34,10 @@ pub const DEFAULT_MAX_MESSAGES_PER_SOURCE: u32 = 32;
 
 /// Sender parachain clients used to build speculative ingress for this collator.
 ///
-/// Each entry holds a type-erased [`OutboxQuery`] that can be either an in-process
-/// [`crate::collators::DirectOutboxClient`] or a cross-process
-/// [`crate::collators::RpcOutboxClient`].
+/// Each entry holds a type-erased [`OutboxQuery`]. The only implementation today is the
+/// cross-process [`crate::collators::RpcOutboxClient`]; the trait is the abstraction point for
+/// future transports (e.g. an in-process client when a single process holds the sender chain's
+/// runtime API).
 pub struct SpeculativeMessageSources {
 	/// `(source_para_id, sender_outbox_query)`.
 	pub sources: Vec<(ParaId, Arc<dyn OutboxQuery>)>,
@@ -101,17 +102,20 @@ where
 	Some(ConsumedAck { proof, receivers })
 }
 
-/// Fetch speculative ingress (and any required late block proofs) for the block being
-/// built on `receiver_parent`.
+/// Fetch speculative ingress for the block being built on `receiver_parent`.
 ///
-/// When `sources` is empty, returns empty ingress / no LBPs (legacy behaviour). Otherwise
-/// queries each sender's outbox at its best block and the receiver's expected
-/// message cursor via [`SpeculativeInboxApi`].
+/// When `sources` is empty, returns empty ingress (legacy behaviour). Otherwise queries each
+/// sender's outbox at its best block and the receiver's expected message cursor via
+/// [`SpeculativeInboxApi`], building a batch against a root the relay already has in its provides
+/// window so the receiver's `requires` matches directly (no proof).
 ///
-/// The collator attaches the returned `Vec<LateBlockProof>` to
-/// `ParachainBlockData::V2.late_block_proofs` so the PVF's `apply_messaging_proofs`
-/// can transform `requires[source].expected_root` from the (older) batch root to
-/// the relay-committed current root.
+/// Note: this no longer produces Late Block Proofs. The build-time rewind already targets an
+/// in-window root, so a batch root outside the window is only seen when the sender (as we see it
+/// over RPC) lacks that root — exactly when a valid bridge can't be generated. Such batches are
+/// skipped; staleness is absorbed by the provides window + resubmission. The LBP generation /
+/// verification machinery is retained (`OutboxQuery::generate_late_block_proof`,
+/// `apply_late_block_proofs`, `ParachainBlockData::V2.late_block_proofs`) for future use — to make
+/// it load-bearing, build against the receiver's *consumed* root and always bridge forward.
 pub async fn fetch_ingress_for_block<Block, Client, RClient>(
 	receiver: &Client,
 	_receiver_parent: Hash,
@@ -120,7 +124,7 @@ pub async fn fetch_ingress_for_block<Block, Client, RClient>(
 	relay_parent: Hash,
 	relay_client: &RClient,
 	relay_parent_number: BlockNumber,
-) -> (SpeculativeIngress, Vec<LateBlockProof>)
+) -> SpeculativeIngress
 where
 	Block: BlockT<Hash = Hash>,
 	Client: ProvideRuntimeApi<Block> + UsageProvider<Block>,
@@ -128,12 +132,11 @@ where
 	RClient: RelayChainInterface,
 {
 	if config.sources.is_empty() {
-		return (empty_speculative_ingress(), Vec::new());
+		return empty_speculative_ingress();
 	}
 
 	let receiver_api = receiver.runtime_api();
 	let mut batches = Vec::new();
-	let mut late_block_proofs = Vec::new();
 
 	// Use the finalized head for position tracking rather than the fork parent.
 	// This prevents re-delivering messages that are already committed on the
@@ -212,57 +215,29 @@ where
 			},
 		};
 
-		// Window-aware Late Block Proof decision (issue #12349):
-		// - batch root already in the window → the relay matches it directly, no proof.
-		// - batch root older than the window → fetch an LBP proving it extends to the newest window
-		//   root, so the relay transforms `requires` and matches (§6.2).
-		// - empty window → no relay anchor; skip (root guard).
+		// The batch is only usable if its root is in the relay's provides window — then the relay
+		// matches `requires` directly, no proof. Otherwise skip:
+		// - empty window → the relay has no committed root for us yet (root guard);
+		// - root out of window → the build-time rewind couldn't target an in-window root (the
+		//   sender, as seen over RPC, lacks it), which is exactly the case a Late Block Proof can't
+		//   bridge. Staleness is absorbed by the window + resubmission; see the doc note above on
+		//   the retained (unused) LBP machinery.
 		if window.contains(&batch.subtree_root) {
 			tracing::debug!(
 				target: "aura::cumulus",
 				source = ?source,
 				messages = batch.messages.len(),
 				subtree_root = ?batch.subtree_root,
-				"fetched speculative batch (root in window, no LBP required)",
+				"fetched speculative batch (root in window)",
 			);
 			batches.push(batch);
-		} else if let Some(target) = newest_root {
-			let lbp_at = sender
-				.block_hash_for_subtree_root(sender_best, destination, target)
-				.await
-				.unwrap_or(sender_best);
-			match sender.generate_late_block_proof(lbp_at, destination, batch.subtree_root).await {
-				Some(proof) => {
-					tracing::debug!(
-						target: "aura::cumulus",
-						source = ?source,
-						messages = batch.messages.len(),
-						batch_subtree_root = ?batch.subtree_root,
-						?target,
-						"fetched speculative batch + late block proof (out of window)",
-					);
-					batches.push(batch);
-					late_block_proofs.push(proof);
-				},
-				None => {
-					tracing::warn!(
-						target: "aura::cumulus",
-						source = ?source,
-						batch_subtree_root = ?batch.subtree_root,
-						?target,
-						"could not generate late block proof; skipping batch",
-					);
-				},
-			}
 		} else {
-			// Empty window: the relay has no committed subtree root for us yet, so the
-			// receiver cannot pass `requires_satisfied` at inclusion. Skip the batch —
-			// see the root guard discussion in the design doc.
 			tracing::debug!(
 				target: "aura::cumulus",
 				source = ?source,
 				batch_subtree_root = ?batch.subtree_root,
-				"root guard: relay window is empty; skipping batch",
+				window_empty = window.is_empty(),
+				"batch root not in relay provides window; skipping (waiting for window/resubmission)",
 			);
 		}
 	}
@@ -270,9 +245,8 @@ where
 	tracing::debug!(
 		target: "aura::cumulus",
 		total_batches = batches.len(),
-		total_lbps = late_block_proofs.len(),
 		"fetch_ingress_for_block: done",
 	);
 
-	(SpeculativeIngress { batches }, late_block_proofs)
+	SpeculativeIngress { batches }
 }
