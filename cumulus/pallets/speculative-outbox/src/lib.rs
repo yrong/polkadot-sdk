@@ -428,6 +428,16 @@ pub mod pallet {
 
 			OutgoingMMRState::<T>::insert(dest, state);
 
+			// Backpressure signal: emit `BacklogCapReached` once, when this recording pushes the
+			// unconsumed backlog up to the cap (a below→at-cap transition). While at the cap the
+			// destination is excluded from `take_outbound_messages`, so it isn't recorded again
+			// until the receiver drains it below the cap — no per-block event spam.
+			let pruned = PrunedUpTo::<T>::get(&dest);
+			let cap = T::MaxBacklogPerDestination::get();
+			if position_before.saturating_sub(pruned) < cap && size.saturating_sub(pruned) >= cap {
+				Self::deposit_event(Event::BacklogCapReached { destination: dest });
+			}
+
 			// Mark this destination's root as changed so it is included in the next block's
 			// delta `provides`. Bounded by `MAX_DESTINATIONS_PER_BLOCK` (the same bound as
 			// `ProvidesCommitment`); a full set means more distinct destinations were touched
@@ -716,28 +726,27 @@ impl<T: Config> XcmpMessageSource for Pallet<T> {
 		maximum_channels: usize,
 		excluded_recipients: &[ParaId],
 	) -> Vec<(ParaId, Vec<u8>)> {
-		let messages = T::InnerXcmpMessageSource::take_outbound_messages(
-			maximum_channels,
-			excluded_recipients,
-		);
-		// Destinations at their backlog cap deliver via plain HRMP (returned below) instead of the
-		// speculative pathway; everything else is recorded speculatively and not returned
-		// (returning it would also place it in `horizontal_messages`, causing double processing
-		// on the receiver).
-		let mut fallback: Vec<(ParaId, Vec<u8>)> = Vec::new();
-		let mut capped: BTreeSet<ParaId> = BTreeSet::new();
-		for (dest, data) in messages {
+		// Backpressure: keep destinations already at their backlog cap out of the inner take, so
+		// their outbound messages stay buffered in the inner queue (`XcmpQueue`) and the existing
+		// XCMP congestion/fee machinery throttles the origin. Self-heals once the receiver drains
+		// the backlog below the cap. (`BacklogCapReached` is emitted edge-triggered in
+		// `record_outbound_messages` when a destination crosses into the capped state.)
+		let mut excluded: Vec<ParaId> = excluded_recipients.to_vec();
+		for (dest, _) in OutgoingMMRState::<T>::iter() {
 			if Pallet::<T>::backlog_full(dest) {
-				capped.insert(dest);
-				fallback.push((dest, data));
-			} else {
-				Pallet::<T>::record_outbound_messages(dest, vec![data]);
+				excluded.push(dest);
 			}
 		}
-		for dest in capped {
-			Pallet::<T>::deposit_event(Event::BacklogCapReached { destination: dest });
+
+		let messages =
+			T::InnerXcmpMessageSource::take_outbound_messages(maximum_channels, &excluded);
+		for (dest, data) in messages {
+			Pallet::<T>::record_outbound_messages(dest, vec![data]);
 		}
-		fallback
+
+		// Messages are delivered exclusively via the speculative pathway; returning them here would
+		// also place them in `horizontal_messages`, causing double processing on the receiver.
+		Vec::new()
 	}
 }
 

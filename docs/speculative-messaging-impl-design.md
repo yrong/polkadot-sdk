@@ -75,7 +75,7 @@ commitment **representation** for a smaller, shippable slice:
 | High-level design (#10449) | This POC | Why |
 |---|---|---|
 | Hierarchical MMR + **top-level Merkle root**; `ProvidesCommitment { root }`; `MessageBatch.subtree_inclusion_proof` | **Flat `CommitmentSet`** of `(destination, subtree_root)`; relay matches by lookup; no top-level tree or inclusion proof | §4 |
-| `provides`/`requires` as **`CandidateCommitments` fields** | **UMP signals** (`UMPSignal::ProvidesRoots`/`RequiresRoots`) | §6 |
+| `provides`/`requires` as **dedicated `CandidateCommitments` fields** (`commitments.provides`/`.requires`) | **UMP signals** (`UMPSignal::ProvidesRoots`/`RequiresRoots`) inside the existing `upward_messages` field | §6 |
 | Relay matching = **exact single-root** equality | **Provides window** membership | §5 |
 | Hash unspecified | **`blake2_256`** (`SpecHasher`) | §4 |
 | Custom MMR extension verification | **`mmr_lib`** inclusion + `verify_incremental` ancestry | §4, §7 |
@@ -257,10 +257,21 @@ and injects via `client::inject_consumed_acks`.
   prefix's peaks (`get_peaks(leaf_index_to_mmr_size(W - 1))`) as the witness frontier — every
   other node there is inside a completed subtree, summarised by its peak, and never read again.
 
-**Backlog cap.** The watermark bounds *consumed* data; a receiver that never consumes would still
-grow its channel. `MaxBacklogPerDestination` caps the unconsumed payload count — over-cap messages
-fall back to plain HRMP and emit `BacklogCapReached`. This is the worst-case DoS guard,
-independent of acks.
+**Backlog cap (backpressure).** The watermark bounds *consumed* data; a receiver that never
+consumes would still grow its channel. `MaxBacklogPerDestination` caps the unconsumed payload
+count per destination. On overflow the outbox applies **backpressure**: it stops taking that
+destination's messages from the inner XCMP source (leaving them buffered in `XcmpQueue`) and emits
+`BacklogCapReached`. This reuses the existing XCMP congestion/fee machinery — the growing buffer
+throttles the XCM origin, so congestion is surfaced rather than rerouted or dropped — and is
+self-healing: once the receiver consumes enough to drop below the cap, the outbox resumes recording.
+This is the worst-case DoS guard, independent of acks and of any other transport.
+
+> The cap is fundamentally backpressure, not a reroute. A *transition-only* alternative, while HRMP
+> still coexists, would be to fall back to plain HRMP delivery for over-cap messages — but since
+> speculative messaging is meant to replace HRMP (and a speculative-only pair may have no HRMP
+> channel), backpressure is the durable behaviour and is what the outbox does (capped destinations
+> are added to `excluded_recipients` on the inner `take_outbound_messages`, so nothing is returned
+> for HRMP).
 
 ## 9. Receiver pallet — `pallet-speculative-inbox`
 
@@ -286,13 +297,27 @@ the PVF call it on the identical signals, so the resulting `upward_messages` —
 
 ## 11. Off-chain networking & collator
 
-- `OutboxQuery` async trait with two impls: `DirectOutboxClient` (in-process) and
-  `RpcOutboxClient` (JSON-RPC WebSocket). `SpeculativeMessageSources` holds
-  `(ParaId, Arc<dyn OutboxQuery>)`; `--speculative-sender <PARA_ID>=<WS_URL>` wires them at
-  startup. (An HTTP provider would be a third `OutboxQuery` impl.)
-- `fetch_ingress_for_block` (lookahead collator) fetches batches, and is **window-aware**: it
-  reads `provides_window(source, dest)` and only generates a `LateBlockProof` when the batch root
-  is outside the window. Returns `(SpeculativeIngress, Vec<LateBlockProof>)`.
+- `OutboxQuery` async trait; the only implementation today is `RpcOutboxClient` (JSON-RPC
+  WebSocket), wired via `--speculative-sender <PARA_ID>=<WS_URL>` at startup.
+  `SpeculativeMessageSources` holds `(ParaId, Arc<dyn OutboxQuery>)`. The trait is the
+  abstraction point for future transports without changing collator logic — e.g. an in-process
+  `DirectOutboxClient` (when a single process holds the sender chain's client, such as a
+  multi-parachain collator) or an HTTP provider.
+- `fetch_ingress_for_block` (lookahead collator) fetches batches and is **window-aware**: it
+  rewinds to the newest in-window root via `block_hash_for_subtree_root` and only keeps a batch
+  whose root is in `provides_window(source, dest)` (direct relay match). Out-of-window batches are
+  **skipped** (they wait on the window + resubmission). Returns `SpeculativeIngress`.
+
+  > **The collator no longer produces Late Block Proofs.** The build-time rewind already lands the
+  > batch on an in-window root, so the out-of-window branch was only reached when the sender — as
+  > seen over RPC — *lacked* that root, which is exactly when a valid bridge can't be generated
+  > (the proof was absent or a no-op `old == new`). So it was removed. Staleness is absorbed by the
+  > **provides window** + the **resubmission loop**. The LBP **machinery is retained** for future
+  > use — generation (`OutboxQuery::generate_late_block_proof`, the pallet/runtime-API helpers),
+  > verification (`apply_late_block_proofs` / `verify_incremental`, §10), and the
+  > `ParachainBlockData::V2.late_block_proofs` carrier (collator now passes an empty vec). To make
+  > it load-bearing, build against the receiver's *consumed* root and always bridge forward instead
+  > of pre-rewinding (see Open items).
 - `fetch_consumed_ack` builds the sender-side `ConsumedAck` (§8).
 - Both are injected through `Collator::create_inherent_data`
   (`inject_speculative_ingress` / `inject_consumed_acks`); `RelayChainInterface` is extended with
@@ -341,10 +366,16 @@ sizes and watermarks.
   policy (the POC has a basic resubmission loop).
 - **Bounds & weights** — explicit per-channel byte limits and priced weight for
   `ingest_verified_messages` / `note_consumed`.
+- **Collator-side LBP removed; machinery retained** — `fetch_ingress_for_block` no longer fetches
+  or attaches late-block proofs (out-of-window batches are skipped, covered by the build-time
+  rewind + provides-window membership + resubmission). The generation/verification machinery
+  (`OutboxQuery::generate_late_block_proof`, `apply_late_block_proofs`/`verify_incremental`) and
+  the `ParachainBlockData::V2.late_block_proofs` carrier are kept for future use. To make it
+  load-bearing, build against the consumed root and always bridge forward (§11) — even then an LBP
+  only bridges to a *build-time* root, so the build→enactment window gap stays covered by
+  resubmission.
 - **LBP beyond the retention window** — if a receiver lags past available history,
   `generate_late_block_proof` returns `None`; consider a checkpoint catch-up scheme.
-- **HRMP fallback** — outside the backlog-cap path the speculative outbox is delivery-only; a
-  per-destination dual-path (speculative + HRMP, receiver dedupes) would harden liveness.
 - **Production commitment versioning** — keep `v9::CandidateCommitments` frozen and version the
   receipt chain rather than gating in place.
 
