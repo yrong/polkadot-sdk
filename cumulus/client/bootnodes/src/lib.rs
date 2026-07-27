@@ -22,6 +22,7 @@
 mod advertisement;
 mod config;
 mod discovery;
+mod peer_set;
 mod task;
 
 mod schema {
@@ -30,4 +31,8 @@ mod schema {
 
 pub use config::{bootnode_request_response_config, paranode_protocol_name};
 pub use discovery::{BootnodeDiscovery, BootnodeDiscoveryParams};
+pub use peer_set::{
+	run_parachain_peer_set, CapabilityProbe, ExpansionStrategy, ParachainPeerSetParams, PeerRegistry,
+	PeerSetConfig, SourcePeers,
+};
 pub use task::{start_bootnode_tasks, StartBootnodeTasksParams};

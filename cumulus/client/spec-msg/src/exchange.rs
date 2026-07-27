@@ -27,19 +27,15 @@
 //! ([`SourcePeers::report_bad`]) — transport failures merely rotate to the
 //! next peer.
 //!
-//! MVP peer sourcing is a plain registry ([`PeerRegistry`]) the node wiring
-//! fills (static addresses; zombienet). Discovering a source's collators
-//! dynamically via the relay chain DHT (authority discovery over the
-//! source's para id) plugs in behind the same trait — wiring work, not
-//! protocol work.
+//! Peers are discovered per source over the relay-chain DHT and held in the
+//! generic health-tracked [`PeerRegistry`] from `cumulus-client-bootnodes`
+//! (re-exported below); the fetch pipeline reads them through [`SourcePeers`].
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use codec::{DecodeAll, Encode};
-use parking_lot::RwLock;
 use sc_network::{IfDisconnected, NetworkRequest, PeerId};
 
-use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{ExchangeRequest, ExchangeResponse};
 
 use crate::protocol::PROTOCOL_NAME;
@@ -64,53 +60,14 @@ pub enum ExchangeError {
 	Verify(#[from] crate::verify::VerifyError),
 }
 
-/// Where the fetch pipeline learns which peers currently serve a source
-/// chain's streams — and where it reports the ones that served garbage.
-pub trait SourcePeers: Send + Sync {
-	/// Candidate peers for `source`, best first.
-	fn peers(&self, source: ParaId) -> Vec<PeerId>;
-
-	/// `peer` sent a response that failed verification for `source`:
-	/// discard it (definitive misbehavior — verified protocol data cannot
-	/// fail honestly).
-	fn report_bad(&self, source: ParaId, peer: PeerId);
-}
-
-/// The MVP [`SourcePeers`] implementation: a plain per-source registry the
-/// node wiring fills and the fetch pipeline consumes. Reported-bad peers
-/// are removed until re-registered.
-#[derive(Default)]
-pub struct PeerRegistry {
-	peers: RwLock<BTreeMap<ParaId, Vec<PeerId>>>,
-}
-
-impl PeerRegistry {
-	/// Replaces the peer set serving `source`.
-	pub fn set_peers(&self, source: ParaId, peers: Vec<PeerId>) {
-		self.peers.write().insert(source, peers);
-	}
-
-	/// Adds one peer serving `source` (idempotent).
-	pub fn add_peer(&self, source: ParaId, peer: PeerId) {
-		let mut peers = self.peers.write();
-		let entry = peers.entry(source).or_default();
-		if !entry.contains(&peer) {
-			entry.push(peer);
-		}
-	}
-}
-
-impl SourcePeers for PeerRegistry {
-	fn peers(&self, source: ParaId) -> Vec<PeerId> {
-		self.peers.read().get(&source).cloned().unwrap_or_default()
-	}
-
-	fn report_bad(&self, source: ParaId, peer: PeerId) {
-		if let Some(peers) = self.peers.write().get_mut(&source) {
-			peers.retain(|candidate| *candidate != peer);
-		}
-	}
-}
+// Where the fetch pipeline learns which peers currently serve a source chain's
+// streams, and reports the ones that served garbage. The generic, health-tracked
+// implementation lives in `cumulus-client-bootnodes` (shared with any
+// cross-parachain consumer, so the trait/registry aren't duplicated here);
+// re-exported for the fetch pipeline and node wiring. `set_peers` is the trusted
+// MVP seeding path; `report_bad` now excludes a peer for a cooldown rather than
+// only until the next re-seed.
+pub use cumulus_client_bootnodes::{PeerRegistry, SourcePeers};
 
 /// One raw `/spec-msg/exchange` round trip to one peer — the seam between
 /// the fetch pipeline and the network backend, mockable in tests.
