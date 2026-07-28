@@ -18394,6 +18394,7 @@ dependencies = [
  "staging-xcm-builder",
  "staging-xcm-executor",
  "substrate-build-script-utils",
+ "subxt 0.50.0",
  "tokio",
  "tokio-util",
  "zombienet-orchestrator",
