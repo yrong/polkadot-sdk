@@ -24,6 +24,7 @@ pub mod command;
 pub mod rpc;
 pub mod runtime;
 pub mod spec;
+pub(crate) mod spec_msg;
 pub(crate) mod statement_store;
 pub mod types;
 
@@ -31,6 +32,7 @@ use crate::cli::AuthoringPolicy;
 
 use cumulus_primitives_core::{
 	CollectCollationInfo, GetParachainInfo, RelayParentOffsetApi, SchedulingV3EnabledApi,
+	SpecMsgApi,
 };
 use cumulus_primitives_source_discovery::SourceDiscoveryApi;
 use sc_client_db::DbHash;
@@ -83,6 +85,7 @@ pub trait NodeRuntimeApi<Block: BlockT>:
 	+ sp_authority_discovery::AuthorityDiscoveryApi<Block>
 	+ SchedulingV3EnabledApi<Block>
 	+ SourceDiscoveryApi<Block>
+	+ SpecMsgApi<Block>
 	+ Sized
 {
 }
@@ -101,6 +104,7 @@ impl<T, Block: BlockT> NodeRuntimeApi<Block> for T where
 		+ sp_authority_discovery::AuthorityDiscoveryApi<Block>
 		+ SchedulingV3EnabledApi<Block>
 		+ SourceDiscoveryApi<Block>
+		+ SpecMsgApi<Block>
 {
 }
 

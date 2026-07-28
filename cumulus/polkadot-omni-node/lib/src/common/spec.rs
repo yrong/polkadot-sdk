@@ -20,6 +20,7 @@ use crate::{
 	common::{
 		command::NodeCommandRunner,
 		rpc::BuildRpcExtensions,
+		spec_msg::{new_spec_msg_protocol, SpecMsgDeps},
 		statement_store::{build_statement_store, new_statement_handler_proto},
 		types::{
 			ParachainBackend, ParachainBlockImport, ParachainClient, ParachainHostFunctions,
@@ -113,6 +114,7 @@ where
 		backend: Arc<ParachainBackend<Block>>,
 		node_extra_args: NodeExtraArgs,
 		block_import_extra_return_value: BIAuxiliaryData,
+		spec_msg: Option<SpecMsgDeps<Block>>,
 	) -> Result<(), sc_service::Error>;
 }
 
@@ -450,6 +452,12 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 				(proto, config)
 			});
 
+			// Speculative Messaging: the `/spec-msg/exchange` protocol must be
+			// registered before the network is built; the tasks start below,
+			// once the network service exists.
+			let spec_msg_protocol =
+				new_spec_msg_protocol::<_, _, Net>(client.clone(), &mut net_config)?;
+
 			let (network, system_rpc_tx, tx_handler_controller, sync_service) =
 				build_network(BuildNetworkParams {
 					parachain_config: &parachain_config,
@@ -476,12 +484,12 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 			// keep a health-tracked peer set. Version-gated + governance-opt-in — a
 			// runtime without `SourceDiscoveryApi`, or with no configured source,
 			// does nothing.
+			let spec_msg_peer_registry =
+				Arc::new(cumulus_client_source_discovery::PeerRegistry::default());
 			{
 				use cumulus_client_source_discovery::{
-					run_source_discovery, BootnodeSourceDiscovery, PeerRegistry,
-					DISCOVERY_REFRESH_INTERVAL,
+					run_source_discovery, BootnodeSourceDiscovery, DISCOVERY_REFRESH_INTERVAL,
 				};
-				let registry = Arc::new(PeerRegistry::default());
 				let discovery = Arc::new(BootnodeSourceDiscovery::new(
 					network.clone(),
 					relay_chain_interface.clone(),
@@ -494,7 +502,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 					run_source_discovery::<Self::Block, _>(
 						client.clone(),
 						discovery,
-						registry,
+						spec_msg_peer_registry.clone(),
 						DISCOVERY_REFRESH_INTERVAL,
 					),
 				);
@@ -690,6 +698,20 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 				prometheus_registry: prometheus_registry.as_ref(),
 			})?;
 
+			// Speculative Messaging: archive + exchange handler on every node;
+			// monitor + fetch pipeline (whose deps feed the consensus wiring)
+			// on collators. Everything version-gates on the `SpecMsgApi`
+			// runtime API and idles for non-participating runtimes.
+			let spec_msg = spec_msg_protocol.start(
+				&task_manager,
+				client.clone(),
+				network.clone(),
+				relay_chain_interface.clone(),
+				spec_msg_peer_registry,
+				para_id,
+				validator,
+			)?;
+
 			start_bootnode_tasks(StartBootnodeTasksParams {
 				embedded_dht_bootnode: collator_options.embedded_dht_bootnode,
 				dht_bootnode_discovery: collator_options.dht_bootnode_discovery,
@@ -725,6 +747,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 					backend.clone(),
 					node_extra_args,
 					block_import_auxiliary_data,
+					spec_msg,
 				)?;
 			}
 
