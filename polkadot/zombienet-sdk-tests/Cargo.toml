@@ -50,6 +50,12 @@ name = "source_discovery"
 path = "tests/source_discovery.rs"
 required-features = ["zombie-ci"]
 
+[[test]]
+# Focused dynamic E2E: spec-msg fetcher consumes DHT-discovered peers.
+name = "spec_msg_consume"
+path = "tests/spec_msg_consume.rs"
+required-features = ["zombie-ci"]
+
 [build-dependencies]
 sc-executor = { workspace = true, default-features = true }
 sc-runtime-utilities = { workspace = true, default-features = true }
