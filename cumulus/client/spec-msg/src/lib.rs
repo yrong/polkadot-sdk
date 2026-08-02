@@ -78,6 +78,7 @@ pub mod monitor;
 mod nodes;
 pub mod pool;
 pub mod protocol;
+pub mod prune;
 pub mod verify;
 pub mod worker;
 
@@ -96,6 +97,7 @@ pub use pool::{InherentBudget, SpecMsgPool};
 pub use protocol::{
 	spec_msg_protocol_config, SpecMsgRequestHandler, MAX_RESPONSE_SIZE, PROTOCOL_NAME,
 };
+pub use prune::run_finalized_pruner;
 pub use verify::{
 	verify_event_response, verify_messages_response, VerifiedEvent, VerifiedMessages, VerifyError,
 };

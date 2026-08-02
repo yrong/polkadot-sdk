@@ -618,6 +618,41 @@ mod tests {
 		assert_eq!(pool.pooled_payloads(source(), &stream), 0);
 	}
 
+	#[test]
+	fn finalized_pruning_drops_payloads_below_the_floor_keeping_leaves_liftable() {
+		// 10 payloads pooled (5 × 2). Finalized consumption reaches position 4:
+		// payloads [0..4] can never be handed again (no live fork sits below the
+		// finalized floor), so they are dropped; leaves are kept, so lifts and the
+		// continuation from >= 4 are unaffected.
+		let (_network, _registry, pool, _root) = fetched_pool(5, 2);
+		let stream = channel(RECEIVER);
+		assert_eq!(pool.pooled_payloads(source(), &stream), 10);
+
+		pool.prune_finalized(source(), &stream, 4);
+		assert_eq!(pool.pooled_payloads(source(), &stream), 6); // [4..10]
+
+		// The continuation from a cursor at/above the floor is handed intact.
+		let data = pool.build_inherent(&[(source(), stream, 4)], &[], InherentBudget::default());
+		assert_eq!(
+			data.messages,
+			vec![(source(), stream, all_payloads(&stream, 10)[4..].to_vec())]
+		);
+
+		// A lift for an endpoint at/above the floor still assembles — leaves retained.
+		let records = [record([(source(), stream, fixture(stream, 10).interval(4, 8))])];
+		assert!(assemble_from_records(&pool, &records).is_ok());
+
+		// No-op at/below the current floor; clamped beyond the fetched end.
+		pool.prune_finalized(source(), &stream, 2);
+		assert_eq!(pool.pooled_payloads(source(), &stream), 6);
+		pool.prune_finalized(source(), &stream, 100);
+		assert_eq!(pool.pooled_payloads(source(), &stream), 0); // [10..10]
+
+		// Even payload-empty, the retained leaves keep the run liftable.
+		let records = [record([(source(), stream, fixture(stream, 10).interval(4, 8))])];
+		assert!(assemble_from_records(&pool, &records).is_ok());
+	}
+
 	/// A register value as the peer's pallet publishes it on the ack stream.
 	fn register(up_to: u64) -> Register {
 		Register {

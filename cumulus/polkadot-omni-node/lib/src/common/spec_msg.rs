@@ -37,8 +37,8 @@
 
 use crate::common::{types::ParachainClient, ConstructNodeRuntimeApi, NodeBlock};
 use cumulus_client_spec_msg::{
-	lift_assembler, run_relay_provides_monitor, run_spec_msg_archiver, run_spec_msg_fetcher,
-	PeerRegistry, SpecMsgArchive, SpecMsgPool, SpecMsgRequestHandler,
+	lift_assembler, run_finalized_pruner, run_relay_provides_monitor, run_spec_msg_archiver,
+	run_spec_msg_fetcher, PeerRegistry, SpecMsgArchive, SpecMsgPool, SpecMsgRequestHandler,
 };
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::LiftsBySource;
@@ -171,6 +171,11 @@ where
 				pool.clone(),
 				events_rx,
 			),
+		);
+		spawner.spawn(
+			"spec-msg-finalized-pruner",
+			Some("spec-msg"),
+			run_finalized_pruner::<Block, _>(para_id, client.clone(), pool.clone()),
 		);
 
 		let lift_assembler = lift_assembler(client, pool.clone());

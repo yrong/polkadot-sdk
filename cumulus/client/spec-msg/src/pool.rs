@@ -145,14 +145,20 @@ pub struct ChannelBinding {
 
 /// One consumed channel stream's contiguous verified run.
 struct ChannelLedger {
-	/// Frontier at the first retained payload (`base.leaf_count` is its
-	/// position).
+	/// Frontier at the first retained *leaf* (`base.leaf_count` is its position)
+	/// — the anchor lift generation reads from.
 	base: MmrFrontier,
 	/// Frontier after the last retained payload — the fetch resume state.
 	end: MmrFrontier,
-	/// The payloads at positions `base.leaf_count..end.leaf_count`.
+	/// Position of the first retained *payload*. Equal to `base.leaf_count`
+	/// until finalized-consumption pruning drops the payloads below it — the
+	/// leaves are retained for lift generation, so `payload_base >=
+	/// base.leaf_count` always.
+	payload_base: u64,
+	/// The payloads at positions `payload_base..end.leaf_count`.
 	payloads: VecDeque<Vec<u8>>,
-	/// Their leaf hashes (kept even where payloads were handed over — lift
+	/// Their leaf hashes at positions `base.leaf_count..end.leaf_count` (kept
+	/// even where payloads were handed over or finalized-pruned — lift
 	/// generation needs hashes, not payloads).
 	leaves: VecDeque<Hash>,
 	/// The newest included root binding the run; `None` only transiently
@@ -167,6 +173,20 @@ impl ChannelLedger {
 
 	fn end_position(&self) -> u64 {
 		self.end.leaf_count
+	}
+
+	/// Drops retained payloads below `floor` (a finalized-consumption position),
+	/// advancing [`Self::payload_base`]. Leaves are untouched, so lift generation
+	/// is unaffected; `floor` is clamped to the fetched end, and a `floor` at or
+	/// below the current `payload_base` is a no-op.
+	fn trim_payloads_below(&mut self, floor: u64) {
+		let floor = floor.min(self.end_position());
+		if floor <= self.payload_base {
+			return;
+		}
+		let drop = (floor - self.payload_base) as usize;
+		self.payloads.drain(..drop);
+		self.payload_base = floor;
 	}
 
 	/// Leaf-hash view for proof generation over the retained run.
@@ -456,6 +476,7 @@ impl SpecMsgPool {
 				channels.insert(
 					stream,
 					ChannelLedger {
+						payload_base: start.leaf_count,
 						base: start,
 						end,
 						payloads: payloads.into(),
@@ -739,8 +760,8 @@ impl SpecMsgPool {
 	/// read at an unfinalized block, and a consuming ancestor may yet be
 	/// reorged away — dropping the payloads would strand the surviving
 	/// branch on an unservable gap (ordered streams admit no skips).
-	/// Retention discipline against *finalized* consumption is future work;
-	/// pooled runs are bounded by the fetch chunking meanwhile.
+	/// Retention below the *finalized* consumption point is bounded separately
+	/// by [`Self::prune_finalized`].
 	pub fn prune_channel(&self, source: ParaId, stream: &StreamId, cursor: u64) {
 		let mut sources = self.sources.lock();
 		let Some(pool) = sources.get_mut(&source) else { return };
@@ -748,6 +769,21 @@ impl SpecMsgPool {
 		if cursor > ledger.end_position() {
 			pool.channels.remove(stream);
 		}
+	}
+
+	/// Drops `stream`'s retained payloads below `finalized` — a *finalized*
+	/// consumption position (leaf count), read from the runtime at a finalized
+	/// block. This is the upper bound on receiver-pool growth: every live fork
+	/// descends from the finalized block and consumption is monotone, so no
+	/// fork's cursor is ever below `finalized`, and payloads under it can never
+	/// be handed again. Leaf hashes are retained (lift generation reads them),
+	/// so this trims only the bulk payload bytes — the ledger's payload span
+	/// collapses to `[finalized..head]` instead of the whole history.
+	pub fn prune_finalized(&self, source: ParaId, stream: &StreamId, finalized: u64) {
+		let mut sources = self.sources.lock();
+		let Some(pool) = sources.get_mut(&source) else { return };
+		let Some(ledger) = pool.channels.get_mut(stream) else { return };
+		ledger.trim_payloads_below(finalized);
 	}
 
 	/// Builds the block's inherent data from the pooled runs.
@@ -794,8 +830,10 @@ impl SpecMsgPool {
 				pool.channels.remove(stream);
 				continue;
 			}
-			if *cursor < ledger.base_position() {
-				// The continuation from the cursor is not retained.
+			if *cursor < ledger.payload_base {
+				// The payloads from the cursor were finalized-pruned (or never
+				// retained) — a live fork always sits at or above the finalized
+				// floor, so this only guards the impossible case.
 				continue;
 			}
 			if ledger.binding.as_ref().map(|binding| binding.root) != target {
@@ -803,7 +841,7 @@ impl SpecMsgPool {
 				// run for one block rather than risk an unliftable record.
 				continue;
 			}
-			let skip = usize::try_from(*cursor - ledger.base_position())
+			let skip = usize::try_from(*cursor - ledger.payload_base)
 				.expect("pooled runs are memory-resident; qed");
 			let mut take = 0usize;
 			let mut taken_bytes = 0usize;
