@@ -619,13 +619,15 @@ mod tests {
 	}
 
 	#[test]
-	fn finalized_pruning_drops_payloads_below_the_floor_keeping_leaves_liftable() {
-		// 10 payloads pooled (5 × 2). Finalized consumption reaches position 4:
-		// payloads [0..4] can never be handed again (no live fork sits below the
-		// finalized floor), so they are dropped; leaves are kept, so lifts and the
-		// continuation from >= 4 are unaffected.
+	fn finalized_pruning_trims_the_ledger_to_the_unfinalized_backlog() {
+		// 10 leaves pooled (5 × 2). Finality reaches position 4: leaves + payloads
+		// [0..4] are dropped and the base frontier advances to 4, so the ledger
+		// holds only [4..10] — bounded to the unfinalized backlog, not the whole
+		// history. No live fork descends below finality, so nothing under it is
+		// ever handed or lifted.
 		let (_network, _registry, pool, _root) = fetched_pool(5, 2);
 		let stream = channel(RECEIVER);
+		let reference = fixture(stream, 10);
 		assert_eq!(pool.pooled_payloads(source(), &stream), 10);
 
 		pool.prune_finalized(source(), &stream, 4);
@@ -638,19 +640,29 @@ mod tests {
 			vec![(source(), stream, all_payloads(&stream, 10)[4..].to_vec())]
 		);
 
-		// A lift for an endpoint at/above the floor still assembles — leaves retained.
-		let records = [record([(source(), stream, fixture(stream, 10).interval(4, 8))])];
-		assert!(assemble_from_records(&pool, &records).is_ok());
+		// The above-floor lift is identical whether or not the ledger was trimmed:
+		// the advanced base frontier (bagging the dropped leaves) reproduces the
+		// exact same proof. An untrimmed twin pool is the reference.
+		let (_n2, _r2, twin, _root2) = fetched_pool(5, 2);
+		let above = [record([(source(), stream, reference.interval(4, 8))])];
+		assert_eq!(
+			assemble_from_records(&pool, &above).expect("trimmed lift assembles"),
+			assemble_from_records(&twin, &above).expect("untrimmed reference"),
+		);
 
-		// No-op at/below the current floor; clamped beyond the fetched end.
+		// A lift BELOW the floor is no longer covered — its leaves were dropped.
+		// Finalized blocks are never lifted, so this only ever guards the impossible.
+		let below = [record([(source(), stream, reference.interval(0, 3))])];
+		assert!(matches!(
+			assemble_from_records(&pool, &below),
+			Err(AssembleError::Material(LiftMaterialError::NotCovered)),
+		));
+
+		// No-op below the current floor; clamped beyond the fetched end.
 		pool.prune_finalized(source(), &stream, 2);
 		assert_eq!(pool.pooled_payloads(source(), &stream), 6);
 		pool.prune_finalized(source(), &stream, 100);
 		assert_eq!(pool.pooled_payloads(source(), &stream), 0); // [10..10]
-
-		// Even payload-empty, the retained leaves keep the run liftable.
-		let records = [record([(source(), stream, fixture(stream, 10).interval(4, 8))])];
-		assert!(assemble_from_records(&pool, &records).is_ok());
 	}
 
 	/// A register value as the peer's pallet publishes it on the ack stream.
