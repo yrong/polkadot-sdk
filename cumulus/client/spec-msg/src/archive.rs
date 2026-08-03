@@ -48,18 +48,21 @@
 //!
 //! # Retention
 //!
-//! Channel payloads are prunable below the peer's confirmation watermark
-//! ([`SpecMsgArchive::prune_payloads`]; the worker drives it from the
-//! `out_channels()` register views). Leaf hashes and boundaries are kept to
-//! the [`SERVING_HORIZON`] regardless ([`SpecMsgArchive::prune_horizon`]):
-//! extension material is serveable from any block boundary within 25 h,
-//! with the boundary frontier at the pruning point retained — exactly what
-//! appending and proof generation over the unpruned tail require.
+//! Retention falls out of the channel protocol — no wall-clock horizon.
+//! `Channel` streams (guaranteed-delivery, flow-controlled) prune BOTH
+//! payload and leaf hash below the peer's confirmation watermark
+//! ([`SpecMsgArchive::prune`]; the worker drives it from the
+//! `out_channels()` register `up_to`) — the unconfirmed span is bounded by
+//! the credit window. Lossy latest-wins kinds (`Ack`/`Broadcast`/`Private`)
+//! keep only their head ([`SpecMsgArchive::prune_lossy_heads`]). Boundaries
+//! no retained stream can serve under are dropped
+//! ([`SpecMsgArchive::prune_boundaries`]). The floor frontier at each
+//! stream's pruning point is retained — its peaks tile the pruned prefix,
+//! exactly what appending and proof generation over the unpruned tail need.
 
 use std::{
 	collections::{BTreeMap, VecDeque},
 	sync::Arc,
-	time::Duration,
 };
 
 use codec::{Decode, Encode};
@@ -77,14 +80,6 @@ use crate::{
 	nodes::{HistoricNodes, LeafHashes},
 	LOG_TARGET,
 };
-
-/// How long extension material stays serveable, counted from a block
-/// boundary's archiving time (v0.5 §Liftability): leaf hashes, boundaries
-/// and with them the resolvable `under` roots are retained this long. The
-/// normative obligation is "any block boundary within 25 h"; the flat
-/// window is the default policy knob on top of the watermark rule, not the
-/// rule itself.
-pub const SERVING_HORIZON: Duration = Duration::from_secs(25 * 60 * 60);
 
 /// Server-side hard cap on served payload bytes per response, regardless of
 /// the request's `max_bytes` ("the server may cap harder"). Leaves ample
@@ -123,13 +118,11 @@ pub enum ServeError {
 	/// named root.
 	#[error("position beyond the stream's head under the named root")]
 	BeyondHead,
-	/// The requested payloads are pruned (below the confirmation
-	/// watermark). Extension material may still be serveable.
-	#[error("payloads pruned below the confirmation watermark")]
-	PayloadsPruned,
-	/// Proof material below the serving horizon is no longer retained.
-	#[error("required material is below the serving horizon")]
-	BelowHorizon,
+	/// The requested position is below the stream's retention floor — both
+	/// payloads and proof material there are pruned. The requester re-anchors
+	/// to the head (roots are cumulative), so this is a retry, not a failure.
+	#[error("position is below the stream's retention floor")]
+	BelowFloor,
 	/// The archive's own state is inconsistent — a local bug, never the
 	/// requester's fault.
 	#[error("internal archive inconsistency")]
@@ -142,11 +135,9 @@ struct StreamState {
 	/// The live frontier over ALL of the stream's messages; its leaf count
 	/// is the next append position.
 	frontier: MmrFrontier,
-	/// Frontier at the horizon floor: leaf hashes below its leaf count are
-	/// pruned, its peaks tile them for proof generation.
+	/// Frontier at the retention floor: below its leaf count BOTH payload and
+	/// leaf hash are pruned; its peaks tile them for proof generation.
 	floor: MmrFrontier,
-	/// Positions below hold no payload (watermark pruning).
-	payload_floor: u64,
 }
 
 /// One block's frontier boundary.
@@ -156,8 +147,6 @@ struct Boundary<H, N> {
 	hash: H,
 	/// The block's number — the boundary's aux key.
 	number: N,
-	/// Local wall-clock seconds when archived; drives the serving horizon.
-	archived_at: u64,
 	/// The recomputed `StreamsRoot` over all stream roots as of this block;
 	/// `None` while no stream exists (a block with no streams commits
 	/// nothing).
@@ -290,19 +279,6 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 		number: NumberFor<Block>,
 		sends: Vec<(StreamId, Vec<Vec<u8>>)>,
 	) -> Result<Option<StreamsRoot>, ArchiveError> {
-		self.import_block_at(hash, parent, number, sends, now_secs())
-	}
-
-	/// [`Self::import_block`] with an explicit archiving timestamp —
-	/// deterministic replay and horizon tests.
-	pub fn import_block_at(
-		&mut self,
-		hash: Block::Hash,
-		parent: Block::Hash,
-		number: NumberFor<Block>,
-		sends: Vec<(StreamId, Vec<Vec<u8>>)>,
-		archived_at: u64,
-	) -> Result<Option<StreamsRoot>, ArchiveError> {
 		if let Some(tip) = self.boundaries.back() {
 			if tip.hash != parent || number != tip.number + One::one() {
 				return Err(ArchiveError::NotChild);
@@ -335,7 +311,7 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 			.map(|(id, state)| (*id, state.frontier.leaf_count))
 			.collect();
 
-		let boundary = Boundary { hash, number, archived_at, root, counts };
+		let boundary = Boundary { hash, number, root, counts };
 		inserts.push((keys::boundary(&number.encode()), boundary.encode()));
 		if let Some(root) = root {
 			self.root_index.insert(root, number);
@@ -348,6 +324,20 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 
 		write_aux(&*self.aux, inserts, Vec::new())?;
 		Ok(root)
+	}
+
+	/// Test shim: [`Self::import_block`] ignoring a (now-removed) archiving
+	/// timestamp, kept so timestamp-passing tests need no churn.
+	#[cfg(test)]
+	pub fn import_block_at(
+		&mut self,
+		hash: Block::Hash,
+		parent: Block::Hash,
+		number: NumberFor<Block>,
+		sends: Vec<(StreamId, Vec<Vec<u8>>)>,
+		_archived_at: u64,
+	) -> Result<Option<StreamsRoot>, ArchiveError> {
+		self.import_block(hash, parent, number, sends)
 	}
 
 	/// Rewinds the archive to the archived block `hash`, dropping every
@@ -382,11 +372,12 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 					.frontier_at(count)
 					.ok_or(ArchiveError::Corrupt("leaf hashes for rewind missing"))?,
 			};
+			// Everything above the truncated frontier is dropped, payload and
+			// leaf together; `frontier_at` succeeding guarantees the target is
+			// at/above the floor, so the floor stays valid untouched.
 			for position in new_frontier.leaf_count..state.frontier.leaf_count {
 				deletes.push(keys::leaf(&id, position));
-				if position >= state.payload_floor {
-					deletes.push(keys::payload(&id, position));
-				}
+				deletes.push(keys::payload(&id, position));
 			}
 			if target.is_none() {
 				// The stream did not exist at the target block.
@@ -394,7 +385,6 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 				deletes.push(keys::stream(&id));
 			} else {
 				let state = self.streams.get_mut(&id).expect("checked above; qed");
-				state.payload_floor = state.payload_floor.min(new_frontier.leaf_count);
 				state.frontier = new_frontier;
 				inserts.push((keys::stream(&id), state.encode()));
 			}
@@ -411,83 +401,78 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 		Ok(())
 	}
 
-	/// Prunes `stream`'s payloads below `below` — the confirmation
-	/// watermark reported by the pallet's channel views. Leaf hashes are
-	/// kept (to the serving horizon): watermark-pruned ranges refuse
-	/// payload requests but still serve extension material.
-	pub fn prune_payloads(
-		&mut self,
-		stream: &StreamId,
-		below: MessagePosition,
-	) -> Result<(), ArchiveError> {
-		let Some(state) = self.streams.get_mut(stream) else { return Ok(()) };
-		let new_floor = below.0.min(state.frontier.leaf_count);
-		if new_floor <= state.payload_floor {
+	/// Prunes `stream` below `floor_pos`, dropping payload AND leaf hash
+	/// together and advancing the floor frontier to `floor_pos` (its peaks
+	/// tile the pruned prefix for proofs). For a `Channel` `floor_pos` is the
+	/// peer's confirmation watermark (`Register.up_to`); lossy latest-wins
+	/// kinds prune to their head via [`Self::prune_lossy_heads`]. A no-op when
+	/// `floor_pos` does not advance the floor. Below-floor requests then refuse
+	/// (the requester re-anchors to the head — roots are cumulative).
+	pub fn prune(&mut self, stream: &StreamId, floor_pos: u64) -> Result<(), ArchiveError> {
+		let Some(state) = self.streams.get(stream).cloned() else { return Ok(()) };
+		let new_floor = floor_pos.min(state.frontier.leaf_count);
+		if new_floor <= state.floor.leaf_count {
 			return Ok(());
 		}
-		let deletes = (state.payload_floor..new_floor)
-			.map(|position| keys::payload(stream, position))
-			.collect();
-		state.payload_floor = new_floor;
+		// Compute the new floor frontier BEFORE deleting leaf hashes.
+		let floor = self
+			.nodes_for(stream, &state)
+			.frontier_at(new_floor)
+			.ok_or(ArchiveError::Corrupt("leaf hashes for floor missing"))?;
+		let mut deletes = Vec::new();
+		for position in state.floor.leaf_count..new_floor {
+			deletes.push(keys::leaf(stream, position));
+			deletes.push(keys::payload(stream, position));
+		}
+		let state = self.streams.get_mut(stream).expect("cloned above; qed");
+		state.floor = floor;
 		let inserts = vec![(keys::stream(stream), state.encode())];
 		write_aux(&*self.aux, inserts, deletes)?;
 		Ok(())
 	}
 
-	/// Drops boundaries archived before `cutoff_secs` (typically `now -`
-	/// [`SERVING_HORIZON`]) and advances each stream's horizon floor to its
-	/// leaf count at the oldest retained boundary: leaf hashes below are
-	/// deleted, the boundary frontier at the pruning point is retained. The
-	/// newest boundary always stays — current roots are always serveable.
-	pub fn prune_horizon(&mut self, cutoff_secs: u64) -> Result<(), ArchiveError> {
-		let mut dropped = Vec::new();
-		while self.boundaries.len() > 1 &&
-			self.boundaries.front().map_or(false, |b| b.archived_at < cutoff_secs)
-		{
-			dropped.push(self.boundaries.pop_front().expect("len checked above; qed"));
+	/// Keep-latest for the lossy latest-wins kinds (`Ack`/`Broadcast`/
+	/// `Private`): prunes each such stream to its head, retaining only the
+	/// latest leaf. Their consumption reads only the head, so nothing below is
+	/// ever fetched.
+	pub fn prune_lossy_heads(&mut self) -> Result<(), ArchiveError> {
+		let ids: Vec<StreamId> = self
+			.streams
+			.keys()
+			.filter(|id| !matches!(id, StreamId::Channel { .. }))
+			.copied()
+			.collect();
+		for id in ids {
+			let head = self.streams.get(&id).expect("iterating own keys; qed").frontier.leaf_count;
+			self.prune(&id, head.saturating_sub(1))?;
 		}
-		if dropped.is_empty() {
+		Ok(())
+	}
+
+	/// Drops boundaries no retained stream can serve under any longer — those
+	/// whose every stream's floor has reached its leaf count at that boundary,
+	/// so nothing below the floor is retrievable there. The newest boundary
+	/// always stays — current roots are always serveable.
+	pub fn prune_boundaries(&mut self) -> Result<(), ArchiveError> {
+		let mut deletes: Vec<Vec<u8>> = Vec::new();
+		while self.boundaries.len() > 1 {
+			let unserveable = {
+				let front = self.boundaries.front().expect("len > 1; qed");
+				self.streams.iter().all(|(id, state)| {
+					front.count(id).map_or(true, |count| state.floor.leaf_count >= count)
+				})
+			};
+			if !unserveable {
+				break;
+			}
+			let dropped = self.boundaries.pop_front().expect("len > 1; qed");
+			deletes.push(keys::boundary(&dropped.number.encode()));
+		}
+		if deletes.is_empty() {
 			return Ok(());
 		}
-
-		let mut inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-		let mut deletes: Vec<Vec<u8>> = Vec::new();
-		for boundary in &dropped {
-			deletes.push(keys::boundary(&boundary.number.encode()));
-		}
-
-		let oldest = self.boundaries.front().expect("newest boundary retained; qed").clone();
-		let ids: Vec<StreamId> = self.streams.keys().copied().collect();
-		for id in ids {
-			let state = self.streams.get(&id).expect("iterating own keys; qed").clone();
-			// Streams born after the oldest retained boundary keep their
-			// (lower) floor.
-			let Some(new_floor) = oldest.count(&id) else { continue };
-			if new_floor <= state.floor.leaf_count {
-				continue;
-			}
-			// Compute the new floor frontier BEFORE deleting leaf hashes.
-			let floor = self
-				.nodes_for(&id, &state)
-				.frontier_at(new_floor)
-				.ok_or(ArchiveError::Corrupt("leaf hashes for horizon floor missing"))?;
-			for position in state.floor.leaf_count..new_floor {
-				deletes.push(keys::leaf(&id, position));
-				if position >= state.payload_floor {
-					// Payloads below the horizon floor are unreachable (no
-					// peaks can be built below it) — dead weight even if the
-					// watermark stalls.
-					deletes.push(keys::payload(&id, position));
-				}
-			}
-			let state = self.streams.get_mut(&id).expect("iterating own keys; qed");
-			state.payload_floor = state.payload_floor.max(new_floor);
-			state.floor = floor;
-			inserts.push((keys::stream(&id), state.encode()));
-		}
-
 		self.rebuild_root_index();
-		inserts.push((keys::meta(), self.meta().encode()));
+		let inserts = vec![(keys::meta(), self.meta().encode())];
 		write_aux(&*self.aux, inserts, deletes)?;
 		Ok(())
 	}
@@ -515,11 +500,14 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 			ServeError::Internal
 		})?;
 
+		// Below the floor neither payloads nor proof material survive; refuse
+		// uniformly (payload fetch and lift material alike).
+		if start < state.floor.leaf_count {
+			return Err(ServeError::BelowFloor);
+		}
+
 		let mut payloads = Vec::new();
 		if request.max_bytes > 0 && start < count {
-			if start < state.payload_floor {
-				return Err(ServeError::PayloadsPruned);
-			}
 			let budget = (request.max_bytes as usize).min(MAX_SERVED_PAYLOAD_BYTES);
 			let mut used = 0usize;
 			for position in start..count {
@@ -537,8 +525,8 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 		let served_to = start + payloads.len() as u64;
 
 		let nodes = self.nodes_for(&request.stream, state);
-		let start_peaks = nodes.frontier_at(start).ok_or(ServeError::BelowHorizon)?.peaks.to_vec();
-		let extension = nodes.extension(served_to, count).ok_or(ServeError::BelowHorizon)?;
+		let start_peaks = nodes.frontier_at(start).ok_or(ServeError::BelowFloor)?.peaks.to_vec();
+		let extension = nodes.extension(served_to, count).ok_or(ServeError::BelowFloor)?;
 		let tree_proof = self.tree_proof_at(boundary, &request.stream)?;
 
 		Ok(MessagesResponse {
@@ -564,14 +552,14 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 			return Err(ServeError::BeyondHead);
 		}
 		let state = self.streams.get(&request.stream).ok_or(ServeError::Internal)?;
-		if position < state.payload_floor {
-			return Err(ServeError::PayloadsPruned);
+		if position < state.floor.leaf_count {
+			return Err(ServeError::BelowFloor);
 		}
 		let payload = self.payload(&request.stream, position).ok_or(ServeError::Internal)?;
 		let inclusion = self
 			.nodes_for(&request.stream, state)
 			.inclusion(count, position)
-			.ok_or(ServeError::BelowHorizon)?;
+			.ok_or(ServeError::BelowFloor)?;
 		let tree_proof = self.tree_proof_at(boundary, &request.stream)?;
 
 		Ok(EventResponse { payload, inclusion, tree_proof })
@@ -592,7 +580,7 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 			let root = if *count == state.frontier.leaf_count {
 				state.frontier.root()
 			} else {
-				self.nodes_for(id, state).root_at(*count).ok_or(ServeError::BelowHorizon)?
+				self.nodes_for(id, state).root_at(*count).ok_or(ServeError::BelowFloor)?
 			};
 			entries.insert(*id, root);
 		}
@@ -678,15 +666,6 @@ impl<AUX: AuxStore> LeafHashes for AuxLeaves<'_, AUX> {
 			},
 		}
 	}
-}
-
-/// Local wall-clock seconds since the unix epoch (0 on a pre-epoch clock —
-/// such boundaries are simply pruned at the first horizon sweep).
-pub(crate) fn now_secs() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.map(|elapsed| elapsed.as_secs())
-		.unwrap_or(0)
 }
 
 fn read_aux<T: Decode, AUX: AuxStore>(aux: &AUX, key: &[u8]) -> Result<Option<T>, ArchiveError> {
@@ -904,64 +883,62 @@ mod tests {
 	}
 
 	#[test]
-	fn pruning_watermark_then_horizon() {
+	fn prune_below_watermark_then_boundaries() {
 		let (aux, mut archive) = new_archive();
 		let streams = [channel(2001), channel(2002)];
 		let roots = import_blocks(&mut archive, &streams, 8, 2, 10_000);
 		let under = roots[7];
 
-		// Watermark pruning: payloads below 6 gone, hashes retained.
-		archive
-			.prune_payloads(&streams[0], MessagePosition(6))
-			.expect("pruning succeeds");
+		// Single floor: prune `streams[0]` below the watermark 6 — payload AND
+		// leaf hash both gone below 6.
+		archive.prune(&streams[0], 6).expect("pruning succeeds");
 
-		// Payload requests into the pruned range are refused...
+		// Below the floor everything is refused — payload fetch AND lift
+		// material alike (the deliberate policy change: below-watermark lift
+		// material is no longer served, since consumption is always above the
+		// watermark).
 		let request = messages_request(streams[0], 0, under, u32::MAX);
-		assert_eq!(archive.serve_messages(&request), Err(ServeError::PayloadsPruned));
-		let event = EventRequest { stream: streams[0], under, at: Some(MessagePosition(2)) };
-		assert_eq!(archive.serve_event(&event), Err(ServeError::PayloadsPruned));
-
-		// ...but the same range still serves extension material (lifts) and
-		// unpruned payloads from the watermark on.
+		assert_eq!(archive.serve_messages(&request), Err(ServeError::BelowFloor));
 		let lift = messages_request(streams[0], 0, under, 0);
-		let response = archive.serve_messages(&lift).expect("extension material still serves");
-		verify_messages_response(&lift, &response, None).expect("still verifies");
+		assert_eq!(archive.serve_messages(&lift), Err(ServeError::BelowFloor));
+		let event = EventRequest { stream: streams[0], under, at: Some(MessagePosition(2)) };
+		assert_eq!(archive.serve_event(&event), Err(ServeError::BelowFloor));
+
+		// From the watermark on, payloads and lift material both serve.
 		let request = messages_request(streams[0], 6, under, u32::MAX);
 		let response = archive.serve_messages(&request).expect("unpruned payloads serve");
 		assert_eq!(response.payloads, all_payloads(&streams[0], 16)[6..].to_vec());
+		verify_messages_response(&request, &response, None).expect("verifies");
+		let lift = messages_request(streams[0], 6, under, 0);
+		let response = archive.serve_messages(&lift).expect("lift material serves");
+		verify_messages_response(&lift, &response, None).expect("verifies");
 
-		// Horizon sweep: boundaries archived before 10_005 (blocks 1-4)
-		// drop; the floor advances to block 5's counts (10 messages).
-		archive.prune_horizon(10_005).expect("horizon sweep succeeds");
-
-		for old in &roots[..4] {
-			let request = messages_request(streams[0], 10, *old, 0);
+		// Boundary pruning: once BOTH streams' floors reach a boundary's count,
+		// nothing below is serveable there and the boundary drops. Prune the
+		// second stream to 6 as well; blocks 1-3 (counts 2/4/6 ≤ 6) then drop.
+		archive.prune(&streams[1], 6).expect("pruning succeeds");
+		archive.prune_boundaries().expect("boundary sweep succeeds");
+		for old in &roots[..3] {
+			let request = messages_request(streams[0], 6, *old, 0);
 			assert_eq!(archive.serve_messages(&request), Err(ServeError::UnknownRoot));
 		}
-
-		// Material below the horizon floor is refused cleanly (the
-		// receiver falls back per liftability's three layers)...
-		let below = messages_request(streams[0], 6, under, 0);
-		assert_eq!(archive.serve_messages(&below), Err(ServeError::BelowHorizon));
-
-		// ...while any retained block boundary still serves: the boundary
-		// frontier was retained at the pruning point.
-		for (index, old) in roots.iter().enumerate().skip(4) {
+		// Blocks 4-8 (counts ≥ 8 > 6) stay serveable from the watermark on.
+		for (index, old) in roots.iter().enumerate().skip(3) {
 			let count = (index as u64 + 1) * 2;
-			let request = messages_request(streams[1], 10, *old, u32::MAX);
+			let request = messages_request(streams[1], 6, *old, u32::MAX);
 			let response = archive.serve_messages(&request).expect("retained boundary serves");
-			assert_eq!(response.payloads, all_payloads(&streams[1], count)[10..].to_vec());
+			assert_eq!(response.payloads, all_payloads(&streams[1], count)[6..].to_vec());
 			verify_messages_response(&request, &response, None).expect("still verifies");
 		}
 
-		// Appending continues over the retained floor, and a restart
-		// reloads the pruned state faithfully.
+		// Appending continues over the retained floor, and a restart reloads
+		// the pruned state faithfully.
 		let sends = vec![(streams[0], vec![payload(&streams[0], 16)])];
 		let new_root = archive
-			.import_block_at(block_hash(9), block_hash(8), 9, sends, 10_009)
+			.import_block(block_hash(9), block_hash(8), 9, sends)
 			.expect("extends the tip")
 			.expect("streams exist");
-		let request = messages_request(streams[0], 10, new_root, u32::MAX);
+		let request = messages_request(streams[0], 6, new_root, u32::MAX);
 		let response = archive.serve_messages(&request).expect("serves under the new root");
 		assert_eq!(response.payloads.last(), Some(&payload(&streams[0], 16)));
 		verify_messages_response(&request, &response, None).expect("verifies");
@@ -969,7 +946,30 @@ mod tests {
 		drop(archive);
 		let archive: TestArchive = SpecMsgArchive::load(aux).expect("pruned archive loads");
 		assert_eq!(archive.serve_messages(&request).expect("still serves"), response);
-		assert_eq!(archive.serve_messages(&below), Err(ServeError::BelowHorizon));
+		let below = messages_request(streams[0], 0, new_root, 0);
+		assert_eq!(archive.serve_messages(&below), Err(ServeError::BelowFloor));
+	}
+
+	#[test]
+	fn keep_latest_for_lossy_kinds() {
+		let (_aux, mut archive) = new_archive();
+		// `Ack` is a lossy latest-wins kind — keep-latest, not watermark.
+		let stream = ack(2001);
+		let roots = import_blocks(&mut archive, &[stream], 5, 2, 1_000);
+		let under = roots[4];
+
+		archive.prune_lossy_heads().expect("keep-latest prune succeeds");
+
+		// Only the head leaf (position 9) survives; everything below is gone.
+		let head = EventRequest { stream, under, at: None };
+		let response = archive.serve_event(&head).expect("head still serves");
+		assert_eq!(response.payload, payload(&stream, 9));
+		verify_event_response(&head, &response).expect("verifies");
+
+		let old = EventRequest { stream, under, at: Some(MessagePosition(3)) };
+		assert_eq!(archive.serve_event(&old), Err(ServeError::BelowFloor));
+		let backlog = messages_request(stream, 0, under, u32::MAX);
+		assert_eq!(archive.serve_messages(&backlog), Err(ServeError::BelowFloor));
 	}
 
 	#[test]

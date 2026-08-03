@@ -31,8 +31,8 @@
 //!   to depend on (`under`), every response is proven under exactly that root.
 //! - [`run_spec_msg_archiver`] follows the chain's best blocks, extracts each block's sends via the
 //!   `SpecMsgApi` runtime API (version-gated: runtimes without the API keep the archive idle) and
-//!   maintains the archive's retention: channel payloads below the peers' confirmation watermarks,
-//!   extension material to the 25 h serving horizon ([`SERVING_HORIZON`]).
+//!   maintains the archive's retention: `Channel` streams prune payload + leaf below the peer's
+//!   confirmation watermark (credit-bounded), lossy latest-wins kinds keep only their head.
 //! - [`SpecMsgRequestHandler`] answers incoming `/spec-msg/exchange` requests from the archive;
 //!   [`spec_msg_protocol_config`] is the protocol registration for
 //!   `net_config.add_request_response_protocol`.
@@ -82,7 +82,7 @@ pub mod prune;
 pub mod verify;
 pub mod worker;
 
-pub use archive::{ArchiveError, ServeError, SpecMsgArchive, SERVING_HORIZON};
+pub use archive::{ArchiveError, ServeError, SpecMsgArchive};
 pub use authoring::{
 	assemble_collation, assemble_lifts, inherent_data_at, lift_assembler, AssembleError,
 	ROUND_GRACE_WINDOW,

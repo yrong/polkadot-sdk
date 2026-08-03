@@ -21,8 +21,9 @@
 //! Per best block: extract the block's sends via the `SpecMsgApi` runtime
 //! API — version-gated exactly like collation info: runtimes without the
 //! API keep the archive idle — append them to the archive, then run
-//! retention (watermark pruning from the `out_channels()` register views,
-//! horizon sweep).
+//! retention (Channels prune payload + leaf below the `out_channels()`
+//! register watermark; lossy kinds keep-latest; unserveable boundaries
+//! dropped).
 //!
 //! Branch handling: the worker walks the new best branch back to the
 //! archived tip (rewinding the archive to the common ancestor on reorgs)
@@ -48,7 +49,7 @@ use cumulus_primitives_spec_messaging::StreamId;
 use polkadot_core_primitives::Hash;
 
 use crate::{
-	archive::{now_secs, ArchiveError, SpecMsgArchive, SERVING_HORIZON},
+	archive::{ArchiveError, SpecMsgArchive},
 	LOG_TARGET,
 };
 
@@ -173,9 +174,11 @@ where
 		);
 	}
 
-	// Retention: channel payloads below the peers' confirmation watermarks
-	// (the latest verified register reads served by the `out_channels()`
-	// view), then the horizon sweep.
+	// Retention: `Channel` streams prune payload + leaf below the peer's
+	// confirmation watermark (`Register.up_to`, the latest verified register
+	// read served by `out_channels()`; the unconfirmed span is credit-bounded);
+	// lossy latest-wins kinds keep only their head; then drop boundaries no
+	// retained stream can serve under.
 	let out_channels = client.runtime_api().out_channels(hash)?;
 	let mut archive = archive.write();
 	for (channel, state) in out_channels {
@@ -185,10 +188,11 @@ where
 				domain: channel.domain,
 				num: channel.num,
 			};
-			archive.prune_payloads(&stream, register.up_to)?;
+			archive.prune(&stream, register.up_to.0)?;
 		}
 	}
-	archive.prune_horizon(now_secs().saturating_sub(SERVING_HORIZON.as_secs()))?;
+	archive.prune_lossy_heads()?;
+	archive.prune_boundaries()?;
 
 	Ok(())
 }
