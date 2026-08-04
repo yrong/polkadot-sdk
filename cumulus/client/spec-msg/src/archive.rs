@@ -1092,4 +1092,56 @@ mod tests {
 		assert!(archive.serves_root(&fork_root));
 		assert!(!archive.serves_root(&roots[4]));
 	}
+
+	#[test]
+	fn rewind_orphans_a_mid_chain_stream_across_restart() {
+		// A stream born *after* the rewind target is orphaned by `rewind_to`
+		// (its count at the target is `None`): removed from the map, its state /
+		// leaves / payloads deleted, and dropped from `meta` — so a restart
+		// reloads cleanly without it and without `Corrupt("stream state
+		// missing")`. The existing rewind test only *truncates* a stream present
+		// from block 1, never exercising this `target.is_none()` branch + reload.
+		let (aux, mut archive) = new_archive();
+		let a = channel(2001);
+		let b = channel(2002);
+
+		// `a` exists from block 1; `b` is born mid-chain at block 4.
+		let mut roots = Vec::new();
+		for n in 1..=5u32 {
+			let base_a = (n as u64 - 1) * 2;
+			let mut sends = vec![(a, vec![payload(&a, base_a), payload(&a, base_a + 1)])];
+			if n >= 4 {
+				let base_b = (n as u64 - 4) * 2;
+				sends.push((b, vec![payload(&b, base_b), payload(&b, base_b + 1)]));
+			}
+			let root = archive
+				.import_block(block_hash(n), block_hash(n - 1), n, sends)
+				.expect("imports in order")
+				.expect("a always carries sends");
+			roots.push(root);
+		}
+		// `b` is live before the rewind.
+		let b_head = messages_request(b, 0, roots[4], u32::MAX);
+		assert!(archive.serve_messages(&b_head).is_ok());
+
+		// Rewind below `b`'s birth (block 2 < 4): `b` is orphaned, `a` truncated.
+		archive.rewind_to(block_hash(2)).expect("block 2 is archived");
+		assert_eq!(archive.tip(), Some((block_hash(2), 2)));
+		// `b`'s aux state is actually reclaimed — no stale keys left to strand.
+		assert!(aux.get_aux(&keys::stream(&b)).expect("aux read").is_none());
+		assert!(aux.get_aux(&keys::leaf(&b, 0)).expect("aux read").is_none());
+		assert!(aux.get_aux(&keys::payload(&b, 0)).expect("aux read").is_none());
+
+		// Restart: reloads cleanly (would `Corrupt` if `meta` still named `b`),
+		// `b` stays gone, `a` intact.
+		drop(archive);
+		let archive: TestArchive =
+			SpecMsgArchive::load(aux).expect("orphaned-stream archive reloads");
+		assert_eq!(archive.tip(), Some((block_hash(2), 2)));
+		let a_req = messages_request(a, 0, roots[1], u32::MAX);
+		let response = archive.serve_messages(&a_req).expect("a retained");
+		assert_eq!(response.payloads, all_payloads(&a, 4));
+		let b_req = messages_request(b, 0, roots[1], u32::MAX);
+		assert_eq!(archive.serve_messages(&b_req), Err(ServeError::UnknownStream));
+	}
 }
