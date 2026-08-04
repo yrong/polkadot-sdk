@@ -16,7 +16,7 @@
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
 //! The receiver's finalized-consumption pruner: the upper bound on verified-pool
-//! payload retention.
+//! retention.
 //!
 //! The pool retains consumed-but-unfinalized payloads non-destructively (a
 //! consuming ancestor may be reorged away, and dropping them would strand the
@@ -24,10 +24,12 @@
 //! the stream length until finality catches up. This worker supplies the finality
 //! signal: on each *finalized* parachain block it reads the finalized consumption
 //! frontier per stream (`SpecMsgApi::consumed_streams()` at the finalized block)
-//! and drops the pool's payloads below it — no live fork descends below a
-//! finalized block, so those payloads can never be handed again (see
-//! [`SpecMsgPool::prune_finalized`]). Leaf hashes are retained for lift
-//! generation, so only the bulk payload bytes are reclaimed.
+//! and drops the pool's payloads AND leaves below it — no live fork descends below
+//! a finalized block, so nothing there can be handed or lifted again (see
+//! [`SpecMsgPool::prune_finalized`]). The dropped leaves fold onto the ledger's
+//! base frontier, whose peaks still tile them for lift generation over the
+//! retained tail — so both the bulk payloads and their 32 B leaf hashes are
+//! reclaimed, not just the payloads.
 
 use std::sync::Arc;
 
