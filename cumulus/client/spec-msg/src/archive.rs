@@ -48,17 +48,19 @@
 //!
 //! # Retention
 //!
-//! Retention falls out of the channel protocol — no wall-clock horizon.
-//! `Channel` streams (guaranteed-delivery, flow-controlled) prune BOTH
-//! payload and leaf hash below the peer's confirmation watermark
-//! ([`SpecMsgArchive::prune`]; the worker drives it from the
-//! `out_channels()` register `up_to`) — the unconfirmed span is bounded by
-//! the credit window. Lossy latest-wins kinds (`Ack`/`Broadcast`/`Private`)
-//! keep only their head ([`SpecMsgArchive::prune_lossy_heads`]). Boundaries
-//! no retained stream can serve under are dropped
-//! ([`SpecMsgArchive::prune_boundaries`]). The floor frontier at each
-//! stream's pruning point is retained — its peaks tile the pruned prefix,
-//! exactly what appending and proof generation over the unpruned tail need.
+//! Retention ([`SpecMsgArchive::apply_retention`], driven by the worker from
+//! the node's finalized head + the `out_channels()` register watermarks) is
+//! `min(watermark, finalized)`: the watermark bounds memory, finality bounds
+//! reorg-safety. `Channel` streams (guaranteed-delivery, flow-controlled)
+//! prune BOTH payload and leaf hash below the peer's confirmation watermark
+//! (`Register.up_to`; the unconfirmed span is credit-bounded); lossy
+//! latest-wins kinds (`Ack`/`Broadcast`/`Private`) keep only their head — but
+//! neither is pruned below the finalized horizon, and boundaries below the
+//! finalized head are dropped, since a best-chain reorg never crosses it and
+//! [`SpecMsgArchive::rewind_to`] must reconstruct the common ancestor. The
+//! floor frontier at each stream's pruning point is retained — its peaks tile
+//! the pruned prefix, exactly what appending and proof generation over the
+//! unpruned tail need.
 
 use std::{
 	collections::{BTreeMap, VecDeque},
@@ -401,14 +403,70 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 		Ok(())
 	}
 
+	/// Runs one retention pass against the node's `finalized` head and the
+	/// current per-`Channel` confirmation watermarks (`Register.up_to` from the
+	/// `out_channels()` view). Two things happen, both **reorg-safe**:
+	///
+	/// - Boundaries below `finalized` are dropped — a best-chain reorg never
+	///   crosses the finalized head, so nothing below it can ever be a
+	///   [`Self::rewind_to`] common ancestor. Everything at/above `finalized`
+	///   is kept so a reorg always reconciles.
+	/// - Each stream is pruned to `min(serving floor, finalized horizon)`:
+	///   `Channel`s to their watermark, lossy latest-wins kinds
+	///   (`Ack`/`Broadcast`/`Private`) to their head, but **never below the
+	///   stream's leaf count at `finalized`** — `rewind_to` must reconstruct
+	///   the frontier at the common ancestor, which needs those leaves. A
+	///   stream born after `finalized` (all leaves still unfinalized) is thus
+	///   not pruned at all.
+	///
+	/// So retention tracks `min(watermark, finalized)` — the watermark bounds
+	/// memory, finality bounds reorg-safety — exactly mirroring the receiver
+	/// pool's finalized retention on the sender side.
+	pub fn apply_retention(
+		&mut self,
+		finalized: NumberFor<Block>,
+		channel_watermarks: &BTreeMap<StreamId, u64>,
+	) -> Result<(), ArchiveError> {
+		// 1. Drop boundaries the finalized head has passed (never rewind
+		//    targets). The newest boundary always stays.
+		let mut deletes: Vec<Vec<u8>> = Vec::new();
+		while self.boundaries.len() > 1 &&
+			self.boundaries.front().map_or(false, |b| b.number < finalized)
+		{
+			let dropped = self.boundaries.pop_front().expect("len > 1; qed");
+			deletes.push(keys::boundary(&dropped.number.encode()));
+		}
+		if !deletes.is_empty() {
+			self.rebuild_root_index();
+			let inserts = vec![(keys::meta(), self.meta().encode())];
+			write_aux(&*self.aux, inserts, deletes)?;
+		}
+
+		// The oldest retained boundary is the finalized horizon; its per-stream
+		// counts are the reorg-safety floor (leaves below cannot be needed by a
+		// rewind to any ancestor >= finalized).
+		let horizon = self.boundaries.front().cloned();
+		let ids: Vec<StreamId> = self.streams.keys().copied().collect();
+		for id in ids {
+			let head = self.streams.get(&id).expect("iterating own keys; qed").frontier.leaf_count;
+			let serving = match id {
+				StreamId::Channel { .. } => channel_watermarks.get(&id).copied().unwrap_or(0),
+				// Lossy latest-wins: keep only the head.
+				_ => head.saturating_sub(1),
+			};
+			let reorg_floor = horizon.as_ref().and_then(|b| b.count(&id)).unwrap_or(0);
+			self.prune_stream(&id, serving.min(reorg_floor))?;
+		}
+		Ok(())
+	}
+
 	/// Prunes `stream` below `floor_pos`, dropping payload AND leaf hash
-	/// together and advancing the floor frontier to `floor_pos` (its peaks
-	/// tile the pruned prefix for proofs). For a `Channel` `floor_pos` is the
-	/// peer's confirmation watermark (`Register.up_to`); lossy latest-wins
-	/// kinds prune to their head via [`Self::prune_lossy_heads`]. A no-op when
-	/// `floor_pos` does not advance the floor. Below-floor requests then refuse
-	/// (the requester re-anchors to the head — roots are cumulative).
-	pub fn prune(&mut self, stream: &StreamId, floor_pos: u64) -> Result<(), ArchiveError> {
+	/// together and advancing the floor frontier to `floor_pos` (its peaks tile
+	/// the pruned prefix for proofs). A no-op when `floor_pos` does not advance
+	/// the floor. Below-floor requests then refuse (the requester re-anchors to
+	/// the head — roots are cumulative). Caller is responsible for the
+	/// reorg-safety cap; see [`Self::apply_retention`].
+	fn prune_stream(&mut self, stream: &StreamId, floor_pos: u64) -> Result<(), ArchiveError> {
 		let Some(state) = self.streams.get(stream).cloned() else { return Ok(()) };
 		let new_floor = floor_pos.min(state.frontier.leaf_count);
 		if new_floor <= state.floor.leaf_count {
@@ -427,52 +485,6 @@ impl<Block: BlockT<Hash = Hash>, AUX: AuxStore> SpecMsgArchive<Block, AUX> {
 		let state = self.streams.get_mut(stream).expect("cloned above; qed");
 		state.floor = floor;
 		let inserts = vec![(keys::stream(stream), state.encode())];
-		write_aux(&*self.aux, inserts, deletes)?;
-		Ok(())
-	}
-
-	/// Keep-latest for the lossy latest-wins kinds (`Ack`/`Broadcast`/
-	/// `Private`): prunes each such stream to its head, retaining only the
-	/// latest leaf. Their consumption reads only the head, so nothing below is
-	/// ever fetched.
-	pub fn prune_lossy_heads(&mut self) -> Result<(), ArchiveError> {
-		let ids: Vec<StreamId> = self
-			.streams
-			.keys()
-			.filter(|id| !matches!(id, StreamId::Channel { .. }))
-			.copied()
-			.collect();
-		for id in ids {
-			let head = self.streams.get(&id).expect("iterating own keys; qed").frontier.leaf_count;
-			self.prune(&id, head.saturating_sub(1))?;
-		}
-		Ok(())
-	}
-
-	/// Drops boundaries no retained stream can serve under any longer — those
-	/// whose every stream's floor has reached its leaf count at that boundary,
-	/// so nothing below the floor is retrievable there. The newest boundary
-	/// always stays — current roots are always serveable.
-	pub fn prune_boundaries(&mut self) -> Result<(), ArchiveError> {
-		let mut deletes: Vec<Vec<u8>> = Vec::new();
-		while self.boundaries.len() > 1 {
-			let unserveable = {
-				let front = self.boundaries.front().expect("len > 1; qed");
-				self.streams.iter().all(|(id, state)| {
-					front.count(id).map_or(true, |count| state.floor.leaf_count >= count)
-				})
-			};
-			if !unserveable {
-				break;
-			}
-			let dropped = self.boundaries.pop_front().expect("len > 1; qed");
-			deletes.push(keys::boundary(&dropped.number.encode()));
-		}
-		if deletes.is_empty() {
-			return Ok(());
-		}
-		self.rebuild_root_index();
-		let inserts = vec![(keys::meta(), self.meta().encode())];
 		write_aux(&*self.aux, inserts, deletes)?;
 		Ok(())
 	}
@@ -695,6 +707,7 @@ mod tests {
 		verify::{verify_event_response, verify_messages_response, VerifyError},
 	};
 	use cumulus_primitives_spec_messaging::test_utils::StreamFixture;
+	use std::collections::BTreeMap;
 
 	/// All payloads of `stream` up to `count`, as the import fixtures
 	/// produce them.
@@ -883,20 +896,21 @@ mod tests {
 	}
 
 	#[test]
-	fn prune_below_watermark_then_boundaries() {
+	fn retention_prunes_to_min_watermark_finalized() {
 		let (aux, mut archive) = new_archive();
 		let streams = [channel(2001), channel(2002)];
+		// Counts 2,4,…,16 at blocks 1..8.
 		let roots = import_blocks(&mut archive, &streams, 8, 2, 10_000);
 		let under = roots[7];
 
-		// Single floor: prune `streams[0]` below the watermark 6 — payload AND
-		// leaf hash both gone below 6.
-		archive.prune(&streams[0], 6).expect("pruning succeeds");
+		// Finalized at block 3 (count 6 per stream); watermark 6 on stream[0]
+		// only. floor(stream0) = min(watermark 6, finalized-count 6) = 6;
+		// stream1 has no watermark → min(0, 6) = 0, untouched.
+		let watermarks = BTreeMap::from([(streams[0], 6u64)]);
+		archive.apply_retention(3, &watermarks).expect("retention runs");
 
-		// Below the floor everything is refused — payload fetch AND lift
-		// material alike (the deliberate policy change: below-watermark lift
-		// material is no longer served, since consumption is always above the
-		// watermark).
+		// stream0 below the floor: payload fetch AND lift material both refused
+		// (below-watermark lift material is no longer served).
 		let request = messages_request(streams[0], 0, under, u32::MAX);
 		assert_eq!(archive.serve_messages(&request), Err(ServeError::BelowFloor));
 		let lift = messages_request(streams[0], 0, under, 0);
@@ -909,44 +923,23 @@ mod tests {
 		let response = archive.serve_messages(&request).expect("unpruned payloads serve");
 		assert_eq!(response.payloads, all_payloads(&streams[0], 16)[6..].to_vec());
 		verify_messages_response(&request, &response, None).expect("verifies");
-		let lift = messages_request(streams[0], 6, under, 0);
-		let response = archive.serve_messages(&lift).expect("lift material serves");
-		verify_messages_response(&lift, &response, None).expect("verifies");
 
-		// Boundary pruning: once BOTH streams' floors reach a boundary's count,
-		// nothing below is serveable there and the boundary drops. Prune the
-		// second stream to 6 as well; blocks 1-3 (counts 2/4/6 ≤ 6) then drop.
-		archive.prune(&streams[1], 6).expect("pruning succeeds");
-		archive.prune_boundaries().expect("boundary sweep succeeds");
-		for old in &roots[..3] {
-			let request = messages_request(streams[0], 6, *old, 0);
-			assert_eq!(archive.serve_messages(&request), Err(ServeError::UnknownRoot));
+		// stream1 (no watermark) is untouched — still serves from 0.
+		let request = messages_request(streams[1], 0, under, u32::MAX);
+		let response = archive.serve_messages(&request).expect("stream1 fully retained");
+		assert_eq!(response.payloads, all_payloads(&streams[1], 16));
+
+		// Boundaries below finalized (blocks 1,2) dropped; block 3 (= finalized)
+		// and above kept.
+		for old in &roots[..2] {
+			assert!(!archive.serves_root(old));
 		}
-		// Blocks 4-8 (counts ≥ 8 > 6) stay serveable from the watermark on.
-		for (index, old) in roots.iter().enumerate().skip(3) {
-			let count = (index as u64 + 1) * 2;
-			let request = messages_request(streams[1], 6, *old, u32::MAX);
-			let response = archive.serve_messages(&request).expect("retained boundary serves");
-			assert_eq!(response.payloads, all_payloads(&streams[1], count)[6..].to_vec());
-			verify_messages_response(&request, &response, None).expect("still verifies");
-		}
+		assert!(archive.serves_root(&roots[2]));
 
-		// Appending continues over the retained floor, and a restart reloads
-		// the pruned state faithfully.
-		let sends = vec![(streams[0], vec![payload(&streams[0], 16)])];
-		let new_root = archive
-			.import_block(block_hash(9), block_hash(8), 9, sends)
-			.expect("extends the tip")
-			.expect("streams exist");
-		let request = messages_request(streams[0], 6, new_root, u32::MAX);
-		let response = archive.serve_messages(&request).expect("serves under the new root");
-		assert_eq!(response.payloads.last(), Some(&payload(&streams[0], 16)));
-		verify_messages_response(&request, &response, None).expect("verifies");
-
+		// Restart reloads the pruned state faithfully.
 		drop(archive);
 		let archive: TestArchive = SpecMsgArchive::load(aux).expect("pruned archive loads");
-		assert_eq!(archive.serve_messages(&request).expect("still serves"), response);
-		let below = messages_request(streams[0], 0, new_root, 0);
+		let below = messages_request(streams[0], 0, under, 0);
 		assert_eq!(archive.serve_messages(&below), Err(ServeError::BelowFloor));
 	}
 
@@ -955,10 +948,12 @@ mod tests {
 		let (_aux, mut archive) = new_archive();
 		// `Ack` is a lossy latest-wins kind — keep-latest, not watermark.
 		let stream = ack(2001);
-		let roots = import_blocks(&mut archive, &[stream], 5, 2, 1_000);
+		let roots = import_blocks(&mut archive, &[stream], 5, 2, 1_000); // 10 leaves
 		let under = roots[4];
 
-		archive.prune_lossy_heads().expect("keep-latest prune succeeds");
+		// Finalized at block 5 (count 10 ≥ head-1), so keep-latest is not
+		// reorg-capped.
+		archive.apply_retention(5, &BTreeMap::new()).expect("retention runs");
 
 		// Only the head leaf (position 9) survives; everything below is gone.
 		let head = EventRequest { stream, under, at: None };
@@ -970,6 +965,52 @@ mod tests {
 		assert_eq!(archive.serve_event(&old), Err(ServeError::BelowFloor));
 		let backlog = messages_request(stream, 0, under, u32::MAX);
 		assert_eq!(archive.serve_messages(&backlog), Err(ServeError::BelowFloor));
+	}
+
+	#[test]
+	fn retention_keeps_reorg_ancestors_with_no_streams() {
+		// Regression for the E2E failure (penpal reorg #9→#10, common ancestor
+		// #7): pre-handshake blocks carry NO streams, and the old serveability
+		// sweep collapsed empty-stream boundaries to one (`iter().all()` is
+		// vacuously true), so the reorg walk-back could not find the ancestor
+		// and the archiver wedged on `Disconnected`. Retention must keep every
+		// boundary ≥ finalized regardless of streams.
+		let (_aux, mut archive) = new_archive();
+		for n in 1..=10 {
+			archive
+				.import_block(block_hash(n), block_hash(n - 1), n, Vec::new())
+				.expect("empty block imports");
+		}
+		archive.apply_retention(7, &BTreeMap::new()).expect("retention runs");
+
+		// The reorg common ancestor (#7, = finalized) is still a rewind target.
+		archive.rewind_to(block_hash(7)).expect("reorg to a ≥ finalized ancestor reconciles");
+		assert_eq!(archive.tip(), Some((block_hash(7), 7)));
+		// Below finalized was dropped — never a rewind target.
+		assert!(matches!(archive.rewind_to(block_hash(6)), Err(ArchiveError::UnknownBlock)));
+	}
+
+	#[test]
+	fn retention_reorg_cap_keeps_leaves_for_rewind() {
+		// The leaf reorg-cap: even with a watermark beyond the finalized
+		// horizon, leaves down to the finalized count are retained so
+		// `rewind_to` a ≥ finalized ancestor can rebuild the frontier. Without
+		// the cap the floor would advance to the watermark and this rewind would
+		// fail `Corrupt`.
+		let (_aux, mut archive) = new_archive();
+		let stream = channel(2001);
+		let roots = import_blocks(&mut archive, &[stream], 8, 2, 1_000); // counts 2..16
+		let watermarks = BTreeMap::from([(stream, 20u64)]); // beyond the head
+		archive.apply_retention(3, &watermarks).expect("retention runs");
+
+		// Floor capped at the finalized count 6 (not the watermark) → leaves
+		// [6..] retained; a reorg to block 4 (> finalized) rebuilds at count 8.
+		archive.rewind_to(block_hash(4)).expect("rewind past the floor reconstructs");
+		assert_eq!(archive.tip(), Some((block_hash(4), 4)));
+		let request = messages_request(stream, 6, roots[3], u32::MAX);
+		let response = archive.serve_messages(&request).expect("serves from the capped floor");
+		assert_eq!(response.payloads, all_payloads(&stream, 8)[6..].to_vec());
+		verify_messages_response(&request, &response, None).expect("verifies");
 	}
 
 	#[test]

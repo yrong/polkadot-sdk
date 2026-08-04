@@ -35,7 +35,7 @@
 //! part of the MVP; re-syncing with execution rebuilds it too, via exactly
 //! this code path).
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -174,25 +174,26 @@ where
 		);
 	}
 
-	// Retention: `Channel` streams prune payload + leaf below the peer's
-	// confirmation watermark (`Register.up_to`, the latest verified register
-	// read served by `out_channels()`; the unconfirmed span is credit-bounded);
-	// lossy latest-wins kinds keep only their head; then drop boundaries no
-	// retained stream can serve under.
+	// Retention: `min(watermark, finalized)`. `Channel` watermarks come from the
+	// `out_channels()` register `up_to` (the unconfirmed span is credit-bounded);
+	// lossy kinds keep-latest; and the finalized head caps both for reorg-safety
+	// (nothing below it is dropped, so a reorg always reconciles via `rewind_to`).
 	let out_channels = client.runtime_api().out_channels(hash)?;
-	let mut archive = archive.write();
-	for (channel, state) in out_channels {
-		if let Some(register) = state.register {
-			let stream = StreamId::Channel {
-				recipient: channel.peer,
-				domain: channel.domain,
-				num: channel.num,
-			};
-			archive.prune(&stream, register.up_to.0)?;
-		}
-	}
-	archive.prune_lossy_heads()?;
-	archive.prune_boundaries()?;
+	let channel_watermarks: BTreeMap<StreamId, u64> = out_channels
+		.into_iter()
+		.filter_map(|(channel, state)| {
+			state.register.map(|register| {
+				let stream = StreamId::Channel {
+					recipient: channel.peer,
+					domain: channel.domain,
+					num: channel.num,
+				};
+				(stream, register.up_to.0)
+			})
+		})
+		.collect();
+	let finalized = client.info().finalized_number;
+	archive.write().apply_retention(finalized, &channel_watermarks)?;
 
 	Ok(())
 }
