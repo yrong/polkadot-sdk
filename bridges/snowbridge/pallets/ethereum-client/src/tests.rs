@@ -231,6 +231,7 @@ fn compute_fork_version() {
 		deneb: Fork { version: [0, 0, 0, 4], epoch: 40 },
 		electra: Fork { version: [0, 0, 0, 5], epoch: 50 },
 		fulu: Fork { version: [0, 0, 0, 6], epoch: 60 },
+		gloas: Fork { version: [0, 0, 0, 7], epoch: 70 },
 	};
 	new_tester().execute_with(|| {
 		assert_eq!(EthereumBeaconClient::select_fork_version(&mock_fork_versions, 0), [0, 0, 0, 0]);

@@ -617,7 +617,14 @@ fn poc_permissionless_forged_receipt_bypasses_verifier_and_injects_xcm() {
 
 		// Build a malicious receipt proof: a real receipts-trie root node + an extra "proof node"
 		// that is just the forged receipt RLP bytes.
-		let receipts_root = fixture.event.proof.execution_proof.execution_header.receipts_root();
+		// Pre-Gloas fixture, so the receipts root is carried in the payload header; qed
+		let receipts_root = fixture
+			.event
+			.proof
+			.execution_proof
+			.execution_header
+			.receipts_root()
+			.expect("deneb fixture carries a receipts root; qed");
 		let root_node = fixture.event.proof.receipt_proof[0].clone();
 		let exploit_proof_nodes = vec![root_node, forged_receipt_bytes.clone()];
 

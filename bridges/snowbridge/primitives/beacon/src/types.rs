@@ -7,7 +7,7 @@ use sp_core::{H160, H256, U256};
 use sp_std::{boxed::Box, iter::repeat, prelude::*};
 use Debug;
 
-use crate::config::{PUBKEY_SIZE, SIGNATURE_SIZE};
+use crate::config::{MAX_EXECUTION_HEADER_RLP_SIZE, PUBKEY_SIZE, SIGNATURE_SIZE};
 
 #[cfg(feature = "std")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,6 +19,8 @@ use crate::ssz::{
 	hash_tree_root, SSZBeaconBlockHeader, SSZExecutionPayloadHeader, SSZForkData, SSZSigningData,
 	SSZSyncAggregate, SSZSyncCommittee,
 };
+use frame_support::{traits::ConstU32, BoundedVec};
+use sp_io::hashing::keccak_256;
 use ssz_rs::SimpleSerializeError;
 
 pub use crate::bits::decompress_sync_committee_bits;
@@ -38,6 +40,7 @@ pub struct ForkVersions {
 	pub deneb: Fork,
 	pub electra: Fork,
 	pub fulu: Fork,
+	pub gloas: Fork,
 }
 
 #[derive(Clone, Encode, Decode, PartialEq, Debug, TypeInfo)]
@@ -387,22 +390,54 @@ pub struct CompactBeaconState {
 pub enum VersionedExecutionPayloadHeader {
 	Capella(ExecutionPayloadHeader),
 	Deneb(deneb::ExecutionPayloadHeader),
+	/// [New in Gloas:EIP7732] Canonical RLP bytes of the Ethereum execution header.
+	///
+	/// Gloas removes `execution_payload` from `BeaconBlockBody`, so the beacon block no
+	/// longer commits to an SSZ `ExecutionPayloadHeader` and therefore no longer commits
+	/// to a `receipts_root`. It commits only to an execution block hash. These bytes are
+	/// authenticated by `keccak256(bytes) == <committed block hash>`; the `receipts_root`
+	/// is then read out of the authenticated encoding.
+	///
+	/// The bytes must be hashed exactly as submitted. An Ethereum block hash is the Keccak
+	/// hash of the canonical encoded header, so decoding and re-encoding before hashing
+	/// would be wrong.
+	Gloas(BoundedVec<u8, ConstU32<MAX_EXECUTION_HEADER_RLP_SIZE>>),
+}
+
+/// The leaf that `ExecutionProof::execution_branch` proves into `BeaconHeader::body_root`.
+///
+/// The two variants are different proof schemes, not different encodings of one value, and
+/// they are proven at different generalized indices.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ExecutionCommitment {
+	/// Pre-Gloas: SSZ hash-tree root of the full execution payload header, committed at
+	/// `BeaconBlockBody.execution_payload`.
+	PayloadHeaderRoot(H256),
+	/// Gloas: the execution block hash, committed at
+	/// `BeaconBlockBody.signed_execution_payload_bid.message.parent_block_hash`.
+	BlockHash(H256),
 }
 
 impl VersionedExecutionPayloadHeader {
-	pub fn hash_tree_root(&self) -> Result<H256, SimpleSerializeError> {
-		match self {
+	/// The leaf to verify `ExecutionProof::execution_branch` against.
+	pub fn commitment(&self) -> Result<ExecutionCommitment, SimpleSerializeError> {
+		Ok(match self {
 			VersionedExecutionPayloadHeader::Capella(execution_payload_header) => {
-				hash_tree_root::<SSZExecutionPayloadHeader>(
+				ExecutionCommitment::PayloadHeaderRoot(hash_tree_root::<SSZExecutionPayloadHeader>(
 					execution_payload_header.clone().try_into()?,
-				)
+				)?)
 			},
 			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
-				hash_tree_root::<crate::ssz::deneb::SSZExecutionPayloadHeader>(
+				ExecutionCommitment::PayloadHeaderRoot(hash_tree_root::<
+					crate::ssz::deneb::SSZExecutionPayloadHeader,
+				>(
 					execution_payload_header.clone().try_into()?,
-				)
+				)?)
 			},
-		}
+			VersionedExecutionPayloadHeader::Gloas(rlp) => {
+				ExecutionCommitment::BlockHash(keccak_256(rlp).into())
+			},
+		})
 	}
 
 	pub fn block_hash(&self) -> H256 {
@@ -413,30 +448,74 @@ impl VersionedExecutionPayloadHeader {
 			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
 				execution_payload_header.block_hash
 			},
+			// An Ethereum block hash is the Keccak hash of the canonical header encoding.
+			VersionedExecutionPayloadHeader::Gloas(rlp) => keccak_256(rlp).into(),
 		}
 	}
 
-	pub fn block_number(&self) -> u64 {
+	/// The receipts root to verify the receipt MPT proof against.
+	///
+	/// Fallible for Gloas, where it is parsed out of the authenticated header encoding.
+	/// Callers must only use this value once `commitment()` has been proven against a
+	/// finalized beacon block; on its own it is submitter-controlled.
+	pub fn receipts_root(&self) -> Option<H256> {
 		match self {
 			VersionedExecutionPayloadHeader::Capella(execution_payload_header) => {
-				execution_payload_header.block_number
+				Some(execution_payload_header.receipts_root)
 			},
 			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
-				execution_payload_header.block_number
+				Some(execution_payload_header.receipts_root)
 			},
+			VersionedExecutionPayloadHeader::Gloas(rlp) => receipts_root_from_rlp(rlp),
 		}
 	}
 
-	pub fn receipts_root(&self) -> H256 {
-		match self {
-			VersionedExecutionPayloadHeader::Capella(execution_payload_header) => {
-				execution_payload_header.receipts_root
-			},
-			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
-				execution_payload_header.receipts_root
-			},
-		}
+	/// Whether this is the Gloas (EIP-7732) proof scheme.
+	pub fn is_gloas(&self) -> bool {
+		matches!(self, VersionedExecutionPayloadHeader::Gloas(_))
 	}
+}
+
+/// Index of `receipts_root` in the canonical Ethereum execution header RLP list.
+const HEADER_RECEIPTS_ROOT_INDEX: usize = 5;
+/// A canonical Ethereum execution header has had at least this many fields since frontier.
+const HEADER_MIN_FIELDS: usize = 15;
+
+/// Reads `receipts_root` out of canonical Ethereum execution header RLP.
+///
+/// Strict on purpose: the bytes are only trustworthy because their Keccak hash matched a
+/// beacon-committed block hash, so anything that is not exactly one canonical top-level
+/// list is rejected rather than interpreted.
+fn receipts_root_from_rlp(bytes: &[u8]) -> Option<H256> {
+	let mut buf = bytes;
+	let header = alloy_rlp::Header::decode(&mut buf).ok()?;
+	if !header.list || buf.len() != header.payload_length {
+		// Not a list, or trailing bytes after the list payload.
+		return None;
+	}
+
+	let mut fields = 0usize;
+	let mut receipts_root = None;
+	while !buf.is_empty() {
+		let item = alloy_rlp::Header::decode(&mut buf).ok()?;
+		if item.payload_length > buf.len() {
+			return None;
+		}
+		let (payload, rest) = buf.split_at(item.payload_length);
+		buf = rest;
+		if fields == HEADER_RECEIPTS_ROOT_INDEX {
+			if item.list || payload.len() != 32 {
+				return None;
+			}
+			receipts_root = Some(H256::from_slice(payload));
+		}
+		fields = fields.checked_add(1)?;
+	}
+
+	if fields < HEADER_MIN_FIELDS {
+		return None;
+	}
+	receipts_root
 }
 
 #[derive(
