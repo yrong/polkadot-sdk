@@ -138,14 +138,17 @@ parameter_types! {
 			version: hex!("05000000"),
 			epoch: 0,
 		},
+		// The existing fixtures all sit below epoch 30, so fulu and gloas are placed above
+		// that but low enough that real Gloas testnet slots (epoch ~3624) land in the gloas
+		// era. gloas is deliberately after fulu so fork-boundary tests have a boundary to
+		// cross.
 		fulu: Fork {
 			version: hex!("06000000"),
-			epoch: 100000000,
+			epoch: 2000,
 		},
-		// Deliberately after fulu, so fork-boundary tests have a real boundary to cross.
 		gloas: Fork {
 			version: hex!("07000000"),
-			epoch: 200000000,
+			epoch: 3000,
 		}
 	};
 }

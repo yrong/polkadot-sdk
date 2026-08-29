@@ -1495,3 +1495,269 @@ mod gloas_sync_committee {
 		});
 	}
 }
+
+/// A full post-Gloas message proof, end to end, on real data.
+///
+/// Everything below comes from one slot of the [Platåberget](https://plataberget.dev/)
+/// Gloas testnet: beacon block 115968, and the execution block it committed to
+/// (EL block 113202, hash 0x9af0c93804597fe5…).
+///
+/// The chain the pallet walks is:
+///
+/// ```text
+/// stored finalized beacon header
+///   -- SSZ branch at 2856 --> keccak256(execution header rlp)
+///   -- rlp element 5       --> receipts_root
+///   -- receipt MPT         --> the receipt carrying the log
+/// ```
+///
+/// The execution header is a genuine Gloas one — 23 RLP fields, including the
+/// `block_access_list_hash` and `slot_number` that Gloas appends — so this also exercises
+/// the parser against a header shape that does not exist pre-Gloas.
+mod gloas_end_to_end {
+	use super::*;
+	use snowbridge_beacon_primitives::{
+		AncestryProof, ExecutionProof, VersionedExecutionPayloadHeader,
+	};
+	use snowbridge_verification_primitives::{Log, Proof};
+	use sp_core::H160;
+
+	const BEACON_SLOT: u64 = 115968;
+	const PROPOSER_INDEX: u64 = 58638;
+	const PARENT_ROOT: [u8; 32] =
+		hex!("84a3016f712471145043f63fe36f9c9dbf7c16b3a709ce4a2b22678b77acbc80");
+	const BEACON_STATE_ROOT: [u8; 32] =
+		hex!("2a6dfcdb7ac509685c815fe141fd7da7f7b24eb8da488aa9d24eb1ff59d410e3");
+	const BODY_ROOT: [u8; 32] =
+		hex!("3b72fb6996412d59a20d92dde86abe3a12b94232ba62a61ac301625f1f8950f0");
+	const BLOCK_ROOTS_ROOT: [u8; 32] =
+		hex!("df568d1e3e530cb6c53aded1ce8329387a2082ae93556b3658fab61eee147d28");
+
+	/// Canonical RLP of the Gloas execution header. `keccak256` of these bytes is the value
+	/// committed at gindex 2856.
+	const EXECUTION_HEADER_RLP: [u8; 660] = hex!(
+		"f90291a0faba146ad08c3f771eb6608436b92bb4c4689915540fde06a4b068b8"
+		"57e592daa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142"
+		"fd40d4934794f4e8263979a89dc357d7f9f79533febc7f3e287ba0e6b0dc3741"
+		"5b8d711a5b79dbd90549f08302c4e3f3adf15a3154c7979cf7816ea03be2fa4f"
+		"53c84d6f4c5dad717b27e46498681de378480ea74837d8a3e0b99defa06e8de8"
+		"0294645f0e074c0e3d322adb756aa9c1896282dd4d9be22739b8006542b90100"
+		"1038c501421a261a961aa2148a90855040c5100073e400a2405c19c29c0ea0a4"
+		"009c08f4080c1a892528f0815eae90a2086100906c227745124f06c0319a2620"
+		"d6433fa2002d1019c0a0220c04205566620c200a845012aa00056a1695982040"
+		"1c418998964fb00627aa49768120289348e0234c48440e2011a0059804988220"
+		"0229100d12c5428ae4531c0800040120041a4021b860441ea0633dee400681c9"
+		"0d6a98ad00a2231208c812691e08864680164a1013240991be8102bc04629d2c"
+		"83010c4300570b21c9690a254600c00286369a2d51a804b91046027e12003665"
+		"36da3a2102021b91482e1cc026a90d6a7803988e344c61d402a468906304974a"
+		"808301ba32840be8c71183ef5bf6846a92edb480a037f7ae9acf1b53b7a17ba5"
+		"5feb12af034c029040ad32f9da0ebd740c7fa942d48800000000000000008477"
+		"9aa3d8a0b263ef4022e60825091500b81487a1b9b2aba0bc91866e93330562b4"
+		"aaf466d3832a000084107fe7bfa039315bc08fc62b4582c5c246ff674d7ae35d"
+		"a70e8abb048267bdf24154eb77b1a0e3b0c44298fc1c149afbf4c8996fb92427"
+		"ae41e4649b934ca495991b7852b855a0a30f7b39ef8f14ee6a00671e43e77087"
+		"a9afa61273745ad85025a0974a165e098301c4ff"
+	);
+
+	const TX_INDEX: u64 = 23;
+	const LOG_ADDRESS: [u8; 20] = hex!("fffffffffffffffffffffffffffffffffffffffe");
+
+	fn beacon_header() -> BeaconHeader {
+		BeaconHeader {
+			slot: BEACON_SLOT,
+			proposer_index: PROPOSER_INDEX,
+			parent_root: PARENT_ROOT.into(),
+			state_root: BEACON_STATE_ROOT.into(),
+			body_root: BODY_ROOT.into(),
+		}
+	}
+
+	fn execution_branch() -> Vec<H256> {
+		vec![
+			hex!("c54e8868daef8005f4c5e5fc56f214389b5b9fa8b8fb011499de194efd6d7dde").into(),
+			hex!("ff0f000000000000000000000000000000000000000000000000000000000000").into(),
+			hex!("99f12ce5f778798e053b12f50afff88c3a033718f2b608acb437f42da3f17c69").into(),
+			hex!("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b").into(),
+			hex!("9db0c9c90f13f6a294022960a4e1ed53fcbd365f0a981c644d1a05fee99fcff4").into(),
+			hex!("586a75beceb384ee9422a8c5259783a83ffa2740e1e38a76824ed302d8b224da").into(),
+			hex!("c78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c").into(),
+			hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
+			hex!("713d100d5174b496d04cbfd23beae240266e811283d4c2d5b612463444616ff1").into(),
+			hex!("5be2625aa3fcff45cc120a25a75f725fb4032d30325b20b9ae568559f5a8c5b9").into(),
+			hex!("ff1f000000000000000000000000000000000000000000000000000000000000").into(),
+		]
+	}
+
+	fn receipt_proof() -> Vec<Vec<u8>> {
+		vec![
+			hex!(
+				"f90131a0903b88892b17f8222d05e8333e67e096f68e54f70b43f0297dc92ba6"
+				"b7251db7a084eb52a0c305d93eb8c8619e784663e1f46fafad17ab0d8df1d094"
+				"b56c513d1ba067ff249ede5afe895e3b878ce5aa1287539766a0276756274f1a"
+				"5bf9660c1e21a0218ead72552341649784764b99be3a644235e75a8c8b4c2155"
+				"e98e10f21ce762a05f396763737eb138c49e1d08124b0c9e9067f1dccb2ce03d"
+				"965c9d5d511da6b2a04b0d5c3e3d7d81fe95597ace2d5c7f17d0a57eaed7e212"
+				"e113df8e43e9ecf835a0ffdd8e9c9dc6765ef99d7fcce229346ef59595aa3a55"
+				"d4f35af117cfdba9a7ada07e6312e7e5b2eefbe2727e5e16b7f23de0fc93589d"
+				"fe23d5d5f87c59adb30ad8a0ce974e78f0c61c552ad183f215afee72654cf989"
+				"34754b07350286dd52ef4a2b8080808080808080"
+			)
+			.to_vec(),
+			hex!(
+				"f90211a087645467651c8763aca2fbcc2ccea7837742ee1c69e5e36bef9cb17b"
+				"e299baefa033c52b0565ca769a3058a99d27eb176f29086c7a39bd6569442da9"
+				"c1d52a2c7ba024aadb584ae746385d080c700a4842d245d7cb4d418b97673b90"
+				"eaaaf4194cc2a0a92e9b070fca8b8938e5c7940eddf25eb724668d3a703a6051"
+				"e494201e36ab88a0eed4feaf1e72168c8f3f01fef84839d56db013809c0941fb"
+				"b49184842899e1aea071cee6d75eac871ad8abf86046c31721090b2fed66a8d5"
+				"e4ea3d1c33c5f11053a0cefbbbe29993bc71b0c814755427b7e1bf397c55a1d3"
+				"299e07b1f6b6bd622480a00756e5a046d501eb86b6f6367214b839af6b0778bd"
+				"12db6fed9c5a4bd2e2448da036d649ef33828a30baafd6d7ccafb3c97ffb5bbe"
+				"4b8fd19f694196e1df265cbca093552f74728f30135798242cf3d7178d8ef5be"
+				"093ceb99765de9e3b9cc94cb1fa00dc11d3237e13698f371cd2d310260089409"
+				"53663af8153fdd80fb178c0fc153a0a6aeaf28ea0b6f85d21c71c7a0115cdafc"
+				"5450df036f80210438684eafc434b4a0683019ce1048534a40aff740be022bb8"
+				"f7a9f4d887dc218bf3aa88f2c087015da0e07dea6f9ee7b09f60d6363716499f"
+				"c4a66558c4cdd1a44bf1f9a8bd4867fd54a03787d62f43b5cbd0fa47d5b98014"
+				"ea7c9070c4ca7184c8cfb3344e681a185bc2a0e188a0d7993590d4dcd9f715bc"
+				"53fe9703a52dec45cc938d33b67211521a71bb80"
+			)
+			.to_vec(),
+			hex!(
+				"f901af20b901ab02f901a7018306d437b9010000000000000000000000000000"
+				"0000000000000000000000000000000000000000000000000000000000000000"
+				"0000000000008000000000000400000000000000000000000000100000000800"
+				"0000000000000000000000000000000000000000000000000000002000000000"
+				"0000000000000000000000000000100000000000000000100000004000000000"
+				"0000000000000000000000000000000000000004000000000000000000000000"
+				"0000000000000000000000000000000000000000000002000000000008000000"
+				"0000000000000000000000000000000000004000000000000000000000000000"
+				"00000000000000000000000000000000000000f89df89b94ffffffffffffffff"
+				"fffffffffffffffffffffffef863a0ddf252ad1be2c89b69c2b068fc378daa95"
+				"2ba7f163c4a11628f55a4df523b3efa000000000000000000000000093e7442e"
+				"b39ab925e9c88b734fc3f73653b6bb2ca000000000000000000000000013bb43"
+				"66ee032cc15d7ac1c55ff5d9977d6d8feba00000000000000000000000000000"
+				"000000000000000000000000001c7cca26f3"
+			)
+			.to_vec(),
+		]
+	}
+
+	fn log() -> Log {
+		Log {
+			address: H160(LOG_ADDRESS),
+			topics: vec![
+				hex!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").into(),
+				hex!("00000000000000000000000093e7442eb39ab925e9c88b734fc3f73653b6bb2c").into(),
+				hex!("00000000000000000000000013bb4366ee032cc15d7ac1c55ff5d9977d6d8feb").into(),
+			],
+			data: hex!("0000000000000000000000000000000000000000000000000000001c7cca26f3").to_vec(),
+			tx_index: TX_INDEX,
+		}
+	}
+
+	fn execution_proof() -> ExecutionProof {
+		ExecutionProof {
+			header: beacon_header(),
+			ancestry_proof: None::<AncestryProof>,
+			execution_header: VersionedExecutionPayloadHeader::Gloas(
+				EXECUTION_HEADER_RLP.to_vec().try_into().expect("fits the bound; qed"),
+			),
+			execution_branch: execution_branch(),
+		}
+	}
+
+	fn store_header() {
+		assert_ok!(EthereumBeaconClient::store_finalized_header(
+			beacon_header(),
+			BLOCK_ROOTS_ROOT.into(),
+		));
+	}
+
+	/// The slot must land in the gloas era of the mock's fork schedule, or the variant/era
+	/// cross-check rejects the proof before any of this is exercised.
+	#[test]
+	fn fixture_slot_is_in_the_gloas_era() {
+		new_tester().execute_with(|| {
+			assert!(
+				compute_epoch(BEACON_SLOT, SLOTS_PER_EPOCH as u64) >=
+					ChainForkVersions::get().gloas.epoch
+			);
+		});
+	}
+
+	#[test]
+	fn verifies_a_real_gloas_message() {
+		new_tester().execute_with(|| {
+			store_header();
+			assert_ok!(EthereumBeaconClient::verify(
+				&log(),
+				&Proof { receipt_proof: receipt_proof(), execution_proof: execution_proof() },
+			));
+		});
+	}
+
+	/// Altering the execution header changes its keccak hash, so the gindex-2856 branch no
+	/// longer verifies. This is what stops a submitter pairing a genuine beacon proof with a
+	/// header of their own.
+	#[test]
+	fn rejects_a_tampered_execution_header() {
+		new_tester().execute_with(|| {
+			store_header();
+			let mut rlp = EXECUTION_HEADER_RLP.to_vec();
+			let last = rlp.len() - 1;
+			rlp[last] ^= 0x01;
+			let mut proof = execution_proof();
+			proof.execution_header =
+				VersionedExecutionPayloadHeader::Gloas(rlp.try_into().expect("fits; qed"));
+			assert!(EthereumBeaconClient::verify(
+				&log(),
+				&Proof { receipt_proof: receipt_proof(), execution_proof: proof },
+			)
+			.is_err());
+		});
+	}
+
+	/// A receipt proof for one transaction index must not satisfy a log claiming another.
+	#[test]
+	fn rejects_a_wrong_transaction_index() {
+		new_tester().execute_with(|| {
+			store_header();
+			let mut l = log();
+			l.tx_index += 1;
+			assert!(EthereumBeaconClient::verify(
+				&l,
+				&Proof { receipt_proof: receipt_proof(), execution_proof: execution_proof() },
+			)
+			.is_err());
+		});
+	}
+
+	/// A log that is not in the proven receipt must be rejected even though every proof in
+	/// the chain is genuine.
+	#[test]
+	fn rejects_a_log_that_is_not_in_the_receipt() {
+		new_tester().execute_with(|| {
+			store_header();
+			let mut l = log();
+			l.address = H160::repeat_byte(0xaa);
+			assert!(EthereumBeaconClient::verify(
+				&l,
+				&Proof { receipt_proof: receipt_proof(), execution_proof: execution_proof() },
+			)
+			.is_err());
+		});
+	}
+
+	/// Without a stored finalized header there is nothing to anchor the proof to.
+	#[test]
+	fn rejects_when_not_bootstrapped() {
+		new_tester().execute_with(|| {
+			assert!(EthereumBeaconClient::verify(
+				&log(),
+				&Proof { receipt_proof: receipt_proof(), execution_proof: execution_proof() },
+			)
+			.is_err());
+		});
+	}
+}
