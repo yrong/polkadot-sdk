@@ -142,9 +142,10 @@ parameter_types! {
 			version: hex!("06000000"),
 			epoch: 100000000,
 		},
+		// Deliberately after fulu, so fork-boundary tests have a real boundary to cross.
 		gloas: Fork {
 			version: hex!("07000000"),
-			epoch: 100000000,
+			epoch: 200000000,
 		}
 	};
 }

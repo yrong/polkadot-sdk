@@ -1337,3 +1337,161 @@ mod gloas_branches {
 		));
 	}
 }
+
+/// Sync-committee signature verification at, and across, the Gloas fork boundary.
+///
+/// Two things are covered. The boundary rule is pure logic: per
+/// `validate_light_client_update` the fork version comes from `max(signature_slot, 1) - 1`,
+/// so an update whose `signature_slot` is the *first* slot of the Gloas epoch still signs
+/// under the Fulu version. Getting that backwards would reject every update across the
+/// boundary.
+///
+/// The second is a real Gloas sync aggregate from Platåberget slot 115968, verified under a
+/// domain built from that network's real Gloas fork version and genesis validators root.
+mod gloas_sync_committee {
+	use super::*;
+	use snowbridge_beacon_primitives::{
+		bls::{fast_aggregate_verify, prepare_milagro_pubkey},
+		PublicKey, Signature, SigningData,
+	};
+
+	/// `max(signature_slot, 1) - 1` lands in the previous epoch, so the *previous* fork
+	/// version signs. This is the case most likely to be got wrong.
+	#[test]
+	fn first_slot_of_gloas_epoch_still_signs_under_fulu() {
+		new_tester().execute_with(|| {
+			let forks = ChainForkVersions::get();
+			let boundary = forks.gloas.epoch * (SLOTS_PER_EPOCH as u64);
+			assert_eq!(boundary % (SLOTS_PER_EPOCH as u64), 0);
+
+			let at_slot = EthereumBeaconClient::compute_fork_version(compute_epoch(
+				boundary,
+				SLOTS_PER_EPOCH as u64,
+			));
+			let at_previous = EthereumBeaconClient::compute_fork_version(compute_epoch(
+				boundary.saturating_sub(1),
+				SLOTS_PER_EPOCH as u64,
+			));
+			assert_eq!(at_slot, forks.gloas.version);
+			assert_eq!(at_previous, forks.fulu.version, "signing crosses back into fulu");
+
+			let header = BeaconHeader {
+				slot: boundary - 1,
+				proposer_index: 0,
+				parent_root: H256::repeat_byte(0x11),
+				state_root: H256::repeat_byte(0x22),
+				body_root: H256::repeat_byte(0x33),
+			};
+			let validators_root = H256::repeat_byte(0x44);
+			let expected = EthereumBeaconClient::compute_signing_root(
+				&header,
+				EthereumBeaconClient::compute_domain(
+					crate::config::DOMAIN_SYNC_COMMITTEE.to_vec(),
+					at_previous,
+					validators_root,
+				)
+				.unwrap(),
+			)
+			.unwrap();
+
+			assert_eq!(
+				EthereumBeaconClient::signing_root(&header, validators_root, boundary).unwrap(),
+				expected,
+			);
+		});
+	}
+
+	/// One epoch later the Gloas version is in force for signing too.
+	#[test]
+	fn epoch_after_the_boundary_signs_under_gloas() {
+		new_tester().execute_with(|| {
+			let forks = ChainForkVersions::get();
+			let slot = (forks.gloas.epoch + 1) * (SLOTS_PER_EPOCH as u64);
+			let version = EthereumBeaconClient::compute_fork_version(compute_epoch(
+				slot.saturating_sub(1),
+				SLOTS_PER_EPOCH as u64,
+			));
+			assert_eq!(version, forks.gloas.version);
+		});
+	}
+
+	// ---- real Gloas aggregate, Platåberget slot 115968 ----
+	/// Platåberget's Gloas fork version and genesis validators root.
+	const GLOAS_FORK_VERSION: [u8; 4] = hex!("80733183");
+	const GENESIS_VALIDATORS_ROOT: [u8; 32] =
+		hex!("bb4a1a9e3f7f4e10edcd734e4acc3b5ffd4f830efe0af2748fa458cfee5d2658");
+	/// The block root the sync committee attested to (the head at the previous slot).
+	const ATTESTED_ROOT: [u8; 32] =
+		hex!("84a3016f712471145043f63fe36f9c9dbf7c16b3a709ce4a2b22678b77acbc80");
+	const AGGREGATE_PUBKEY: [u8; 48] = hex!(
+		"a0204ec4a82c619af447bbe55ced39ba43a72be2eed1764d12e086b7f353433b"
+		"56399d5e37d4dc2ac868f23dcc846f50"
+	);
+	/// 511 of 512 participated; `fast_aggregate_verify` subtracts the absent one from the
+	/// committee aggregate, which is exactly what the pallet does.
+	const ABSENT_PUBKEY: [u8; 48] = hex!(
+		"abeaf40cb88549819e7778a1e94bb0aeb26a9a970b2fc1dd98951b4572528778"
+		"3ca4b41a148aff6a95b068cb45ca0d94"
+	);
+	const SIGNATURE: [u8; 96] = hex!(
+		"878bad4793e3e804765ba3ed094d671ca1debfdaa2877afc8349427d05e0f1ff"
+		"ab526d393bc868211f9160886a430c3c0580879e3be37ed11f9c44187a2368e8"
+		"5ce19f5a6a962afb93bd7941e719d1e616bd1d1f7d27df71ff7590df9cf3100f"
+	);
+
+	/// A real Gloas sync aggregate verifies under a domain the pallet computed. This is the
+	/// end-to-end check that the Gloas fork version, `compute_domain` and the signing root
+	/// still compose after EIP-7688 — the sync-committee signature scheme itself is
+	/// unchanged, and this pins that.
+	#[test]
+	fn real_gloas_sync_aggregate_verifies() {
+		new_tester().execute_with(|| {
+			let domain = EthereumBeaconClient::compute_domain(
+				crate::config::DOMAIN_SYNC_COMMITTEE.to_vec(),
+				GLOAS_FORK_VERSION,
+				GENESIS_VALIDATORS_ROOT.into(),
+			)
+			.unwrap();
+
+			let signing_root = SigningData { object_root: ATTESTED_ROOT.into(), domain }
+				.hash_tree_root()
+				.unwrap();
+
+			let aggregate = prepare_milagro_pubkey(&PublicKey(AGGREGATE_PUBKEY)).unwrap();
+			let absent = vec![prepare_milagro_pubkey(&PublicKey(ABSENT_PUBKEY)).unwrap()];
+
+			assert_ok!(fast_aggregate_verify(
+				&aggregate,
+				&absent,
+				signing_root,
+				&Signature(SIGNATURE),
+			));
+		});
+	}
+
+	/// The same aggregate must not verify under the Fulu version. Without this, a wrong
+	/// fork-version arm would pass the test above unnoticed.
+	#[test]
+	fn real_gloas_aggregate_rejects_the_wrong_fork_version() {
+		new_tester().execute_with(|| {
+			let domain = EthereumBeaconClient::compute_domain(
+				crate::config::DOMAIN_SYNC_COMMITTEE.to_vec(),
+				hex!("70733183"), // Platåberget's fulu version
+				GENESIS_VALIDATORS_ROOT.into(),
+			)
+			.unwrap();
+			let signing_root = SigningData { object_root: ATTESTED_ROOT.into(), domain }
+				.hash_tree_root()
+				.unwrap();
+			let aggregate = prepare_milagro_pubkey(&PublicKey(AGGREGATE_PUBKEY)).unwrap();
+			let absent = vec![prepare_milagro_pubkey(&PublicKey(ABSENT_PUBKEY)).unwrap()];
+			assert!(fast_aggregate_verify(
+				&aggregate,
+				&absent,
+				signing_root,
+				&Signature(SIGNATURE)
+			)
+			.is_err());
+		});
+	}
+}
