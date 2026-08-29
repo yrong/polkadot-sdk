@@ -1082,3 +1082,165 @@ fn signing_root_handles_signature_slot_zero() {
 		assert!(result.is_ok(), "signing_root should handle signature_slot = 0");
 	});
 }
+
+/// Gloas merkle-branch fixtures.
+///
+/// Built from the EIP-7495/7916 progressive-container rules rather than taken from a
+/// consensus client: the ethpandaops glamsterdam devnets were not reachable when these
+/// were written. So this pins the pallet's own wiring — that `verify_merkle_branch`,
+/// `subtree_index` and `generalized_index_length` agree with the Gloas gindices at their
+/// real depths (11 and 8, versus 4 to 6 pre-Gloas) — and does not prove that a real
+/// consensus client produces the same roots. Replace with devnet fixtures when one is up.
+mod gloas_branches {
+	use super::*;
+
+	/// Mainnet block 22020096, the same value the RLP tests in beacon-primitives use.
+	const PARENT_BLOCK_HASH: [u8; 32] =
+		hex!("b634e83cfc769ae4ce0808ca48f4ae2b564a3e27e7cd87cc6b0a3d4f66b494d2");
+	const BODY_ROOT: [u8; 32] =
+		hex!("35d67a42d1a8b17d269c2ee43238f9427ff7c914912450a2a40e932681736d2b");
+	const BLOCK_ROOTS_ROOT: [u8; 32] =
+		hex!("eef53a249682ce6ba65510383e09e8920a46025db8750bcd326f9876464c6f7a");
+	const STATE_ROOT: [u8; 32] =
+		hex!("d135837497dd6c5fcd73bed4ca80ed7523beb389fd2481faf1cd35c671afd9a1");
+
+	fn body_branch() -> Vec<H256> {
+		vec![
+			hex!("977575971ad54a0fa2fcab1391e593aa5f668f0de949ab19729d73d464d55cc0").into(),
+			hex!("ff0f000000000000000000000000000000000000000000000000000000000000").into(),
+			hex!("6337069ba1321d1a11e9d068a314c37c64aa9ef80c3906e87193a5b093e6b8f3").into(),
+			hex!("34be70b1c74b6847a535c74ee560ddc98b7c1e4565f601779866c5ffbc42749c").into(),
+			hex!("bafb3fb24194cd1ae003f1d140d3d40671c3e0f06968a6c59dd7fd1dedcf8e69").into(),
+			hex!("d804bb9908223e983cd7586bbc075ffe42e7904a0125cf1e840cbfb964c87d3c").into(),
+			hex!("c78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c").into(),
+			hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
+			hex!("9a2dbe70bfa0fa940874fff2c62ffcd40e672ecddf4921d69f0a1f7ce5e41c06").into(),
+			hex!("cdb2708db3af6ec743ef3a63ed2465c002da3ddebd89f91522519ccbc32089cf").into(),
+			hex!("ff1f000000000000000000000000000000000000000000000000000000000000").into(),
+		]
+	}
+
+	fn state_branch() -> Vec<H256> {
+		vec![
+			hex!("b2788245ddab823897a8af10dbd37eb7da4e33e4f52fbbe6ffd0f95ea6d94243").into(),
+			hex!("9c855f4615402aee93466f57cb54ed26d848544e37daefd7e4aebda71a107d3e").into(),
+			hex!("8aae9864937d0ee1969c5700e0ca5278d73bc5f995aa639690e4745ccc23ba3b").into(),
+			hex!("516a97e6048181ee4061909b596a84a942064ee847fc2ce9b40a3a38e6e9142e").into(),
+			hex!("088cf341c6c5880b2228e340d9e063b928fc5c6c468e2f36e824c4605c8e2dbe").into(),
+			hex!("1445fea2f4e4ae0a9aff938fbac76f351b004bde1bc106e8336fa8f5adb0c0e0").into(),
+			hex!("290a11a975fd3c956331c2cc4e1becd682c611435af44d336d9260d205166b52").into(),
+			hex!("ffffffffff3f0000000000000000000000000000000000000000000000000000").into(),
+		]
+	}
+
+	fn gloas_slot() -> u64 {
+		ChainForkVersions::get().gloas.epoch * (SLOTS_PER_EPOCH as u64)
+	}
+
+	/// The fixtures are only meaningful if they sit at the indices the pallet selects.
+	#[test]
+	fn pallet_selects_the_gloas_indices() {
+		new_tester().execute_with(|| {
+			assert_eq!(EthereumBeaconClient::execution_commitment_gindex(true), 2856);
+			assert_eq!(EthereumBeaconClient::execution_commitment_gindex(false), 25);
+			assert_eq!(
+				EthereumBeaconClient::block_roots_gindex_at_slot(
+					gloas_slot(),
+					ChainForkVersions::get()
+				),
+				352
+			);
+		});
+	}
+
+	#[test]
+	fn execution_commitment_branch_verifies() {
+		let g = EthereumBeaconClient::execution_commitment_gindex(true);
+		assert_eq!(generalized_index_length(g), 11);
+		assert!(verify_merkle_branch(
+			PARENT_BLOCK_HASH.into(),
+			&body_branch(),
+			subtree_index(g),
+			generalized_index_length(g),
+			BODY_ROOT.into(),
+		));
+	}
+
+	#[test]
+	fn execution_commitment_branch_rejects_tampering() {
+		let g = EthereumBeaconClient::execution_commitment_gindex(true);
+		let (idx, depth) = (subtree_index(g), generalized_index_length(g));
+
+		// A different execution block hash: the whole point of the commitment.
+		let mut leaf = PARENT_BLOCK_HASH;
+		leaf[0] ^= 0x01;
+		assert!(!verify_merkle_branch(leaf.into(), &body_branch(), idx, depth, BODY_ROOT.into()));
+
+		// A corrupted sibling anywhere in the path.
+		for i in 0..depth {
+			let mut branch = body_branch();
+			branch[i] = H256::repeat_byte(0xff);
+			assert!(
+				!verify_merkle_branch(
+					PARENT_BLOCK_HASH.into(),
+					&branch,
+					idx,
+					depth,
+					BODY_ROOT.into()
+				),
+				"sibling {i} was not checked"
+			);
+		}
+
+		// A short branch must be rejected, not silently accepted.
+		let mut short = body_branch();
+		short.pop();
+		assert!(!verify_merkle_branch(
+			PARENT_BLOCK_HASH.into(),
+			&short,
+			idx,
+			depth,
+			BODY_ROOT.into()
+		));
+
+		// The pre-Gloas index must not verify a Gloas branch.
+		let legacy = EthereumBeaconClient::execution_commitment_gindex(false);
+		assert!(!verify_merkle_branch(
+			PARENT_BLOCK_HASH.into(),
+			&body_branch(),
+			subtree_index(legacy),
+			generalized_index_length(legacy),
+			BODY_ROOT.into()
+		));
+	}
+
+	#[test]
+	fn block_roots_branch_verifies() {
+		let g = EthereumBeaconClient::block_roots_gindex_at_slot(
+			gloas_slot(),
+			ChainForkVersions::get(),
+		);
+		assert_eq!(generalized_index_length(g), 8);
+		assert!(verify_merkle_branch(
+			BLOCK_ROOTS_ROOT.into(),
+			&state_branch(),
+			subtree_index(g),
+			generalized_index_length(g),
+			STATE_ROOT.into(),
+		));
+	}
+
+	/// Guards the correction this branch exists for: the Electra index must not verify a
+	/// Gloas ancestry proof, and vice versa.
+	#[test]
+	fn electra_block_roots_index_rejects_a_gloas_branch() {
+		let electra = 69usize;
+		assert!(!verify_merkle_branch(
+			BLOCK_ROOTS_ROOT.into(),
+			&state_branch(),
+			subtree_index(electra),
+			generalized_index_length(electra),
+			STATE_ROOT.into(),
+		));
+	}
+}
