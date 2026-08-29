@@ -938,4 +938,75 @@ mod gloas_execution_header_tests {
 		encoded[at] = 0xe0;
 		assert_eq!(receipts_root_from_rlp(&encoded), None);
 	}
+
+	/// Wraps already-encoded items in a list header, so a test can hand-craft item
+	/// encodings that `rlp_list` would never produce.
+	fn rlp_list_raw(payload: &[u8]) -> Vec<u8> {
+		let mut out = if payload.len() < 56 {
+			vec![0xc0 + payload.len() as u8]
+		} else {
+			let be = payload.len().to_be_bytes();
+			let first = be.iter().position(|b| *b != 0).expect("non-empty; qed");
+			let mut h = vec![0xf7 + (be.len() - first) as u8];
+			h.extend_from_slice(&be[first..]);
+			h
+		};
+		out.extend_from_slice(payload);
+		out
+	}
+
+	/// Six canonical leading items, with the receipts root at index 5.
+	fn canonical_prefix() -> Vec<u8> {
+		let mut payload = Vec::new();
+		for _ in 0..5 {
+			payload.push(0xa0);
+			payload.extend_from_slice(&[0x11; 32]);
+		}
+		payload.push(0xa0);
+		payload.extend_from_slice(&RECEIPTS_ROOT);
+		payload
+	}
+
+	/// The parser leans on `alloy_rlp` to reject non-canonical encodings rather than
+	/// checking them itself, so that reliance is worth pinning.
+	#[test]
+	fn rejects_non_canonical_item_encodings() {
+		// 0x81 0x01 is a non-canonical encoding of the single byte 0x01.
+		let mut bad = canonical_prefix();
+		bad.extend_from_slice(&[0x81, 0x01]);
+		bad.extend(core::iter::repeat(0x01).take(9));
+		assert_eq!(receipts_root_from_rlp(&rlp_list_raw(&bad)), None);
+
+		// 0xb8 0x03 is the long form for a 3-byte string, which must use 0x83.
+		let mut bad = canonical_prefix();
+		bad.extend_from_slice(&[0xb8, 0x03, 0xaa, 0xbb, 0xcc]);
+		bad.extend(core::iter::repeat(0x01).take(9));
+		assert_eq!(receipts_root_from_rlp(&rlp_list_raw(&bad)), None);
+
+		// The same shapes, canonically encoded, parse.
+		let mut good = canonical_prefix();
+		good.push(0x01);
+		good.extend_from_slice(&[0x83, 0xaa, 0xbb, 0xcc]);
+		good.extend(core::iter::repeat(0x01).take(8));
+		assert_eq!(receipts_root_from_rlp(&rlp_list_raw(&good)), Some(H256::from(RECEIPTS_ROOT)));
+	}
+
+	/// An empty list terminates the walk immediately and must not be read as a header.
+	#[test]
+	fn rejects_empty_list() {
+		assert_eq!(receipts_root_from_rlp(&[0xc0]), None);
+	}
+
+	/// Every item form consumes at least one byte, so the walk always terminates. Empty
+	/// strings (0x80) and empty lists (0xc0) are the degenerate cases.
+	#[test]
+	fn walk_terminates_on_zero_length_items() {
+		let mut payload = canonical_prefix();
+		payload.extend(core::iter::repeat(0x80).take(5)); // empty strings
+		payload.extend(core::iter::repeat(0xc0).take(5)); // empty lists
+		assert_eq!(
+			receipts_root_from_rlp(&rlp_list_raw(&payload)),
+			Some(H256::from(RECEIPTS_ROOT))
+		);
+	}
 }
