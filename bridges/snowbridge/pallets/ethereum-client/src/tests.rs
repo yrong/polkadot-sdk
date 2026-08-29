@@ -1085,42 +1085,75 @@ fn signing_root_handles_signature_slot_zero() {
 
 /// Gloas merkle-branch fixtures.
 ///
-/// Built from the EIP-7495/7916 progressive-container rules rather than taken from a
-/// consensus client: the ethpandaops glamsterdam devnets were not reachable when these
-/// were written. So this pins the pallet's own wiring — that `verify_merkle_branch`,
-/// `subtree_index` and `generalized_index_length` agree with the Gloas gindices at their
-/// real depths (11 and 8, versus 4 to 6 pre-Gloas) — and does not prove that a real
-/// consensus client produces the same roots. Replace with devnet fixtures when one is up.
+/// The execution-commitment and ancestry fixtures are REAL, from the Platåberget public
+/// Gloas (ePBS) testnet, block at slot 115968. They are not hand-built. The block was
+/// merkleized locally from the EIP-7495/7916 rules and the resulting block root matched the
+/// one the beacon node reports
+/// (0xe992e2a80c28003ec1c8856043e097708759a6e37d97538b1783c33b711e3e98), which is what proves the
+/// tree shape — and with it, that gindex 2856 really does address `signed_execution_payload_bid.
+/// message.parent_block_hash` on a live Gloas chain.
+///
+/// The `block_roots` fixture at gindex 352 is still spec-derived rather than real. Producing
+/// a real one needs roots for all 46 BeaconState fields, which is the `BeaconStateGloas`
+/// work item belonging to the beacon-state service, not to a test fixture.
 mod gloas_branches {
 	use super::*;
 
-	/// Mainnet block 22020096, the same value the RLP tests in beacon-primitives use.
-	const PARENT_BLOCK_HASH: [u8; 32] =
-		hex!("b634e83cfc769ae4ce0808ca48f4ae2b564a3e27e7cd87cc6b0a3d4f66b494d2");
+	// ---- real, from Platåberget slot 115968 ----
 	const BODY_ROOT: [u8; 32] =
-		hex!("35d67a42d1a8b17d269c2ee43238f9427ff7c914912450a2a40e932681736d2b");
+		hex!("3b72fb6996412d59a20d92dde86abe3a12b94232ba62a61ac301625f1f8950f0");
+	/// `signed_execution_payload_bid.message.parent_block_hash`: the execution block the bid
+	/// builds on, which is the block a Snowbridge event proof would target.
+	const EXECUTION_BLOCK_HASH: [u8; 32] =
+		hex!("9af0c93804597fe505c22f3b15abb47acb01f7c6106474b196b52f592fae0e39");
+
 	const BLOCK_ROOTS_ROOT: [u8; 32] =
-		hex!("eef53a249682ce6ba65510383e09e8920a46025db8750bcd326f9876464c6f7a");
-	const STATE_ROOT: [u8; 32] =
+		hex!("df568d1e3e530cb6c53aded1ce8329387a2082ae93556b3658fab61eee147d28");
+	const ANCESTRY_LEAF: [u8; 32] =
+		hex!("84a3016f712471145043f63fe36f9c9dbf7c16b3a709ce4a2b22678b77acbc80");
+	const ANCESTRY_SLOT: u64 = 115967;
+
+	// ---- spec-derived, for the state tree ----
+	const SYNTHETIC_STATE_ROOT: [u8; 32] =
 		hex!("d135837497dd6c5fcd73bed4ca80ed7523beb389fd2481faf1cd35c671afd9a1");
+	const SYNTHETIC_BLOCK_ROOTS_ROOT: [u8; 32] =
+		hex!("eef53a249682ce6ba65510383e09e8920a46025db8750bcd326f9876464c6f7a");
 
 	fn body_branch() -> Vec<H256> {
 		vec![
-			hex!("977575971ad54a0fa2fcab1391e593aa5f668f0de949ab19729d73d464d55cc0").into(),
+			hex!("c54e8868daef8005f4c5e5fc56f214389b5b9fa8b8fb011499de194efd6d7dde").into(),
 			hex!("ff0f000000000000000000000000000000000000000000000000000000000000").into(),
-			hex!("6337069ba1321d1a11e9d068a314c37c64aa9ef80c3906e87193a5b093e6b8f3").into(),
-			hex!("34be70b1c74b6847a535c74ee560ddc98b7c1e4565f601779866c5ffbc42749c").into(),
-			hex!("bafb3fb24194cd1ae003f1d140d3d40671c3e0f06968a6c59dd7fd1dedcf8e69").into(),
-			hex!("d804bb9908223e983cd7586bbc075ffe42e7904a0125cf1e840cbfb964c87d3c").into(),
+			hex!("99f12ce5f778798e053b12f50afff88c3a033718f2b608acb437f42da3f17c69").into(),
+			hex!("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b").into(),
+			hex!("9db0c9c90f13f6a294022960a4e1ed53fcbd365f0a981c644d1a05fee99fcff4").into(),
+			hex!("586a75beceb384ee9422a8c5259783a83ffa2740e1e38a76824ed302d8b224da").into(),
 			hex!("c78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c").into(),
 			hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
-			hex!("9a2dbe70bfa0fa940874fff2c62ffcd40e672ecddf4921d69f0a1f7ce5e41c06").into(),
-			hex!("cdb2708db3af6ec743ef3a63ed2465c002da3ddebd89f91522519ccbc32089cf").into(),
+			hex!("713d100d5174b496d04cbfd23beae240266e811283d4c2d5b612463444616ff1").into(),
+			hex!("5be2625aa3fcff45cc120a25a75f725fb4032d30325b20b9ae568559f5a8c5b9").into(),
 			hex!("ff1f000000000000000000000000000000000000000000000000000000000000").into(),
 		]
 	}
 
-	fn state_branch() -> Vec<H256> {
+	fn ancestry_branch() -> Vec<H256> {
+		vec![
+			hex!("39315bc08fc62b4582c5c246ff674d7ae35da70e8abb048267bdf24154eb77b1").into(),
+			hex!("34f663b44aa3307aa454d7eddbf999f865cd0b4fbe638b7b07b313a3579fde3f").into(),
+			hex!("c81e4ea481aab3c2c7d9d8cb5e2b6994a35caff9b5437546ba249e4438d1046d").into(),
+			hex!("a5964286cf65763c5682ee2b754d86695cb2857c1bb06387f405a993c076c3ea").into(),
+			hex!("112410017a93f6d8dadf4e1d3b32ef8b8ccd9786be5f084c34c648c480e5883a").into(),
+			hex!("037fb7647d0e6dcda85b857aa7408f37ba4c61837c7dadc1c6198b7dae49ad13").into(),
+			hex!("1251aff786c251583d20ed02b9ae225917cc6115377a6fbfe29244607ea7acca").into(),
+			hex!("7c1f59f29dbfc8f663c3818f0f26f6f29fbb218fab0c53ec557c7eb5b4698838").into(),
+			hex!("30973fd0636524623dc1a0ed30a216129d7f5bdb88abd08f1837d67108256a55").into(),
+			hex!("212fc5af32a93d0159439fa84495a3f822cb7fa12c9af08fc49f48605fcf9f48").into(),
+			hex!("e7c3104878f8a42edadbef3628722a51849342490591ea3b07e7c213b2e4533a").into(),
+			hex!("cc157066363462a64b246eef7ab342ec0db9caf932b00f0c7f40755dae74f815").into(),
+			hex!("bcb1a9d8c416c4e7f187f5f21861bdf5231bf3902c7816f179cdfc5bec9408bd").into(),
+		]
+	}
+
+	fn synthetic_state_branch() -> Vec<H256> {
 		vec![
 			hex!("b2788245ddab823897a8af10dbd37eb7da4e33e4f52fbbe6ffd0f95ea6d94243").into(),
 			hex!("9c855f4615402aee93466f57cb54ed26d848544e37daefd7e4aebda71a107d3e").into(),
@@ -1153,12 +1186,14 @@ mod gloas_branches {
 		});
 	}
 
+	/// Real Gloas consensus data: the execution block hash verifies into the block body at
+	/// gindex 2856.
 	#[test]
 	fn execution_commitment_branch_verifies() {
 		let g = EthereumBeaconClient::execution_commitment_gindex(true);
 		assert_eq!(generalized_index_length(g), 11);
 		assert!(verify_merkle_branch(
-			PARENT_BLOCK_HASH.into(),
+			EXECUTION_BLOCK_HASH.into(),
 			&body_branch(),
 			subtree_index(g),
 			generalized_index_length(g),
@@ -1172,17 +1207,17 @@ mod gloas_branches {
 		let (idx, depth) = (subtree_index(g), generalized_index_length(g));
 
 		// A different execution block hash: the whole point of the commitment.
-		let mut leaf = PARENT_BLOCK_HASH;
+		let mut leaf = EXECUTION_BLOCK_HASH;
 		leaf[0] ^= 0x01;
 		assert!(!verify_merkle_branch(leaf.into(), &body_branch(), idx, depth, BODY_ROOT.into()));
 
-		// A corrupted sibling anywhere in the path.
+		// Every sibling must actually be checked.
 		for i in 0..depth {
 			let mut branch = body_branch();
 			branch[i] = H256::repeat_byte(0xff);
 			assert!(
 				!verify_merkle_branch(
-					PARENT_BLOCK_HASH.into(),
+					EXECUTION_BLOCK_HASH.into(),
 					&branch,
 					idx,
 					depth,
@@ -1196,7 +1231,7 @@ mod gloas_branches {
 		let mut short = body_branch();
 		short.pop();
 		assert!(!verify_merkle_branch(
-			PARENT_BLOCK_HASH.into(),
+			EXECUTION_BLOCK_HASH.into(),
 			&short,
 			idx,
 			depth,
@@ -1206,7 +1241,7 @@ mod gloas_branches {
 		// The pre-Gloas index must not verify a Gloas branch.
 		let legacy = EthereumBeaconClient::execution_commitment_gindex(false);
 		assert!(!verify_merkle_branch(
-			PARENT_BLOCK_HASH.into(),
+			EXECUTION_BLOCK_HASH.into(),
 			&body_branch(),
 			subtree_index(legacy),
 			generalized_index_length(legacy),
@@ -1214,6 +1249,33 @@ mod gloas_branches {
 		));
 	}
 
+	/// Real Gloas `block_roots`: the inner half of the ancestry proof, indexed exactly as
+	/// `verify_ancestry_proof` does it. `BLOCK_ROOT_AT_INDEX_DEPTH` is unchanged by Gloas
+	/// because `BlockRoots` is still a plain `Vector[Root, 8192]`; this pins that.
+	#[test]
+	fn ancestry_branch_verifies() {
+		let leaf_index = (SLOTS_PER_HISTORICAL_ROOT as u64) +
+			(ANCESTRY_SLOT % (SLOTS_PER_HISTORICAL_ROOT as u64));
+		assert_eq!(ancestry_branch().len(), crate::config::BLOCK_ROOT_AT_INDEX_DEPTH);
+		assert!(verify_merkle_branch(
+			ANCESTRY_LEAF.into(),
+			&ancestry_branch(),
+			leaf_index as usize,
+			crate::config::BLOCK_ROOT_AT_INDEX_DEPTH,
+			BLOCK_ROOTS_ROOT.into(),
+		));
+
+		// A wrong slot means a wrong index, which must not verify.
+		assert!(!verify_merkle_branch(
+			ANCESTRY_LEAF.into(),
+			&ancestry_branch(),
+			(leaf_index + 1) as usize,
+			crate::config::BLOCK_ROOT_AT_INDEX_DEPTH,
+			BLOCK_ROOTS_ROOT.into(),
+		));
+	}
+
+	/// Spec-derived, not real: see the module comment.
 	#[test]
 	fn block_roots_branch_verifies() {
 		let g = EthereumBeaconClient::block_roots_gindex_at_slot(
@@ -1222,25 +1284,25 @@ mod gloas_branches {
 		);
 		assert_eq!(generalized_index_length(g), 8);
 		assert!(verify_merkle_branch(
-			BLOCK_ROOTS_ROOT.into(),
-			&state_branch(),
+			SYNTHETIC_BLOCK_ROOTS_ROOT.into(),
+			&synthetic_state_branch(),
 			subtree_index(g),
 			generalized_index_length(g),
-			STATE_ROOT.into(),
+			SYNTHETIC_STATE_ROOT.into(),
 		));
 	}
 
-	/// Guards the correction this branch exists for: the Electra index must not verify a
-	/// Gloas ancestry proof, and vice versa.
+	/// Guards the correction this work exists for: the Electra index must not verify a Gloas
+	/// ancestry branch.
 	#[test]
 	fn electra_block_roots_index_rejects_a_gloas_branch() {
 		let electra = 69usize;
 		assert!(!verify_merkle_branch(
-			BLOCK_ROOTS_ROOT.into(),
-			&state_branch(),
+			SYNTHETIC_BLOCK_ROOTS_ROOT.into(),
+			&synthetic_state_branch(),
 			subtree_index(electra),
 			generalized_index_length(electra),
-			STATE_ROOT.into(),
+			SYNTHETIC_STATE_ROOT.into(),
 		));
 	}
 }
