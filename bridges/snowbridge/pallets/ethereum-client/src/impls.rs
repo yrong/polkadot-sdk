@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
 use super::*;
 use frame_support::ensure;
-use snowbridge_beacon_primitives::{ExecutionCommitment, ExecutionProof};
+use snowbridge_beacon_primitives::{CommitmentError, ExecutionProof};
 use sp_runtime::DispatchError;
 
 use alloy_primitives::Log as AlloyLog;
@@ -123,31 +123,30 @@ impl<T: Config> Pallet<T> {
 			},
 		}
 
-		// The leaf proven into `body_root` differs by fork. Pre-Gloas it is the SSZ root of
+		// What the branch must prove differs by fork. Pre-Gloas the leaf is the SSZ root of
 		// the full execution payload header. Gloas (EIP-7732) removes that field from the
 		// body, leaving only an execution block hash, so the leaf is
 		// `keccak256(canonical header RLP)` at a different generalized index.
-		let (leaf, is_gloas) = match execution_proof
-			.execution_header
-			.commitment()
-			.map_err(|_| Error::<T>::BlockBodyHashTreeRootFailed)?
-		{
-			ExecutionCommitment::PayloadHeaderRoot(root) => (root, false),
-			ExecutionCommitment::BlockHash(hash) => (hash, true),
-		};
+		//
+		// The commitment also carries the receipts root, which stays unreachable until the
+		// leaf below has been proven.
+		let commitment = execution_proof.execution_header.commitment().map_err(|e| match e {
+			CommitmentError::Merkleization => Error::<T>::BlockBodyHashTreeRootFailed,
+			CommitmentError::MalformedExecutionHeader => Error::<T>::InvalidExecutionHeaderProof,
+		})?;
 
-		// Reject a legacy proof presented for a Gloas-era block, and vice versa, rather than
-		// relying on the branch check alone to notice.
+		// Reject a legacy proof presented for a Gloas-era block, and vice versa. The slot the
+		// sync committee signed over is the arbiter, not the variant the submitter chose.
 		let fork_versions = T::ForkVersions::get();
 		let is_gloas_slot =
 			compute_epoch(execution_proof.header.slot, config::SLOTS_PER_EPOCH as u64) >=
 				fork_versions.gloas.epoch;
-		ensure!(is_gloas == is_gloas_slot, Error::<T>::InvalidExecutionHeaderProof);
+		ensure!(commitment.is_gloas() == is_gloas_slot, Error::<T>::InvalidExecutionHeaderProof);
 
-		let gindex = Self::execution_commitment_gindex(is_gloas);
+		let gindex = Self::execution_commitment_gindex(commitment.is_gloas());
 		ensure!(
 			verify_merkle_branch(
-				leaf,
+				commitment.leaf(),
 				&execution_proof.execution_branch,
 				subtree_index(gindex),
 				generalized_index_length(gindex),
@@ -156,14 +155,8 @@ impl<T: Config> Pallet<T> {
 			Error::<T>::InvalidExecutionHeaderProof
 		);
 
-		// Only now are the header bytes authenticated, so only now may the receipts root be
-		// read out of them.
-		let receipts_root = execution_proof
-			.execution_header
-			.receipts_root()
-			.ok_or(Error::<T>::InvalidExecutionHeaderProof)?;
-
-		Ok(receipts_root)
+		// The leaf is proven, so the receipts root it authenticates may now be released.
+		Ok(commitment.receipts_root_once_proven())
 	}
 
 	/// Verify that `block_root` is an ancestor of `finalized_block_root` Used to prove that

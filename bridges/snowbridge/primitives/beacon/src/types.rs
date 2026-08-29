@@ -404,75 +404,100 @@ pub enum VersionedExecutionPayloadHeader {
 	Gloas(BoundedVec<u8, ConstU32<MAX_EXECUTION_HEADER_RLP_SIZE>>),
 }
 
-/// The leaf that `ExecutionProof::execution_branch` proves into `BeaconHeader::body_root`.
-///
-/// The two variants are different proof schemes, not different encodings of one value, and
-/// they are proven at different generalized indices.
-#[derive(Clone, PartialEq, Debug)]
-pub enum ExecutionCommitment {
-	/// Pre-Gloas: SSZ hash-tree root of the full execution payload header, committed at
-	/// `BeaconBlockBody.execution_payload`.
-	PayloadHeaderRoot(H256),
-	/// Gloas: the execution block hash, committed at
+/// Which commitment scheme a proof uses. The two are proven at different generalized
+/// indices against different leaves, so this is not merely an encoding difference.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum CommitmentScheme {
+	/// Pre-Gloas: the leaf is the SSZ hash-tree root of the full execution payload header,
+	/// committed at `BeaconBlockBody.execution_payload`.
+	PayloadHeaderRoot,
+	/// Gloas (EIP-7732): the leaf is the execution block hash, committed at
 	/// `BeaconBlockBody.signed_execution_payload_bid.message.parent_block_hash`.
-	BlockHash(H256),
+	BlockHash,
+}
+
+/// Why a commitment could not be derived from a submitted execution header.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum CommitmentError {
+	/// The pre-Gloas payload header could not be merkleized.
+	Merkleization,
+	/// The Gloas bytes are not one canonical Ethereum execution header.
+	MalformedExecutionHeader,
+}
+
+/// What `ExecutionProof::execution_branch` must prove, and what proving it establishes.
+///
+/// Carries the leaf to verify against `BeaconHeader::body_root` together with the receipts
+/// root that leaf authenticates. The receipts root is private and reachable only through
+/// [`Self::receipts_root_once_proven`], whose name states its precondition. That is the
+/// point of the type: a submitter-supplied receipts root should be unreachable from a proof
+/// nobody verified.
+#[must_use]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ExecutionCommitment {
+	leaf: H256,
+	scheme: CommitmentScheme,
+	receipts_root: H256,
+}
+
+impl ExecutionCommitment {
+	/// The leaf to verify against `BeaconHeader::body_root`.
+	pub fn leaf(&self) -> H256 {
+		self.leaf
+	}
+
+	pub fn scheme(&self) -> CommitmentScheme {
+		self.scheme
+	}
+
+	/// Whether this proof uses the Gloas scheme. Cross-check this against the fork era of
+	/// the beacon header's slot, so a proof cannot select its own verification path.
+	pub fn is_gloas(&self) -> bool {
+		matches!(self.scheme, CommitmentScheme::BlockHash)
+	}
+
+	/// The receipts root this commitment authenticates.
+	///
+	/// Call only once [`Self::leaf`] has been proven into a finalized beacon block.
+	/// Consumes the commitment so the leaf cannot be reused afterwards.
+	pub fn receipts_root_once_proven(self) -> H256 {
+		self.receipts_root
+	}
 }
 
 impl VersionedExecutionPayloadHeader {
-	/// The leaf to verify `ExecutionProof::execution_branch` against.
-	pub fn commitment(&self) -> Result<ExecutionCommitment, SimpleSerializeError> {
+	/// Derive what the execution branch must prove, and what proving it establishes.
+	///
+	/// This is the only way to obtain a receipts root. For Gloas that means parsing
+	/// submitter-supplied bytes, which happens here — before verification, deliberately, so
+	/// malformed input is rejected without paying for a merkle check.
+	pub fn commitment(&self) -> Result<ExecutionCommitment, CommitmentError> {
 		Ok(match self {
-			VersionedExecutionPayloadHeader::Capella(execution_payload_header) => {
-				ExecutionCommitment::PayloadHeaderRoot(hash_tree_root::<SSZExecutionPayloadHeader>(
-					execution_payload_header.clone().try_into()?,
-				)?)
+			VersionedExecutionPayloadHeader::Capella(header) => ExecutionCommitment {
+				leaf: hash_tree_root::<SSZExecutionPayloadHeader>(
+					header.clone().try_into().map_err(|_| CommitmentError::Merkleization)?,
+				)
+				.map_err(|_| CommitmentError::Merkleization)?,
+				scheme: CommitmentScheme::PayloadHeaderRoot,
+				receipts_root: header.receipts_root,
 			},
-			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
-				ExecutionCommitment::PayloadHeaderRoot(hash_tree_root::<
-					crate::ssz::deneb::SSZExecutionPayloadHeader,
-				>(
-					execution_payload_header.clone().try_into()?,
-				)?)
+			VersionedExecutionPayloadHeader::Deneb(header) => ExecutionCommitment {
+				leaf: hash_tree_root::<crate::ssz::deneb::SSZExecutionPayloadHeader>(
+					header.clone().try_into().map_err(|_| CommitmentError::Merkleization)?,
+				)
+				.map_err(|_| CommitmentError::Merkleization)?,
+				scheme: CommitmentScheme::PayloadHeaderRoot,
+				receipts_root: header.receipts_root,
 			},
-			VersionedExecutionPayloadHeader::Gloas(rlp) => {
-				ExecutionCommitment::BlockHash(keccak_256(rlp).into())
+			// The leaf is the execution block hash, which is by definition the Keccak hash
+			// of the canonical header encoding. Hash the bytes exactly as submitted.
+			VersionedExecutionPayloadHeader::Gloas(rlp) => ExecutionCommitment {
+				leaf: keccak_256(rlp).into(),
+				scheme: CommitmentScheme::BlockHash,
+				receipts_root: receipts_root_from_rlp(rlp)
+					.ok_or(CommitmentError::MalformedExecutionHeader)?,
 			},
 		})
-	}
-
-	pub fn block_hash(&self) -> H256 {
-		match self {
-			VersionedExecutionPayloadHeader::Capella(execution_payload_header) => {
-				execution_payload_header.block_hash
-			},
-			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
-				execution_payload_header.block_hash
-			},
-			// An Ethereum block hash is the Keccak hash of the canonical header encoding.
-			VersionedExecutionPayloadHeader::Gloas(rlp) => keccak_256(rlp).into(),
-		}
-	}
-
-	/// The receipts root to verify the receipt MPT proof against.
-	///
-	/// Fallible for Gloas, where it is parsed out of the authenticated header encoding.
-	/// Callers must only use this value once `commitment()` has been proven against a
-	/// finalized beacon block; on its own it is submitter-controlled.
-	pub fn receipts_root(&self) -> Option<H256> {
-		match self {
-			VersionedExecutionPayloadHeader::Capella(execution_payload_header) => {
-				Some(execution_payload_header.receipts_root)
-			},
-			VersionedExecutionPayloadHeader::Deneb(execution_payload_header) => {
-				Some(execution_payload_header.receipts_root)
-			},
-			VersionedExecutionPayloadHeader::Gloas(rlp) => receipts_root_from_rlp(rlp),
-		}
-	}
-
-	/// Whether this is the Gloas (EIP-7732) proof scheme.
-	pub fn is_gloas(&self) -> bool {
-		matches!(self, VersionedExecutionPayloadHeader::Gloas(_))
 	}
 }
 
@@ -734,5 +759,183 @@ pub mod deneb {
 		pub withdrawals_root: H256,
 		pub blob_gas_used: u64,   // [New in Deneb:EIP4844]
 		pub excess_blob_gas: u64, // [New in Deneb:EIP4844]
+	}
+}
+
+#[cfg(test)]
+mod gloas_execution_header_tests {
+	use super::*;
+	use hex_literal::hex;
+
+	/// Ethereum mainnet block 22020096, fetched from a public node and RLP-encoded.
+	///
+	/// Ground truth, not a synthetic fixture: `keccak256` of these bytes equals the real
+	/// block hash below, which `block_hash_matches_mainnet` asserts. A parser bug and an
+	/// encoder bug cannot cancel out here, because the chain fixed the hash.
+	const HEADER_RLP: [u8; 604] = hex!(
+		"f90259a0f22a42f6854bb46481bb54471991a515518ff7bc1de393e156348e13"
+		"f0041794a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142"
+		"fd40d493479495222290dd7278aa3ddd389cc1e1d165cc4bafe5a0b49b609c8a"
+		"1fa32ea876c75277228cc49e565208e046ddd5dd489693fc8da7d3a0d93270f6"
+		"bac2141b5ef4a4cab2c53841a33ca6c97805083c5bdfaca87dc975d6a0676ddf"
+		"6e20e71df49c805f4d5592a53290c8bbdb62b65ceb95ce27d720d1e453b90100"
+		"ffbfff7fe7fffffeb7fbdf6fe6dbfd7dffffffcffd5ffbfcffdef3ff9fd77fff"
+		"fe4fdfffffeffb8cfffbffff3ffffffffb37f0fdfdbfffff7ffeff5ffdffffff"
+		"e7bfff78f7effffdebe7f5fffefdfeff7eb73ff7fbffdffefbf7fffbf7fcffbf"
+		"fdfffeffffff5bbeffffff57fffefffffffefffdcf7ffebff7ffffffdf7ffdfa"
+		"fefffffffffffef7eddfef7ffffff7befb77f7fffffbffffffeffbffbfffeddf"
+		"f7ff5feefff7fffffefedfeffddffdedffff9ffffefff5befffbb7fffffff8ff"
+		"dbfddddbfff9fdfffff78fffeede7fffeffd7f7effffefffdf7fef7ff7f5ffff"
+		"fbffffdfffffffff8ffffff7ff7e3bf7dffdfbffefefffffe5fffdffff7dffbf"
+		"80840150000084021ff63383e50a3c8467cf85db8f6265617665726275696c64"
+		"2e6f7267a0f3e1b797664817853ef750acf790fb97cf4d355213a347ad8cc7c7"
+		"5fc757d2e988000000000000000085020060d51ca067941095f427d953a4a028"
+		"b48c88945a533acbf8f022e520ef5e1ee38af120fe808403860000a0f5c72aed"
+		"88b42fd7e07063dbdc1f0303a866bac45cc45d968ccc9b84b74d9748"	);
+	const BLOCK_HASH: [u8; 32] =
+		hex!("b634e83cfc769ae4ce0808ca48f4ae2b564a3e27e7cd87cc6b0a3d4f66b494d2");
+	const RECEIPTS_ROOT: [u8; 32] =
+		hex!("676ddf6e20e71df49c805f4d5592a53290c8bbdb62b65ceb95ce27d720d1e453");
+
+	fn gloas(bytes: &[u8]) -> VersionedExecutionPayloadHeader {
+		VersionedExecutionPayloadHeader::Gloas(
+			bytes.to_vec().try_into().expect("fits the bound; qed"),
+		)
+	}
+
+	/// Anchors the fixture: these bytes really are that block's header.
+	#[test]
+	fn block_hash_matches_mainnet() {
+		assert_eq!(keccak_256(&HEADER_RLP), BLOCK_HASH);
+	}
+
+	#[test]
+	fn extracts_receipts_root_from_a_real_header() {
+		assert_eq!(receipts_root_from_rlp(&HEADER_RLP), Some(H256::from(RECEIPTS_ROOT)));
+	}
+
+	#[test]
+	fn commitment_leaf_is_the_block_hash() {
+		let commitment = gloas(&HEADER_RLP).commitment().unwrap();
+		assert_eq!(commitment.leaf(), H256::from(BLOCK_HASH));
+		assert_eq!(commitment.scheme(), CommitmentScheme::BlockHash);
+		assert!(commitment.is_gloas());
+		assert_eq!(commitment.receipts_root_once_proven(), H256::from(RECEIPTS_ROOT));
+	}
+
+	/// Altering any byte changes the leaf, so an altered header cannot be proven even
+	/// though it still parses. This is what makes the parse safe to do before verifying.
+	#[test]
+	fn altering_a_byte_changes_the_leaf() {
+		let mut altered = HEADER_RLP.to_vec();
+		let last = altered.len() - 1;
+		altered[last] ^= 0x01;
+		assert_ne!(gloas(&altered).commitment().unwrap().leaf(), H256::from(BLOCK_HASH));
+	}
+
+	#[test]
+	fn rejects_trailing_bytes() {
+		let mut trailing = HEADER_RLP.to_vec();
+		trailing.push(0x00);
+		assert_eq!(receipts_root_from_rlp(&trailing), None);
+	}
+
+	#[test]
+	fn rejects_truncated_header() {
+		assert_eq!(receipts_root_from_rlp(&HEADER_RLP[..HEADER_RLP.len() - 1]), None);
+	}
+
+	#[test]
+	fn rejects_non_list() {
+		// A 32-byte string, not a list.
+		let mut bytes = vec![0xa0];
+		bytes.extend_from_slice(&RECEIPTS_ROOT);
+		assert_eq!(receipts_root_from_rlp(&bytes), None);
+	}
+
+	#[test]
+	fn rejects_empty_input() {
+		assert_eq!(receipts_root_from_rlp(&[]), None);
+	}
+
+	/// Builds a header-shaped list so the field walk can be exercised directly.
+	fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+		fn header(len: usize, offset: u8) -> Vec<u8> {
+			if len < 56 {
+				return vec![offset + len as u8];
+			}
+			let be = len.to_be_bytes();
+			let first = be.iter().position(|b| *b != 0).unwrap();
+			let mut out = vec![offset + 55 + (be.len() - first) as u8];
+			out.extend_from_slice(&be[first..]);
+			out
+		}
+		fn item(bytes: &[u8]) -> Vec<u8> {
+			if bytes.len() == 1 && bytes[0] < 0x80 {
+				return bytes.to_vec();
+			}
+			let mut out = header(bytes.len(), 0x80);
+			out.extend_from_slice(bytes);
+			out
+		}
+		let payload: Vec<u8> = items.iter().flat_map(|i| item(i)).collect();
+		let mut out = header(payload.len(), 0xc0);
+		out.extend_from_slice(&payload);
+		out
+	}
+
+	fn header_fields() -> Vec<Vec<u8>> {
+		let mut fields: Vec<Vec<u8>> = (0..5).map(|_| vec![0x11; 32]).collect();
+		fields.push(RECEIPTS_ROOT.to_vec());
+		fields
+	}
+
+	/// Fields after the receipts root are frequently small integers, which RLP encodes as a
+	/// bare byte carrying no length prefix. If the walk mishandled that, the field count
+	/// would desync and the minimum-field check would pass or fail for the wrong reason.
+	#[test]
+	fn walks_single_byte_and_empty_items() {
+		let mut fields = header_fields();
+		// difficulty = 0 (empty string), then small integers, then a zero byte.
+		fields.push(vec![]);
+		for n in 1u8..=8 {
+			fields.push(vec![n]);
+		}
+		fields.push(vec![0x00]);
+		assert_eq!(fields.len(), 16);
+		assert_eq!(receipts_root_from_rlp(&rlp_list(&fields)), Some(H256::from(RECEIPTS_ROOT)));
+	}
+
+	#[test]
+	fn rejects_too_few_fields() {
+		let fields = header_fields();
+		assert_eq!(fields.len(), 6);
+		assert_eq!(receipts_root_from_rlp(&rlp_list(&fields)), None);
+	}
+
+	#[test]
+	fn rejects_receipts_root_of_wrong_length() {
+		let mut fields = header_fields();
+		fields[5] = vec![0x22; 31];
+		fields.extend((0..10).map(|_| vec![0x01]));
+		assert_eq!(receipts_root_from_rlp(&rlp_list(&fields)), None);
+	}
+
+	#[test]
+	fn rejects_receipts_root_that_is_a_list() {
+		// Element 5 is a nested list rather than a 32-byte string.
+		let mut fields = header_fields();
+		fields.extend((0..10).map(|_| vec![0x01]));
+		let mut encoded = rlp_list(&fields);
+		// Locate element 5 by its contents, then turn its 32-byte string prefix into a
+		// nested-list prefix of the same length.
+		let at = encoded
+			.windows(RECEIPTS_ROOT.len())
+			.position(|w| w == RECEIPTS_ROOT)
+			.expect("receipts root is present; qed") -
+			1;
+		assert_eq!(encoded[at], 0xa0);
+		encoded[at] = 0xe0;
+		assert_eq!(receipts_root_from_rlp(&encoded), None);
 	}
 }
