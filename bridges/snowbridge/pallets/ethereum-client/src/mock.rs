@@ -32,6 +32,14 @@ pub fn load_checkpoint_update_fixture(
 	load_fixture("initial-checkpoint.json".to_string()).unwrap()
 }
 
+/// Real Gloas checkpoint from the Platåberget testnet, slot 116768. Its sync-committee
+/// branch is at gindex 2945 and its `block_roots` branch at 352, so loading it through
+/// `force_checkpoint` exercises the Gloas arms of both selectors.
+pub fn load_gloas_checkpoint_fixture(
+) -> snowbridge_beacon_primitives::CheckpointUpdate<{ config::SYNC_COMMITTEE_SIZE }> {
+	load_fixture("gloas-checkpoint.json".to_string()).unwrap()
+}
+
 pub fn load_sync_committee_update_fixture() -> snowbridge_beacon_primitives::Update<
 	{ config::SYNC_COMMITTEE_SIZE },
 	{ config::SYNC_COMMITTEE_BITS_SIZE },

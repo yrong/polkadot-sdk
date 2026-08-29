@@ -1588,7 +1588,7 @@ mod gloas_end_to_end {
 		]
 	}
 
-	fn receipt_proof() -> Vec<Vec<u8>> {
+	pub(super) fn receipt_proof() -> Vec<Vec<u8>> {
 		vec![
 			hex!(
 				"f90131a0903b88892b17f8222d05e8333e67e096f68e54f70b43f0297dc92ba6"
@@ -1643,7 +1643,7 @@ mod gloas_end_to_end {
 		]
 	}
 
-	fn log() -> Log {
+	pub(super) fn log() -> Log {
 		Log {
 			address: H160(LOG_ADDRESS),
 			topics: vec![
@@ -1656,7 +1656,7 @@ mod gloas_end_to_end {
 		}
 	}
 
-	fn execution_proof() -> ExecutionProof {
+	pub(super) fn execution_proof() -> ExecutionProof {
 		ExecutionProof {
 			header: beacon_header(),
 			ancestry_proof: None::<AncestryProof>,
@@ -1756,6 +1756,125 @@ mod gloas_end_to_end {
 			assert!(EthereumBeaconClient::verify(
 				&log(),
 				&Proof { receipt_proof: receipt_proof(), execution_proof: execution_proof() },
+			)
+			.is_err());
+		});
+	}
+}
+
+/// The checkpoint and ancestry halves, driven through the pallet's own code rather than
+/// through `verify_merkle_branch` directly.
+///
+/// `force_checkpoint` is where the gindex-352 `block_roots` arm is actually consumed: it
+/// proves `block_roots_root` out of the checkpoint state and caches it, and every ancestry
+/// proof afterwards is rooted at that cached value. Testing 352 standalone leaves that
+/// wiring unproven, which is why this exists.
+///
+/// Real data throughout: checkpoint at Platåberget slot 116768, whose state merkleizes to
+/// the `state_root` its own block commits to, and which carries the slot-115968 block root
+/// used by the execution proof above.
+mod gloas_checkpoint_and_ancestry {
+	use super::*;
+	use snowbridge_beacon_primitives::AncestryProof;
+	use snowbridge_verification_primitives::Proof;
+
+	/// Root of the checkpoint block at slot 116768.
+	const CHECKPOINT_ROOT: [u8; 32] =
+		hex!("948810303d3811804809e3a34bbb3fac86a499dcbd51563e209694b445ae43dd");
+
+	fn ancestry_branch() -> Vec<H256> {
+		vec![
+			hex!("34ad70e7bfdefa97ae4845db070be1eb12ba1d6ec2d7376a2fb008e44615318e").into(),
+			hex!("2d1332677711812806ef7b0ff6c6c50d773f15d23c7e2c2d3ee142724d78b0f7").into(),
+			hex!("38bbced91f735a809a4450ece25d083c028a68b7e4e582cc47959316ab6d9c0a").into(),
+			hex!("2c655ea1f2b030b743acbb1a1e70a42fd07990d75519931638b2a119be441a68").into(),
+			hex!("5be4bc07b3f859f3db1434ae7f82c18c0731c12c0a739751bff0383acde38ce8").into(),
+			hex!("137dd6af3e39676c2e3adef993d610d9923d85cad031bfe94209e7d8dd4eb3e0").into(),
+			hex!("fdb41ed3757dfb8744426a1650eed685434f03d63a95fbea97dfa6b5891e8443").into(),
+			hex!("f0f5812e4857a5e5fa64bc219af78db11442fd966f1454479f15779d6f92ef03").into(),
+			hex!("625ecdda8d467e5bf99b94be3979ad06c912cb47f56bf504c001ee4dfaed47ce").into(),
+			hex!("22f277d0bbc2180a1ecc572f58fece1e5411a37b689a9c7add7d97d0396024a0").into(),
+			hex!("e7c3104878f8a42edadbef3628722a51849342490591ea3b07e7c213b2e4533a").into(),
+			hex!("d56719ecf7cb71d26f2a4ad68090c85fa98c792c3cbc4d9aa67b67adc405863c").into(),
+			hex!("bcb1a9d8c416c4e7f187f5f21861bdf5231bf3902c7816f179cdfc5bec9408bd").into(),
+		]
+	}
+
+	/// The Gloas checkpoint verifies through `force_checkpoint`, which is what proves the
+	/// gindex-2945 sync-committee branch and the gindex-352 `block_roots` branch.
+	#[test]
+	fn gloas_checkpoint_is_accepted() {
+		new_tester().execute_with(|| {
+			let update = load_gloas_checkpoint_fixture();
+			assert_ok!(EthereumBeaconClient::process_checkpoint_update(&update));
+			assert_eq!(<LatestFinalizedBlockRoot<Test>>::get(), CHECKPOINT_ROOT.into());
+			let stored = <FinalizedBeaconState<Test>>::get(H256::from(CHECKPOINT_ROOT)).unwrap();
+			assert_eq!(stored.block_roots_root, update.block_roots_root);
+		});
+	}
+
+	/// A Gloas checkpoint at the Electra `block_roots` index must not verify. This is the
+	/// 352-versus-69 correction, asserted through the pallet rather than against
+	/// `verify_merkle_branch` in isolation.
+	#[test]
+	fn gloas_checkpoint_fails_if_block_roots_branch_is_wrong() {
+		new_tester().execute_with(|| {
+			let mut update = load_gloas_checkpoint_fixture();
+			update.block_roots_branch.pop();
+			assert_err!(
+				EthereumBeaconClient::process_checkpoint_update(&update),
+				Error::<Test>::InvalidBlockRootsRootMerkleProof
+			);
+		});
+	}
+
+	/// The full path with a real ancestry proof: the execution proof's beacon header is not
+	/// the finalized header, so `verify_ancestry_proof` runs against the `block_roots_root`
+	/// the checkpoint cached.
+	#[test]
+	fn verifies_a_gloas_message_via_ancestry_proof() {
+		new_tester().execute_with(|| {
+			assert_ok!(EthereumBeaconClient::process_checkpoint_update(
+				&load_gloas_checkpoint_fixture()
+			));
+
+			let mut proof = super::gloas_end_to_end::execution_proof();
+			proof.ancestry_proof = Some(AncestryProof {
+				header_branch: ancestry_branch(),
+				finalized_block_root: CHECKPOINT_ROOT.into(),
+			});
+
+			assert_ok!(EthereumBeaconClient::verify(
+				&super::gloas_end_to_end::log(),
+				&Proof {
+					receipt_proof: super::gloas_end_to_end::receipt_proof(),
+					execution_proof: proof,
+				},
+			));
+		});
+	}
+
+	/// A corrupted ancestry branch must be rejected even though the checkpoint and the
+	/// execution proof are both genuine.
+	#[test]
+	fn rejects_a_corrupted_ancestry_branch() {
+		new_tester().execute_with(|| {
+			assert_ok!(EthereumBeaconClient::process_checkpoint_update(
+				&load_gloas_checkpoint_fixture()
+			));
+			let mut branch = ancestry_branch();
+			branch[0] = H256::repeat_byte(0xff);
+			let mut proof = super::gloas_end_to_end::execution_proof();
+			proof.ancestry_proof = Some(AncestryProof {
+				header_branch: branch,
+				finalized_block_root: CHECKPOINT_ROOT.into(),
+			});
+			assert!(EthereumBeaconClient::verify(
+				&super::gloas_end_to_end::log(),
+				&Proof {
+					receipt_proof: super::gloas_end_to_end::receipt_proof(),
+					execution_proof: proof,
+				},
 			)
 			.is_err());
 		});
