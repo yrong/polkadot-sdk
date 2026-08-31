@@ -1970,3 +1970,237 @@ mod gloas_fork_isolation {
 		});
 	}
 }
+
+/// A second, independent end-to-end message — different beacon block, different execution
+/// block, different transaction.
+///
+/// One fixture can pass for reasons peculiar to itself. This one differs from
+/// `gloas_end_to_end` in ways that matter: the payload bid carries **11 blob commitments**
+/// where the other carried none, so the branch to gindex 2856 runs through a different
+/// subtree; the execution header has 29 bytes of `extra_data` and a non-zero `blob_gas_used`,
+/// so the RLP walk sees different item widths; and the receipt is proven at a different
+/// transaction index, against a log that is not the first in its receipt.
+///
+/// Platåberget beacon block 128608, execution block 125689.
+mod gloas_end_to_end_second {
+	use super::*;
+	use snowbridge_beacon_primitives::{
+		AncestryProof, ExecutionProof, VersionedExecutionPayloadHeader,
+	};
+	use snowbridge_verification_primitives::{Log, Proof};
+	use sp_core::H160;
+
+	const BODY_ROOT: [u8; 32] =
+		hex!("6c4326c786538f0f75e8f7985d8f792487914611b660cbf46b9434fdfb5ff42f");
+	const EXECUTION_BLOCK_HASH: [u8; 32] =
+		hex!("7232474f8d4a21d2909ecb502c27b5ae3443c74db80095ec15ef086f5a56c057");
+	const EXECUTION_HEADER_RLP: [u8; 690] = hex!(
+		"f902afa03b1156a0e9a12472425d03c4bfd448b9c2026b1fdf088cf3289f4538"
+		"78416aa9a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142"
+		"fd40d4934794f97e180c050e5ab072211ad2c213eb5aee4df134a073b1854c5e"
+		"f1543279fb5bcbfff718e5b91d79cd9d52d5c5a136b65fb98d37e2a0a4db3d7b"
+		"b625dac6a0a59fac73c1b2f3c8c068875b9d9f68fac57a9c8adae106a037c3ba"
+		"655f8213c2f6cf3ab0579bb012a5c60bfe4ca4f328b2ff0c89642a67bdb90100"
+		"1023400464cf0442872a028dc8d6051dc3c51018f3408920405038c21c0d3085"
+		"101c00e0000c8889090d188102850008004320c505243b47420c4681b21e2630"
+		"de4b0806b808113de081320c463014666280612a06d4502200426a2e93900008"
+		"0805899c9a46e0026d40050424080883c244a1405854461429000110041a06a6"
+		"8201010e1045420a4491102a00440182941a49012984195a80812ceb5008c088"
+		"0c6820ac01a2050a08cc32791628254a4054461ca20001f10442029c82528900"
+		"03000f460444090340690aa74423c0600206074541f9043111658a1228002666"
+		"66100e610c01b191080e08803411076c7c4db800020c00c50a856b916210b550"
+		"808301eaf9840be8c59584062c3d90846a953e349d6275696c646f6f722f2f4e"
+		"65746865726d696e642076312e34302e3061a0b7e4e8580ba3ae933eb98b977f"
+		"a92435f836f656fd3518e87109a7c8291fcaae880000000000000000847453c2"
+		"b3a0c6a36bc236ea27593da15251d91d556c925730f7407e30afe2ff0c3a0c1b"
+		"bf3c83140000840cf131afa04bb04546b509ced8dedb770bbaceebedd99f2c70"
+		"e17c7a26f4f4e8850ed34758a0e3b0c44298fc1c149afbf4c8996fb92427ae41"
+		"e4649b934ca495991b7852b855a0df196f581609037bc82f7d74be3a82ca120b"
+		"7b3f3c5d65f0ab1a4ab5426a3f178301f65f"
+	);
+	const TX_INDEX: u64 = 8;
+	const LOG_ADDRESS: [u8; 20] = hex!("fffffffffffffffffffffffffffffffffffffffe");
+
+	fn beacon_header() -> BeaconHeader {
+		BeaconHeader {
+			slot: 128608,
+			proposer_index: 1950,
+			parent_root: hex!("e13eeebecc2670a233de5c1acb51aa3ac5e70c47e073aa89e8b41246591b31e9")
+				.into(),
+			state_root: hex!("885c2ca09e76e2c2000f43d2df3f0f4928ce9933af49cec81aefe416cf3ed86b")
+				.into(),
+			body_root: BODY_ROOT.into(),
+		}
+	}
+
+	fn execution_branch() -> Vec<H256> {
+		vec![
+			hex!("3076238706742ac39fd1c1d66f57a0fce1815dd1c17d9ecda4907450d46bea5c").into(),
+			hex!("ff0f000000000000000000000000000000000000000000000000000000000000").into(),
+			hex!("5aa023f6916c2b0a79745eb081b620c9aef6d4e60120a9334b845b3fb92381f9").into(),
+			hex!("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b").into(),
+			hex!("95dd9c9499ed213ca60a2dc33466b09605e2335c95c70797ae46837ec2a7da4f").into(),
+			hex!("2a63671a5217bf2d114e4db54dc674b5b15601503d52ec7126840d39d530cc7b").into(),
+			hex!("c78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c").into(),
+			hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
+			hex!("886c3ce370b103f718f2dc5d56d021431d97e2bb491aa7cb42cf9677047bd4ed").into(),
+			hex!("18382df1ac8fcf9ea8521c85ae3bf7605c7447f42730f2048ed98b798256455d").into(),
+			hex!("ff1f000000000000000000000000000000000000000000000000000000000000").into(),
+		]
+	}
+
+	fn receipt_proof() -> Vec<Vec<u8>> {
+		vec![
+			hex!(
+				"f90111a00d70e377b5d3d6ec5d3554869060fdf637975f6c37e3b08a2aef7abd"
+				"bef6d874a046264bf2c3c180b9f5f94f0f92242b10a2b9db23ef965f785510b3"
+				"986f2346eea0d82ec4ef58949250aad74dcfa396ff9359359356eebc91c35de8"
+				"f58a2bc06f6fa0313617bbe4d71c509564b5b13f9eb09b3d1341d6a03d5a9ff0"
+				"9ff96a227980fea0a6add39b96a29c5c278cbed379ad965a685623a75de84891"
+				"d418de01efbf4a1aa0f56b145a735d454e288c686612bfdefa76822b658948e9"
+				"ef7c9335e881e7db46a09b9a9059cb75519fa5698aedc526661fc33fc4b749e6"
+				"c7ecebba781966577aa080a00c7043cf862a4186ac2f25e7ad3bcad16ff920d6"
+				"a35771a699a9c40b490eb2338080808080808080"
+			)
+			.to_vec(),
+			hex!(
+				"f901f180a053a139fc9d77162e3ca49b36512ea8da5c026d244a7f60fc40115f"
+				"d19342e5dda004cf3a2035ea68c142b389fcf46e7edc879bf0f4c76684c320f5"
+				"8bfdac65b527a0864a04f6599921df1e6337c37de299720ab7320de2dafdd6d3"
+				"21244b8bafe6e5a066a3e24f416b5634a68cf8fe180629e4ec3641f2fa4186b4"
+				"dd63e69e5431e847a000954567937c701711a16e2a0f52684235d53f872a376a"
+				"61011209e1973e4476a0a468dc682349c174d5b6ade2a666bf9277872eaf3684"
+				"b8edf4c6a593e1686027a0e919ef7004fed8162d3ebf202d8de7a8b71d660d60"
+				"7cf0c707e068509aef21e8a003c50073c61048d4ed37699116258473b8fde6f4"
+				"e3819828c6e92eb200a8d983a072424026cb4c1e505d72f07cc256784122af13"
+				"db8df1fe473acd0c3f2c3740b9a0a8c9360bbeeca020b09f6a002aa7fc7033a2"
+				"0b65369bd302a19ba5616a810418a013fb872b14b995d06b07544f714ba5482a"
+				"72b3d941713f6a40b52fe7a6a68f09a03518772dc585012084a5910281689eb2"
+				"0c21b23881c7fd52ea0771c382d969e2a0a35bed0d5391fb1b2dcf9f91adb37d"
+				"ad20d9d5ed971d6bf82b9772efdeda4c02a00feb2a13dc9eb9632af012ee2827"
+				"ae5356f5f4678f9cbf71513f0ac29020c4ada0e548ca0a3feead1822d622e7a5"
+				"9b83e19e3b95affd9c2d6c66d135f9e0ce2fb580"
+			)
+			.to_vec(),
+			hex!(
+				"f9057c20b9057802f90574018305d309b9010000200000000000000002000080"
+				"0000000000100040000000000000800000000000000000000000000000000000"
+				"8000000000000000000100000000000000000000020000000000000000000800"
+				"0000204000000200100000000000008000000000000000000000002000000000"
+				"0000000000000000000000000000100000000000000000000040000000000000"
+				"0000000000000100000008000000400000000000080004000000000000000000"
+				"0000000000000000000001000000000000080000000402000008000008000000"
+				"0000000000000000080010000000000000004000100000000000000000000004"
+				"00000000000000000000400000000000000100f90469f89b94ffffffffffffff"
+				"fffffffffffffffffffffffffef863a0ddf252ad1be2c89b69c2b068fc378daa"
+				"952ba7f163c4a11628f55a4df523b3efa0000000000000000000000000fc0d12"
+				"6d830db7f740475de336c28cca26e36994a00000000000000000000000005401"
+				"1a28e45cbbeeaaa778c66f9fafe6fea1fcbca000000000000000000000000000"
+				"00000000000000000000000028ef2f6b021ebaf89b94ffffffffffffffffffff"
+				"fffffffffffffffffffef863a0ddf252ad1be2c89b69c2b068fc378daa952ba7"
+				"f163c4a11628f55a4df523b3efa000000000000000000000000054011a28e45c"
+				"bbeeaaa778c66f9fafe6fea1fcbca00000000000000000000000007225fa654d"
+				"238fc50271d3ad9737213cd0111b69a000000000000000000000000000000000"
+				"00000000000000000028ef2f6b021ebaf87a947225fa654d238fc50271d3ad97"
+				"37213cd0111b69f842a0e1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c46"
+				"0751c2402c5c5cc9109ca000000000000000000000000054011a28e45cbbeeaa"
+				"a778c66f9fafe6fea1fcbca00000000000000000000000000000000000000000"
+				"000000000028ef2f6b021ebaf89b947225fa654d238fc50271d3ad9737213cd0"
+				"111b69f863a0ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f5"
+				"5a4df523b3efa000000000000000000000000054011a28e45cbbeeaaa778c66f"
+				"9fafe6fea1fcbca0000000000000000000000000c7332d9f3a0f4786ce661925"
+				"008148733564fb0ba00000000000000000000000000000000000000000000000"
+				"000028ef2f6b021ebaf89b94029e947be3f40981b7058573e4870dd6960ae794"
+				"f863a0ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df5"
+				"23b3efa0000000000000000000000000c7332d9f3a0f4786ce66192500814873"
+				"3564fb0ba0000000000000000000000000fc0d126d830db7f740475de336c28c"
+				"ca26e36994a0000000000000000000000000000000000000000000000005de57"
+				"c3a40dbe8283f87994c7332d9f3a0f4786ce661925008148733564fb0be1a01c"
+				"411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1b8"
+				"40000000000000000000000000000000000000000000084d47582a398be9ca60"
+				"c2000000000000000000000000000000000000000000000039bbfe12699a8ab8"
+				"93f8fc94c7332d9f3a0f4786ce661925008148733564fb0bf863a0d78ad95fa4"
+				"6c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822a000000000"
+				"000000000000000054011a28e45cbbeeaaa778c66f9fafe6fea1fcbca0000000"
+				"000000000000000000fc0d126d830db7f740475de336c28cca26e36994b88000"
+				"0000000000000000000000000000000000000000000000000000000000000000"
+				"00000000000000000000000000000000000000000000000028ef2f6b021eba00"
+				"0000000000000000000000000000000000000000000005de57c3a40dbe828300"
+				"00000000000000000000000000000000000000000000000000000000000000"
+			)
+			.to_vec(),
+		]
+	}
+
+	fn log() -> Log {
+		Log {
+			address: H160(LOG_ADDRESS),
+			topics: vec![
+				hex!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").into(),
+				hex!("00000000000000000000000054011a28e45cbbeeaaa778c66f9fafe6fea1fcbc").into(),
+				hex!("0000000000000000000000007225fa654d238fc50271d3ad9737213cd0111b69").into(),
+			],
+			data: hex!("0000000000000000000000000000000000000000000000000028ef2f6b021eba").to_vec(),
+			tx_index: TX_INDEX,
+		}
+	}
+
+	fn execution_proof() -> ExecutionProof {
+		ExecutionProof {
+			header: beacon_header(),
+			ancestry_proof: None::<AncestryProof>,
+			execution_header: VersionedExecutionPayloadHeader::Gloas(
+				EXECUTION_HEADER_RLP.to_vec().try_into().expect("fits the bound; qed"),
+			),
+			execution_branch: execution_branch(),
+		}
+	}
+
+	/// The gindex-2856 leaf is the execution block hash, through a bid with a non-empty
+	/// blob-commitment list.
+	#[test]
+	fn commitment_leaf_is_the_execution_block_hash() {
+		let g = EthereumBeaconClient::execution_commitment_gindex(true);
+		assert!(verify_merkle_branch(
+			EXECUTION_BLOCK_HASH.into(),
+			&execution_branch(),
+			subtree_index(g),
+			generalized_index_length(g),
+			BODY_ROOT.into(),
+		));
+	}
+
+	#[test]
+	fn verifies_a_second_real_gloas_message() {
+		new_tester().execute_with(|| {
+			assert_ok!(EthereumBeaconClient::store_finalized_header(
+				beacon_header(),
+				H256::repeat_byte(0x99),
+			));
+			assert_ok!(EthereumBeaconClient::verify(
+				&log(),
+				&Proof { receipt_proof: receipt_proof(), execution_proof: execution_proof() },
+			));
+		});
+	}
+
+	/// The two fixtures must not be interchangeable: this message's receipt proof against the
+	/// other message's execution proof is rejected.
+	#[test]
+	fn fixtures_are_not_interchangeable() {
+		new_tester().execute_with(|| {
+			assert_ok!(EthereumBeaconClient::store_finalized_header(
+				beacon_header(),
+				H256::repeat_byte(0x99),
+			));
+			assert!(EthereumBeaconClient::verify(
+				&log(),
+				&Proof {
+					receipt_proof: super::gloas_end_to_end::receipt_proof(),
+					execution_proof: execution_proof(),
+				},
+			)
+			.is_err());
+		});
+	}
+}
