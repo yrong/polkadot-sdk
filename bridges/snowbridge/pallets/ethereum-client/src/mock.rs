@@ -146,10 +146,18 @@ parameter_types! {
 			version: hex!("05000000"),
 			epoch: 0,
 		},
-		// The existing fixtures all sit below epoch 30, so fulu and gloas are placed above
-		// that but low enough that real Gloas testnet slots (epoch ~3624) land in the gloas
-		// era. gloas is deliberately after fulu so fork-boundary tests have a boundary to
-		// cross.
+		// These epochs are squeezed between two constraints. The existing fixtures reach
+		// epoch 258 (`next-sync-committee-update.json`), so fulu and gloas must sit above
+		// that or those fixtures change fork era. Real Gloas testnet slots are around epoch
+		// 3624, so gloas must sit below that or the Gloas fixtures are rejected by the
+		// variant/era cross-check. gloas is after fulu so fork-boundary tests have a
+		// boundary to cross.
+		//
+		// Trap when adding a fixture above epoch 2000: the gindices would not change, since
+		// Fulu shares Electra's and there is deliberately no `fulu` arm in the
+		// `*_gindex_at_slot` helpers. Only `select_fork_version` differs, so the sync
+		// committee signature would fail and it would look like a bad signature rather than
+		// a fork-schedule problem.
 		fulu: Fork {
 			version: hex!("06000000"),
 			epoch: 2000,
