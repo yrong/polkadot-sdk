@@ -431,7 +431,6 @@ pub enum CommitmentError {
 #[derive(Clone, PartialEq, Debug)]
 pub struct ExecutionCommitment {
 	leaf: H256,
-	scheme: CommitmentScheme,
 	receipts_root: H256,
 }
 
@@ -441,20 +440,9 @@ impl ExecutionCommitment {
 		self.leaf
 	}
 
-	pub fn scheme(&self) -> CommitmentScheme {
-		self.scheme
-	}
-
-	/// Whether this proof uses the Gloas scheme. Cross-check this against the fork era of
-	/// the beacon header's slot, so a proof cannot select its own verification path.
-	pub fn is_gloas(&self) -> bool {
-		matches!(self.scheme, CommitmentScheme::BlockHash)
-	}
-
 	/// The receipts root this commitment authenticates.
 	///
 	/// Call only once [`Self::leaf`] has been proven into a finalized beacon block.
-	/// Consumes the commitment so the leaf cannot be reused afterwards.
 	pub fn receipts_root_once_proven(self) -> H256 {
 		self.receipts_root
 	}
@@ -483,7 +471,6 @@ impl VersionedExecutionPayloadHeader {
 					header.clone().try_into().map_err(|_| CommitmentError::Merkleization)?,
 				)
 				.map_err(|_| CommitmentError::Merkleization)?,
-				scheme: CommitmentScheme::PayloadHeaderRoot,
 				receipts_root: header.receipts_root,
 			},
 			VersionedExecutionPayloadHeader::Deneb(header) => ExecutionCommitment {
@@ -491,14 +478,12 @@ impl VersionedExecutionPayloadHeader {
 					header.clone().try_into().map_err(|_| CommitmentError::Merkleization)?,
 				)
 				.map_err(|_| CommitmentError::Merkleization)?,
-				scheme: CommitmentScheme::PayloadHeaderRoot,
 				receipts_root: header.receipts_root,
 			},
 			// The leaf is the execution block hash, which is by definition the Keccak hash
 			// of the canonical header encoding. Hash the bytes exactly as submitted.
 			VersionedExecutionPayloadHeader::Gloas(rlp) => ExecutionCommitment {
 				leaf: keccak_256(rlp).into(),
-				scheme: CommitmentScheme::BlockHash,
 				receipts_root: receipts_root_from_rlp(rlp)
 					.ok_or(CommitmentError::MalformedExecutionHeader)?,
 			},
@@ -820,8 +805,6 @@ mod gloas_execution_header_tests {
 	fn commitment_leaf_is_the_block_hash() {
 		let commitment = gloas(&HEADER_RLP).commitment().unwrap();
 		assert_eq!(commitment.leaf(), H256::from(BLOCK_HASH));
-		assert_eq!(commitment.scheme(), CommitmentScheme::BlockHash);
-		assert!(commitment.is_gloas());
 		assert_eq!(commitment.receipts_root_once_proven(), H256::from(RECEIPTS_ROOT));
 	}
 

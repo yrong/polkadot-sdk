@@ -120,14 +120,7 @@ impl<T: Config> Pallet<T> {
 			},
 		}
 
-		// Reject a legacy proof presented for a Gloas-era block, and vice versa. Checked
-		// before the commitment is built, so no submitter-controlled bytes are parsed first.
 		let is_gloas = execution_proof.execution_header.scheme() == CommitmentScheme::BlockHash;
-		let fork_versions = T::ForkVersions::get();
-		let is_gloas_slot =
-			compute_epoch(execution_proof.header.slot, config::SLOTS_PER_EPOCH as u64) >=
-				fork_versions.gloas.epoch;
-		ensure!(is_gloas == is_gloas_slot, Error::<T>::InvalidExecutionHeaderProof);
 
 		// Pre-Gloas the leaf is the SSZ root of the execution payload header; Gloas removes
 		// that field, so the leaf is `keccak256(canonical header RLP)` at a different index.

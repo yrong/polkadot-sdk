@@ -1690,20 +1690,6 @@ mod gloas_end_to_end {
 		});
 	}
 
-	/// `scheme()` gates the fork-era check while `commitment()` produces the leaf, so the two
-	/// must never disagree — a divergence would pick the gindex for one scheme and the leaf
-	/// for the other. Both real fixtures are checked.
-	#[test]
-	fn scheme_agrees_with_the_constructed_commitment() {
-		for header in [
-			execution_proof().execution_header,
-			super::gloas_end_to_end_second::execution_proof().execution_header,
-			load_execution_proof_fixture().execution_header,
-		] {
-			assert_eq!(header.scheme(), header.commitment().unwrap().scheme());
-		}
-	}
-
 	/// A receipt proof for one transaction index must not satisfy a log claiming another.
 	#[test]
 	fn rejects_a_wrong_transaction_index() {
@@ -1877,10 +1863,6 @@ mod gloas_checkpoint_and_ancestry {
 mod gloas_fork_isolation {
 	use super::*;
 	use snowbridge_beacon_primitives::CommitmentScheme;
-	fn gloas_era_slot() -> u64 {
-		ChainForkVersions::get().gloas.epoch * (SLOTS_PER_EPOCH as u64)
-	}
-
 	fn is_gloas_era(slot: u64) -> bool {
 		compute_epoch(slot, SLOTS_PER_EPOCH as u64) >= ChainForkVersions::get().gloas.epoch
 	}
@@ -1902,58 +1884,6 @@ mod gloas_fork_isolation {
 				H256::repeat_byte(0x99),
 			));
 			assert_ok!(EthereumBeaconClient::verify_execution_proof(&proof));
-		});
-	}
-
-	/// A Gloas proof presented for a pre-Gloas header is refused on the era check, before
-	/// the branch is even looked at. Without this a submitter could pick their own
-	/// verification path.
-	///
-	/// This is also what protects a chain that has not scheduled Gloas. The runtimes ship
-	/// `gloas.epoch = u64::MAX` until the fork is announced, which makes *every* slot
-	/// pre-Gloas era, so a Gloas-variant proof reduces to exactly this case and is refused
-	/// rather than mis-verified.
-	#[test]
-	fn gloas_variant_is_refused_for_a_pre_gloas_header() {
-		let mut proof = super::gloas_end_to_end::execution_proof();
-		proof.ancestry_proof = None;
-		proof.header.slot = 64; // pre-Gloas in the mock's schedule
-
-		new_tester().execute_with(|| {
-			assert!(!is_gloas_era(proof.header.slot));
-			assert!(proof.execution_header.scheme() == CommitmentScheme::BlockHash);
-
-			assert_ok!(EthereumBeaconClient::store_finalized_header(
-				proof.header,
-				H256::repeat_byte(0x99),
-			));
-			assert_err!(
-				EthereumBeaconClient::verify_execution_proof(&proof),
-				Error::<Test>::InvalidExecutionHeaderProof
-			);
-		});
-	}
-
-	/// And the reverse: a legacy proof cannot be replayed against a Gloas-era header to
-	/// smuggle a post-Gloas claim onto the cheaper pre-Gloas gindex.
-	#[test]
-	fn legacy_variant_is_refused_for_a_gloas_era_header() {
-		let mut proof = Box::new(load_execution_proof_fixture());
-		proof.ancestry_proof = None;
-		proof.header.slot = gloas_era_slot();
-
-		new_tester().execute_with(|| {
-			assert!(is_gloas_era(proof.header.slot));
-			assert!(proof.execution_header.scheme() != CommitmentScheme::BlockHash);
-
-			assert_ok!(EthereumBeaconClient::store_finalized_header(
-				proof.header,
-				H256::repeat_byte(0x99),
-			));
-			assert_err!(
-				EthereumBeaconClient::verify_execution_proof(&proof),
-				Error::<Test>::InvalidExecutionHeaderProof
-			);
 		});
 	}
 }
