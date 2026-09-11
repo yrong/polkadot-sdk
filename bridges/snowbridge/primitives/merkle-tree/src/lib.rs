@@ -24,6 +24,8 @@ use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+pub mod mmr;
+
 use codec::{Decode, Encode};
 use scale_info::TypeInfo;
 use sp_core::H256;

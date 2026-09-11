@@ -15,6 +15,7 @@ use frame_support::{
 use hex_literal::hex;
 use snowbridge_beacon_primitives::{types::deneb, VersionedExecutionPayloadHeader};
 use snowbridge_core::{digest_item::SnowbridgeDigestItem, ChannelId, ParaId};
+use snowbridge_merkle_tree::mmr;
 use snowbridge_outbound_queue_primitives::{
 	v2::{abi::OutboundMessageWrapper, Command, Initializer, SendMessage},
 	EventProof, Proof, SendError, VerificationError,
@@ -61,9 +62,9 @@ fn prove_message_recomputes_committed_leaves_after_commit() {
 		assert_eq!(messages.len(), 4);
 		assert_eq!(MessageLeaves::<Test>::decode_len().unwrap_or_default(), 0);
 
-		// Recover the merkle root that was committed on-chain into the header digest.
+		// The digest now carries the MMR root, not this block's merkle root.
 		let digest = System::digest();
-		let committed_root = digest
+		let committed_mmr_root = digest
 			.logs()
 			.iter()
 			.find_map(|item| item.as_other())
@@ -74,12 +75,21 @@ fn prove_message_recomputes_committed_leaves_after_commit() {
 			})
 			.expect("commitment digest item should be present");
 
+		// The block root is recoverable from the MMR state, whose only leaf so far is this block.
+		let peaks = CommitmentPeaks::<Test>::get();
+		assert_eq!(CommitmentLeafCount::<Test>::get(), 1);
+		assert_eq!(peaks.len(), 1);
+		let block_root = peaks[0];
+		// With a single leaf the MMR root is that leaf, so the digest still equals the block root
+		// here. `mmr_commits_to_earlier_block_roots` covers the case where they diverge.
+		assert_eq!(committed_mmr_root, block_root);
+
 		// `prove_message` recomputes the leaves from `Messages` (since `MessageLeaves` is gone) and
-		// must produce proofs that verify against the very same root committed on-chain.
+		// must produce proofs that verify against this block's merkle root.
 		for (index, message) in messages.iter().enumerate() {
 			let proof = crate::api::prove_message::<Test>(index as u64)
 				.expect("a proof should be generated for a committed message");
-			assert_eq!(proof.root, committed_root);
+			assert_eq!(proof.root, block_root);
 			assert_eq!(proof.leaf, OutboundQueue::message_leaf(message));
 			assert_eq!(proof.leaf_index, index as u64);
 			assert_eq!(proof.number_of_leaves, messages.len() as u64);
@@ -87,6 +97,47 @@ fn prove_message_recomputes_committed_leaves_after_commit() {
 
 		// An out-of-range `leaf_index` returns `None` instead of panicking in `merkle_proof`.
 		assert!(crate::api::prove_message::<Test>(messages.len() as u64).is_none());
+	});
+}
+
+#[test]
+fn mmr_commits_to_earlier_block_roots() {
+	// The property the MMR exists for: a later root still commits to an earlier block's root, so a
+	// block whose own header is unreachable (any but the last of a bundled candidate) keeps its
+	// messages provable against a later, reachable header.
+	new_tester().execute_with(|| {
+		let commit_one_block = |para_id: u32| {
+			let message = mock_message(para_id);
+			let ticket = OutboundQueue::validate(&message).unwrap();
+			assert_ok!(OutboundQueue::deliver(ticket));
+			ServiceWeight::set(Some(Weight::MAX));
+			run_to_end_of_next_block();
+		};
+
+		commit_one_block(1000);
+		assert_eq!(CommitmentLeafCount::<Test>::get(), 1);
+		let first_root = CommitmentPeaks::<Test>::get()[0];
+
+		commit_one_block(1001);
+		assert_eq!(CommitmentLeafCount::<Test>::get(), 2);
+
+		// Two leaves merge into one peak, so the current MMR root is derived from the first block's
+		// root — it has not been displaced by the second.
+		let peaks = CommitmentPeaks::<Test>::get();
+		assert_eq!(peaks.len(), 1);
+		let second_root = System::events()
+			.iter()
+			.rev()
+			.find_map(|record| match &record.event {
+				RuntimeEvent::OutboundQueue(Event::MessagesCommitted { root, .. }) => Some(*root),
+				_ => None,
+			})
+			.expect("second block should have committed");
+		assert_ne!(first_root, second_root);
+		assert_eq!(
+			mmr::root::<<Test as Config>::Hashing>(&peaks),
+			mmr::node::<<Test as Config>::Hashing>(&first_root, &second_root),
+		);
 	});
 }
 

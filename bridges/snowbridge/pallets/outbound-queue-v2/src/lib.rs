@@ -85,7 +85,7 @@ use snowbridge_core::{
 	reward::{AddTip, AddTipError},
 	BasicOperatingMode,
 };
-use snowbridge_merkle_tree::merkle_root;
+use snowbridge_merkle_tree::{merkle_root, mmr};
 use snowbridge_outbound_queue_primitives::{
 	v2::{
 		abi::{CommandWrapper, OutboundMessageWrapper},
@@ -213,8 +213,10 @@ pub mod pallet {
 		},
 		/// Some messages have been committed
 		MessagesCommitted {
-			/// Merkle root of the committed messages
+			/// Merkle root of the messages committed in this block
 			root: H256,
+			/// Root of the append-only MMR over per-block roots, as placed in the header digest
+			mmr_root: H256,
 			/// number of committed messages
 			count: u64,
 		},
@@ -263,6 +265,21 @@ pub mod pallet {
 	#[pallet::storage]
 	#[pallet::unbounded]
 	pub type MessageLeaves<T: Config> = StorageValue<_, Vec<H256>, ValueQuery>;
+
+	/// Peaks of the append-only MMR over per-block commitment roots, highest first.
+	///
+	/// A per-block root is only provable on Ethereum while its own header is reachable through the
+	/// relay's parachain-heads root, which fails for every block of a bundled candidate except the
+	/// last. Appending each root here means a later MMR root already commits to the earlier ones,
+	/// so only the most recent root has to be provable. O(log n): 64 peaks cover 2^64 blocks.
+	#[pallet::storage]
+	pub type CommitmentPeaks<T: Config> =
+		StorageValue<_, BoundedVec<H256, ConstU32<64>>, ValueQuery>;
+
+	/// Number of per-block roots appended to [`CommitmentPeaks`]. Its binary representation
+	/// determines which heights the peaks occupy, so the heights are not stored.
+	#[pallet::storage]
+	pub type CommitmentLeafCount<T: Config> = StorageValue<_, u64, ValueQuery>;
 
 	/// The current nonce for the messages
 	#[pallet::storage]
@@ -331,17 +348,34 @@ pub mod pallet {
 				return;
 			}
 
-			// Create merkle root of messages
+			// Create merkle root of this block's messages
 			let root = merkle_root::<<T as Config>::Hashing, _>(MessageLeaves::<T>::stream_iter());
 
-			let digest_item: DigestItem = SnowbridgeDigestItem::SnowbridgeV2(root).into();
+			// Append it to the append-only MMR over per-block roots, and commit to the MMR rather
+			// than to `root` alone. A later MMR root contains every earlier block root, so a block
+			// whose own header is unreachable (any but the last of a bundled candidate) still has
+			// its messages provable against a later, reachable header.
+			let mut peaks = CommitmentPeaks::<T>::get().into_inner();
+			let leaf_count =
+				mmr::append::<<T as Config>::Hashing>(&mut peaks, CommitmentLeafCount::<T>::get(), root);
+			let mmr_root = mmr::root::<<T as Config>::Hashing>(&peaks);
 
-			// Insert merkle root into the header digest
+			// `append` never grows the peaks beyond 64 for a u64 leaf count, so the bound holds.
+			if let Ok(bounded) = BoundedVec::try_from(peaks) {
+				CommitmentPeaks::<T>::put(bounded);
+				CommitmentLeafCount::<T>::put(leaf_count);
+			}
+
+			let digest_item: DigestItem = SnowbridgeDigestItem::SnowbridgeV2(mmr_root).into();
+
+			// Insert the MMR root into the header digest
 			<frame_system::Pallet<T>>::deposit_log(digest_item);
 
-			T::OnNewCommitment::on_new_commitment(root);
+			T::OnNewCommitment::on_new_commitment(mmr_root);
 
-			Self::deposit_event(Event::MessagesCommitted { root, count });
+			// `root` is emitted so off-chain consumers can rebuild the MMR leaf sequence; it is not
+			// recoverable from the digest, which now carries `mmr_root`.
+			Self::deposit_event(Event::MessagesCommitted { root, mmr_root, count });
 
 			// Drop the leaves now that the root has been committed, so they never persist to state.
 			// They can be recomputed from `Messages` on demand (e.g. by the `prove_message` runtime
