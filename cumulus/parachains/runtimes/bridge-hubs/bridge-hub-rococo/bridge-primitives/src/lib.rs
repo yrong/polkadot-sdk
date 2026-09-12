@@ -83,7 +83,9 @@ pub type AccountSigner = MultiSigner;
 pub type Address = MultiAddress<AccountId, ()>;
 
 /// Identifier of BridgeHubRococo in the Rococo relay chain.
-pub const BRIDGE_HUB_ROCOCO_PARACHAIN_ID: u32 = 1013;
+/// Local-only E2E override: set to 1002 to match the other Bridge Hub paraIDs and Snowbridge
+/// contracts.
+pub const BRIDGE_HUB_ROCOCO_PARACHAIN_ID: u32 = 1002;
 
 /// Name of the With-BridgeHubRococo messages pallet instance that is deployed at bridged chains.
 pub const WITH_BRIDGE_HUB_ROCOCO_MESSAGES_PALLET_NAME: &str = "BridgeRococoMessages";

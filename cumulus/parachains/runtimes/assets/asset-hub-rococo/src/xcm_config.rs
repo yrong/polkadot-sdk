@@ -567,7 +567,7 @@ pub mod bridging {
 			);
 
 			pub const WestendNetwork: NetworkId = NetworkId::ByGenesis(WESTEND_GENESIS_HASH);
-			pub const EthereumNetwork: NetworkId = NetworkId::Ethereum { chain_id: 11155111 };
+			pub const EthereumNetwork: NetworkId = NetworkId::Ethereum { chain_id: 7091047534 };
 			pub WestendEcosystem: Location = Location::new(2, [GlobalConsensus(WestendNetwork::get())]);
 			pub EthereumEcosystem: Location = Location::new(2, [GlobalConsensus(EthereumNetwork::get())]);
 			pub WndLocation: Location = Location::new(2, [GlobalConsensus(WestendNetwork::get())]);
