@@ -167,38 +167,40 @@ impl snowbridge_pallet_outbound_queue::Config for Runtime {
 
 #[cfg(any(feature = "std", feature = "fast-runtime", feature = "runtime-benchmarks", test))]
 parameter_types! {
+	// Local E2E (lodestar --params.*): mainnet-style fork versions, Fulu@0, Gloas@$GLOAS_FORK_EPOCH.
+	// Must stay aligned with web/packages/test lodestar + beacon-relay forkVersions.gloas.
 	pub const ChainForkVersions: ForkVersions = ForkVersions {
 		genesis: Fork {
-			version: hex!("10733183"),
+			version: hex!("00000000"),
 			epoch: 0,
 		},
 		altair: Fork {
-			version: hex!("20733183"),
+			version: hex!("01000000"),
 			epoch: 0,
 		},
 		bellatrix: Fork {
-			version: hex!("30733183"),
+			version: hex!("02000000"),
 			epoch: 0,
 		},
 		capella: Fork {
-			version: hex!("40733183"),
+			version: hex!("03000000"),
 			epoch: 0,
 		},
 		deneb: Fork {
-			version: hex!("50733183"),
+			version: hex!("04000000"),
 			epoch: 0,
 		},
 		electra: Fork {
-			version: hex!("60733183"),
+			version: hex!("05000000"),
 			epoch: 0,
 		},
 		fulu: Fork {
-			version: hex!("70733183"),
+			version: hex!("06000000"),
 			epoch: 0,
 		},
 		gloas: Fork {
-			version: hex!("80733183"),
-			epoch: 1536,
+			version: hex!("07000000"),
+			epoch: 40,
 		}
 	};
 }

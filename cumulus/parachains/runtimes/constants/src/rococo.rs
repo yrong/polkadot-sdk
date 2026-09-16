@@ -157,10 +157,9 @@ pub mod snowbridge {
 	pub const INBOUND_QUEUE_PALLET_INDEX_V2: u8 = 91;
 
 	parameter_types! {
-		/// Network and location for the Ethereum chain.
-		/// Local Gloas E2E against Platåberget uses chain ID 7091047534 (not Sepolia 11155111).
+		/// Network and location for the Ethereum chain. Matches local geth `--networkid 11155111`.
 		/// <https://ethereum.org/en/developers/docs/apis/json-rpc/#net_version>
-		pub EthereumNetwork: NetworkId = NetworkId::Ethereum { chain_id: 7091047534 };
+		pub EthereumNetwork: NetworkId = NetworkId::Ethereum { chain_id: 11155111 };
 		pub EthereumLocation: Location = Location::new(2, EthereumNetwork::get());
 		pub AssetHubParaId: ParaId = ParaId::from(rococo_runtime_constants::system_parachain::ASSET_HUB_ID);
 	}
