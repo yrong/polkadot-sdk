@@ -1,43 +1,34 @@
-// Copyright (C) Parity Technologies (UK) Ltd.
-// This file is part of Cumulus.
-// SPDX-License-Identifier: Apache-2.0
-
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #[cfg(not(feature = "runtime-benchmarks"))]
 use crate::XcmRouter;
 use crate::{
-	xcm_config, xcm_config::UniversalLocation, Balances, EthereumInboundQueue,
-	EthereumOutboundQueue, EthereumSystem, MessageQueue, Runtime, RuntimeEvent, TransactionByteFee,
-	TreasuryAccount,
+	xcm_config, xcm_config::UniversalLocation, Balances, EthereumBeaconClient,
+	EthereumInboundQueue, EthereumOutboundQueue, EthereumSystem, MessageQueue, Runtime,
+	RuntimeEvent, TransactionByteFee, TreasuryAccount,
 };
 use parachains_common::{AccountId, Balance};
 use snowbridge_beacon_primitives::{Fork, ForkVersions};
 use snowbridge_core::{gwei, meth, AllowSiblingsOnly, PricingParameters, Rewards};
-use snowbridge_inbound_queue_primitives::v1::MessageToXcm;
+use snowbridge_inbound_queue_primitives::{
+	v1::MessageToXcm as MessageToXcmV1,
+	v2::{CreateAssetCallInfo, MessageToXcm, XcmMessageProcessor as InboundXcmMessageProcessor},
+};
 use snowbridge_outbound_queue_primitives::v1::EthereumBlobExporter;
 
 use sp_core::H160;
 use testnet_parachains_constants::rococo::{
 	currency::*,
 	fee::WeightToFee,
-	snowbridge::{EthereumLocation, EthereumNetwork, INBOUND_QUEUE_PALLET_INDEX},
+	snowbridge::{
+		AssetHubParaId, EthereumLocation, EthereumNetwork, INBOUND_QUEUE_PALLET_INDEX,
+		INBOUND_QUEUE_PALLET_INDEX_V2,
+	},
 };
 
 use crate::xcm_config::RelayNetwork;
 #[cfg(feature = "runtime-benchmarks")]
 use benchmark_helpers::DoNothingRouter;
 use bp_asset_hub_rococo::CreateForeignAssetDeposit;
+use bp_relayers::RewardLedger;
 use frame_support::{parameter_types, weights::ConstantMultiplier};
 use hex_literal::hex;
 use pallet_xcm::EnsureXcm;
@@ -45,7 +36,8 @@ use sp_runtime::{
 	traits::{ConstU32, ConstU8, Keccak256},
 	FixedU128,
 };
-use xcm::prelude::{GlobalConsensus, InteriorLocation, Location, Parachain};
+use xcm::prelude::{GlobalConsensus, InteriorLocation, Location, PalletInstance, Parachain};
+use xcm_executor::XcmExecutor;
 
 /// Exports message to the Ethereum Gateway contract.
 pub type SnowbridgeExporter = EthereumBlobExporter<
@@ -63,6 +55,8 @@ parameter_types! {
 
 parameter_types! {
 	pub const CreateAssetCall: [u8;2] = [53, 0];
+	pub const CreateAssetCallIndex: [u8;2] = [53, 0];
+	pub const SetReservesCallIndex: [u8;2] = [53, 33];
 	pub Parameters: PricingParameters<u128> = PricingParameters {
 		exchange_rate: FixedU128::from_rational(1, 400),
 		fee_per_gas: gwei(20),
@@ -71,6 +65,15 @@ parameter_types! {
 	};
 	pub AssetHubFromEthereum: Location = Location::new(1,[GlobalConsensus(RelayNetwork::get()),Parachain(rococo_runtime_constants::system_parachain::ASSET_HUB_ID)]);
 	pub EthereumUniversalLocation: InteriorLocation = [GlobalConsensus(EthereumNetwork::get())].into();
+	pub InboundQueueV2Location: InteriorLocation = [PalletInstance(INBOUND_QUEUE_PALLET_INDEX_V2)].into();
+	pub CreateAssetCallV2: CreateAssetCallInfo = CreateAssetCallInfo {
+		create_call: CreateAssetCallIndex::get(),
+		deposit: CreateForeignAssetDeposit::get(),
+		min_balance: 1,
+		set_reserves_call: SetReservesCallIndex::get(),
+	};
+	pub TargetLocation: Location = Location::new(1, [Parachain(AssetHubParaId::get().into())]);
+	pub const DefaultSnowbridgeRewardKind: u8 = 0;
 }
 
 impl snowbridge_pallet_inbound_queue::Config for Runtime {
@@ -85,7 +88,7 @@ impl snowbridge_pallet_inbound_queue::Config for Runtime {
 	type GatewayAddress = EthereumGatewayAddress;
 	#[cfg(feature = "runtime-benchmarks")]
 	type Helper = Runtime;
-	type MessageConverter = MessageToXcm<
+	type MessageConverter = MessageToXcmV1<
 		CreateAssetCall,
 		CreateForeignAssetDeposit,
 		ConstU8<INBOUND_QUEUE_PALLET_INDEX>,
@@ -101,6 +104,50 @@ impl snowbridge_pallet_inbound_queue::Config for Runtime {
 	type WeightInfo = crate::weights::snowbridge_pallet_inbound_queue::WeightInfo<Runtime>;
 	type PricingParameters = EthereumSystem;
 	type AssetTransactor = <xcm_config::XcmConfig as xcm_executor::Config>::AssetTransactor;
+}
+
+pub type XcmMessageProcessorV2 = InboundXcmMessageProcessor<
+	Runtime,
+	crate::XcmRouter,
+	XcmExecutor<xcm_config::XcmConfig>,
+	MessageToXcm<
+		CreateAssetCallV2,
+		EthereumNetwork,
+		RelayNetwork,
+		EthereumGatewayAddress,
+		InboundQueueV2Location,
+		AssetHubParaId,
+		EthereumSystem,
+		AccountId,
+	>,
+	xcm_builder::AliasesIntoAccountId32<
+		xcm_config::RelayNetwork,
+		<Runtime as frame_system::Config>::AccountId,
+	>,
+	TargetLocation,
+>;
+
+/// Local E2E noop reward ledger. Rococo BH does not yet use westend's BridgeReward::Snowbridge
+/// payment path; inbound verification still works without claiming rewards.
+pub struct NoopRewardLedger;
+impl RewardLedger<AccountId, u8, u128> for NoopRewardLedger {
+	fn register_reward(_relayer: &AccountId, _reward: u8, _reward_balance: u128) {}
+}
+
+impl snowbridge_pallet_inbound_queue_v2::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Verifier = EthereumBeaconClient;
+	type GatewayAddress = EthereumGatewayAddress;
+	type WeightInfo = crate::weights::snowbridge_pallet_inbound_queue_v2::WeightInfo<Runtime>;
+	#[cfg(feature = "runtime-benchmarks")]
+	type MessageProcessor = benchmark_helpers::DoNothingMessageProcessor;
+	#[cfg(not(feature = "runtime-benchmarks"))]
+	type MessageProcessor = XcmMessageProcessorV2;
+	type RewardKind = u8;
+	type DefaultRewardKind = DefaultSnowbridgeRewardKind;
+	type RewardPayment = NoopRewardLedger;
+	#[cfg(feature = "runtime-benchmarks")]
+	type Helper = Runtime;
 }
 
 impl snowbridge_pallet_outbound_queue::Config for Runtime {
@@ -120,6 +167,8 @@ impl snowbridge_pallet_outbound_queue::Config for Runtime {
 
 #[cfg(any(feature = "std", feature = "fast-runtime", feature = "runtime-benchmarks", test))]
 parameter_types! {
+	// Local E2E (lodestar --params.*): mainnet-style fork versions, Fulu@0, Gloas@$GLOAS_FORK_EPOCH.
+	// Must stay aligned with web/packages/test lodestar + beacon-relay forkVersions.gloas.
 	pub const ChainForkVersions: ForkVersions = ForkVersions {
 		genesis: Fork {
 			version: hex!("00000000"),
@@ -147,11 +196,11 @@ parameter_types! {
 		},
 		fulu: Fork {
 			version: hex!("06000000"),
-			epoch: 2000,
+			epoch: 0,
 		},
 		gloas: Fork {
-			version: hex!("80733183"),
-			epoch: 3000,
+			version: hex!("07000000"),
+			epoch: 40,
 		}
 	};
 }
@@ -224,12 +273,30 @@ impl snowbridge_pallet_system::Config for Runtime {
 pub mod benchmark_helpers {
 	use crate::{EthereumBeaconClient, Runtime, RuntimeOrigin};
 	use codec::Encode;
-	use snowbridge_inbound_queue_primitives::EventFixture;
+	use parachains_common::AccountId;
+	use snowbridge_inbound_queue_primitives::{
+		v2::{Message, MessageProcessor, MessageProcessorError},
+		EventFixture,
+	};
 	use snowbridge_pallet_inbound_queue::BenchmarkHelper;
 	use snowbridge_pallet_inbound_queue_fixtures::register_token::make_register_token_message;
 	use xcm::latest::{Assets, Location, SendError, SendResult, SendXcm, Xcm, XcmHash};
 
 	impl<T: snowbridge_pallet_ethereum_client::Config> BenchmarkHelper<T> for Runtime {
+		fn initialize_storage() -> EventFixture {
+			let message = make_register_token_message();
+			EthereumBeaconClient::store_finalized_header(
+				message.finalized_header,
+				message.block_roots_root,
+			)
+			.unwrap();
+			message
+		}
+	}
+
+	impl<T: snowbridge_pallet_inbound_queue_v2::Config>
+		snowbridge_pallet_inbound_queue_v2::BenchmarkHelper<T> for Runtime
+	{
 		fn initialize_storage() -> EventFixture {
 			let message = make_register_token_message();
 			EthereumBeaconClient::store_finalized_header(
@@ -254,6 +321,19 @@ pub mod benchmark_helpers {
 		fn deliver(xcm: Xcm<()>) -> Result<XcmHash, SendError> {
 			let hash = xcm.using_encoded(sp_io::hashing::blake2_256);
 			Ok(hash)
+		}
+	}
+
+	pub struct DoNothingMessageProcessor;
+	impl MessageProcessor<AccountId> for DoNothingMessageProcessor {
+		fn can_process_message(_relayer: &AccountId, _message: &Message) -> bool {
+			true
+		}
+		fn process_message(
+			_relayer: AccountId,
+			_message: Message,
+		) -> Result<[u8; 32], MessageProcessorError> {
+			Ok([0u8; 32])
 		}
 	}
 

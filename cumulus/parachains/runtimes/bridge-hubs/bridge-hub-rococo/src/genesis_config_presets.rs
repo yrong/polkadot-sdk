@@ -80,7 +80,7 @@ pub fn get_preset(id: &sp_genesis_builder::PresetId) -> Option<sp_std::vec::Vec<
 				(Sr25519Keyring::Bob.to_account_id(), Sr25519Keyring::Bob.public().into()),
 			],
 			Sr25519Keyring::well_known().map(|k| k.to_account_id()).collect(),
-			1013.into(),
+			rococo_runtime_constants::system_parachain::BRIDGE_HUB_ID.into(),
 			Some(Sr25519Keyring::Bob.to_account_id()),
 			rococo_runtime_constants::system_parachain::ASSET_HUB_ID.into(),
 			vec![(
@@ -96,7 +96,7 @@ pub fn get_preset(id: &sp_genesis_builder::PresetId) -> Option<sp_std::vec::Vec<
 				(Sr25519Keyring::Bob.to_account_id(), Sr25519Keyring::Bob.public().into()),
 			],
 			Sr25519Keyring::well_known().map(|k| k.to_account_id()).collect(),
-			1013.into(),
+			rococo_runtime_constants::system_parachain::BRIDGE_HUB_ID.into(),
 			Some(Sr25519Keyring::Bob.to_account_id()),
 			rococo_runtime_constants::system_parachain::ASSET_HUB_ID.into(),
 			vec![],

@@ -147,19 +147,21 @@ pub mod time {
 }
 
 pub mod snowbridge {
+	use cumulus_primitives_core::ParaId;
 	use frame_support::parameter_types;
 	use xcm::prelude::{Location, NetworkId};
 
 	/// The pallet index of the Ethereum inbound queue pallet in the bridge hub runtime.
 	pub const INBOUND_QUEUE_PALLET_INDEX: u8 = 80;
+	pub const INBOUND_QUEUE_PALLET_INDEX_V1: u8 = INBOUND_QUEUE_PALLET_INDEX;
+	pub const INBOUND_QUEUE_PALLET_INDEX_V2: u8 = 91;
 
 	parameter_types! {
-		/// Network and location for the Ethereum chain. On Rococo, the Ethereum chain bridged
-		/// to is the Sepolia Ethereum testnet, with chain ID 11155111.
-		/// <https://chainlist.org/chain/11155111>
+		/// Network and location for the Ethereum chain. Matches local geth `--networkid 11155111`.
 		/// <https://ethereum.org/en/developers/docs/apis/json-rpc/#net_version>
 		pub EthereumNetwork: NetworkId = NetworkId::Ethereum { chain_id: 11155111 };
 		pub EthereumLocation: Location = Location::new(2, EthereumNetwork::get());
+		pub AssetHubParaId: ParaId = ParaId::from(rococo_runtime_constants::system_parachain::ASSET_HUB_ID);
 	}
 }
 
