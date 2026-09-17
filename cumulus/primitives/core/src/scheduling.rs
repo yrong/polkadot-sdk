@@ -101,21 +101,20 @@ impl SchedulingSignals {
 						panic!("Parachain emitted more than one `ApprovedPeer` UMP signal");
 					}
 				},
-				// Speculative-messaging commitments (`Provides`/`Requires`) are not scheduling
-				// signals and `into_ump_messages` does not carry them, so reaching here would
-				// delete the block's commitment from the candidate. Nothing emits them yet; panic
-				// until the pass-through exists.
-				UMPSignal::Provides(_) | UMPSignal::Requires(_) => panic!(
-					"Parachain emitted a speculative-messaging UMP signal, which `validate_block` does not yet forward"
-				),
+				// The speculative-messaging class is parsed by its own pass
+				// (`validate_block`'s `SpecMessagingSignals`), which also runs under a
+				// `signed_scheduling_info` override; the "blocks never emit `Requires`"
+				// rejection lives there.
+				UMPSignal::Provides(_) | UMPSignal::Requires(_) => {},
 			}
 		}
 		signals
 	}
 
-	/// Build the tail from a verified `SignedSchedulingInfo`, replacing the block's own signals
-	/// wholesale. Assumes every `UMPSignal` is a scheduling signal; guarded by
-	/// `all_ump_signals_are_scheduling_signals`.
+	/// Build the tail from a verified `SignedSchedulingInfo`, replacing the block's own
+	/// *scheduling* signals wholesale. The speculative-messaging signals are not part of this tail;
+	/// `validate_block` builds them in its own pass on both paths. Each new `UMPSignal` variant must
+	/// be classified in `all_ump_signals_are_scheduling_signals`.
 	pub fn from_scheduling_info(signed_info: &SignedSchedulingInfo) -> Self {
 		let payload = &signed_info.payload;
 		Self {
@@ -391,8 +390,8 @@ mod tests {
 		fn classify(signal: UMPSignal) {
 			match signal {
 				UMPSignal::SelectCore(..) | UMPSignal::ApprovedPeer(..) => {},
-				// Not scheduling signals. Nothing emits them yet, and `from_block_signals` panics
-				// on them. `from_scheduling_info` must merge them before anything emits them.
+				// Not scheduling signals: `validate_block` builds them in its own pass on both
+				// paths, so the override dropping them here is intended.
 				UMPSignal::Provides(..) | UMPSignal::Requires(..) => {},
 			}
 		}
