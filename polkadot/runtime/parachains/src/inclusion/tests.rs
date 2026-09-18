@@ -3209,3 +3209,103 @@ fn check_validation_outputs_for_runtime_api_rejects_oversized_new_validation_cod
 		assert!(!ParaInclusion::check_validation_outputs_for_runtime_api(chain_a, 1, commitments,));
 	});
 }
+
+#[cfg(test)]
+mod speculative_provides_window {
+	//! Isolation tests for the relay-side speculative-messaging provides window: window
+	//! advance/trim and requires matching by root.
+	use super::*;
+	use polkadot_primitives::{RequiresSet, StreamsRoot};
+
+	fn sr(b: u8) -> StreamsRoot {
+		StreamsRoot(Hash::repeat_byte(b))
+	}
+
+	fn requires(entries: &[(u32, u8)]) -> RequiresSet {
+		RequiresSet::try_from_iter(
+			entries.iter().map(|(src, root)| (ParaId::from(*src), sr(*root))),
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn record_provides_trims_to_window_and_keeps_newest() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let source = ParaId::from(1000);
+			let total = MAX_PROVIDES_WINDOW_SIZE + 3;
+			for i in 0..total {
+				ParaInclusion::record_provides(source, sr(i as u8));
+			}
+			// The window holds exactly `MAX_PROVIDES_WINDOW_SIZE` entries.
+			assert_eq!(
+				RecentProvides::<Test>::get(source).len(),
+				MAX_PROVIDES_WINDOW_SIZE as usize
+			);
+			// The 3 oldest roots were dropped; roots from index 3 onward are retained.
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 0)])).is_err());
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 2)])).is_err());
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 3)])).is_ok());
+			assert!(
+				ParaInclusion::requires_satisfied(&requires(&[(1000, (total - 1) as u8)])).is_ok()
+			);
+		});
+	}
+
+	#[test]
+	fn requires_satisfied_needs_all_sources_and_exact_roots() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let (a, b) = (ParaId::from(1), ParaId::from(2));
+			ParaInclusion::record_provides(a, sr(0xA));
+			ParaInclusion::record_provides(b, sr(0xB));
+			// Both sources present with the right roots → satisfied.
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (2, 0xB)])).is_ok());
+			// Wrong root for a present source → Err names that (source, root).
+			assert_eq!(
+				ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (2, 0xC)])),
+				Err((ParaId::from(2), sr(0xC))),
+			);
+			// Unknown source → Err names it.
+			assert_eq!(
+				ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (3, 0xB)])),
+				Err((ParaId::from(3), sr(0xB))),
+			);
+			// Empty requires → trivially satisfied.
+			assert!(ParaInclusion::requires_satisfied(&requires(&[])).is_ok());
+		});
+	}
+
+	#[test]
+	fn offboarding_clears_provides_window() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let (staying, leaving) = (ParaId::from(1), ParaId::from(2));
+			ParaInclusion::record_provides(staying, sr(0xA));
+			ParaInclusion::record_provides(leaving, sr(0xB));
+			assert!(!RecentProvides::<Test>::get(leaving).is_empty());
+
+			// A session change that offboards `leaving` drops its window; `staying` is untouched.
+			let notification = crate::initializer::SessionChangeNotification::default();
+			ParaInclusion::initializer_on_new_session(&notification, &[leaving]);
+
+			assert!(RecentProvides::<Test>::get(leaving).is_empty());
+			assert!(!RecentProvides::<Test>::get(staying).is_empty());
+		});
+	}
+
+	#[test]
+	fn clear_provides_empties_every_window() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			// Seed several senders' windows.
+			for src in 1..=3u32 {
+				ParaInclusion::record_provides(ParaId::from(src), sr(src as u8));
+			}
+			assert!(
+				(1..=3u32).all(|src| !RecentProvides::<Test>::get(ParaId::from(src)).is_empty())
+			);
+
+			// A freeze transition clears the whole map (see `paras_inherent`).
+			ParaInclusion::clear_provides();
+
+			assert!((1..=3u32).all(|src| RecentProvides::<Test>::get(ParaId::from(src)).is_empty()));
+		});
+	}
+}
