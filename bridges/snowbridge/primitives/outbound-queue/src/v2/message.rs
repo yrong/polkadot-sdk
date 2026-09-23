@@ -280,7 +280,7 @@ pub trait GasMeter {
 
 /// A meter that assigns a constant amount of gas for the execution of a command.
 ///
-/// The ceilings, and the reasoning behind them, live in [`crate::dispatch_gas`].
+/// The ceilings live in [`crate::dispatch_gas`].
 pub struct ConstantGasMeter;
 
 impl GasMeter for ConstantGasMeter {

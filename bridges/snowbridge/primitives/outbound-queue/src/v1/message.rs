@@ -331,19 +331,13 @@ pub trait GasMeter {
 
 /// A meter that assigns a constant amount of gas for the execution of a command.
 ///
-/// The ceilings, and the reasoning behind them, live in [`crate::dispatch_gas`].
+/// The ceilings live in [`crate::dispatch_gas`].
 pub struct ConstantGasMeter;
 
 impl GasMeter for ConstantGasMeter {
 	// The base transaction cost, which includes:
 	// 21_000 transaction cost, roughly worst case 64_000 for calldata, and 100_000
 	// for message verification
-	//
-	// EIP-7976 raises the calldata floor to 64 gas per byte, but the floor is a `max()`
-	// against the whole transaction, not an addition to it. It only binds when total
-	// execution falls below 48 gas per calldata byte, about 192_000 for a 4000 byte proof,
-	// which no command but the governance ones approaches. The verification term still
-	// needs re-benchmarking under EIP-8038 state-access repricing.
 	const MAXIMUM_BASE_GAS: u64 = 185_000;
 
 	fn maximum_dispatch_gas_used_at_most(command: &Command) -> u64 {
