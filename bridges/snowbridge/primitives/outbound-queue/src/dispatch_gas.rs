@@ -3,13 +3,11 @@
 //! Gas ceilings for dispatching a command on the Gateway contract, shared by the v1 and v2
 //! `ConstantGasMeter`.
 //!
-//! Figures from `forge test --match-path test/Gateway.t.sol --gas-report`, buffered for the
-//! EIP-150 63/64 rule and future EVM upgrades.
-//!
-//! Glamsterdam (EIP-8037) prices new state at 1530 gas/byte: 183_600 for a new account,
-//! 97_920 for a new storage slot. It replaces the old allocation charges rather than adding
-//! to them. Commands that allocate no new state move only for EIP-8038, which reprices state
-//! access. These are floors, not measurements: re-benchmark on a Gloas execution client.
+//! Measured on the Gateway handlers with `forge test --hardfork amsterdam --gas-report`
+//! (Foundry v1.8.3, revm's Glamsterdam devnet-8 schedule), then buffered for the EIP-150 63/64
+//! rule and future EVM upgrades. Glamsterdam prices new state separately (EIP-8037: 183_600 for
+//! a new account, 97_920 for a new storage slot) and reprices state access (EIP-8038).
+//! Re-check once the EIP-8038 values are final.
 
 /// Halting writes the `mode` slot from zero, allocating a new slot (110_020); measured 116_162.
 pub const SET_OPERATING_MODE: u64 = 200_000;
