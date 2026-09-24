@@ -29,9 +29,9 @@ pub const REGISTER_FOREIGN_TOKEN: u64 = 7_000_000;
 /// A first mint allocates totalSupply and the recipient balance: two slots.
 pub const MINT_FOREIGN_TOKEN: u64 = 400_000;
 
-/// v1 only. Worst case: no refund for clearing the source slot, a fresh destination allocates
-/// one slot (97_920), and transferFrom may do more than update balances.
-pub const TRANSFER_TOKEN: u64 = 400_000;
+/// v1 only. The same agent transfer as [`UNLOCK_NATIVE_TOKEN`], Ether or ERC20, so the same
+/// ceiling.
+pub const TRANSFER_TOKEN: u64 = UNLOCK_NATIVE_TOKEN;
 
 /// Writes existing slots only. v1 only.
 pub const SET_TOKEN_TRANSFER_FEES: u64 = 90_000;
