@@ -11,8 +11,8 @@
 //! to them. Commands that allocate no new state move only for EIP-8038, which reprices state
 //! access. These are floors, not measurements: re-benchmark on a Gloas execution client.
 
-/// Writes one existing slot.
-pub const SET_OPERATING_MODE: u64 = 60_000;
+/// Halting writes the `mode` slot from zero, allocating a new slot (110_020); measured 116_162.
+pub const SET_OPERATING_MODE: u64 = 200_000;
 
 /// Proxy update before the initializer runs; `maximum_required_gas` is added on top.
 pub const UPGRADE_BASE: u64 = 75_000;
