@@ -335,9 +335,9 @@ pub trait GasMeter {
 pub struct ConstantGasMeter;
 
 impl GasMeter for ConstantGasMeter {
-	// The base transaction cost, which includes:
-	// 21_000 transaction cost, roughly worst case 64_000 for calldata, and 100_000
-	// for message verification
+	// Intrinsic gas, calldata and verification: about 120_000 for a real `submitV1` on
+	// Glamsterdam. Plus the smallest dispatch ceiling, it also covers the EIP-7976 calldata floor
+	// up to about 3.8 KB.
 	const MAXIMUM_BASE_GAS: u64 = 185_000;
 
 	fn maximum_dispatch_gas_used_at_most(command: &Command) -> u64 {

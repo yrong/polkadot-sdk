@@ -13,6 +13,7 @@
 pub const SET_OPERATING_MODE: u64 = 200_000;
 
 /// Proxy update before the initializer runs; `maximum_required_gas` is added on top.
+/// Measured 27_142.
 pub const UPGRADE_BASE: u64 = 75_000;
 
 /// Ether to a new account (183_600), or an ERC20 transfer to a fresh recipient (97_920),
@@ -31,8 +32,8 @@ pub const MINT_FOREIGN_TOKEN: u64 = 400_000;
 /// ceiling.
 pub const TRANSFER_TOKEN: u64 = UNLOCK_NATIVE_TOKEN;
 
-/// Writes existing slots only. v1 only.
+/// Writes existing slots only; measured 19_734. v1 only.
 pub const SET_TOKEN_TRANSFER_FEES: u64 = 90_000;
 
-/// Writes existing slots only. v1 only.
+/// Writes existing slots only; measured 43_837. v1 only.
 pub const SET_PRICING_PARAMETERS: u64 = 90_000;
