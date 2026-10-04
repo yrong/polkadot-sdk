@@ -18,7 +18,7 @@ use hex_literal::hex;
 use snowbridge_beacon_primitives::{
 	merkle_proof::{generalized_index_length, subtree_index},
 	types::deneb,
-	Fork, ForkVersions, NextSyncCommitteeUpdate, VersionedExecutionPayloadHeader,
+	CommitmentScheme, Fork, ForkVersions, NextSyncCommitteeUpdate, VersionedExecutionPayloadHeader,
 };
 use snowbridge_verification_primitives::{VerificationError, Verifier};
 use sp_core::H256;
@@ -1157,6 +1157,18 @@ mod gloas_branches {
 		ChainForkVersions::get().gloas.epoch * (SLOTS_PER_EPOCH as u64)
 	}
 
+	fn gloas_execution_gindex() -> usize {
+		EthereumBeaconClient::execution_commitment_gindex_at_slot(
+			gloas_slot(),
+			ChainForkVersions::get(),
+		)
+	}
+
+	/// Slot 0 is always pre-Gloas: the mock puts the fork at a non-zero epoch.
+	fn legacy_execution_gindex() -> usize {
+		EthereumBeaconClient::execution_commitment_gindex_at_slot(0, ChainForkVersions::get())
+	}
+
 	fn ancestry_leaf_index() -> usize {
 		((SLOTS_PER_HISTORICAL_ROOT as u64) + (ANCESTRY_SLOT % (SLOTS_PER_HISTORICAL_ROOT as u64)))
 			as usize
@@ -1179,11 +1191,14 @@ mod gloas_branches {
 		};
 		let slot = |epoch: u64| epoch * SLOTS_PER_EPOCH as u64;
 
-		for (epoch, finalized, current_sc, next_sc, block_roots) in [
-			(0u64, 105, 54, 55, 37),     // altair, and everything up to deneb falls here
-			(100, 169, 86, 87, 69),      // electra
-			(150, 169, 86, 87, 69),      // fulu, which shares electra's indices
-			(200, 735, 2945, 2946, 352), // gloas
+		use CommitmentScheme::{BlockHash, PayloadHeaderRoot};
+		for (epoch, finalized, current_sc, next_sc, block_roots, execution, scheme) in [
+			// altair, and everything up to deneb falls here
+			(0u64, 105, 54, 55, 37, 25, PayloadHeaderRoot),
+			(100, 169, 86, 87, 69, 25, PayloadHeaderRoot),
+			// fulu shares electra's indices
+			(150, 169, 86, 87, 69, 25, PayloadHeaderRoot),
+			(200, 735, 2945, 2946, 352, 2856, BlockHash),
 		] {
 			let s = slot(epoch);
 			assert_eq!(
@@ -1206,6 +1221,16 @@ mod gloas_branches {
 				block_roots,
 				"block_roots at epoch {epoch}"
 			);
+			assert_eq!(
+				EthereumBeaconClient::execution_commitment_gindex_at_slot(s, versions.clone()),
+				execution,
+				"execution_commitment at epoch {epoch}"
+			);
+			assert_eq!(
+				EthereumBeaconClient::commitment_scheme_at_slot(s, versions.clone()),
+				scheme,
+				"commitment_scheme at epoch {epoch}"
+			);
 		}
 	}
 
@@ -1213,8 +1238,8 @@ mod gloas_branches {
 	#[test]
 	fn pallet_selects_the_gloas_indices() {
 		new_tester().execute_with(|| {
-			assert_eq!(EthereumBeaconClient::execution_commitment_gindex(true), 2856);
-			assert_eq!(EthereumBeaconClient::execution_commitment_gindex(false), 25);
+			assert_eq!(gloas_execution_gindex(), 2856);
+			assert_eq!(legacy_execution_gindex(), 25);
 			assert_eq!(
 				EthereumBeaconClient::block_roots_gindex_at_slot(
 					gloas_slot(),
@@ -1228,7 +1253,7 @@ mod gloas_branches {
 	/// The execution block hash verifies into the block body at gindex 2856.
 	#[test]
 	fn execution_commitment_branch_verifies() {
-		let g = EthereumBeaconClient::execution_commitment_gindex(true);
+		let g = gloas_execution_gindex();
 		assert_eq!(generalized_index_length(g), 11);
 		assert!(verify_merkle_branch(
 			EXECUTION_BLOCK_HASH.into(),
@@ -1241,7 +1266,7 @@ mod gloas_branches {
 
 	#[test]
 	fn execution_commitment_branch_rejects_tampering() {
-		let g = EthereumBeaconClient::execution_commitment_gindex(true);
+		let g = gloas_execution_gindex();
 		let (idx, depth) = (subtree_index(g), generalized_index_length(g));
 
 		// A different execution block hash: the whole point of the commitment.
@@ -1277,7 +1302,7 @@ mod gloas_branches {
 		));
 
 		// The pre-Gloas index must not verify a Gloas branch.
-		let legacy = EthereumBeaconClient::execution_commitment_gindex(false);
+		let legacy = legacy_execution_gindex();
 		assert!(!verify_merkle_branch(
 			EXECUTION_BLOCK_HASH.into(),
 			&body_branch(),
@@ -1689,9 +1714,12 @@ mod gloas_end_to_end {
 	#[test]
 	fn fixture_slot_is_in_the_gloas_era() {
 		new_tester().execute_with(|| {
-			assert!(
-				compute_epoch(BEACON_SLOT, SLOTS_PER_EPOCH as u64) >=
-					ChainForkVersions::get().gloas.epoch
+			assert_eq!(
+				EthereumBeaconClient::commitment_scheme_at_slot(
+					BEACON_SLOT,
+					ChainForkVersions::get()
+				),
+				CommitmentScheme::BlockHash
 			);
 		});
 	}
@@ -1897,12 +1925,13 @@ mod gloas_checkpoint_and_ancestry {
 	}
 }
 
-/// Fork isolation: adding Gloas must not break the legacy path.
+/// Fork isolation: adding Gloas must not break the legacy path, and the two commitment
+/// schemes must not be interchangeable across eras.
 mod gloas_fork_isolation {
 	use super::*;
-	use snowbridge_beacon_primitives::CommitmentScheme;
 	fn is_gloas_era(slot: u64) -> bool {
-		compute_epoch(slot, SLOTS_PER_EPOCH as u64) >= ChainForkVersions::get().gloas.epoch
+		EthereumBeaconClient::commitment_scheme_at_slot(slot, ChainForkVersions::get()) ==
+			CommitmentScheme::BlockHash
 	}
 
 	/// The legacy path still works with Gloas configured. Guards against the Gloas arms
@@ -1915,13 +1944,57 @@ mod gloas_fork_isolation {
 		new_tester().execute_with(|| {
 			// The assertion is only meaningful if the fixture really is pre-Gloas.
 			assert!(!is_gloas_era(proof.header.slot));
-			assert!(proof.execution_header.scheme() != CommitmentScheme::BlockHash);
 
 			assert_ok!(EthereumBeaconClient::store_finalized_header(
 				proof.header,
 				H256::repeat_byte(0x99),
 			));
 			assert_ok!(EthereumBeaconClient::verify_execution_proof(&proof));
+		});
+	}
+
+	/// A Gloas-era slot must not accept a pre-Gloas commitment, even though the proof is
+	/// otherwise well formed and its header is finalized.
+	#[test]
+	fn gloas_era_slot_rejects_a_pre_gloas_commitment() {
+		let mut proof = super::gloas_end_to_end::execution_proof();
+		proof.execution_header = VersionedExecutionPayloadHeader::Deneb(Default::default());
+
+		new_tester().execute_with(|| {
+			assert!(is_gloas_era(proof.header.slot));
+
+			assert_ok!(EthereumBeaconClient::store_finalized_header(
+				proof.header,
+				H256::repeat_byte(0x99),
+			));
+			assert_err!(
+				EthereumBeaconClient::verify_execution_proof(&proof),
+				Error::<Test>::ExecutionHeaderEraMismatch
+			);
+		});
+	}
+
+	/// The mirror image: a pre-Gloas slot must not accept a Gloas commitment. The blob is
+	/// deliberately unparseable, which also pins the ordering — the scheme comes from the slot
+	/// and the mismatched variant is rejected before the RLP is parsed.
+	#[test]
+	fn pre_gloas_slot_rejects_a_gloas_commitment() {
+		let mut proof = Box::new(load_execution_proof_fixture());
+		proof.ancestry_proof = None;
+		proof.execution_header =
+			VersionedExecutionPayloadHeader::Gloas(vec![0xc0; 8].try_into().expect("fits; qed"));
+
+		new_tester().execute_with(|| {
+			assert!(!is_gloas_era(proof.header.slot));
+
+			assert_ok!(EthereumBeaconClient::store_finalized_header(
+				proof.header,
+				H256::repeat_byte(0x99),
+			));
+			assert_err!(
+				EthereumBeaconClient::verify_execution_proof(&proof),
+				Error::<Test>::ExecutionHeaderEraMismatch
+			);
 		});
 	}
 }
@@ -2108,7 +2181,10 @@ mod gloas_end_to_end_second {
 	/// blob-commitment list.
 	#[test]
 	fn commitment_leaf_is_the_execution_block_hash() {
-		let g = EthereumBeaconClient::execution_commitment_gindex(true);
+		let g = EthereumBeaconClient::execution_commitment_gindex_at_slot(
+			beacon_header().slot,
+			ChainForkVersions::get(),
+		);
 		assert!(verify_merkle_branch(
 			EXECUTION_BLOCK_HASH.into(),
 			&execution_branch(),

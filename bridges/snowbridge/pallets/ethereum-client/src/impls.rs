@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023 Snowfork <hello@snowfork.com>
 use super::*;
 use frame_support::ensure;
-use snowbridge_beacon_primitives::{CommitmentError, CommitmentScheme, ExecutionProof};
+use snowbridge_beacon_primitives::{CommitmentError, ExecutionProof};
 use sp_runtime::DispatchError;
 
 use alloy_primitives::Log as AlloyLog;
@@ -120,14 +120,16 @@ impl<T: Config> Pallet<T> {
 			},
 		}
 
-		let is_gloas = execution_proof.execution_header.scheme() == CommitmentScheme::BlockHash;
-
-		let commitment = execution_proof.execution_header.commitment().map_err(|e| match e {
+		let (commitment, gindex) = Self::execution_commitment_at_slot(
+			&execution_proof.execution_header,
+			execution_proof.header.slot,
+			T::ForkVersions::get(),
+		)
+		.map_err(|e| match e {
 			CommitmentError::Merkleization => Error::<T>::BlockBodyHashTreeRootFailed,
 			CommitmentError::MalformedExecutionHeader => Error::<T>::MalformedExecutionHeader,
+			CommitmentError::EraMismatch => Error::<T>::ExecutionHeaderEraMismatch,
 		})?;
-
-		let gindex = Self::execution_commitment_gindex(is_gloas);
 		ensure!(
 			verify_merkle_branch(
 				commitment.leaf(),

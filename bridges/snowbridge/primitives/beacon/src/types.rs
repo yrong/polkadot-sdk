@@ -395,9 +395,9 @@ pub enum VersionedExecutionPayloadHeader {
 	Gloas(BoundedVec<u8, ConstU32<MAX_EXECUTION_HEADER_RLP_SIZE>>),
 }
 
-/// The commitment scheme a proof uses. Pre-Gloas the leaf is the SSZ root of
-/// `BeaconBlockBody.execution_payload`; for Gloas it is the execution block hash at
-/// `BeaconBlockBody.signed_execution_payload_bid.message.parent_block_hash`.
+/// The leaf a proof commits to: pre-Gloas, the SSZ root of `BeaconBlockBody.execution_payload`;
+/// for Gloas, the execution block hash in `signed_execution_payload_bid.message.parent_block_hash`.
+/// The beacon header's slot picks the scheme, never the variant a relayer submits.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum CommitmentScheme {
 	PayloadHeaderRoot,
@@ -408,6 +408,8 @@ pub enum CommitmentScheme {
 pub enum CommitmentError {
 	Merkleization,
 	MalformedExecutionHeader,
+	/// The submitted variant cannot produce the scheme the header's slot demands.
+	EraMismatch,
 }
 
 /// The leaf `ExecutionProof::execution_branch` must prove, and the receipts root it unlocks.
@@ -433,18 +435,16 @@ impl ExecutionCommitment {
 }
 
 impl VersionedExecutionPayloadHeader {
-	/// Which commitment scheme this proof declares.
-	pub fn scheme(&self) -> CommitmentScheme {
-		match self {
-			VersionedExecutionPayloadHeader::Deneb(_) => CommitmentScheme::PayloadHeaderRoot,
-			VersionedExecutionPayloadHeader::Gloas(_) => CommitmentScheme::BlockHash,
-		}
-	}
-
-	/// Build the commitment the execution branch must prove.
-	pub fn commitment(&self) -> Result<ExecutionCommitment, CommitmentError> {
-		Ok(match self {
-			VersionedExecutionPayloadHeader::Deneb(header) => ExecutionCommitment {
+	/// Build the commitment for `scheme`, rejecting a variant that cannot satisfy it.
+	pub fn commitment(
+		&self,
+		scheme: CommitmentScheme,
+	) -> Result<ExecutionCommitment, CommitmentError> {
+		Ok(match (self, scheme) {
+			(
+				VersionedExecutionPayloadHeader::Deneb(header),
+				CommitmentScheme::PayloadHeaderRoot,
+			) => ExecutionCommitment {
 				leaf: hash_tree_root::<crate::ssz::deneb::SSZExecutionPayloadHeader>(
 					header.clone().try_into().map_err(|_| CommitmentError::Merkleization)?,
 				)
@@ -453,11 +453,14 @@ impl VersionedExecutionPayloadHeader {
 			},
 			// The leaf is the execution block hash, which is by definition the Keccak hash
 			// of the canonical header encoding. Hash the bytes exactly as submitted.
-			VersionedExecutionPayloadHeader::Gloas(rlp) => ExecutionCommitment {
-				leaf: keccak_256(rlp).into(),
-				receipts_root: receipts_root_from_rlp(rlp)
-					.ok_or(CommitmentError::MalformedExecutionHeader)?,
+			(VersionedExecutionPayloadHeader::Gloas(rlp), CommitmentScheme::BlockHash) => {
+				ExecutionCommitment {
+					leaf: keccak_256(rlp).into(),
+					receipts_root: receipts_root_from_rlp(rlp)
+						.ok_or(CommitmentError::MalformedExecutionHeader)?,
+				}
 			},
+			_ => return Err(CommitmentError::EraMismatch),
 		})
 	}
 }
@@ -774,7 +777,7 @@ mod gloas_execution_header_tests {
 
 	#[test]
 	fn commitment_leaf_is_the_block_hash() {
-		let commitment = gloas(&HEADER_RLP).commitment().unwrap();
+		let commitment = gloas(&HEADER_RLP).commitment(CommitmentScheme::BlockHash).unwrap();
 		assert_eq!(commitment.leaf(), H256::from(BLOCK_HASH));
 		assert_eq!(commitment.receipts_root(), H256::from(RECEIPTS_ROOT));
 	}
@@ -786,7 +789,10 @@ mod gloas_execution_header_tests {
 		let mut altered = HEADER_RLP.to_vec();
 		let last = altered.len() - 1;
 		altered[last] ^= 0x01;
-		assert_ne!(gloas(&altered).commitment().unwrap().leaf(), H256::from(BLOCK_HASH));
+		assert_ne!(
+			gloas(&altered).commitment(CommitmentScheme::BlockHash).unwrap().leaf(),
+			H256::from(BLOCK_HASH)
+		);
 	}
 
 	#[test]
