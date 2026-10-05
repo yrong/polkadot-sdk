@@ -16,14 +16,14 @@ doc:
     protocol and its verifiers, channel and flow-control state, the messaging inherent data,
     and the `ProvideUmpSignals` runtime hook.
 
-    Nothing emits the new signals yet. `validate_block` in `cumulus-pallet-parachain-system`
-    panics if a parachain emits one, until a follow-up forwards them.
+    Nothing emits the new signals yet. `SchedulingSignals::from_block_signals` in
+    `cumulus-primitives-core` panics if a parachain emits one, until a follow-up forwards them.
 crates:
 - name: polkadot-primitives
   bump: major
 - name: cumulus-primitives-spec-messaging
   bump: patch
-- name: cumulus-pallet-parachain-system
+- name: cumulus-primitives-core
   bump: patch
 - name: polkadot-primitives-test-helpers
   bump: patch
