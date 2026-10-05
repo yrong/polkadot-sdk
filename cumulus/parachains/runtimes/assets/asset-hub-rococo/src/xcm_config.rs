@@ -48,7 +48,7 @@ use polkadot_runtime_common::xcm_sender::ExponentialPrice;
 use rococo_runtime_constants::system_parachain::ASSET_HUB_ID;
 use sp_runtime::traits::{AccountIdConversion, TryConvertInto};
 use testnet_parachains_constants::rococo::snowbridge::{
-	EthereumNetwork, INBOUND_QUEUE_PALLET_INDEX,
+	EthereumNetwork, INBOUND_QUEUE_PALLET_INDEX, INBOUND_QUEUE_PALLET_INDEX_V2,
 };
 use xcm::latest::{prelude::*, ROCOCO_GENESIS_HASH, WESTEND_GENESIS_HASH};
 use xcm_builder::{
@@ -632,6 +632,13 @@ pub mod bridging {
 					PalletInstance(INBOUND_QUEUE_PALLET_INDEX)
 				]
 			);
+			pub SiblingBridgeHubWithEthereumInboundQueueV2Instance: Location = Location::new(
+				1,
+				[
+					Parachain(SiblingBridgeHubParaId::get()),
+					PalletInstance(INBOUND_QUEUE_PALLET_INDEX_V2)
+				]
+			);
 
 			/// Set up exporters configuration.
 			/// `Option<Asset>` represents static "base fee" which is used for total delivery fee calculation.
@@ -651,6 +658,7 @@ pub mod bridging {
 			pub UniversalAliases: BTreeSet<(Location, Junction)> = BTreeSet::from_iter(
 				alloc::vec![
 					(SiblingBridgeHubWithEthereumInboundQueueInstance::get(), GlobalConsensus(EthereumNetwork::get().into())),
+					(SiblingBridgeHubWithEthereumInboundQueueV2Instance::get(), GlobalConsensus(EthereumNetwork::get().into())),
 				]
 			);
 		}

@@ -121,7 +121,7 @@ pub mod system_parachain {
 	/// People parachain ID.
 	pub const PEOPLE_ID: u32 = 1004;
 	/// BridgeHub parachain ID.
-	pub const BRIDGE_HUB_ID: u32 = 1013;
+	pub const BRIDGE_HUB_ID: u32 = 1002;
 	/// Brokerage parachain ID.
 	pub const BROKER_ID: u32 = 1005;
 
