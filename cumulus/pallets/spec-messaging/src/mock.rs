@@ -15,7 +15,11 @@
 
 use crate as cumulus_pallet_spec_messaging;
 use cumulus_primitives_spec_messaging::WindowGrant;
-use frame_support::{derive_impl, parameter_types};
+use frame_support::{
+	derive_impl, parameter_types,
+	traits::{ConstU32, EnqueueMessage},
+	BoundedSlice,
+};
 use frame_system::EnsureRoot;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::BuildStorage;
@@ -54,12 +58,38 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 	type MaxMessagesPerBlock = MaxMessagesPerBlock;
 	type MaxTouchedStreams = MaxTouchedStreams;
 	type MaxContextGaps = MaxContextGaps;
-	type DataHandler = ();
+	type DataHandler = crate::EnqueueToXcmQueue<RecordingQueue>;
 	type OpenChannelOrigin = EnsureRoot<u64>;
 	type AcceptChannelOrigin = EnsureRoot<u64>;
 	type ChannelManagementOrigin = EnsureRoot<u64>;
 	type DefaultWindowGrant = TestGrant;
 	type MaxInFlight = TestGrant;
+}
+
+parameter_types! {
+	/// Messages [`RecordingQueue`] received: `(origin, message)`.
+	pub static Enqueued: Vec<(ParaId, Vec<u8>)> = Vec::new();
+}
+
+/// Message queue that records what it is given. Its `MaxMessageLen` is below the pallet's
+/// `MaxMsgLen`, so tests can reach the oversize path.
+pub struct RecordingQueue;
+
+impl EnqueueMessage<ParaId> for RecordingQueue {
+	type MaxMessageLen = ConstU32<512>;
+
+	fn enqueue_message(message: BoundedSlice<u8, Self::MaxMessageLen>, origin: ParaId) {
+		Enqueued::mutate(|enqueued| enqueued.push((origin, message.to_vec())));
+	}
+
+	fn enqueue_messages<'a>(
+		messages: impl Iterator<Item = BoundedSlice<'a, u8, Self::MaxMessageLen>>,
+		origin: ParaId,
+	) {
+		messages.for_each(|message| Self::enqueue_message(message, origin));
+	}
+
+	fn sweep_queue(_: ParaId) {}
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
