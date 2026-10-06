@@ -115,6 +115,12 @@ pub enum AggregateMessageOrigin {
 	///
 	/// This is used by the HRMP queue.
 	Sibling(ParaId),
+	/// The message came from a sibling para-chain over Speculative Messaging.
+	///
+	/// This is used by the Speculative Messaging queue. It converts to the same `Location` as
+	/// [`Self::Sibling`], so the XCM executor, its barriers and every filter see the same origin
+	/// as for HRMP: no XCM program can tell the two transports apart.
+	SpecMsg(ParaId),
 }
 
 impl From<AggregateMessageOrigin> for Location {
@@ -122,7 +128,9 @@ impl From<AggregateMessageOrigin> for Location {
 		match origin {
 			AggregateMessageOrigin::Here => Location::here(),
 			AggregateMessageOrigin::Parent => Location::parent(),
-			AggregateMessageOrigin::Sibling(id) => Location::new(1, Junction::Parachain(id.into())),
+			AggregateMessageOrigin::Sibling(id) | AggregateMessageOrigin::SpecMsg(id) => {
+				Location::new(1, Junction::Parachain(id.into()))
+			},
 		}
 	}
 }
@@ -775,5 +783,20 @@ sp_api::decl_runtime_apis! {
 		/// assembly; the `validate_block` wrapper calls the same implementation in-wasm after
 		/// each block of a bundle.
 		fn consumption_record() -> ConsumptionRecord;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn spec_msg_origin_is_the_sibling_location() {
+		// The XCM executor must not be able to tell spec-msg from HRMP.
+		let id = ParaId::from(2000u32);
+		assert_eq!(
+			Location::from(AggregateMessageOrigin::SpecMsg(id)),
+			Location::from(AggregateMessageOrigin::Sibling(id))
+		);
 	}
 }

@@ -46,11 +46,13 @@ use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::generic::DigestItem;
 
 pub use pallet::*;
+pub use xcm_transport::{xcm_channel, EnqueueToXcmQueue, XCM_CHANNEL_DOMAIN, XCM_CHANNEL_NUM};
 
 #[cfg(test)]
 mod mock;
 #[cfg(test)]
 mod tests;
+pub mod xcm_transport;
 
 /// The channel protocol version this implementation announces, in every `OpenChannel` signal and
 /// every published register. `0` gates nothing yet.
@@ -90,7 +92,8 @@ impl OutChannelMeta {
 	}
 }
 
-/// Sink for consumed `Data` payloads. `()` drops them; the real handler lands with the XCM layer.
+/// Sink for consumed `Data` payloads. `()` drops them; [`EnqueueToXcmQueue`] executes the XCM
+/// channel's payloads as XCM.
 pub trait OnSpecMsgData {
 	/// One `Data` payload, consumed in order at `position` of `(source, stream)`.
 	fn on_data(source: ParaId, stream: StreamId, position: MessagePosition, data: Vec<u8>);

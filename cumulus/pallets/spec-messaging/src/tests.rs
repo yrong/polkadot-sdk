@@ -945,6 +945,61 @@ fn rereading_an_unchanged_register_head_is_harmless() {
 	});
 }
 
+#[test]
+fn xcm_channel_data_is_enqueued_under_the_source() {
+	new_test_ext().execute_with(|| {
+		accept(0); // `stream(0)` is the XCM channel `(0, 0)`.
+		let open = SpecMsgKind::Signal(SpecMsgSignal::OpenChannel { version: 0 }).encode();
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			inherent(vec![(
+				src(),
+				stream(0),
+				ConsumeItem::Channel {
+					payloads: vec![open, data_payload(b"xcm-1"), data_payload(b"xcm-2")]
+				}
+			)]),
+		));
+		// Data in order, verbatim; the signal is the channel layer's, not XCM.
+		assert_eq!(Enqueued::get(), vec![(src(), b"xcm-1".to_vec()), (src(), b"xcm-2".to_vec())]);
+	});
+}
+
+#[test]
+fn other_channels_are_never_executed_as_xcm() {
+	new_test_ext().execute_with(|| {
+		accept(1);
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			inherent(vec![(
+				src(),
+				stream(1),
+				ConsumeItem::Channel { payloads: vec![data_payload(b"not xcm")] }
+			)]),
+		));
+		// Consumed, but not handed to the XCM queue.
+		assert_eq!(InboundFrontier::<Test>::get((src(), stream(1))).leaf_count(), 1);
+		assert!(Enqueued::get().is_empty());
+	});
+}
+
+#[test]
+#[should_panic(expected = "Defensive failure")]
+fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
+	new_test_ext().execute_with(|| {
+		accept(0);
+		// Within the pallet's `MaxMsgLen` (1024), over the queue's `MaxMessageLen` (512).
+		let _ = SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			inherent(vec![(
+				src(),
+				stream(0),
+				ConsumeItem::Channel { payloads: vec![data_payload(&[0u8; 600])] },
+			)]),
+		);
+	});
+}
+
 /// The first `n` leaves of [`src`]'s channel `0`, as `Data` payloads.
 fn skip_payloads(n: usize) -> Vec<Vec<u8>> {
 	(0..n).map(|i| data_payload(&[i as u8])).collect()
