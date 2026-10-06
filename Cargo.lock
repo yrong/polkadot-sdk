@@ -5726,6 +5726,7 @@ dependencies = [
  "cumulus-pallet-weight-reclaim",
  "cumulus-primitives-aura",
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "cumulus-primitives-storage-weight-reclaim",
  "frame-executive",
  "frame-support",
