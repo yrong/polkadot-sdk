@@ -19,8 +19,8 @@
 //! `SpecMsg(source)`; outbound, [`SpecMsgRouter`] sends to a sibling with no HRMP channel.
 
 use crate::{
-	BlockStreamsRoot, Config, Error, HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages,
-	Pallet,
+	BlockStreamsRoot, Config, Error, HrmpClosing, OnSpecMsgData, OutChannels, OutboundLeafHashes,
+	OutboundMessages, Pallet, SendsThisBlock,
 };
 use alloc::vec::Vec;
 use codec::{DecodeAll, DecodeLimit, Encode};
@@ -165,8 +165,10 @@ impl<T: Config, ChannelInfo, VersionWrapper, Price> InspectMessageQueues
 	for SpecMsgRouter<T, ChannelInfo, VersionWrapper, Price>
 {
 	fn clear_messages() {
-		// `OutboundMessages` holds only this block's sends, so this isolates a dry run's output.
+		// These hold only this block's sends, so this isolates a dry run's output.
 		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
+		let _ = OutboundLeafHashes::<T>::clear(u32::MAX, None);
+		SendsThisBlock::<T>::kill();
 		// The state is the last block's, whose `on_finalize` may have committed a root: a send
 		// would then fail with `RootCommitted`, though it would not in a real block.
 		BlockStreamsRoot::<T>::kill();
