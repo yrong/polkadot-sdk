@@ -92,6 +92,45 @@ impl EnqueueMessage<ParaId> for RecordingQueue {
 	fn sweep_queue(_: ParaId) {}
 }
 
+parameter_types! {
+	/// HRMP channel state [`MockHrmp`] reports for every sibling.
+	pub static HrmpState: HrmpChannel = HrmpChannel::Closed;
+}
+
+/// The HRMP channel state tests can set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HrmpChannel {
+	Closed,
+	Ready,
+	Full,
+}
+
+/// HRMP channel info for the XCM router tests: every sibling is in [`HrmpState`].
+pub struct MockHrmp;
+
+impl cumulus_primitives_core::GetChannelInfo for MockHrmp {
+	fn get_channel_status(_: ParaId) -> cumulus_primitives_core::ChannelStatus {
+		use cumulus_primitives_core::ChannelStatus;
+		match HrmpState::get() {
+			HrmpChannel::Closed => ChannelStatus::Closed,
+			HrmpChannel::Ready => ChannelStatus::Ready(1024, 1024),
+			HrmpChannel::Full => ChannelStatus::Full,
+		}
+	}
+
+	fn get_channel_info(_: ParaId) -> Option<cumulus_primitives_core::ChannelInfo> {
+		None
+	}
+}
+
+/// The router as a runtime would wire it, with no fee and no version negotiation.
+pub type Router = crate::SpecMsgRouter<
+	Test,
+	MockHrmp,
+	(),
+	polkadot_runtime_common::xcm_sender::NoPriceForMessageDelivery<ParaId>,
+>;
+
 pub fn new_test_ext() -> sp_io::TestExternalities {
 	let mut ext: sp_io::TestExternalities =
 		frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into();

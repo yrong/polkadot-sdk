@@ -1000,6 +1000,101 @@ fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
 	});
 }
 
+mod router {
+	use super::*;
+	use xcm::{
+		latest::{
+			send_xcm, Instruction::ClearOrigin, Junction::Parachain, Location, SendError, SendXcm,
+			Xcm,
+		},
+		VersionedLocation, VersionedXcm,
+	};
+	use xcm_builder::InspectMessageQueues;
+
+	fn sibling() -> Location {
+		Location::new(1, [Parachain(u32::from(peer()))])
+	}
+
+	fn xcm() -> Xcm<()> {
+		Xcm(vec![ClearOrigin])
+	}
+
+	/// `validate` declined: it says `NotApplicable` and hands both arguments back.
+	fn declines(dest: Location) {
+		let (mut d, mut m) = (Some(dest.clone()), Some(xcm()));
+		assert_eq!(Router::validate(&mut d, &mut m), Err(SendError::NotApplicable));
+		assert_eq!((d, m), (Some(dest), Some(xcm())));
+	}
+
+	#[test]
+	fn other_destinations_are_not_applicable() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			declines(Location::parent());
+			declines(Location::new(1, [Parachain(1), Parachain(2)]));
+		});
+	}
+
+	#[test]
+	fn hrmp_wins_while_it_exists() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			for state in [HrmpChannel::Ready, HrmpChannel::Full] {
+				HrmpState::set(state);
+				declines(sibling());
+			}
+		});
+	}
+
+	#[test]
+	fn without_an_open_spec_msg_channel_it_falls_through() {
+		new_test_ext().execute_with(|| {
+			// No channel at all.
+			declines(sibling());
+			// Opened, but the peer's register not read yet.
+			open_out_channel();
+			declines(sibling());
+		});
+	}
+
+	#[test]
+	fn xcm_goes_over_the_open_channel_and_dry_runs_see_it() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+
+			// The leaf is the `VersionedXcm`, bare, as `Data` on the XCM channel.
+			let sent = sent_on(SpecMessaging::outbound_stream(&xcm_channel(peer())));
+			assert_eq!(
+				sent.last(),
+				Some(&SpecMsgKind::Data(VersionedXcm::<()>::from(xcm()).encode()).encode())
+			);
+			// The dry-run view decodes it back; the `OpenChannel` signal is not XCM.
+			assert_eq!(
+				Router::get_messages(),
+				vec![(VersionedLocation::from(sibling()), vec![VersionedXcm::from(xcm())])]
+			);
+			Router::clear_messages();
+			assert!(Router::get_messages().is_empty());
+		});
+	}
+
+	#[test]
+	fn an_open_channel_without_credit_is_a_hard_error() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			// A grant of 4 messages, and `OpenChannel` is one of them.
+			for _ in 0..3 {
+				assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			}
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("spec-msg XCM channel has no capacity"))
+			);
+		});
+	}
+}
+
 /// The first `n` leaves of [`src`]'s channel `0`, as `Data` payloads.
 fn skip_payloads(n: usize) -> Vec<Vec<u8>> {
 	(0..n).map(|i| data_payload(&[i as u8])).collect()

@@ -46,7 +46,9 @@ use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::generic::DigestItem;
 
 pub use pallet::*;
-pub use xcm_transport::{xcm_channel, EnqueueToXcmQueue, XCM_CHANNEL_DOMAIN, XCM_CHANNEL_NUM};
+pub use xcm_transport::{
+	xcm_channel, EnqueueToXcmQueue, SpecMsgRouter, XCM_CHANNEL_DOMAIN, XCM_CHANNEL_NUM,
+};
 
 #[cfg(test)]
 mod mock;
@@ -861,14 +863,32 @@ impl<T: Config> Pallet<T> {
 		StreamId::Ack { recipient: channel.peer, domain: channel.domain, num: channel.num }
 	}
 
-	/// Send `data` on an outbound channel as a [`SpecMsgKind::Data`] leaf, returning its position.
-	/// The channel must be `Open` with credit left in the peer's granted window. On error, nothing
-	/// changes.
-	pub fn send(channel: ChannelId, data: Vec<u8>) -> Result<MessagePosition, Error<T>> {
+	/// Whether [`Pallet::send`] would accept `data_len` bytes on `channel` now: the encoded
+	/// [`SpecMsgKind::Data`] leaf fits [`Config::MaxMsgLen`] and the peer's `max_message_size`, the
+	/// channel is `Open` with credit left, and the stream has room this block. No side effects.
+	pub fn can_send(channel: &ChannelId, data_len: usize) -> Result<(), Error<T>> {
+		// The leaf is `SpecMsgKind::Data` SCALE-encoded: a variant byte, the compact length, the
+		// bytes.
+		let len = u32::try_from(data_len).map_err(|_| Error::<T>::MessageTooBig)?;
+		let leaf_len = (data_len as u64)
+			.saturating_add(1)
+			.saturating_add(codec::Compact(len).encoded_size() as u64);
+		ensure!(leaf_len <= u64::from(T::MaxMsgLen::get()), Error::<T>::MessageTooBig);
+
 		let state = OutChannels::<T>::get(channel).ok_or(Error::<T>::ChannelNotOpen)?;
 		ensure!(state.phase() == ChannelPhase::Open, Error::<T>::ChannelNotOpen);
+		Self::ensure_credit(channel, &state, leaf_len as usize)?;
+
+		let queued = OutboundMessages::<T>::decode_len(Self::outbound_stream(channel)).unwrap_or(0);
+		ensure!(queued < T::MaxMessagesPerBlock::get() as usize, Error::<T>::TooManyMessages);
+		Ok(())
+	}
+
+	/// Send `data` on an outbound channel as a [`SpecMsgKind::Data`] leaf, returning its position.
+	/// Fails, changing nothing, unless [`Pallet::can_send`] holds.
+	pub fn send(channel: ChannelId, data: Vec<u8>) -> Result<MessagePosition, Error<T>> {
+		Self::can_send(&channel, data.len())?;
 		let payload = SpecMsgKind::Data(data).encode();
-		Self::ensure_credit(&channel, &state, payload.len())?;
 		let size = payload.len() as u32;
 		let position = Self::append_to_stream(Self::outbound_stream(&channel), payload)?;
 		OutChannelsMeta::<T>::mutate(channel, |meta| meta.account_send(size));
