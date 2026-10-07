@@ -693,6 +693,8 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type SelfParaId = ParachainInfo;
 	type MaxMsgLen = SpecMsgMaxMsgLen;
 	type MaxMessagesPerBlock = ConstU32<256>;
+	// Every block with sends reads all stream frontiers; this bounds that block's PoV.
+	type MaxStreams = ConstU32<1024>;
 	type MaxTouchedStreams = ConstU32<128>;
 	type MaxContextGaps = ConstU32<64>;
 	// Execute the XCM channel's payloads under `SpecMsg(source)`, which XCM sees as the sibling.
