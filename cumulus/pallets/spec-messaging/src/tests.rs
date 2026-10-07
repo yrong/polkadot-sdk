@@ -1005,6 +1005,54 @@ fn hrmp_closing_needs_an_open_xcm_channel() {
 	});
 }
 
+/// An outbound channel data stream to a peer, by number.
+fn out_stream(num: u16) -> StreamId {
+	StreamId::Channel { recipient: peer(), domain: 0, num }
+}
+
+#[test]
+fn the_stream_count_changes_only_on_first_touch() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![1]));
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![2]));
+		assert_eq!(StreamCount::<Test>::get(), 1);
+
+		// Drained into its stored frontier, the stream still exists.
+		roll_one_block();
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![3]));
+		assert_eq!(StreamCount::<Test>::get(), 1);
+
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(1), vec![1]));
+		assert_eq!(StreamCount::<Test>::get(), 2);
+	});
+}
+
+#[test]
+fn the_stream_cap_refuses_new_streams_on_every_path() {
+	new_test_ext().execute_with(|| {
+		for num in 0..MaxStreams::get() as u16 {
+			assert_ok!(SpecMessaging::append_to_stream(out_stream(num), vec![1]));
+		}
+		assert_err!(
+			SpecMessaging::append_to_stream(out_stream(999), vec![1]),
+			Error::<Test>::TooManyOutboundStreams
+		);
+		// Opening a channel and accepting one both create a stream.
+		assert_err!(
+			SpecMessaging::open_channel(RuntimeOrigin::root(), peer(), 1, 0),
+			Error::<Test>::TooManyOutboundStreams
+		);
+		assert_err!(
+			SpecMessaging::accept_open_channel(RuntimeOrigin::root(), src(), 0, 0),
+			Error::<Test>::TooManyOutboundStreams
+		);
+
+		// Existing streams keep working.
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![2]));
+		assert_eq!(StreamCount::<Test>::get(), MaxStreams::get());
+	});
+}
+
 mod router {
 	use super::*;
 	use xcm::{

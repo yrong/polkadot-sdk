@@ -138,6 +138,13 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxMessagesPerBlock: Get<u32>;
 
+		/// Cap on the outbound streams this chain ever creates: one per opened channel, one `Ack`
+		/// stream per accepted channel. Streams are never removed, and every block with sends
+		/// recomputes the `StreamsRoot` from all of them, so this bounds that block's weight and
+		/// PoV. Size it against the PoV budget.
+		#[pallet::constant]
+		type MaxStreams: Get<u32>;
+
 		/// Per-block cap on streams the inherent may touch; `integrity_test` keeps it
 		/// `<= MAX_COMMITMENT_ENTRIES`.
 		#[pallet::constant]
@@ -198,6 +205,10 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type InboundFrontier<T: Config> =
 		StorageMap<_, Twox64Concat, (ParaId, StreamId), MmrFrontier, ValueQuery>;
+
+	/// Number of outbound streams ever created, at most [`Config::MaxStreams`].
+	#[pallet::storage]
+	pub type StreamCount<T: Config> = StorageValue<_, u32, ValueQuery>;
 
 	/// Sender side, per outbound channel. The phase is a view: `Opening` until the peer's register
 	/// is first read, which is the acceptance. Entries are never removed.
@@ -283,6 +294,8 @@ pub mod pallet {
 		BadRegister,
 		/// No such channel.
 		UnknownChannel,
+		/// A new outbound stream would exceed [`Config::MaxStreams`].
+		TooManyOutboundStreams,
 		/// The channel is already closed from this side.
 		AlreadyClosed,
 		/// The inbound channel is already suspended.
@@ -672,7 +685,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Append `payload` to `stream`'s outbound MMR, returning its stable position. Enforces only
-	/// the consensus hard caps.
+	/// the consensus hard caps, and [`Config::MaxStreams`] when this creates the stream.
 	pub fn append_to_stream(
 		stream: StreamId,
 		payload: Vec<u8>,
@@ -684,9 +697,20 @@ impl<T: Config> Pallet<T> {
 		// Once the root is committed (`parachain-system` does so in its `on_finalize`), a send
 		// would show in `outbound_messages` but not in the root, and no node could serve it.
 		ensure!(!BlockStreamsRoot::<T>::exists(), Error::<T>::RootCommitted);
+		// A stream exists once it has a stored frontier, or sends queued this block.
+		let new_stream = !OutboundFrontier::<T>::contains_key(stream) &&
+			!OutboundMessages::<T>::contains_key(stream);
+		if new_stream {
+			let count = StreamCount::<T>::get();
+			ensure!(count < T::MaxStreams::get(), Error::<T>::TooManyOutboundStreams);
+		}
+
 		let index = OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
 		OutboundMessages::<T>::try_append(stream, payload)
 			.map_err(|()| Error::<T>::TooManyMessages)?;
+		if new_stream {
+			StreamCount::<T>::mutate(|count| *count = count.saturating_add(1));
+		}
 
 		Ok(MessagePosition(OutboundFrontier::<T>::get(stream).leaf_count() + index))
 	}
