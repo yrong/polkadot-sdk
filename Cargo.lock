@@ -5404,6 +5404,7 @@ version = "0.1.0"
 dependencies = [
  "cumulus-primitives-core",
  "cumulus-primitives-spec-messaging",
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "log",
