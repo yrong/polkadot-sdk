@@ -43,18 +43,23 @@ use cumulus_primitives_spec_messaging::{
 use frame_support::{ensure, pallet_prelude::Weight, traits::Get, BoundedVec};
 use polkadot_core_primitives::Hash;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
-use sp_runtime::generic::DigestItem;
+use sp_runtime::{generic::DigestItem, Saturating};
 
 pub use pallet::*;
 pub use xcm_transport::{
 	xcm_channel, EnqueueToXcmQueue, SpecMsgRouter, XCM_CHANNEL_DOMAIN, XCM_CHANNEL_NUM,
 };
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 #[cfg(test)]
 mod mock;
 #[cfg(test)]
 mod tests;
+pub mod weights;
 pub mod xcm_transport;
+
+pub use weights::WeightInfo;
 
 /// The channel protocol version this implementation announces, in every `OpenChannel` signal and
 /// every published register. `0` gates nothing yet.
@@ -180,6 +185,9 @@ pub mod pallet {
 		/// the peer's grant. It bounds the per-channel bookkeeping and the archive's unconfirmed
 		/// tail whatever the peer grants.
 		type MaxInFlight: Get<WindowGrant>;
+
+		/// Weights of this pallet's calls and hooks.
+		type WeightInfo: WeightInfo;
 	}
 
 	/// Per-stream outbound MMR frontiers; reflects state as of the previous block.
@@ -330,11 +338,15 @@ pub mod pallet {
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
 			// Usually the roll-over runs here. A pallet whose `on_initialize` runs first and sends
-			// has already run it; the drain is charged here either way. TODO: benchmark.
+			// has already run it; the drain is charged here either way.
 			let drained = Self::roll_over();
-			T::DbWeight::get().reads_writes(3, 3).saturating_add(
-				T::DbWeight::get().reads_writes(2, 2).saturating_mul(drained.into()),
-			)
+
+			// `on_finalize` cannot report weight, so reserve the fold's worst case now: every
+			// stream, and a full block of sends.
+			T::WeightInfo::drain(drained).saturating_add(T::WeightInfo::commit_streams_root(
+				StreamCount::<T>::get(),
+				T::MaxSendsPerBlock::get(),
+			))
 		}
 
 		fn on_finalize(_n: BlockNumberFor<T>) {
@@ -398,7 +410,7 @@ pub mod pallet {
 		/// is read. A reopen after our own close is `Open` at once; after the peer's close it
 		/// waits for a new register.
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::open_channel())]
 		pub fn open_channel(
 			origin: OriginFor<T>,
 			recipient: ParaId,
@@ -444,7 +456,7 @@ pub mod pallet {
 		/// `Ack` stream: the acceptance as the sender sees it. Either order works; accepting first
 		/// is pre-authorization. Rejecting is never accepting, which costs nothing.
 		#[pallet::call_index(2)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::accept_open_channel())]
 		pub fn accept_open_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -482,7 +494,7 @@ pub mod pallet {
 		/// advisory and safe at any time; [`Pallet::open_channel`] reopens over the same stream.
 		/// With no credit left, just stop sending: abandonment needs no signal.
 		#[pallet::call_index(3)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::close_channel())]
 		pub fn close_channel(
 			origin: OriginFor<T>,
 			recipient: ParaId,
@@ -506,7 +518,7 @@ pub mod pallet {
 		/// grant; `up_to` still reports what we consumed) and stop consuming it. The frontier is
 		/// kept, so [`Pallet::accept_open_channel`] later resumes where consumption stopped.
 		#[pallet::call_index(4)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::close_inbound_channel())]
 		pub fn close_inbound_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -527,7 +539,7 @@ pub mod pallet {
 		/// [`Pallet::consumed_streams`] omits the stream, and the published register grants
 		/// zero. All state stays.
 		#[pallet::call_index(5)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::suspend_inbound_channel())]
 		pub fn suspend_inbound_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -547,7 +559,7 @@ pub mod pallet {
 		/// Resume a suspended inbound channel: republish a real grant. Consumption restarts from
 		/// the kept frontier.
 		#[pallet::call_index(6)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::resume_inbound_channel())]
 		pub fn resume_inbound_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -627,7 +639,7 @@ pub mod pallet {
 		/// execute before an older one still queued from HRMP: where order matters, let that queue
 		/// drain first.
 		#[pallet::call_index(8)]
-		#[pallet::weight((T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational))]
+		#[pallet::weight((T::WeightInfo::set_hrmp_closing(), DispatchClass::Operational))]
 		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
 			T::ChannelManagementOrigin::ensure_origin(origin)?;
 			let open = OutChannels::<T>::get(xcm_channel(peer))
@@ -640,7 +652,7 @@ pub mod pallet {
 		/// Clear the [`HrmpClosing`] flag for `peer`: the router prefers HRMP again whenever an
 		/// HRMP channel is open. XCM already sent over spec-msg is still delivered. Idempotent.
 		#[pallet::call_index(9)]
-		#[pallet::weight((T::DbWeight::get().reads_writes(0, 1), DispatchClass::Operational))]
+		#[pallet::weight((T::WeightInfo::clear_hrmp_closing(), DispatchClass::Operational))]
 		pub fn clear_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
 			T::ChannelManagementOrigin::ensure_origin(origin)?;
 			HrmpClosing::<T>::remove(peer);
@@ -667,11 +679,27 @@ pub mod pallet {
 	}
 }
 
-/// Weight of one `enact_messages`. TODO: benchmark.
+/// Weight of one `enact_messages`, from the inherent's shape: channel items, payloads beyond one
+/// per item, payload bytes, register reads.
 fn enact_weight<T: Config>(data: &MessagingInherentData) -> Weight {
-	T::DbWeight::get()
-		.reads_writes(1, 1)
-		.saturating_mul(1 + data.items.len() as u64)
+	let (mut items, mut payloads, mut bytes, mut reads) = (0u32, 0u32, 0u32, 0u32);
+	for (_, _, item) in &data.items {
+		let item_payloads = match item {
+			ConsumeItem::Channel { payloads } => {
+				items.saturating_inc();
+				payloads
+			},
+			ConsumeItem::Events { payloads, .. } => {
+				reads.saturating_inc();
+				payloads
+			},
+		};
+		payloads = payloads.saturating_add(item_payloads.len() as u32);
+		bytes = item_payloads
+			.iter()
+			.fold(bytes, |sum, payload| sum.saturating_add(payload.len() as u32));
+	}
+	T::WeightInfo::enact_messages(items, payloads.saturating_sub(items), bytes, reads)
 }
 
 impl<T: Config> Pallet<T> {

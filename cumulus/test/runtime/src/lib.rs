@@ -380,6 +380,8 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type ChannelManagementOrigin = EnsureRoot<AccountId>;
 	type DefaultWindowGrant = SpecMsgWindowGrant;
 	type MaxInFlight = SpecMsgWindowGrant;
+	// TODO: benchmarked weights.
+	type WeightInfo = ();
 }
 
 impl parachain_info::Config for Runtime {}

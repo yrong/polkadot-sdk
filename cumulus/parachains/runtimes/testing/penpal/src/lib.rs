@@ -708,6 +708,8 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type ChannelManagementOrigin = EnsureRoot<AccountId>;
 	type DefaultWindowGrant = SpecMsgWindowGrant;
 	type MaxInFlight = SpecMsgWindowGrant;
+	// TODO: benchmarked weights.
+	type WeightInfo = ();
 }
 
 parameter_types! {
@@ -906,6 +908,7 @@ mod benches {
 		[pallet_collator_selection, CollatorSelection]
 		[cumulus_pallet_parachain_system, ParachainSystem]
 		[cumulus_pallet_xcmp_queue, XcmpQueue]
+		[cumulus_pallet_spec_messaging, SpecMessaging]
 		[pallet_utility, Utility]
 	);
 }
