@@ -42,6 +42,7 @@ parameter_types! {
 	pub const MaxMessagesPerBlock: u32 = 16;
 	/// Small, so tests can reach the cap.
 	pub const MaxStreams: u32 = 16;
+	pub const MaxSendsPerBlock: u32 = 64;
 	pub const MaxTouchedStreams: u32 = 8;
 	pub const MaxContextGaps: u32 = 4;
 	pub SelfParaId: ParaId = ParaId::from(SELF_PARA);
@@ -55,6 +56,7 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 	type MaxMsgLen = MaxMsgLen;
 	type MaxMessagesPerBlock = MaxMessagesPerBlock;
 	type MaxStreams = MaxStreams;
+	type MaxSendsPerBlock = MaxSendsPerBlock;
 	type MaxTouchedStreams = MaxTouchedStreams;
 	type MaxContextGaps = MaxContextGaps;
 	type DataHandler = crate::EnqueueToXcmQueue<RecordingQueue>;

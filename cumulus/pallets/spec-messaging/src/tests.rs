@@ -1053,6 +1053,62 @@ fn the_stream_cap_refuses_new_streams_on_every_path() {
 	});
 }
 
+#[test]
+fn sends_store_their_leaf_hashes_in_order() {
+	new_test_ext().execute_with(|| {
+		let payloads = [vec![1u8], vec![2, 2], vec![3, 3, 3]];
+		for payload in &payloads {
+			assert_ok!(SpecMessaging::append_to_stream(out_stream(0), payload.clone()));
+		}
+		let expected: Vec<_> = payloads.iter().map(|p| leaf_hash(LEAF_VERSION, p)).collect();
+		assert_eq!(OutboundLeafHashes::<Test>::get(out_stream(0)).into_inner(), expected);
+
+		// The drain folds them into the frontier and clears both queues.
+		roll_one_block();
+		assert!(OutboundLeafHashes::<Test>::iter().next().is_none());
+		assert!(OutboundMessages::<Test>::iter().next().is_none());
+		assert_eq!(OutboundFrontier::<Test>::get(out_stream(0)).leaf_count(), 3);
+	});
+}
+
+#[test]
+fn the_per_block_send_cap_resets_every_block() {
+	new_test_ext().execute_with(|| {
+		// Spread over streams, so the per-stream cap is not what binds.
+		let per_stream = MaxMessagesPerBlock::get();
+		let mut sent = 0;
+		for num in 0.. {
+			for _ in 0..per_stream {
+				if sent == MaxSendsPerBlock::get() {
+					break;
+				}
+				assert_ok!(SpecMessaging::append_to_stream(out_stream(num), vec![1]));
+				sent += 1;
+			}
+			if sent == MaxSendsPerBlock::get() {
+				break;
+			}
+		}
+		assert_err!(
+			SpecMessaging::append_to_stream(out_stream(0), vec![1]),
+			Error::<Test>::TooManySends
+		);
+
+		roll_one_block();
+		assert_eq!(SendsThisBlock::<Test>::get(), 0);
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![1]));
+	});
+}
+
+#[test]
+fn can_send_refuses_once_the_block_is_full() {
+	new_test_ext().execute_with(|| {
+		open_and_accepted();
+		SendsThisBlock::<Test>::put(MaxSendsPerBlock::get());
+		assert_err!(SpecMessaging::can_send(&out_channel(), 1), Error::<Test>::TooManySends);
+	});
+}
+
 mod router {
 	use super::*;
 	use xcm::{

@@ -145,6 +145,11 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxStreams: Get<u32>;
 
+		/// Cap on sends per block, across all streams. With [`Config::MaxStreams`] it bounds the
+		/// end-of-block `StreamsRoot` fold, which `on_initialize` reserves weight for.
+		#[pallet::constant]
+		type MaxSendsPerBlock: Get<u32>;
+
 		/// Per-block cap on streams the inherent may touch; `integrity_test` keeps it
 		/// `<= MAX_COMMITMENT_ENTRIES`.
 		#[pallet::constant]
@@ -191,6 +196,16 @@ pub mod pallet {
 		BoundedVec<BoundedVec<u8, T::MaxMsgLen>, T::MaxMessagesPerBlock>,
 		ValueQuery,
 	>;
+
+	/// The leaf hashes of [`OutboundMessages`], in the same order. Each payload is hashed once,
+	/// when it is sent, so the end-of-block fold and the next block's drain only fold hashes.
+	#[pallet::storage]
+	pub type OutboundLeafHashes<T: Config> =
+		StorageMap<_, Twox64Concat, StreamId, BoundedVec<Hash, T::MaxMessagesPerBlock>, ValueQuery>;
+
+	/// Sends this block, across all streams; at most [`Config::MaxSendsPerBlock`].
+	#[pallet::storage]
+	pub type SendsThisBlock<T: Config> = StorageValue<_, u32, ValueQuery>;
 
 	/// This block's committed [`StreamsRoot`] (the `Provides` source); transient.
 	#[pallet::storage]
@@ -296,6 +311,8 @@ pub mod pallet {
 		UnknownChannel,
 		/// A new outbound stream would exceed [`Config::MaxStreams`].
 		TooManyOutboundStreams,
+		/// This block already holds [`Config::MaxSendsPerBlock`] sends.
+		TooManySends,
 		/// The channel is already closed from this side.
 		AlreadyClosed,
 		/// The inbound channel is already suspended.
@@ -671,11 +688,15 @@ impl<T: Config> Pallet<T> {
 
 		BlockStreamsRoot::<T>::kill();
 		ConsumptionOutbox::<T>::kill();
+		SendsThisBlock::<T>::kill();
+
+		// Drain by the stored leaf hashes.
+		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
 		let mut drained = 0u32;
-		for (stream, messages) in OutboundMessages::<T>::drain() {
+		for (stream, hashes) in OutboundLeafHashes::<T>::drain() {
 			let mut frontier = OutboundFrontier::<T>::get(stream);
-			for payload in &messages {
-				frontier.append(leaf_hash(LEAF_VERSION, payload));
+			for hash in hashes {
+				frontier.append(hash);
 				drained = drained.saturating_add(1);
 			}
 			OutboundFrontier::<T>::insert(stream, frontier);
@@ -704,10 +725,17 @@ impl<T: Config> Pallet<T> {
 			let count = StreamCount::<T>::get();
 			ensure!(count < T::MaxStreams::get(), Error::<T>::TooManyOutboundStreams);
 		}
+		let sends = SendsThisBlock::<T>::get();
+		ensure!(sends < T::MaxSendsPerBlock::get(), Error::<T>::TooManySends);
 
+		// Hash the leaf now, once: the fold and the drain use the stored hash.
+		let hash = leaf_hash(LEAF_VERSION, &payload);
 		let index = OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
 		OutboundMessages::<T>::try_append(stream, payload)
 			.map_err(|()| Error::<T>::TooManyMessages)?;
+		OutboundLeafHashes::<T>::try_append(stream, hash)
+			.map_err(|()| Error::<T>::TooManyMessages)?;
+		SendsThisBlock::<T>::put(sends.saturating_add(1));
 		if new_stream {
 			StreamCount::<T>::mutate(|count| *count = count.saturating_add(1));
 		}
@@ -734,10 +762,10 @@ impl<T: Config> Pallet<T> {
 		}
 
 		let mut touched = false;
-		for (stream, messages) in OutboundMessages::<T>::iter() {
+		for (stream, hashes) in OutboundLeafHashes::<T>::iter() {
 			let mut frontier = OutboundFrontier::<T>::get(stream);
-			for payload in &messages {
-				frontier.append(leaf_hash(LEAF_VERSION, payload));
+			for hash in hashes {
+				frontier.append(hash);
 			}
 			entries.insert(stream, frontier.root().0);
 			touched = true;
@@ -934,7 +962,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Whether [`Pallet::send`] would accept `data_len` bytes on `channel` now: the encoded
 	/// [`SpecMsgKind::Data`] leaf fits [`Config::MaxMsgLen`] and the peer's `max_message_size`, the
-	/// channel is `Open` with credit left, and the stream has room this block. No side effects.
+	/// channel is `Open` with credit left, and the stream and the block have room. No side effects.
 	pub fn can_send(channel: &ChannelId, data_len: usize) -> Result<(), Error<T>> {
 		// The leaf is `SpecMsgKind::Data` SCALE-encoded: a variant byte, the compact length, the
 		// bytes.
@@ -950,6 +978,7 @@ impl<T: Config> Pallet<T> {
 
 		let queued = OutboundMessages::<T>::decode_len(Self::outbound_stream(channel)).unwrap_or(0);
 		ensure!(queued < T::MaxMessagesPerBlock::get() as usize, Error::<T>::TooManyMessages);
+		ensure!(SendsThisBlock::<T>::get() < T::MaxSendsPerBlock::get(), Error::<T>::TooManySends);
 		Ok(())
 	}
 
