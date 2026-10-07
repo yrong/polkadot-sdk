@@ -1000,6 +1000,28 @@ fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
 	});
 }
 
+#[test]
+fn hrmp_closing_needs_an_open_xcm_channel() {
+	new_test_ext().execute_with(|| {
+		assert_err!(
+			SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer()),
+			Error::<Test>::ChannelNotOpen
+		);
+		open_and_accepted();
+		assert!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::signed(1), peer()).is_err());
+
+		// Setting and clearing are idempotent.
+		for _ in 0..2 {
+			assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer()));
+			assert!(HrmpClosing::<Test>::contains_key(peer()));
+		}
+		for _ in 0..2 {
+			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer()));
+			assert!(!HrmpClosing::<Test>::contains_key(peer()));
+		}
+	});
+}
+
 mod router {
 	use super::*;
 	use xcm::{
@@ -1076,6 +1098,24 @@ mod router {
 			);
 			Router::clear_messages();
 			assert!(Router::get_messages().is_empty());
+		});
+	}
+
+	#[test]
+	fn a_closing_hrmp_channel_diverts_new_xcm_to_spec_msg() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			HrmpState::set(HrmpChannel::Ready);
+			declines(sibling());
+
+			// Flagged: HRMP only drains, new XCM goes over spec-msg.
+			assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer()));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(Router::get_messages().len(), 1);
+
+			// Cleared (a rollback): HRMP wins again.
+			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer()));
+			declines(sibling());
 		});
 	}
 

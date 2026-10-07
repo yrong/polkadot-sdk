@@ -146,6 +146,19 @@ fn without_hrmp_xcm_goes_over_spec_msg_only_on_an_open_channel() {
 }
 
 #[test]
+fn a_closing_hrmp_channel_diverts_new_xcm_while_it_drains() {
+	new_test_ext().execute_with(|| {
+		// HRMP still open, but flagged for the cutover: new XCM goes over spec-msg.
+		open_hrmp_channel();
+		open_spec_msg_channel();
+		assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), SIBLING.into()));
+		assert_ok!(send_xcm::<XcmRouter>(sibling(), xcm()));
+		let stream = SpecMessaging::outbound_stream(&xcm_channel(SIBLING.into()));
+		assert_eq!(OutboundMessages::<Runtime>::get(stream).len(), 1);
+	});
+}
+
+#[test]
 fn consumed_payloads_fit_the_message_queue() {
 	// `EnqueueToXcmQueue` needs room for every payload the pallet can consume.
 	assert!(

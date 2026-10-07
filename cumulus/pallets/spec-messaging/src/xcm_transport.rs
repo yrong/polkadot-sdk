@@ -27,7 +27,7 @@
 //! Outbound, [`SpecMsgRouter`] sends XCM to a sibling over that channel once no HRMP channel
 //! exists.
 
-use crate::{Config, Error, OnSpecMsgData, OutChannels, OutboundMessages, Pallet};
+use crate::{Config, Error, HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages, Pallet};
 use alloc::vec::Vec;
 use codec::{DecodeAll, DecodeLimit, Encode};
 use core::marker::PhantomData;
@@ -99,7 +99,8 @@ impl<Queue: EnqueueMessage<ParaId>> OnSpecMsgData for EnqueueToXcmQueue<Queue> {
 ///
 /// Which transport a send takes:
 /// - **HRMP wins while it exists.** A `Ready` or `Full` HRMP channel falls through to `XcmpQueue`
-///   (`Full` is backpressure, not absence).
+///   (`Full` is backpressure, not absence), unless the sibling is flagged [`HrmpClosing`]: then
+///   HRMP counts as closed, and only drains what it already queued.
 /// - With no HRMP channel, the XCM goes over the spec-msg XCM channel if that channel is `Open`.
 ///   Otherwise it falls through too, which keeps today's behaviour for siblings without spec-msg.
 /// - An `Open` channel without capacity (no credit, or this block's stream is full) is a hard
@@ -138,7 +139,8 @@ where
 			},
 		};
 		let channel = xcm_channel(id);
-		let hrmp_open = !matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
+		let hrmp_open = !HrmpClosing::<T>::contains_key(id) &&
+			!matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
 		let spec_msg_open =
 			OutChannels::<T>::get(channel).is_some_and(|state| state.phase() == ChannelPhase::Open);
 		if hrmp_open || !spec_msg_open {
