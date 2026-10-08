@@ -234,7 +234,12 @@ mod benchmarks {
 			.map_err(|_| BenchmarkError::Stop("ancestry proof failed"))?;
 		let extension = MMRExtensionProof {
 			leaf_count: TO,
-			connecting_nodes: proof.prev_peaks_proof.proof_items().iter().map(|(_, h)| *h).collect(),
+			connecting_nodes: proof
+				.prev_peaks_proof
+				.proof_items()
+				.iter()
+				.map(|(_, h)| *h)
+				.collect(),
 		};
 		InboundFrontier::<T>::insert((sender, xcm_channel_stream::<T>()), old);
 
