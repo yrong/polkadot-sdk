@@ -65,6 +65,25 @@ pub use weights::WeightInfo;
 /// every published register. `0` gates nothing yet.
 pub const PROTOCOL_VERSION: u8 = 0;
 
+/// Worst-case encoded `MMRExtensionProof`: a compact leaf count (at most 9 bytes) and up to 64
+/// connecting hashes with their compact length.
+pub const MAX_EXTENSION_PROOF_BYTES: u64 = 9 + 2 + 64 * 32;
+
+/// Worst-case encoded `StreamProof`: up to 64 trie steps of a split bit and a sibling hash, with
+/// their compact length.
+pub const MAX_TREE_PROOF_BYTES: u64 = 2 + 64 * (1 + 32);
+
+/// PoV reserved per stream an inherent touches: one lift with no advances (an empty advances list,
+/// the extension and the tree proof), plus its source's framing in `LiftsBySource` (`ParaId` and a
+/// compact length). Lifts are attached after authoring, so the inherent reserves room for them
+/// (design § The Messaging Inherent: PoV weight reservation). About 4.2 KB.
+pub const LIFT_RESERVATION_BYTES: u64 =
+	1 + MAX_EXTENSION_PROOF_BYTES + MAX_TREE_PROOF_BYTES + 4 + 2;
+
+/// PoV reserved per read-context gap, which an `Events` item can open at most once: one advance
+/// proof. About 2.1 KB.
+pub const ADVANCE_RESERVATION_BYTES: u64 = MAX_EXTENSION_PROOF_BYTES;
+
 /// Sender-side credit bookkeeping of one outbound channel, kept next to [`OutChannels`] so the
 /// stored view stays exactly the runtime-API type.
 #[derive(Clone, Encode, Decode, scale_info::TypeInfo, Debug, Default, Eq, PartialEq)]
@@ -699,7 +718,14 @@ fn enact_weight<T: Config>(data: &MessagingInherentData) -> Weight {
 			.iter()
 			.fold(bytes, |sum, payload| sum.saturating_add(payload.len() as u32));
 	}
+	// Room for the lifts the submitter attaches after authoring: one per touched stream, plus one
+	// advance per read-context gap. Charged up front so a candidate with every lift still fits.
+	let streams = u64::from(items.saturating_add(reads));
+	let lift_room = streams
+		.saturating_mul(LIFT_RESERVATION_BYTES)
+		.saturating_add(u64::from(reads).saturating_mul(ADVANCE_RESERVATION_BYTES));
 	T::WeightInfo::enact_messages(items, payloads.saturating_sub(items), bytes, reads)
+		.saturating_add(Weight::from_parts(0, lift_room))
 }
 
 impl<T: Config> Pallet<T> {
@@ -735,7 +761,10 @@ impl<T: Config> Pallet<T> {
 
 	/// Append `payload` to `stream`'s outbound MMR, returning its stable position. Enforces only
 	/// the consensus hard caps, and [`Config::MaxStreams`] when this creates the stream.
-	pub fn append_to_stream(
+	///
+	/// Crate-internal: it skips the channel and credit gates, and would let a caller forge `Signal`
+	/// leaves. Other code sends through [`Pallet::send`] (design § Message Kinds).
+	pub(crate) fn append_to_stream(
 		stream: StreamId,
 		payload: Vec<u8>,
 	) -> Result<MessagePosition, Error<T>> {

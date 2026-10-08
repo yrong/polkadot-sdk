@@ -1127,6 +1127,49 @@ fn can_send_refuses_once_the_block_is_full() {
 	});
 }
 
+#[test]
+fn reservation_constants_cover_the_worst_case_proofs() {
+	use cumulus_primitives_spec_messaging::{
+		streams_root::TreeStep, LiftsBySource, MMRExtensionProof, RequiresLift, StreamProof,
+	};
+	let hash = polkadot_core_primitives::Hash::repeat_byte(1);
+	let extension = MMRExtensionProof {
+		leaf_count: cumulus_primitives_spec_messaging::mmr::MAX_MMR_LEAF_COUNT,
+		connecting_nodes: vec![hash; 64],
+	};
+	let tree_proof = StreamProof {
+		steps: vec![TreeStep { split_bit: 63, sibling: hash }; 64].try_into().unwrap(),
+	};
+	assert!(extension.encoded_size() as u64 <= MAX_EXTENSION_PROOF_BYTES);
+	assert!(tree_proof.encoded_size() as u64 <= MAX_TREE_PROOF_BYTES);
+
+	// A whole PoV lift set for one stream fits the per-stream reservation.
+	let lift = RequiresLift { advances: Vec::new(), extension, tree_proof };
+	let lifts = LiftsBySource::try_from(BTreeMap::from([(src(), vec![lift])])).unwrap();
+	assert!(lifts.encoded_size() as u64 <= LIFT_RESERVATION_BYTES);
+}
+
+#[test]
+fn enact_weight_reserves_room_for_lifts() {
+	let register = register(0, TestGrant::get()).encode();
+	let data = inherent(vec![
+		(src(), stream(0), ConsumeItem::Channel { payloads: vec![data_payload(b"a")] }),
+		(src(), stream(1), ConsumeItem::Channel { payloads: vec![data_payload(b"b")] }),
+		(
+			peer(),
+			peer_ack(),
+			ConsumeItem::Events {
+				base: MessagePosition(0),
+				start_peaks: vec![],
+				payloads: vec![register],
+			},
+		),
+	]);
+	// Two channel items and one register read: three lifts and one advance.
+	let reserved = 3 * LIFT_RESERVATION_BYTES + ADVANCE_RESERVATION_BYTES;
+	assert!(crate::enact_weight::<Test>(&data).proof_size() >= reserved);
+}
+
 mod router {
 	use super::*;
 	use xcm::{
