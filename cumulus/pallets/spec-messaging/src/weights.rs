@@ -59,6 +59,7 @@ pub trait WeightInfo {
 	fn resume_inbound_channel() -> Weight;
 	fn set_hrmp_closing() -> Weight;
 	fn clear_hrmp_closing() -> Weight;
+	fn skip_inbound_stream() -> Weight;
 	fn enact_messages(c: u32, n: u32, b: u32, r: u32, ) -> Weight;
 	fn send(b: u32, ) -> Weight;
 	fn drain(h: u32, ) -> Weight;
@@ -232,6 +233,31 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 		// Minimum execution time: 4_000_000 picoseconds.
 		Weight::from_parts(5_000_000, 0)
 			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
+	/// Storage: `SpecMessaging::InChannels` (r:1 w:1)
+	/// Proof: `SpecMessaging::InChannels` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParachainInfo::ParachainId` (r:1 w:0)
+	/// Proof: `ParachainInfo::ParachainId` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+	/// Storage: `SpecMessaging::ConsumptionOutbox` (r:1 w:1)
+	/// Proof: `SpecMessaging::ConsumptionOutbox` (`max_values`: Some(1), `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::InboundFrontier` (r:1 w:1)
+	/// Proof: `SpecMessaging::InboundFrontier` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutboundFrontier` (r:1 w:0)
+	/// Proof: `SpecMessaging::OutboundFrontier` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutboundMessages` (r:1 w:1)
+	/// Proof: `SpecMessaging::OutboundMessages` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::SendsThisBlock` (r:1 w:1)
+	/// Proof: `SpecMessaging::SendsThisBlock` (`max_values`: Some(1), `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutboundLeafHashes` (r:1 w:1)
+	/// Proof: `SpecMessaging::OutboundLeafHashes` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn skip_inbound_stream() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `202556`
+		//  Estimated: `206021`
+		// Minimum execution time: 188_000_000 picoseconds.
+		Weight::from_parts(231_000_000, 206021)
+			.saturating_add(T::DbWeight::get().reads(8_u64))
+			.saturating_add(T::DbWeight::get().writes(6_u64))
 	}
 	/// Storage: `ParachainInfo::ParachainId` (r:1 w:0)
 	/// Proof: `ParachainInfo::ParachainId` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
@@ -526,6 +552,31 @@ impl WeightInfo for () {
 		// Minimum execution time: 4_000_000 picoseconds.
 		Weight::from_parts(5_000_000, 0)
 			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	/// Storage: `SpecMessaging::InChannels` (r:1 w:1)
+	/// Proof: `SpecMessaging::InChannels` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParachainInfo::ParachainId` (r:1 w:0)
+	/// Proof: `ParachainInfo::ParachainId` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+	/// Storage: `SpecMessaging::ConsumptionOutbox` (r:1 w:1)
+	/// Proof: `SpecMessaging::ConsumptionOutbox` (`max_values`: Some(1), `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::InboundFrontier` (r:1 w:1)
+	/// Proof: `SpecMessaging::InboundFrontier` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutboundFrontier` (r:1 w:0)
+	/// Proof: `SpecMessaging::OutboundFrontier` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutboundMessages` (r:1 w:1)
+	/// Proof: `SpecMessaging::OutboundMessages` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::SendsThisBlock` (r:1 w:1)
+	/// Proof: `SpecMessaging::SendsThisBlock` (`max_values`: Some(1), `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutboundLeafHashes` (r:1 w:1)
+	/// Proof: `SpecMessaging::OutboundLeafHashes` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn skip_inbound_stream() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `202556`
+		//  Estimated: `206021`
+		// Minimum execution time: 188_000_000 picoseconds.
+		Weight::from_parts(231_000_000, 206021)
+			.saturating_add(RocksDbWeight::get().reads(8_u64))
+			.saturating_add(RocksDbWeight::get().writes(6_u64))
 	}
 	/// Storage: `ParachainInfo::ParachainId` (r:1 w:0)
 	/// Proof: `ParachainInfo::ParachainId` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)

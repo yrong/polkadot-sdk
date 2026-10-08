@@ -19,6 +19,7 @@
 
 use super::*;
 use alloc::vec;
+use cumulus_primitives_spec_messaging::mmr::SpecMerge;
 use frame_benchmarking::v2::*;
 use frame_support::traits::{EnsureOrigin, Hooks};
 use frame_system::RawOrigin;
@@ -197,6 +198,64 @@ mod benchmarks {
 		_(origin as T::RuntimeOrigin, peer);
 
 		assert!(!HrmpClosing::<T>::contains_key(peer));
+		Ok(())
+	}
+
+	/// Skip an inbound XCM channel from 4,095 to 8,191 leaves (12 peaks to 13), with the
+	/// consumption record one stream below [`Config::MaxTouchedStreams`]. The extension proof is
+	/// real; verifying it costs O(log n) hashes, so a larger MMR changes little.
+	#[benchmark]
+	fn skip_inbound_stream() -> Result<(), BenchmarkError> {
+		use mmr_lib::{
+			leaf_index_to_mmr_size,
+			util::{MemMMR, MemStore},
+		};
+		const FROM: u64 = (1 << 12) - 1;
+		const TO: u64 = (1 << 13) - 1;
+
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let sender = sibling::<T>(0);
+		accept_inbound::<T>(sender)?;
+
+		let store = MemStore::default();
+		let mut mmr = MemMMR::<_, SpecMerge>::new(0, &store);
+		let (mut old, mut new) = (MmrFrontier::new(), MmrFrontier::new());
+		for i in 0..TO {
+			let leaf = Hash::from_low_u64_be(i + 1);
+			mmr.push(leaf).map_err(|_| BenchmarkError::Stop("mmr push failed"))?;
+			if i < FROM {
+				old.append(leaf);
+			}
+			new.append(leaf);
+		}
+		let proof = mmr
+			.gen_ancestry_proof(leaf_index_to_mmr_size(FROM - 1))
+			.map_err(|_| BenchmarkError::Stop("ancestry proof failed"))?;
+		let extension = MMRExtensionProof {
+			leaf_count: TO,
+			connecting_nodes: proof.prev_peaks_proof.proof_items().iter().map(|(_, h)| *h).collect(),
+		};
+		InboundFrontier::<T>::insert((sender, xcm_channel_stream::<T>()), old);
+
+		// Other streams already consumed this block, each with a full frontier.
+		for i in 1..T::MaxTouchedStreams::get() {
+			let interval = Interval { start: MmrFrontier::new().root(), end: full_frontier() };
+			ConsumptionOutbox::<T>::append((sibling::<T>(i), stream(i), interval));
+		}
+
+		#[extrinsic_call]
+		_(
+			origin as T::RuntimeOrigin,
+			sender,
+			XCM_CHANNEL_DOMAIN,
+			XCM_CHANNEL_NUM,
+			new.peaks().to_vec(),
+			TO,
+			extension,
+		);
+
+		assert_eq!(InboundFrontier::<T>::get((sender, xcm_channel_stream::<T>())), new);
 		Ok(())
 	}
 
