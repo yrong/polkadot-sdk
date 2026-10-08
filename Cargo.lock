@@ -6040,6 +6040,7 @@ dependencies = [
  "bs58",
  "cid",
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "cumulus-test-runtime",
  "cumulus-zombienet-sdk-helpers",
  "env_logger 0.11.3",
