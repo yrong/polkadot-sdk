@@ -49,6 +49,8 @@ fn source() -> ParaId {
 /// The source's collator: one peer, answering from the archive through the protocol handler.
 struct Sender {
 	archive: RwLock<TestArchive>,
+	/// Every request fails, as over a dropped connection.
+	down: RwLock<bool>,
 	model: RwLock<Model>,
 	number: RwLock<u64>,
 	peer: PeerId,
@@ -58,6 +60,7 @@ impl Sender {
 	fn new() -> Arc<Self> {
 		Arc::new(Self {
 			archive: RwLock::new(Archive::open(Arc::new(MemoryStore::default()))),
+			down: RwLock::new(false),
 			model: RwLock::new(Model::default()),
 			number: RwLock::new(0),
 			peer: PeerId::random(),
@@ -86,6 +89,9 @@ impl Transport for Sender {
 	}
 
 	async fn request(&self, _: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		if *self.down.read() {
+			return Err("connection closed".into());
+		}
 		protocol::answer(&self.archive.read(), &request).ok_or_else(|| "refused".into())
 	}
 }
@@ -269,6 +275,34 @@ fn nothing_is_consumed_without_a_root_or_a_peer() {
 	block_on(receiver.on_root(other, StreamsRoot(Default::default()), &wants));
 	let view = ChainView { sources: BTreeMap::from([(other, wants)]) };
 	assert!(block_on(receiver.inherent_data(&view)).is_empty());
+}
+
+#[test]
+fn a_failed_fetch_is_retried_under_the_same_root() {
+	let sender = Sender::new();
+	let root = sender.author(vec![(channel(US), payloads(1, 2))]);
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	// Channel data only: this source publishes no `Ack` stream, so a register read would never
+	// settle.
+	let wants = SourceWants {
+		channels: chain.view().sources[&source()].channels.clone(),
+		..Default::default()
+	};
+
+	// The first round fails: the root is noted but not settled, and nothing is consumed.
+	*sender.down.write() = true;
+	block_on(receiver.on_root(source(), root, &wants));
+	assert!(!receiver.is_settled(&source(), &root));
+	assert!(block_on(receiver.inherent_data(&chain.view())).is_empty());
+
+	// The source does not move, yet the next round under the same root fetches again.
+	*sender.down.write() = false;
+	block_on(receiver.on_root(source(), root, &wants));
+	let record = chain.block(&receiver);
+	assert_eq!(chain.frontier.leaf_count(), 2);
+	assert_eq!(requires(&receiver, &[record]), Some(root));
+	assert!(receiver.is_settled(&source(), &root));
 }
 
 #[test]
