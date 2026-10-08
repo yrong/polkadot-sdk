@@ -771,8 +771,11 @@ impl<T: Config> Pallet<T> {
 
 		let mut frontier =
 			MmrFrontier::from_parts(start_peaks, base.0).ok_or(Error::<T>::BadFrontier)?;
-		let start = frontier.root();
 		frontier.append(leaf_hash(LEAF_VERSION, leaf));
+		// A read advances nothing: the interval starts and ends at the context it was read
+		// against. Two blocks that read the same head then chain with no gap, and a gap between
+		// two heads is a forward extension to the later context, which the lift can prove.
+		let start = frontier.root();
 		ConsumptionOutbox::<T>::append((source, stream, Interval { start, end: frontier }));
 		*gaps += 1;
 		Self::apply_register_read(&channel, register);
