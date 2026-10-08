@@ -653,7 +653,7 @@ pub mod pallet {
 		/// `system.set_storage` on `InboundFrontier((sender, stream))`. Never restore one older
 		/// than the last consumed: its messages would run again.
 		#[pallet::call_index(7)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(4, 4))]
+		#[pallet::weight(skip_weight::<T>())]
 		pub fn skip_inbound_stream(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -749,6 +749,13 @@ pub mod pallet {
 			matches!(call, Call::enact_messages { .. })
 		}
 	}
+}
+
+/// Weight of one `skip_inbound_stream`. The skip adds a stream to this block's consumption record,
+/// so the PoV must also carry one lift for it.
+fn skip_weight<T: Config>() -> Weight {
+	T::WeightInfo::skip_inbound_stream()
+		.saturating_add(Weight::from_parts(0, LIFT_RESERVATION_BYTES))
 }
 
 /// Weight of one `enact_messages`, from the inherent's shape: channel items, payloads beyond one
