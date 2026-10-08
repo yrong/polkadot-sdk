@@ -18,9 +18,10 @@
 //! The receiver's ties to the own chain and the relay chain.
 //!
 //! - [`run_receiver`]: on each new relay best block, ask the relay for each source's newest
-//!   included root (`ParachainHost::newest_included_provides`, v17) and pass a changed one to
-//!   [`Receiver::on_root`]; note each imported own block's consumption record; prune on finality.
-//!   The first relay block after a restart is all the state it needs (design § Relay Runtime API).
+//!   included root (`ParachainHost::newest_included_provides`, v17) and pass it to
+//!   [`Receiver::on_root`] until everything under it has been fetched; note each imported own
+//!   block's consumption record; prune on finality. The first relay block after a restart is all
+//!   the state it needs (design § Relay Runtime API).
 //! - [`inherent_data`]: the messaging inherent for a block on `parent`.
 //! - [`assembler`]: the collator's [`SpecMsgAssembler`].
 //!
@@ -194,7 +195,7 @@ async fn on_relay_block<Block, C, T>(
 	}
 	let updates = view.sources.iter().map(|(source, wants)| async move {
 		let root = newest_included_provides(relay, relay_hash, *source).await?;
-		if receiver.newest_root(source) != Some(root) {
+		if !receiver.is_settled(source, &root) {
 			receiver.on_root(*source, root, wants).await;
 		}
 		Some(())

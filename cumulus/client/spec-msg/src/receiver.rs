@@ -218,17 +218,24 @@ where
 		self.state.lock().sources.get(source).and_then(SourcePool::newest_root)
 	}
 
+	/// Whether everything under `root`, `source`'s newest root, has been fetched.
+	pub fn is_settled(&self, source: &ParaId, root: &StreamsRoot) -> bool {
+		self.state
+			.lock()
+			.sources
+			.get(source)
+			.is_some_and(|pool| pool.newest_root().as_ref() == Some(root) && pool.settled)
+	}
+
 	/// `root` is `source`'s newest included root: fetch under it what `wants` names, and bind the
-	/// live endpoints to it.
+	/// live endpoints to it. Under a root already settled this does nothing; under one whose last
+	/// round had a failed fetch, it fetches again.
 	pub async fn on_root(&self, source: ParaId, root: StreamsRoot, wants: &SourceWants) {
-		{
-			let mut state = self.state.lock();
-			let pool = state.sources.entry(source).or_default();
-			if pool.newest_root() == Some(root) {
-				return;
-			}
-			pool.push_root(root);
+		if self.is_settled(&source, &root) {
+			return;
 		}
+		self.state.lock().sources.entry(source).or_default().push_root(root);
+		let mut settled = true;
 
 		for consumed in &wants.channels {
 			let stream = consumed.stream_id(self.us);
@@ -246,19 +253,25 @@ where
 				under: root,
 				max_bytes: FETCH_MAX_BYTES,
 			};
-			if let Some((payloads, binding)) = self.fetch_messages(source, request).await {
-				let end = start + payloads.len() as u64;
-				let mut state = self.state.lock();
-				let pool = state.sources.entry(source).or_default();
-				pool.insert_payloads(stream, start, payloads);
-				pool.insert_binding(stream, end, root, binding);
+			match self.fetch_messages(source, request).await {
+				Some((payloads, binding)) => {
+					let end = start + payloads.len() as u64;
+					let mut state = self.state.lock();
+					let pool = state.sources.entry(source).or_default();
+					pool.insert_payloads(stream, start, payloads);
+					pool.insert_binding(stream, end, root, binding);
+				},
+				None => settled = false,
 			}
 		}
 
 		for (stream, _) in &wants.registers {
-			if let Some((head, tree_proof)) = self.fetch_head(source, *stream, root).await {
-				let mut state = self.state.lock();
-				state.sources.entry(source).or_default().insert_head(*stream, head, tree_proof);
+			match self.fetch_head(source, *stream, root).await {
+				Some((head, tree_proof)) => {
+					let mut state = self.state.lock();
+					state.sources.entry(source).or_default().insert_head(*stream, head, tree_proof);
+				},
+				None => settled = false,
 			}
 		}
 
@@ -274,7 +287,15 @@ where
 				.collect()
 		};
 		for (stream, count) in unbound {
-			self.fetch_binding(source, stream, count, root).await;
+			settled &= self.fetch_binding(source, stream, count, root).await;
+		}
+
+		let mut state = self.state.lock();
+		if let Some(pool) = state.sources.get_mut(&source) {
+			// A newer root may have arrived meanwhile; it settles on its own.
+			if pool.newest_root() == Some(root) {
+				pool.settled = settled;
+			}
 		}
 	}
 

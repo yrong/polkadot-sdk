@@ -99,6 +99,9 @@ pub fn peaks_before_head(
 pub struct SourcePool {
 	/// Roots material was fetched under, newest last.
 	pub(crate) roots: VecDeque<StreamsRoot>,
+	/// Every fetch under the newest root succeeded. Until then, each relay block fetches under it
+	/// again: a request can fail for reasons that pass, such as a dropped connection.
+	pub(crate) settled: bool,
 	/// Channel payloads, by stream and position.
 	pub(crate) payloads: BTreeMap<StreamId, BTreeMap<u64, Vec<u8>>>,
 	/// The newest head read per `Ack` stream.
@@ -125,6 +128,7 @@ impl SourcePool {
 		}
 		self.roots.retain(|r| *r != root);
 		self.roots.push_back(root);
+		self.settled = false;
 		while self.roots.len() > ROOTS_KEPT {
 			if let Some(old) = self.roots.pop_front() {
 				for by_root in self.bindings.values_mut() {
