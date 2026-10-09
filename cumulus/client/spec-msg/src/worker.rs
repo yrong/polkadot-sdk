@@ -15,18 +15,12 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! The archiver: follows the own chain and keeps the [`Archive`] current.
+//! The archiver: keeps the [`Archive`] current.
 //!
-//! - **New best block**: walk the route from the archived tip, rewind past retracted blocks, and
-//!   archive each enacted block's sends from `SpecMsgApi::outbound_messages`. Runtimes without the
-//!   API send nothing.
-//! - **First start**: archive from the chain's spec-msg *origin*, the first block of the newest run
-//!   of blocks whose runtime has the API; nothing before it has streams. This replays history, so
-//!   it needs that history's state. A node without it (state-pruned, or synced without execution)
-//!   logs and stays idle; recovering from the own chain's other nodes over the fetch protocol is
-//!   future work (design § Runtime API, recovery from downtime).
-//! - **Finality**: apply retention, reading the channel watermarks from the finalized block's
-//!   `out_channels()` (design § Archive Pruning: pruning acts only on irreversible reads).
+//! - **New best block:** rewind past retracted blocks, then archive each enacted block's sends.
+//! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. This needs that
+//!   history's state; without it the node logs and stays idle.
+//! - **Finality:** apply retention with watermarks read at the finalized block.
 
 use crate::{archive::Archive, store::ArchiveStore, LOG_TARGET};
 use cumulus_primitives_core::SpecMsgApi;
