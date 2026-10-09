@@ -579,18 +579,11 @@ pub mod pallet {
 			Ok(())
 		}
 
-		/// Flag the HRMP channel to `peer` as closing, so new XCM to `peer` goes over spec-msg
-		/// while HRMP drains. Requires our spec-msg XCM channel to `peer` to be `Open`.
-		///
-		/// A closed HRMP channel loses whatever is still queued in it, so the cutover is:
-		/// 1. Open the spec-msg XCM channels both ways, and wait until both are `Open`.
-		/// 2. In one governance batch: this call and the relay chain's `hrmp.close_channel`. The
-		///    close takes effect at the next session; until then, `XcmpQueue` drains the HRMP queue
-		///    while new XCM already goes over spec-msg.
-		/// 3. Before the session ends, check that the HRMP queues for `peer` are empty.
-		///
-		/// Once HRMP is closed, the flag has no effect. Clear it with
-		/// [`Pallet::clear_hrmp_closing`] before reopening HRMP, or to roll back. Idempotent.
+		/// Flag the HRMP channel to `peer` as closing: new XCM goes over spec-msg while HRMP
+		/// drains. Needs our spec-msg XCM channel to `peer` `Open`. Cutover: open spec-msg both
+		/// ways, then batch this call with the relay's `hrmp.close_channel`, which takes effect
+		/// next session. Clear with [`Pallet::clear_hrmp_closing`] before reopening HRMP.
+		/// Idempotent.
 		#[pallet::call_index(8)]
 		#[pallet::weight((T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational))]
 		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {

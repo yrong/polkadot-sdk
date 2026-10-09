@@ -115,11 +115,8 @@ pub enum AggregateMessageOrigin {
 	///
 	/// This is used by the HRMP queue.
 	Sibling(ParaId),
-	/// The message came from a sibling para-chain over Speculative Messaging.
-	///
-	/// This is used by the Speculative Messaging queue. It converts to the same `Location` as
-	/// [`Self::Sibling`], so the XCM executor, its barriers and every filter see the same origin
-	/// as for HRMP: no XCM program can tell the two transports apart.
+	/// The message came from a sibling para-chain over Speculative Messaging. It converts to the
+	/// same `Location` as [`Self::Sibling`], so XCM cannot tell the two transports apart.
 	SpecMsg(ParaId),
 }
 

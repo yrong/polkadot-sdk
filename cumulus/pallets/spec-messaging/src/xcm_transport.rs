@@ -14,18 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! XCM over Speculative Messaging.
-//!
-//! XCM uses one well-known channel per peer, `(domain 0, num 0)`. On it, a `Data` payload is
-//! exactly the SCALE-encoded `VersionedXcm`, with no extra framing. Other channels are free for
-//! non-XCM protocols; demultiplexing is by channel, never in-band.
-//!
-//! Inbound, [`EnqueueToXcmQueue`] hands the XCM channel's payloads to the message queue for
-//! execution under `AggregateMessageOrigin::SpecMsg(source)`, which converts to the same
-//! `Location` as HRMP's `Sibling(source)`.
-//!
-//! Outbound, [`SpecMsgRouter`] sends XCM to a sibling over that channel once no HRMP channel
-//! exists.
+//! XCM over Speculative Messaging, on one channel per peer, `(domain 0, num 0)`, whose `Data`
+//! payload is the SCALE-encoded `VersionedXcm`. Inbound, [`EnqueueToXcmQueue`] queues it under
+//! `SpecMsg(source)`; outbound, [`SpecMsgRouter`] sends to a sibling with no HRMP channel.
 
 use crate::{Config, Error, HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages, Pallet};
 use alloc::vec::Vec;
@@ -57,9 +48,7 @@ fn is_xcm_channel(stream: &StreamId) -> bool {
 	matches!(stream, StreamId::Channel { domain: XCM_CHANNEL_DOMAIN, num: XCM_CHANNEL_NUM, .. })
 }
 
-/// [`OnSpecMsgData`] that forwards the XCM channel's consumed payloads, verbatim and in order, to
-/// the runtime's message queue, mirroring the XCMP enqueue path. Wire `Queue` so the source maps
-/// to its spec-msg queue book:
+/// [`OnSpecMsgData`] that forwards the XCM channel's payloads, in order, to the message queue:
 ///
 /// ```ignore
 /// type DataHandler = EnqueueToXcmQueue<
@@ -67,12 +56,8 @@ fn is_xcm_channel(stream: &StreamId) -> bool {
 /// >;
 /// ```
 ///
-/// Only the XCM channel is forwarded. Inbound XCM executes with the source chain's sibling
-/// origin, so bytes from any other channel, which a chain may hand to an application, must never
-/// be executed as XCM. They are consumed and dropped until such a protocol brings its own handler.
-///
-/// The queue's `MaxMessageLen` must be at least the pallet's `MaxMsgLen`, so every consumed
-/// payload fits. A payload that does not fit is dropped defensively.
+/// Other channels are never executed as XCM, since XCM runs with the sibling origin; they are
+/// dropped. The queue's `MaxMessageLen` must be at least `MaxMsgLen`.
 pub struct EnqueueToXcmQueue<Queue>(core::marker::PhantomData<Queue>);
 
 impl<Queue: EnqueueMessage<ParaId>> OnSpecMsgData for EnqueueToXcmQueue<Queue> {
@@ -91,27 +76,16 @@ impl<Queue: EnqueueMessage<ParaId>> OnSpecMsgData for EnqueueToXcmQueue<Queue> {
 	}
 }
 
-/// XCM sender to sibling parachains over Speculative Messaging.
+/// XCM sender to sibling parachains over Speculative Messaging. Place it **before** `XcmpQueue`,
+/// which accepts any sibling.
 ///
-/// Put it in the runtime's router tuple **before** `XcmpQueue`: both serve `(1, [Parachain(id)])`,
-/// and `XcmpQueue` accepts any sibling at `validate`, so placed after it this router is never
-/// reached.
+/// - HRMP wins while a channel exists (`Full` included), unless the sibling is [`HrmpClosing`].
+/// - Otherwise the XCM goes over the spec-msg XCM channel if it is `Open`, else falls through.
+/// - An `Open` channel without capacity is a hard [`SendError::Transport`]: falling through would
+///   lose the XCM in `XcmpQueue`.
 ///
-/// Which transport a send takes:
-/// - **HRMP wins while it exists.** A `Ready` or `Full` HRMP channel falls through to `XcmpQueue`
-///   (`Full` is backpressure, not absence), unless the sibling is flagged [`HrmpClosing`]: then
-///   HRMP counts as closed, and only drains what it already queued.
-/// - With no HRMP channel, the XCM goes over the spec-msg XCM channel if that channel is `Open`.
-///   Otherwise it falls through too, which keeps today's behaviour for siblings without spec-msg.
-/// - An `Open` channel without capacity (no credit, or this block's stream is full) is a hard
-///   [`SendError::Transport`]: falling through would hand the XCM to `XcmpQueue` for a closed HRMP
-///   channel, which loses it silently.
-///
-/// - `T`: the runtime's spec-messaging pallet.
-/// - `ChannelInfo`: HRMP channel state, usually `ParachainSystem`.
-/// - `VersionWrapper`: XCM version negotiation, usually `PolkadotXcm`. It is keyed by the same
-///   destination `Location` as for HRMP, so negotiated versions carry over.
-/// - `Price`: the delivery fee.
+/// `ChannelInfo` is usually `ParachainSystem`, `VersionWrapper` usually `PolkadotXcm` (same
+/// destination `Location` as HRMP, so negotiated versions carry over).
 pub struct SpecMsgRouter<T, ChannelInfo, VersionWrapper, Price>(
 	PhantomData<(T, ChannelInfo, VersionWrapper, Price)>,
 );
