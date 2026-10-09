@@ -15,23 +15,13 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! The receiver: fetches under newly included source roots, builds the messaging inherent from
-//! what verified, and assembles each candidate's lifts.
+//! The receiver, inclusion tier only:
 //!
-//! - [`Receiver::on_root`]: a source's newest included root changed (design § Relay Runtime API).
-//!   Fetch the channel data from each cursor and the head of each `Ack` stream under it, and
-//!   refresh the bindings of every unfinalized block's endpoints to it, so lifts can always target
-//!   the newest root (§ Verification, "Root choice"; § Window Depth).
-//! - [`Receiver::inherent_data`]: per block, consume from the pool within a [`Budget`]. Every
-//!   endpoint the inherent creates has a binding under its source's newest root before the item is
-//!   included, so the block is liftable as built.
-//! - [`Receiver::on_block`]: note an imported block's consumption record. A read whose context
-//!   differs from the previous read of the stream opens a gap; fetch the advance between the two
-//!   contexts (§ Requires Lifting, `stitch`).
-//! - [`Receiver::assemble`]: per candidate, one lift per recorded stream, all of a source's streams
-//!   to one root, checked with the PVF's own `build_requires_entry`.
-//!
-//! Only the inclusion tier: the roots come from relay inclusion, nothing is speculative.
+//! - [`Receiver::on_root`]: under a source's newest included root, fetch channel data and `Ack`
+//!   heads, and rebind every unfinalized endpoint to it.
+//! - [`Receiver::inherent_data`]: consume within a [`Budget`], only items already liftable.
+//! - [`Receiver::on_block`]: note a block's record and fetch the advance for a read-context gap.
+//! - [`Receiver::assemble`]: one lift per recorded stream, checked with `build_requires_entry`.
 
 use crate::{
 	fetch::{fetch, Transport, Verified},

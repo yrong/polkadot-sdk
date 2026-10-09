@@ -17,16 +17,12 @@
 
 //! The receiver's ties to the own chain and the relay chain.
 //!
-//! - [`run_receiver`]: on each new relay best block, ask the relay for each source's newest
-//!   included root (`ParachainHost::newest_included_provides`, v17) and pass it to
-//!   [`Receiver::on_root`] until everything under it has been fetched; note each imported own
-//!   block's consumption record; prune on finality. The first relay block after a restart is all
-//!   the state it needs (design § Relay Runtime API).
-//! - [`inherent_data`]: the messaging inherent for a block on `parent`.
-//! - [`assembler`]: the collator's [`SpecMsgAssembler`].
+//! - [`run_receiver`]: per relay best block, pass each source's newest included root to
+//!   [`Receiver::on_root`] until it settles; note own blocks; prune on finality.
+//! - [`inherent_data`] and [`assembler`]: the inherent provider and the collator's
+//!   [`SpecMsgAssembler`].
 //!
-//! Every own-chain call is gated on `SpecMsgApi` at the block it reads, and the relay call on the
-//! `ParachainHost` version: without them, the receiver stays idle.
+//! Idle without `SpecMsgApi` or `ParachainHost` v17.
 
 use crate::{
 	fetch::Transport,
