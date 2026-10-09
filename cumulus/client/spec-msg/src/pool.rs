@@ -15,17 +15,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! The receiver's pool: per source, everything the fetches verified.
-//!
-//! - **Payloads** of channel streams, by position. They feed the messaging inherent.
-//! - **Head reads** of `Ack` streams: the register and the hints its `Events` item needs.
-//! - **Bindings**: lift material from a stream's leaf count to a source root, the `extension` and
-//!   `tree_proof` of a [`RequiresLift`](cumulus_primitives_spec_messaging::RequiresLift).
-//! - **Advances**: extension proofs between two read contexts of one stream, for bundles whose
-//!   blocks read the stream at different heads.
-//!
-//! Everything here verified under a root that was newest-included when it was fetched. The pool
-//! keeps no state that cannot be fetched again.
+//! The receiver's pool, per source: channel payloads by position, `Ack` head reads, bindings (lift
+//! material from a leaf count to a root) and advances between read contexts. All of it verified,
+//! and all of it fetchable again.
 
 use cumulus_primitives_spec_messaging::{
 	EventResponse, MMRExtensionProof, MessagePosition, MmrFrontier, StreamId, StreamProof,
@@ -67,12 +59,9 @@ impl HeadRead {
 	}
 }
 
-/// The peaks before the head leaf, from a head response that verified as `frontier` at `position`.
-///
-/// A head proof holds the other peaks, then the head's left siblings bottom up (the shape
-/// `MmrInclusionProof::verify_head` checks). Those siblings are exactly the peaks the head leaf
-/// merged when it was appended, so the peaks before it are the other peaks and then the siblings
-/// top down. The result is checked by appending the head leaf again.
+/// The peaks before the head leaf of a head response that verified as `frontier` at `position`:
+/// the proof's other peaks, then the head's left siblings top down (the peaks the head merged).
+/// Checked by appending the head leaf again.
 pub fn peaks_before_head(
 	response: &EventResponse,
 	position: MessagePosition,
