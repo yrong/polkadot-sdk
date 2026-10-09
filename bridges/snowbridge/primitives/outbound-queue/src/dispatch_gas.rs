@@ -15,7 +15,7 @@ pub const UPGRADE_BASE: u64 = 75_000;
 pub const UNLOCK_NATIVE_TOKEN: u64 = 600_000;
 
 /// Deploys a Token. Measured 5_396_266.
-pub const REGISTER_FOREIGN_TOKEN: u64 = 7_000_000;
+pub const REGISTER_FOREIGN_TOKEN: u64 = 8_500_000;
 
 /// A first mint allocates two slots. Measured 237_657.
 pub const MINT_FOREIGN_TOKEN: u64 = 400_000;
