@@ -17,27 +17,14 @@
 
 //! The sender-side archive: the own chain's sends, keyed for the fetch protocol.
 //!
-//! # Layout
+//! - **Per stream:** every MMR node by position and every payload by leaf index, so `mmr_lib` can
+//!   build a proof at any historic size.
+//! - **Per block:** a `Boundary` with each stream's leaf count and root. The recomputed
+//!   `StreamsRoot` is indexed only if it equals the header digest, so a divergence shows as an
+//!   unknown root, never a wrong proof.
+//! - **Per root:** the block that committed it, to resolve a request's `under`.
 //!
-//! - **Per stream**, every MMR node by position, and every payload by leaf index. Positions are
-//!   dense, so a request addresses `(stream, position)` and never walks blocks. Keeping the nodes
-//!   (about two per leaf) lets `mmr_lib` build any proof at any historic size: an MMR's nodes below
-//!   a size never change once written.
-//! - **Per block**, a [`Boundary`]: parent, number, and, for a block with sends, every stream's
-//!   leaf count and root plus the `StreamsRoot` over them. The archive recomputes that root itself
-//!   and indexes it only if it equals the header digest, so a divergence shows as an unknown root,
-//!   never as a wrong proof.
-//! - **Per root**, the block that committed it: how a request's `under` resolves.
-//!
-//! The archive follows the own chain's best blocks, rewinding on reorgs (design § Networking:
-//! archives are built while following the own chain).
-//!
-//! # Retention
-//!
-//! [`Archive::retain`] applies the design's rules (§ Archive Pruning, § Liftability) at a
-//! finalized block. Channel streams drop everything below the receiver's confirmed watermark.
-//! Other streams, and block boundaries, are kept for the serving horizon. Below a stream's floor
-//! only the floor's peaks remain, which is all that proofs over the newer part need.
+//! [`Archive::retain`] prunes channels below their watermark and the rest past the serving horizon.
 
 use crate::{
 	store::{ArchiveStore, Batch},
@@ -535,17 +522,10 @@ where
 		Some(EventResponse { payload, leaf_version: LEAF_VERSION, inclusion, tree_proof })
 	}
 
-	/// Apply retention at the finalized block `finalized` (design § Archive Pruning,
-	/// § Liftability):
-	///
-	/// - Boundaries imported before `horizon_cutoff` (unix seconds) are dropped, oldest first, but
-	///   never `finalized` itself; their roots are no longer served.
-	/// - A channel stream keeps nothing below its confirmed watermark in `watermarks`: the receiver
-	///   never requests below its own frontier. Without a watermark it keeps everything.
-	/// - Every other stream keeps what the oldest kept boundary needs: its head and everything
-	///   after (§ Liftability: heads under every servable root, extensions from every boundary).
-	///
-	/// `watermarks` must come from `finalized`'s state, so a reverted read can never prune.
+	/// Apply retention at `finalized`: drop boundaries imported before `horizon_cutoff` (never
+	/// `finalized` itself); prune each channel below its watermark (none: keep all); keep every
+	/// other stream from the oldest kept boundary's head. `watermarks` must be read at `finalized`,
+	/// so a reverted read never prunes.
 	pub fn retain(
 		&mut self,
 		finalized: H,
