@@ -15,15 +15,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! The `/spec-msg/exchange/1` request-response protocol (design § Fetch Protocol).
-//!
-//! The two ends belong to different chains, so the name is not genesis-scoped: both sides must
-//! agree on it a priori. Nothing is trusted by connection: every request names the `StreamsRoot`
-//! it is willing to depend on, and the requester verifies the response against exactly that root
-//! (`cumulus_primitives_spec_messaging::verify_exchange`).
-//!
-//! A server that cannot serve refuses at the transport level, with no detail: a request is a pure
-//! function of `(stream, position, under)`; it either serves or fails.
+//! The `/spec-msg/exchange/1` request-response protocol. Not genesis-scoped, since the two ends are
+//! on different chains. Nothing is trusted by connection: the requester verifies each response
+//! under the `StreamsRoot` it named. A server that cannot serve refuses without detail.
 
 use crate::{archive::Archive, store::ArchiveStore, LOG_TARGET};
 use codec::{Decode, DecodeLimit, Encode};
