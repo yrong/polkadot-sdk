@@ -359,14 +359,9 @@ pub mod pallet {
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
-	/// Per-sender window of recently-committed `StreamsRoot`s for speculative messaging. Newest
-	/// entry last, at most [`MAX_PROVIDES_WINDOW_SIZE`] entries. A receiver's `requires` root
-	/// matches when it is present in the referenced source's window. Bare ring (no block tag): a
-	/// fork-revert dispute is unwound by the node's state-revert (no per-entry eviction); a
-	/// *freeze* (finalized-invalid candidate the node can't revert) clears the whole map on the
-	/// freeze transition (see `paras_inherent`), so an invalid root can't outlive
-	/// `force_unfreeze`. A sender's window is dropped in full when it offboards (see
-	/// `initializer_on_new_session`).
+	/// Per-sender window of recently committed `StreamsRoot`s for speculative messaging, newest
+	/// last, at most [`MAX_PROVIDES_WINDOW_SIZE`]. A receiver's `Requires` matches a root in it.
+	/// Reverted with the chain, cleared on a dispute freeze, dropped when the sender offboards.
 	#[pallet::storage]
 	pub(crate) type RecentProvides<T: Config> = StorageMap<
 		_,
@@ -382,11 +377,8 @@ pub mod pallet {
 
 const LOG_TARGET: &str = "runtime::inclusion";
 
-/// Maximum length of a sender's `provides` window for speculative messaging. Holds the most-recent
-/// `StreamsRoot`s a sender has committed; a receiver's `requires` root matches when present here.
-///
-/// `W = 128` must cover the authoring→backing→inclusion pipeline including elastic-scaling bursts,
-/// so a valid `requires` can't miss a still-recent `provides`; sized with slack.
+/// Length of a sender's provides window. It must cover the authoring→inclusion pipeline, including
+/// elastic-scaling bursts; 128 leaves ample slack.
 pub const MAX_PROVIDES_WINDOW_SIZE: u32 = 128;
 
 /// The reason that a candidate's outputs were rejected for.
@@ -498,8 +490,7 @@ impl<T: Config> Pallet<T> {
 
 		Self::cleanup_outgoing_ump_dispatch_queues(outgoing_paras);
 
-		// Speculative messaging: drop the offboarded senders' provides windows so their entries
-		// don't linger in `RecentProvides` after the para is gone.
+		// Drop the offboarded senders' provides windows.
 		for outgoing_para in outgoing_paras {
 			RecentProvides::<T>::remove(outgoing_para);
 		}
@@ -886,8 +877,7 @@ impl<T: Config> Pallet<T> {
 		let commitments = receipt.commitments;
 		let config = configuration::ActiveConfig::<T>::get();
 
-		// Speculative messaging: parse the UMP signals up front, before any field of
-		// `commitments` is moved out below; a malformed signal set is treated as absent.
+		// Read `Provides` before `commitments` is moved out below.
 		let provides = commitments.ump_signals().ok().and_then(|s| s.provides().copied());
 
 		T::RewardValidators::reward_backing(
@@ -937,12 +927,7 @@ impl<T: Config> Pallet<T> {
 			commitments.horizontal_messages,
 		);
 
-		// Record the sender's committed `StreamsRoot` into its provides window so a later
-		// receiver's `requires` can match it. One-phase (inclusion tier):
-		// requires are matched only at `sanitize_backed_candidates`; a candidate carrying
-		// `provides` reaches enactment only after passing sanitize with the feature enabled
-		// (the feature-off case is dropped at sanitize), so recording here needs no separate
-		// feature gate.
+		// Record the sender's `StreamsRoot` for later receivers' `Requires`.
 		if let Some(root) = provides {
 			Self::record_provides(receipt.descriptor.para_id(), root);
 		}
@@ -975,10 +960,8 @@ impl<T: Config> Pallet<T> {
 		RecentProvides::<T>::get(source).last().copied()
 	}
 
-	/// Match `requires` against the relay-side provides windows — the check a receiver candidate
-	/// must pass to be included. `Ok(())` if every `(source, StreamsRoot)` is present in that
-	/// source's window; otherwise `Err` with the first unmatched `(source, root)`, so the caller
-	/// can log exactly why the candidate was dropped.
+	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
+	/// first miss.
 	pub(crate) fn requires_satisfied(requires: &RequiresSet) -> Result<(), (ParaId, StreamsRoot)> {
 		// Does one `RecentProvides` read per required source (≤ `MAX_COMMITMENT_ENTRIES` = 256).
 		for (source, expected) in requires.iter() {
@@ -989,17 +972,11 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Record a sender's committed `StreamsRoot` into its provides window at enactment, trimming to
-	/// [`MAX_PROVIDES_WINDOW_SIZE`] (drop-oldest). A fork-revert is handled by the node's
-	/// state-revert; a freeze clears the whole map (see [`clear_provides`]). No per-entry eviction.
-	///
-	/// [`clear_provides`]: Self::clear_provides
+	/// Push a sender's `StreamsRoot` into its window, dropping the oldest when full.
 	pub(crate) fn record_provides(source: ParaId, root: StreamsRoot) {
 		RecentProvides::<T>::mutate(source, |window| {
-			// Drop oldest entries until there is room for one more within the window.
-			// `remove(0)` is O(n), but the shift is dominated by the whole-window SCALE
-			// decode/encode this `mutate` already does; a ring buffer would only complicate the
-			// newest-first short-circuit scan in `provides_contains` for no storage saving.
+			// `remove(0)` shifts at most 128 entries, cheap next to the whole-window decode and
+			// encode this `mutate` already does.
 			while window.len() >= MAX_PROVIDES_WINDOW_SIZE as usize {
 				window.remove(0);
 			}
@@ -1008,13 +985,9 @@ impl<T: Config> Pallet<T> {
 		});
 	}
 
-	/// Clear every sender's provides window — called on a dispute-induced **freeze** transition
-	/// (see `paras_inherent`). A finalized-invalid candidate cannot be reverted, so its committed
-	/// `StreamsRoot` would otherwise survive `force_unfreeze` (no rollback) and match a later
-	/// `requires`. Clearing the whole ring is safe here: a freeze only happens in the can't-revert
-	/// case, no candidates are included while frozen, and windows self-refill as senders re-provide
-	/// after unfreeze. The fork-revert path needs nothing — the node's state-revert unwinds the
-	/// writes with the abandoned branch.
+	/// Clear every window, on a dispute freeze. A finalized invalid candidate cannot be reverted,
+	/// so its root would otherwise outlive `force_unfreeze`. Windows refill as senders provide
+	/// again.
 	pub(crate) fn clear_provides() {
 		let _ = RecentProvides::<T>::clear(u32::MAX, None);
 	}
