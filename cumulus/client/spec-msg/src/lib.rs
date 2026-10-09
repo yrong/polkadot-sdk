@@ -15,23 +15,13 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! Speculative Messaging node side.
+//! Speculative Messaging node side: the off-chain half that moves payloads between collators.
 //!
-//! A sending parachain's block commits to all its outbound streams with one `StreamsRoot`; the
-//! payloads travel off-chain between collators. This crate is that off-chain half, starting with
-//! the sender:
+//! - [`Archive`]: the own chain's sends, served under the root a requester names.
+//! - [`run_archiver`]: keeps the archive current through reorgs and retention.
+//! - [`exchange_protocol_config`] and [`run_request_handler`]: the `/spec-msg/exchange/1` protocol.
 //!
-//! - [`Archive`]: the own chain's sends by `(stream, position)`, with per-block boundaries indexed
-//!   by the recomputed `StreamsRoot`. Serves the fetch protocol's two requests, each proven under
-//!   the root the requester names.
-//! - [`run_archiver`]: follows the own chain and keeps the archive current, including reorgs and
-//!   retention.
-//! - [`exchange_protocol_config`] and [`run_request_handler`]: the `/spec-msg/exchange/1`
-//!   request-response protocol.
-//!
-//! The receiver side (relay monitor, fetcher, pool, inherent provider, lift assembler) builds on
-//! these. Design: paritytech/polkadot-sdk#12659 (v0.5), sections Runtime API, Fetch Protocol,
-//! Liftability, Archive Pruning and Networking.
+//! Design: paritytech/polkadot-sdk#12659 (v0.5).
 
 #![warn(missing_docs)]
 
