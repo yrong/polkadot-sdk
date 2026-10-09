@@ -20,7 +20,6 @@
 //! - [`Archive`]: the own chain's sends, served under the root a requester names.
 //! - [`run_archiver`]: keeps the archive current through reorgs and retention.
 //! - [`exchange_protocol_config`] and [`run_request_handler`]: the `/spec-msg/exchange/1` protocol.
-//!
 //! - [`Receiver`]: fetches under each source's newest included root, keeps what verifies, builds
 //!   the messaging inherent within a [`Budget`] and assembles each candidate's lifts.
 //! - [`run_receiver`], [`inherent_data`] and [`assembler`]: its ties to the chain and collator.

@@ -15,13 +15,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! The requester side of `/spec-msg/exchange/1` (design § Fetch Protocol, § Verification).
-//!
-//! A request goes to the source's peers in turn. The first response that verifies under the root
-//! the request names is accepted; nothing about the peer is trusted. A refusal or a response that
-//! does not verify only moves on to the next peer. Some refusals are expected, for example a
-//! channel accepted before the sender opened it (§ Fetch Protocol, pre-authorization), so no peer
-//! is penalized.
+//! The requester side of `/spec-msg/exchange/1`: try the source's peers in turn and accept the
+//! first response that verifies under the named root. Some refusals are expected, so no peer is
+//! penalized.
 
 use crate::{protocol::PROTOCOL_NAME, LOG_TARGET};
 use codec::{DecodeLimit, Encode};
