@@ -583,7 +583,9 @@ pub mod pallet {
 		/// drains. Needs our spec-msg XCM channel to `peer` `Open`. Cutover: open spec-msg both
 		/// ways, then batch this call with the relay's `hrmp.close_channel`, which takes effect
 		/// next session. Clear with [`Pallet::clear_hrmp_closing`] before reopening HRMP.
-		/// Idempotent.
+		/// Idempotent. The two transports feed separate queues, so a new XCM over spec-msg can
+		/// execute before an older one still queued from HRMP: where order matters, let that queue
+		/// drain first.
 		#[pallet::call_index(8)]
 		#[pallet::weight((T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational))]
 		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
