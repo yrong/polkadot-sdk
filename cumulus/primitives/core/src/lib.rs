@@ -33,6 +33,7 @@ pub const REF_TIME_PER_CORE_IN_SECS: u64 = 2;
 
 pub mod parachain_block_data;
 pub mod scheduling;
+pub mod spec_messaging;
 
 pub use parachain_block_data::ParachainBlockData;
 pub use polkadot_core_primitives::InboundDownwardMessage;
@@ -53,6 +54,7 @@ pub use sp_runtime::{
 	traits::Block as BlockT,
 	ConsensusEngineId,
 };
+pub use spec_messaging::{ump_signal_tail, SpecMessagingError, SpecMessagingSignals};
 pub use xcm::latest::prelude::*;
 
 /// A module that re-exports relevant relay chain definitions.

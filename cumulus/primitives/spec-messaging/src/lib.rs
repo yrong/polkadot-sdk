@@ -69,6 +69,29 @@ pub use mmr::{MessagePosition, MmrFrontier, MmrRoot};
 pub use stream::{PrivateKind, StreamId, STREAM_ID_LEN};
 pub use streams_root::{StreamProof, StreamsRoot};
 
+/// How `parachain-system` sources the speculative-messaging signals without depending on the
+/// messaging pallet. `()` emits nothing. There is no `Requires` hook: blocks never emit it.
+pub trait ProvideUmpSignals {
+	/// The block's `StreamsRoot` for `Provides`, or `None` if no stream was touched (an unchanged
+	/// root would duplicate a window entry). Also deposits the [`SPMS_ENGINE_ID`] digest.
+	fn provides_root() -> Option<StreamsRoot>;
+
+	/// The block's consumption record: what the messaging inherent did. Called by the
+	/// `consumption_record()` runtime API node-side and by the `validate_block` wrapper in-wasm
+	/// after executing each block of a bundle.
+	fn consumption_record() -> ConsumptionRecord;
+}
+
+impl ProvideUmpSignals for () {
+	fn provides_root() -> Option<StreamsRoot> {
+		None
+	}
+
+	fn consumption_record() -> ConsumptionRecord {
+		ConsumptionRecord::default()
+	}
+}
+
 /// The hash function for all of speculative messaging: leaves, MMR merges, stream and
 /// commitment-tree roots. A protocol constant. Changing it is a consensus break, so nothing here
 /// is generic over it.
