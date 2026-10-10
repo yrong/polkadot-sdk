@@ -360,6 +360,9 @@ pub struct Cli<Config: CliConfig> {
 
 	/// Enable speculative messaging: archive and serve this chain's sends and, on a collator,
 	/// fetch and consume other chains' messages. Idle while the runtime has no `SpecMsgApi`.
+	///
+	/// Peer chains must have distinct chain-spec `protocolId`s: chains sharing one fail each
+	/// other's block-announce handshake and ban the peer, refusing fetches for about a minute.
 	#[arg(long)]
 	pub enable_spec_msg: bool,
 
