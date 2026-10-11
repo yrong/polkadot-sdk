@@ -26,7 +26,10 @@ use cumulus_primitives_core::{ChannelStatus, GetChannelInfo};
 use cumulus_primitives_spec_messaging::{
 	ChannelId, ChannelPhase, MessagePosition, SpecMsgKind, StreamId,
 };
-use frame_support::{traits::EnqueueMessage, BoundedSlice};
+use frame_support::{
+	traits::{EnqueueMessage, Get},
+	BoundedSlice,
+};
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use polkadot_runtime_common::xcm_sender::PriceForMessageDelivery;
 use xcm::{latest::prelude::*, VersionedLocation, VersionedXcm, WrapVersion, MAX_XCM_DECODE_DEPTH};
@@ -57,7 +60,7 @@ fn is_xcm_channel(stream: &StreamId) -> bool {
 /// ```
 ///
 /// Other channels are never executed as XCM, since XCM runs with the sibling origin; they are
-/// dropped. The queue's `MaxMessageLen` must be at least `MaxMsgLen`.
+/// dropped. The pallet's `integrity_test` keeps `MaxMsgLen` within the queue's `MaxMessageLen`.
 pub struct EnqueueToXcmQueue<Queue>(core::marker::PhantomData<Queue>);
 
 impl<Queue: EnqueueMessage<ParaId>> OnSpecMsgData for EnqueueToXcmQueue<Queue> {
@@ -73,6 +76,10 @@ impl<Queue: EnqueueMessage<ParaId>> OnSpecMsgData for EnqueueToXcmQueue<Queue> {
 			return;
 		};
 		Queue::enqueue_message(message, source);
+	}
+
+	fn max_len() -> u32 {
+		Queue::MaxMessageLen::get()
 	}
 }
 
