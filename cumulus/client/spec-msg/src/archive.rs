@@ -48,6 +48,10 @@ use std::collections::BTreeMap;
 
 const PREFIX: &[u8] = b"spec-msg/archive/v1/";
 
+/// Maximum payloads served per response, whatever the byte budget: each costs a store read, so
+/// tiny leaves under a large budget would make a 1 KiB request cost many reads.
+pub const MAX_LEAVES_PER_RESPONSE: u64 = 1024;
+
 /// Errors of the archive's write paths. Serving never errors: it refuses with `None`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArchiveError {
@@ -454,7 +458,7 @@ where
 				return None;
 			}
 			let mut used = 0u64;
-			for index in start..leaf_count {
+			for index in start..leaf_count.min(start.saturating_add(MAX_LEAVES_PER_RESPONSE)) {
 				let payload = self.store.get(&payload_key(&req.stream, index))?;
 				used += payload.len() as u64;
 				if used > budget {
