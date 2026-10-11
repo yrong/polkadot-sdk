@@ -15,11 +15,7 @@
 
 use crate as cumulus_pallet_spec_messaging;
 use cumulus_primitives_spec_messaging::WindowGrant;
-use frame_support::{
-	derive_impl, parameter_types,
-	traits::{ConstU32, EnqueueMessage},
-	BoundedSlice,
-};
+use frame_support::{derive_impl, parameter_types, traits::EnqueueMessage, BoundedSlice};
 use frame_system::EnsureRoot;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::BuildStorage;
@@ -71,12 +67,12 @@ parameter_types! {
 	pub static Enqueued: Vec<(ParaId, Vec<u8>)> = Vec::new();
 }
 
-/// Message queue that records what it is given. Its `MaxMessageLen` is below the pallet's
-/// `MaxMsgLen`, so tests can reach the oversize path.
+/// Message queue that records what it is given. Its `MaxMessageLen` is the pallet's `MaxMsgLen`,
+/// the least `integrity_test` allows.
 pub struct RecordingQueue;
 
 impl EnqueueMessage<ParaId> for RecordingQueue {
-	type MaxMessageLen = ConstU32<512>;
+	type MaxMessageLen = MaxMsgLen;
 
 	fn enqueue_message(message: BoundedSlice<u8, Self::MaxMessageLen>, origin: ParaId) {
 		Enqueued::mutate(|enqueued| enqueued.push((origin, message.to_vec())));
