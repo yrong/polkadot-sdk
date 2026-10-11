@@ -945,6 +945,179 @@ fn rereading_an_unchanged_register_head_is_harmless() {
 	});
 }
 
+#[test]
+fn xcm_channel_data_is_enqueued_under_the_source() {
+	new_test_ext().execute_with(|| {
+		accept(0); // `stream(0)` is the XCM channel `(0, 0)`.
+		let open = SpecMsgKind::Signal(SpecMsgSignal::OpenChannel { version: 0 }).encode();
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			inherent(vec![(
+				src(),
+				stream(0),
+				ConsumeItem::Channel {
+					payloads: vec![open, data_payload(b"xcm-1"), data_payload(b"xcm-2")]
+				}
+			)]),
+		));
+		// Data in order, verbatim; the signal is the channel layer's, not XCM.
+		assert_eq!(Enqueued::get(), vec![(src(), b"xcm-1".to_vec()), (src(), b"xcm-2".to_vec())]);
+	});
+}
+
+#[test]
+fn other_channels_are_never_executed_as_xcm() {
+	new_test_ext().execute_with(|| {
+		accept(1);
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			inherent(vec![(
+				src(),
+				stream(1),
+				ConsumeItem::Channel { payloads: vec![data_payload(b"not xcm")] }
+			)]),
+		));
+		// Consumed, but not handed to the XCM queue.
+		assert_eq!(InboundFrontier::<Test>::get((src(), stream(1))).leaf_count(), 1);
+		assert!(Enqueued::get().is_empty());
+	});
+}
+
+#[test]
+fn hrmp_closing_needs_an_open_xcm_channel() {
+	new_test_ext().execute_with(|| {
+		assert_err!(
+			SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer()),
+			Error::<Test>::ChannelNotOpen
+		);
+		open_and_accepted();
+		assert!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::signed(1), peer()).is_err());
+
+		// Setting and clearing are idempotent.
+		for _ in 0..2 {
+			assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer()));
+			assert!(HrmpClosing::<Test>::contains_key(peer()));
+		}
+		for _ in 0..2 {
+			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer()));
+			assert!(!HrmpClosing::<Test>::contains_key(peer()));
+		}
+	});
+}
+
+mod router {
+	use super::*;
+	use xcm::{
+		latest::{
+			send_xcm, Instruction::ClearOrigin, Junction::Parachain, Location, SendError, SendXcm,
+			Xcm,
+		},
+		VersionedLocation, VersionedXcm,
+	};
+	use xcm_builder::InspectMessageQueues;
+
+	fn sibling() -> Location {
+		Location::new(1, [Parachain(u32::from(peer()))])
+	}
+
+	fn xcm() -> Xcm<()> {
+		Xcm(vec![ClearOrigin])
+	}
+
+	/// `validate` declined: it says `NotApplicable` and hands both arguments back.
+	fn declines(dest: Location) {
+		let (mut d, mut m) = (Some(dest.clone()), Some(xcm()));
+		assert_eq!(Router::validate(&mut d, &mut m), Err(SendError::NotApplicable));
+		assert_eq!((d, m), (Some(dest), Some(xcm())));
+	}
+
+	#[test]
+	fn other_destinations_are_not_applicable() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			declines(Location::parent());
+			declines(Location::new(1, [Parachain(1), Parachain(2)]));
+		});
+	}
+
+	#[test]
+	fn hrmp_wins_while_it_exists() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			for state in [HrmpChannel::Ready, HrmpChannel::Full] {
+				HrmpState::set(state);
+				declines(sibling());
+			}
+		});
+	}
+
+	#[test]
+	fn without_an_open_spec_msg_channel_it_falls_through() {
+		new_test_ext().execute_with(|| {
+			// No channel at all.
+			declines(sibling());
+			// Opened, but the peer's register not read yet.
+			open_out_channel();
+			declines(sibling());
+		});
+	}
+
+	#[test]
+	fn xcm_goes_over_the_open_channel_and_dry_runs_see_it() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+
+			// The leaf is the `VersionedXcm`, bare, as `Data` on the XCM channel.
+			let sent = sent_on(SpecMessaging::outbound_stream(&xcm_channel(peer())));
+			assert_eq!(
+				sent.last(),
+				Some(&SpecMsgKind::Data(VersionedXcm::<()>::from(xcm()).encode()).encode())
+			);
+			// The dry-run view decodes it back; the `OpenChannel` signal is not XCM.
+			assert_eq!(
+				Router::get_messages(),
+				vec![(VersionedLocation::from(sibling()), vec![VersionedXcm::from(xcm())])]
+			);
+			Router::clear_messages();
+			assert!(Router::get_messages().is_empty());
+		});
+	}
+
+	#[test]
+	fn a_closing_hrmp_channel_diverts_new_xcm_to_spec_msg() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			HrmpState::set(HrmpChannel::Ready);
+			declines(sibling());
+
+			// Flagged: HRMP only drains, new XCM goes over spec-msg.
+			assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer()));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(Router::get_messages().len(), 1);
+
+			// Cleared (a rollback): HRMP wins again.
+			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer()));
+			declines(sibling());
+		});
+	}
+
+	#[test]
+	fn an_open_channel_without_credit_is_a_hard_error() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			// A grant of 4 messages, and `OpenChannel` is one of them.
+			for _ in 0..3 {
+				assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			}
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("spec-msg XCM channel has no capacity"))
+			);
+		});
+	}
+}
+
 /// The first `n` leaves of [`src`]'s channel `0`, as `Data` payloads.
 fn skip_payloads(n: usize) -> Vec<Vec<u8>> {
 	(0..n).map(|i| data_payload(&[i as u8])).collect()
