@@ -69,7 +69,11 @@ where
 		.out_channels(at)
 		.map_err(|e| log::warn!(target: LOG_TARGET, "out_channels at {at:?} failed: {e}"))
 		.ok()?;
-	Some(ChainView::new(us, consumed, out_channels))
+	let caps = api
+		.consumption_caps(at)
+		.map_err(|e| log::warn!(target: LOG_TARGET, "consumption_caps at {at:?} failed: {e}"))
+		.ok()?;
+	Some(ChainView { caps: Some(caps), ..ChainView::new(us, consumed, out_channels) })
 }
 
 /// The consumption record of block `at`; empty if its runtime has no `SpecMsgApi`.

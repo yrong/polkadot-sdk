@@ -64,8 +64,8 @@ pub const MAX_BUFFERED_BYTES: u64 = 8 * 1024 * 1024;
 pub const INHERENT_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Per-block consumption limits. `enact_messages` is a mandatory inherent, so its cost must fit the
-/// block whatever arrived; the runtime's `MaxTouchedStreams` and `MaxContextGaps` must not be lower
-/// than `max_streams` and `max_reads`, or a built block fails its own import.
+/// block whatever arrived. `max_streams` and `max_reads` are clamped to the runtime's caps
+/// ([`ChainView::caps`]): an inherent over them fails the block.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
 	/// Streams touched per block: channel items and register reads.
@@ -101,6 +101,9 @@ pub struct SourceWants {
 pub struct ChainView {
 	/// What is consumed from each source.
 	pub sources: BTreeMap<ParaId, SourceWants>,
+	/// The runtime's caps on streams and register reads per block (`consumption_caps()`). `None`
+	/// leaves the [`Budget`] alone.
+	pub caps: Option<(u32, u32)>,
 }
 
 impl ChainView {
@@ -122,7 +125,7 @@ impl ChainView {
 				.registers
 				.push((stream, state.register));
 		}
-		Self { sources }
+		Self { sources, caps: None }
 	}
 }
 
@@ -348,7 +351,11 @@ where
 	/// slot and stall our own sends. Channels then fill the budget from a start that rotates each
 	/// block, so no source's backlog takes every block.
 	fn plan(&self, view: &ChainView) -> Vec<Planned> {
-		let Budget { max_streams, max_reads, max_payloads, max_bytes } = self.budget;
+		let Budget { mut max_streams, mut max_reads, max_payloads, max_bytes } = self.budget;
+		if let Some((streams, reads)) = view.caps {
+			max_streams = max_streams.min(streams);
+			max_reads = max_reads.min(reads);
+		}
 		let (mut streams, mut reads, mut payloads, mut bytes) = (0u32, 0u32, 0u32, 0u64);
 		let mut planned = Vec::new();
 		let state = self.state.lock();

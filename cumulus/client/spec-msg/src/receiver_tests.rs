@@ -129,7 +129,7 @@ impl Chain {
 			}],
 			registers: vec![(ack(US), self.register)],
 		};
-		ChainView { sources: BTreeMap::from([(source(), wants)]) }
+		ChainView { sources: BTreeMap::from([(source(), wants)]), caps: None }
 	}
 
 	/// Enact `data` as `enact_messages` does and return the block's consumption record.
@@ -145,7 +145,7 @@ impl Chain {
 					Interval { start, end: self.frontier.clone() }
 				},
 				ConsumeItem::Events { base, start_peaks, payloads } => {
-					let mut end = MmrFrontier::from_parts(start_peaks.clone(), base.0).unwrap();
+					let mut end = MmrFrontier::from_parts(start_peaks.to_vec(), base.0).unwrap();
 					end.append(leaf_hash(LEAF_VERSION, &payloads[0]));
 					self.register = Some(codec::Decode::decode(&mut &payloads[0][..]).unwrap());
 					Interval { start: end.root(), end }
@@ -278,7 +278,7 @@ fn nothing_is_consumed_without_a_root_or_a_peer() {
 		..Default::default()
 	};
 	block_on(receiver.on_root(other, StreamsRoot(Default::default()), &wants));
-	let view = ChainView { sources: BTreeMap::from([(other, wants)]) };
+	let view = ChainView { sources: BTreeMap::from([(other, wants)]), caps: None };
 	assert!(block_on(receiver.inherent_data(&view)).is_empty());
 }
 
@@ -360,12 +360,43 @@ fn a_backlogged_channel_does_not_take_every_block() {
 	let consumed = |num| ConsumedStream::Channel { domain: 0, num, from: MessagePosition(0) };
 	let wants = SourceWants { channels: vec![consumed(0), consumed(1)], registers: Vec::new() };
 	block_on(receiver.on_root(source(), root, &wants));
-	let view = ChainView { sources: BTreeMap::from([(source(), wants)]) };
+	let view = ChainView { sources: BTreeMap::from([(source(), wants)]), caps: None };
 
 	// Both channels hold more than a block's budget; each block starts at the next one.
 	let first = |data: MessagingInherentData| data.items[0].1;
 	assert_eq!(first(block_on(receiver.inherent_data(&view))), lane(0));
 	assert_eq!(first(block_on(receiver.inherent_data(&view))), lane(1));
+}
+
+#[test]
+fn the_runtime_caps_clamp_the_budget() {
+	use cumulus_primitives_spec_messaging::StreamId;
+	let lane = |num| StreamId::Channel { recipient: US.into(), domain: 0, num };
+	let sender = Sender::new();
+	let root = sender.author(vec![
+		(lane(0), payloads(1, 1)),
+		(lane(1), payloads(2, 1)),
+		(ack(US), vec![register(0).encode()]),
+	]);
+	let receiver = receiver(&sender, Budget::default());
+	let consumed = |num| ConsumedStream::Channel { domain: 0, num, from: MessagePosition(0) };
+	let wants =
+		SourceWants { channels: vec![consumed(0), consumed(1)], registers: vec![(ack(US), None)] };
+	block_on(receiver.on_root(source(), root, &wants));
+	let view = |caps| ChainView { sources: BTreeMap::from([(source(), wants.clone())]), caps };
+
+	// Within the default budget, all three streams fit.
+	assert_eq!(block_on(receiver.inherent_data(&view(None))).items.len(), 3);
+	// No register reads allowed: only the two channels.
+	let data = block_on(receiver.inherent_data(&view(Some((2, 0)))));
+	assert_eq!(data.items.len(), 2);
+	assert!(data
+		.items
+		.iter()
+		.all(|(_, stream, _)| matches!(stream, StreamId::Channel { .. })));
+	// One stream: the register read, which goes first.
+	let data = block_on(receiver.inherent_data(&view(Some((1, 1)))));
+	assert_eq!(data.items.len(), 1);
 }
 
 #[test]
@@ -386,7 +417,7 @@ fn missing_bindings_are_fetched_under_one_deadline() {
 
 	// Each fetch takes 60% of the deadline: one after another, the second would miss it.
 	*sender.delay.write() = crate::receiver::INHERENT_FETCH_TIMEOUT * 3 / 5;
-	let view = ChainView { sources: BTreeMap::from([(source(), wants)]) };
+	let view = ChainView { sources: BTreeMap::from([(source(), wants)]), caps: None };
 	let started = std::time::Instant::now();
 	let data = block_on(receiver.inherent_data(&view));
 	assert!(started.elapsed() < crate::receiver::INHERENT_FETCH_TIMEOUT);
