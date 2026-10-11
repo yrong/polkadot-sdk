@@ -27,33 +27,33 @@ use cumulus_primitives_spec_messaging::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-type TestArchive = Archive<u64, Arc<MemoryStore>>;
+pub(crate) type TestArchive = Archive<u64, Arc<MemoryStore>>;
 
-fn channel(peer: u32) -> StreamId {
+pub(crate) fn channel(peer: u32) -> StreamId {
 	StreamId::Channel { recipient: peer.into(), domain: 0, num: 0 }
 }
 
-fn ack(peer: u32) -> StreamId {
+pub(crate) fn ack(peer: u32) -> StreamId {
 	StreamId::Ack { recipient: peer.into(), domain: 0, num: 0 }
 }
 
-fn payloads(tag: u8, n: usize) -> Vec<Vec<u8>> {
+pub(crate) fn payloads(tag: u8, n: usize) -> Vec<Vec<u8>> {
 	(0..n).map(|i| vec![tag, i as u8, 0xAB]).collect()
 }
 
 /// The chain's sends so far, per stream, to compute roots without the archive.
 #[derive(Default, Clone)]
-struct Model(BTreeMap<StreamId, Vec<Vec<u8>>>);
+pub(crate) struct Model(BTreeMap<StreamId, Vec<Vec<u8>>>);
 
 impl Model {
-	fn send(&mut self, sends: &[(StreamId, Vec<Vec<u8>>)]) -> StreamsRoot {
+	pub(crate) fn send(&mut self, sends: &[(StreamId, Vec<Vec<u8>>)]) -> StreamsRoot {
 		for (stream, payloads) in sends {
 			self.0.entry(*stream).or_default().extend(payloads.iter().cloned());
 		}
 		self.root()
 	}
 
-	fn root(&self) -> StreamsRoot {
+	pub(crate) fn root(&self) -> StreamsRoot {
 		let entries = self
 			.0
 			.iter()
@@ -70,7 +70,7 @@ impl Model {
 }
 
 /// Archive block `number` (hash = number) with `sends`, committing the model's root.
-fn import(
+pub(crate) fn import(
 	archive: &mut TestArchive,
 	model: &mut Model,
 	number: u64,
