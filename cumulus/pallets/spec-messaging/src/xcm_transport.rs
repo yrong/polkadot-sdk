@@ -18,7 +18,10 @@
 //! payload is the SCALE-encoded `VersionedXcm`. Inbound, [`EnqueueToXcmQueue`] queues it under
 //! `SpecMsg(source)`; outbound, [`SpecMsgRouter`] sends to a sibling with no HRMP channel.
 
-use crate::{Config, Error, HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages, Pallet};
+use crate::{
+	BlockStreamsRoot, Config, Error, HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages,
+	Pallet,
+};
 use alloc::vec::Vec;
 use codec::{DecodeAll, DecodeLimit, Encode};
 use core::marker::PhantomData;
@@ -161,6 +164,9 @@ impl<T: Config, ChannelInfo, VersionWrapper, Price> InspectMessageQueues
 	fn clear_messages() {
 		// `OutboundMessages` holds only this block's sends, so this isolates a dry run's output.
 		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
+		// The state is the last block's, whose `on_finalize` may have committed a root: a send
+		// would then fail with `RootCommitted`, though it would not in a real block.
+		BlockStreamsRoot::<T>::kill();
 	}
 
 	fn get_messages() -> Vec<(VersionedLocation, Vec<VersionedXcm<()>>)> {

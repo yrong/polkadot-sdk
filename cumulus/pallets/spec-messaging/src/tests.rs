@@ -1325,6 +1325,20 @@ mod router {
 	}
 
 	#[test]
+	fn a_dry_run_on_a_block_that_committed_a_root_can_send() {
+		new_test_ext().execute_with(|| {
+			open_and_accepted();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			// The block ends: its root is committed, as in the state a dry run executes on.
+			SpecMessaging::on_finalize(System::block_number());
+			assert!(BlockStreamsRoot::<Test>::exists());
+
+			Router::clear_messages();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+		});
+	}
+
+	#[test]
 	fn a_closing_hrmp_channel_diverts_new_xcm_to_spec_msg() {
 		new_test_ext().execute_with(|| {
 			open_and_accepted();
