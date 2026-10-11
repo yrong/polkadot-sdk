@@ -136,6 +136,19 @@ fn the_server_cap_bounds_payloads() {
 }
 
 #[test]
+fn the_leaf_cap_bounds_payloads() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let cap = crate::archive::MAX_LEAVES_PER_RESPONSE as usize;
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, cap + 1))]);
+	let req = messages(a, 0, root, u32::MAX);
+	let resp = archive.serve_messages(&req, u32::MAX).unwrap();
+	assert_eq!(resp.payloads.len(), cap);
+	verify_messages(&req, &resp).unwrap();
+}
+
+#[test]
 fn events_verify_at_the_head_and_at_a_position() {
 	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
 	let mut model = Model::default();
