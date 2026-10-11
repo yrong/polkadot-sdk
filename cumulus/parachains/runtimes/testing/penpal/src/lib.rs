@@ -697,8 +697,10 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	// about 2.5 KB of PoV each (benchmarked). These caps keep that near 5% of the block.
 	type MaxStreams = ConstU32<128>;
 	type MaxSendsPerBlock = ConstU32<64>;
-	type MaxTouchedStreams = ConstU32<128>;
-	type MaxContextGaps = ConstU32<64>;
+	// The collator's default inherent budget (16 streams, 8 reads); `MaxSendsPerBlock` keeps
+	// room for one register publish per touched stream.
+	type MaxTouchedStreams = ConstU32<16>;
+	type MaxContextGaps = ConstU32<8>;
 	// Execute the XCM channel's payloads under `SpecMsg(source)`, which XCM sees as the sibling.
 	type DataHandler = cumulus_pallet_spec_messaging::EnqueueToXcmQueue<
 		TransformOrigin<MessageQueue, AggregateMessageOrigin, ParaId, ParaIdToSpecMsg>,
