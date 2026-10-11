@@ -1236,6 +1236,10 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		fn consumption_record() -> cumulus_primitives_spec_messaging::ConsumptionRecord {
 			SpecMessaging::consumption_record()
 		}
+
+		fn consumption_caps() -> (u32, u32) {
+			SpecMessaging::consumption_caps()
+		}
 	}
 
 	impl cumulus_primitives_core::GetParachainInfo<Block> for Runtime {
