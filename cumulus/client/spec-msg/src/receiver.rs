@@ -306,25 +306,37 @@ where
 	/// The messaging inherent for a block whose parent has `view`.
 	pub async fn inherent_data(&self, view: &ChainView) -> MessagingInherentData {
 		let planned = self.plan(view);
-		let mut items = Vec::with_capacity(planned.len());
-		for Planned { source, stream, item, endpoint, root } in planned {
-			let bound = self
-				.state
+		let bound = |p: &Planned| {
+			self.state
 				.lock()
 				.sources
-				.get(&source)
-				.is_some_and(|pool| pool.binding(&stream, endpoint, &root).is_some());
-			let bound = bound ||
-				futures::select! {
-					bound = self.fetch_binding(source, stream, endpoint, root).fuse() => bound,
-					_ = futures_timer::Delay::new(INHERENT_FETCH_TIMEOUT).fuse() => false,
-				};
-			if bound {
-				items.push((source, stream, item));
+				.get(&p.source)
+				.is_some_and(|pool| pool.binding(&p.stream, p.endpoint, &p.root).is_some())
+		};
+		// Fetch every missing binding at once, under one deadline: authoring waits at most
+		// `INHERENT_FETCH_TIMEOUT`, however many items there are and whatever their peers do.
+		let missing: Vec<_> = planned
+			.iter()
+			.filter(|p| !bound(p))
+			.map(|p| self.fetch_binding(p.source, p.stream, p.endpoint, p.root))
+			.collect();
+		if !missing.is_empty() {
+			futures::select! {
+				_ = futures::future::join_all(missing).fuse() => {},
+				_ = futures_timer::Delay::new(INHERENT_FETCH_TIMEOUT).fuse() => {},
+			}
+		}
+		let mut items = Vec::with_capacity(planned.len());
+		for p in planned {
+			if bound(&p) {
+				items.push((p.source, p.stream, p.item));
 			} else {
 				log::debug!(
 					target: LOG_TARGET,
-					"Not consuming {stream:?} of {source:?}: no lift material at {endpoint}",
+					"Not consuming {:?} of {:?}: no lift material at {}",
+					p.stream,
+					p.source,
+					p.endpoint,
 				);
 			}
 		}
