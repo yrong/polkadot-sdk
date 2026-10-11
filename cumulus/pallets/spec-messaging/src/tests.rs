@@ -984,23 +984,6 @@ fn other_channels_are_never_executed_as_xcm() {
 }
 
 #[test]
-#[should_panic(expected = "Defensive failure")]
-fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
-	new_test_ext().execute_with(|| {
-		accept(0);
-		// Within the pallet's `MaxMsgLen` (1024), over the queue's `MaxMessageLen` (512).
-		let _ = SpecMessaging::enact_messages(
-			RuntimeOrigin::none(),
-			inherent(vec![(
-				src(),
-				stream(0),
-				ConsumeItem::Channel { payloads: vec![data_payload(&[0u8; 600])] },
-			)]),
-		);
-	});
-}
-
-#[test]
 fn hrmp_closing_needs_an_open_xcm_channel() {
 	new_test_ext().execute_with(|| {
 		assert_err!(

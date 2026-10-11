@@ -99,6 +99,12 @@ impl OutChannelMeta {
 pub trait OnSpecMsgData {
 	/// One `Data` payload, consumed in order at `position` of `(source, stream)`.
 	fn on_data(source: ParaId, stream: StreamId, position: MessagePosition, data: Vec<u8>);
+
+	/// The longest `data` this handler accepts; `integrity_test` keeps [`Config::MaxMsgLen`] within
+	/// it, so no consumed payload is dropped for its size.
+	fn max_len() -> u32 {
+		u32::MAX
+	}
 }
 
 impl OnSpecMsgData for () {
@@ -313,6 +319,10 @@ pub mod pallet {
 			assert!(
 				T::DefaultWindowGrant::get().max_message_size <= T::MaxMsgLen::get(),
 				"`DefaultWindowGrant::max_message_size` must not exceed `MaxMsgLen`",
+			);
+			assert!(
+				T::MaxMsgLen::get() <= T::DataHandler::max_len(),
+				"`MaxMsgLen` must not exceed what the `DataHandler` accepts",
 			);
 		}
 	}
