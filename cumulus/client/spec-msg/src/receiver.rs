@@ -43,7 +43,10 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	fmt::Debug,
 	hash::Hash as StdHash,
-	sync::Arc,
+	sync::{
+		atomic::{AtomicUsize, Ordering},
+		Arc,
+	},
 	time::Duration,
 };
 
@@ -185,6 +188,8 @@ pub struct Receiver<H, T: ?Sized> {
 	budget: Budget,
 	transport: Arc<T>,
 	state: Mutex<State<H>>,
+	/// Where the next block starts handing out channel budget.
+	rotation: AtomicUsize,
 }
 
 impl<H, T> Receiver<H, T>
@@ -199,6 +204,7 @@ where
 			budget,
 			transport,
 			state: Mutex::new(State { sources: BTreeMap::new(), live: HashMap::new() }),
+			rotation: AtomicUsize::new(0),
 		}
 	}
 
@@ -326,43 +332,21 @@ where
 	}
 
 	/// Choose the items within the budget, from what the pool holds under each source's newest
-	/// root.
+	/// root. Register reads go first: one leaf each, so channel backlogs cannot take every stream
+	/// slot and stall our own sends. Channels then fill the budget from a start that rotates each
+	/// block, so no source's backlog takes every block.
 	fn plan(&self, view: &ChainView) -> Vec<Planned> {
 		let Budget { max_streams, max_reads, max_payloads, max_bytes } = self.budget;
 		let (mut streams, mut reads, mut payloads, mut bytes) = (0u32, 0u32, 0u32, 0u64);
 		let mut planned = Vec::new();
 		let state = self.state.lock();
+		let newest = |source: &ParaId| {
+			let pool = state.sources.get(source)?;
+			Some((pool, pool.newest_root()?))
+		};
+
 		for (source, wants) in &view.sources {
-			let Some(pool) = state.sources.get(source) else { continue };
-			let Some(root) = pool.newest_root() else { continue };
-			for consumed in &wants.channels {
-				if streams >= max_streams {
-					return planned;
-				}
-				let stream = consumed.stream_id(self.us);
-				let from = consumed.from().0;
-				let mut taken = Vec::new();
-				for payload in pool.contiguous_from(&stream, from) {
-					let len = payload.len() as u64;
-					if payloads >= max_payloads || bytes + len > max_bytes {
-						break;
-					}
-					payloads += 1;
-					bytes += len;
-					taken.push(payload.clone());
-				}
-				if taken.is_empty() {
-					continue;
-				}
-				streams += 1;
-				planned.push(Planned {
-					source: *source,
-					stream,
-					endpoint: from + taken.len() as u64,
-					item: ConsumeItem::Channel { payloads: taken },
-					root,
-				});
-			}
+			let Some((pool, root)) = newest(source) else { continue };
 			for (stream, last) in &wants.registers {
 				if streams >= max_streams || reads >= max_reads {
 					break;
@@ -388,6 +372,43 @@ where
 					root,
 				});
 			}
+		}
+
+		let channels: Vec<_> = view
+			.sources
+			.iter()
+			.flat_map(|(source, wants)| wants.channels.iter().map(move |c| (*source, c)))
+			.collect();
+		let offset = self.rotation.fetch_add(1, Ordering::Relaxed) % channels.len().max(1);
+		let (after, before) = channels.split_at(offset);
+		for (source, consumed) in before.iter().chain(after) {
+			if streams >= max_streams {
+				break;
+			}
+			let Some((pool, root)) = newest(source) else { continue };
+			let stream = consumed.stream_id(self.us);
+			let from = consumed.from().0;
+			let mut taken = Vec::new();
+			for payload in pool.contiguous_from(&stream, from) {
+				let len = payload.len() as u64;
+				if payloads >= max_payloads || bytes + len > max_bytes {
+					break;
+				}
+				payloads += 1;
+				bytes += len;
+				taken.push(payload.clone());
+			}
+			if taken.is_empty() {
+				continue;
+			}
+			streams += 1;
+			planned.push(Planned {
+				source: *source,
+				stream,
+				endpoint: from + taken.len() as u64,
+				item: ConsumeItem::Channel { payloads: taken },
+				root,
+			});
 		}
 		planned
 	}
