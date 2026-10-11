@@ -51,6 +51,8 @@ struct Sender {
 	archive: RwLock<TestArchive>,
 	/// Every request fails, as over a dropped connection.
 	down: RwLock<bool>,
+	/// How long each request takes.
+	delay: RwLock<std::time::Duration>,
 	model: RwLock<Model>,
 	number: RwLock<u64>,
 	peer: PeerId,
@@ -61,6 +63,7 @@ impl Sender {
 		Arc::new(Self {
 			archive: RwLock::new(Archive::open(Arc::new(MemoryStore::default()))),
 			down: RwLock::new(false),
+			delay: RwLock::new(Default::default()),
 			model: RwLock::new(Model::default()),
 			number: RwLock::new(0),
 			peer: PeerId::random(),
@@ -89,6 +92,8 @@ impl Transport for Sender {
 	}
 
 	async fn request(&self, _: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		let delay = *self.delay.read();
+		futures_timer::Delay::new(delay).await;
 		if *self.down.read() {
 			return Err("connection closed".into());
 		}
@@ -361,6 +366,31 @@ fn a_backlogged_channel_does_not_take_every_block() {
 	let first = |data: MessagingInherentData| data.items[0].1;
 	assert_eq!(first(block_on(receiver.inherent_data(&view))), lane(0));
 	assert_eq!(first(block_on(receiver.inherent_data(&view))), lane(1));
+}
+
+#[test]
+fn missing_bindings_are_fetched_under_one_deadline() {
+	use cumulus_primitives_spec_messaging::StreamId;
+	let lane = |num| StreamId::Channel { recipient: US.into(), domain: 0, num };
+	let sender = Sender::new();
+	let root = sender.author(vec![(lane(0), payloads(1, 5)), (lane(1), payloads(2, 5))]);
+	let receiver = receiver(&sender, Budget::default());
+	let consumed = |num| ConsumedStream::Channel { domain: 0, num, from: MessagePosition(0) };
+	let wants = SourceWants { channels: vec![consumed(0), consumed(1)], registers: Vec::new() };
+	block_on(receiver.on_root(source(), root, &wants));
+	// A newer root whose round failed: no item is bound under it.
+	let newer = sender.author(vec![(ack(US), vec![register(0).encode()])]);
+	*sender.down.write() = true;
+	block_on(receiver.on_root(source(), newer, &wants));
+	*sender.down.write() = false;
+
+	// Each fetch takes 60% of the deadline: one after another, the second would miss it.
+	*sender.delay.write() = crate::receiver::INHERENT_FETCH_TIMEOUT * 3 / 5;
+	let view = ChainView { sources: BTreeMap::from([(source(), wants)]) };
+	let started = std::time::Instant::now();
+	let data = block_on(receiver.inherent_data(&view));
+	assert!(started.elapsed() < crate::receiver::INHERENT_FETCH_TIMEOUT);
+	assert_eq!(data.items.len(), 2);
 }
 
 #[test]
