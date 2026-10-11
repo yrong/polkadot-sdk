@@ -1359,13 +1359,13 @@ fn the_per_block_send_cap_resets_every_block() {
 		let mut sent = 0;
 		for num in 0.. {
 			for _ in 0..per_stream {
-				if sent == MaxSendsPerBlock::get() {
+				if sent == SpecMessaging::send_limit() {
 					break;
 				}
 				assert_ok!(SpecMessaging::append_to_stream(out_stream(num), vec![1]));
 				sent += 1;
 			}
-			if sent == MaxSendsPerBlock::get() {
+			if sent == SpecMessaging::send_limit() {
 				break;
 			}
 		}
@@ -1384,8 +1384,27 @@ fn the_per_block_send_cap_resets_every_block() {
 fn can_send_refuses_once_the_block_is_full() {
 	new_test_ext().execute_with(|| {
 		open_and_accepted();
-		SendsThisBlock::<Test>::put(MaxSendsPerBlock::get());
+		SendsThisBlock::<Test>::put(SpecMessaging::send_limit());
 		assert_err!(SpecMessaging::can_send(&out_channel(), 1), Error::<Test>::TooManySends);
+	});
+}
+
+#[test]
+fn earlier_sends_never_fail_the_inherent() {
+	new_test_ext().execute_with(|| {
+		let channels = 0..MaxTouchedStreams::get() as u16;
+		channels.clone().for_each(accept);
+		roll_one_block();
+		// Earlier hooks used every send they may.
+		SendsThisBlock::<Test>::put(SpecMessaging::send_limit());
+		let items = channels
+			.map(|num| {
+				(src(), stream(num), ConsumeItem::Channel { payloads: vec![data_payload(b"a")] })
+			})
+			.collect();
+		// Every consumed channel still publishes its register.
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), inherent(items)));
+		assert_eq!(SendsThisBlock::<Test>::get(), MaxSendsPerBlock::get());
 	});
 }
 
@@ -1422,7 +1441,7 @@ fn enact_weight_reserves_room_for_lifts() {
 			peer_ack(),
 			ConsumeItem::Events {
 				base: MessagePosition(0),
-				start_peaks: vec![],
+				start_peaks: Default::default(),
 				payloads: vec![register],
 			},
 		),

@@ -169,7 +169,9 @@ pub mod pallet {
 		type MaxStreams: Get<u32>;
 
 		/// Cap on sends per block, across all streams. With [`Config::MaxStreams`] it bounds the
-		/// end-of-block `StreamsRoot` fold, which `on_initialize` reserves weight for.
+		/// end-of-block `StreamsRoot` fold, which `on_initialize` reserves weight for. The
+		/// inherent's register publishes, at most [`Config::MaxTouchedStreams`], are kept out of
+		/// reach of every other send, so earlier sends in the block can never fail the inherent.
 		#[pallet::constant]
 		type MaxSendsPerBlock: Get<u32>;
 
@@ -392,6 +394,11 @@ pub mod pallet {
 				"`MaxTouchedStreams` must not exceed `MAX_COMMITMENT_ENTRIES`",
 			);
 			assert!(
+				T::MaxTouchedStreams::get() < T::MaxSendsPerBlock::get(),
+				"`MaxTouchedStreams` must be below `MaxSendsPerBlock`, which reserves room for the \
+				 inherent's register publishes",
+			);
+			assert!(
 				T::DefaultWindowGrant::get().max_message_size <= T::MaxMsgLen::get(),
 				"`DefaultWindowGrant::max_message_size` must not exceed `MaxMsgLen`",
 			);
@@ -552,7 +559,7 @@ pub mod pallet {
 					suspended: false,
 				},
 			};
-			Self::publish_register(&channel, &mut state)?;
+			Self::publish_register(&channel, &mut state, Self::send_limit())?;
 			InChannels::<T>::insert(channel, state);
 			Ok(())
 		}
@@ -598,7 +605,7 @@ pub mod pallet {
 			let mut state = InChannels::<T>::get(channel).ok_or(Error::<T>::UnknownChannel)?;
 			ensure!(!state.published.closed, Error::<T>::AlreadyClosed);
 			state.published.closed = true;
-			Self::publish_register(&channel, &mut state)?;
+			Self::publish_register(&channel, &mut state, Self::send_limit())?;
 			InChannels::<T>::insert(channel, state);
 			Ok(())
 		}
@@ -619,7 +626,7 @@ pub mod pallet {
 			let mut state = InChannels::<T>::get(channel).ok_or(Error::<T>::UnknownChannel)?;
 			ensure!(!state.suspended, Error::<T>::AlreadySuspended);
 			state.suspended = true;
-			Self::publish_register(&channel, &mut state)?;
+			Self::publish_register(&channel, &mut state, Self::send_limit())?;
 			InChannels::<T>::insert(channel, state);
 			Ok(())
 		}
@@ -639,7 +646,7 @@ pub mod pallet {
 			let mut state = InChannels::<T>::get(channel).ok_or(Error::<T>::UnknownChannel)?;
 			ensure!(state.suspended, Error::<T>::NotSuspended);
 			state.suspended = false;
-			Self::publish_register(&channel, &mut state)?;
+			Self::publish_register(&channel, &mut state, Self::send_limit())?;
 			InChannels::<T>::insert(channel, state);
 			Ok(())
 		}
@@ -697,7 +704,7 @@ pub mod pallet {
 			let (from, to) = (MessagePosition(old.leaf_count()), MessagePosition(leaf_count));
 			InboundFrontier::<T>::insert((sender, stream), &new);
 			SkippedStreams::<T>::put(skipped);
-			Self::publish_register(&channel, &mut state)?;
+			Self::publish_register(&channel, &mut state, Self::send_limit())?;
 			InChannels::<T>::insert(channel, state);
 			Self::deposit_event(Event::StreamSkipped { channel, from, to });
 			Ok(())
@@ -821,14 +828,30 @@ impl<T: Config> Pallet<T> {
 		drained
 	}
 
+	/// The block's send cap for everything but the inherent's register publishes, which keep
+	/// [`Config::MaxTouchedStreams`] of [`Config::MaxSendsPerBlock`] for themselves.
+	pub fn send_limit() -> u32 {
+		T::MaxSendsPerBlock::get().saturating_sub(T::MaxTouchedStreams::get())
+	}
+
 	/// Append `payload` to `stream`'s outbound MMR, returning its stable position. Enforces only
-	/// the consensus hard caps, and [`Config::MaxStreams`] when this creates the stream.
+	/// the consensus hard caps, [`Pallet::send_limit`], and [`Config::MaxStreams`] when this
+	/// creates the stream.
 	///
 	/// Crate-internal: it skips the channel and credit gates, and would let a caller forge `Signal`
 	/// leaves. Other code sends through [`Pallet::send`] (design § Message Kinds).
 	pub(crate) fn append_to_stream(
 		stream: StreamId,
 		payload: Vec<u8>,
+	) -> Result<MessagePosition, Error<T>> {
+		Self::append_within(stream, payload, Self::send_limit())
+	}
+
+	/// [`Pallet::append_to_stream`] with the block's sends capped at `limit` instead.
+	fn append_within(
+		stream: StreamId,
+		payload: Vec<u8>,
+		limit: u32,
 	) -> Result<MessagePosition, Error<T>> {
 		let payload: BoundedVec<u8, T::MaxMsgLen> =
 			payload.try_into().map_err(|_| Error::<T>::MessageTooBig)?;
@@ -845,7 +868,7 @@ impl<T: Config> Pallet<T> {
 			ensure!(count < T::MaxStreams::get(), Error::<T>::TooManyOutboundStreams);
 		}
 		let sends = SendsThisBlock::<T>::get();
-		ensure!(sends < T::MaxSendsPerBlock::get(), Error::<T>::TooManySends);
+		ensure!(sends < limit, Error::<T>::TooManySends);
 
 		// Hash the leaf now, once: the fold and the drain use the stored hash.
 		let hash = leaf_hash(LEAF_VERSION, &payload);
@@ -977,8 +1000,8 @@ impl<T: Config> Pallet<T> {
 
 		// Consumption moved the watermark: publish it, so the sender regains credit and can prune.
 		// A stream is consumed at most once per block, so this is at most one publish per channel
-		// per block.
-		Self::publish_register(&channel, &mut state)?;
+		// per block. The inherent may use the room kept for it below `MaxSendsPerBlock`.
+		Self::publish_register(&channel, &mut state, T::MaxSendsPerBlock::get())?;
 		InChannels::<T>::insert(channel, state);
 		Ok(true)
 	}
@@ -1137,7 +1160,7 @@ impl<T: Config> Pallet<T> {
 
 		let queued = OutboundMessages::<T>::decode_len(Self::outbound_stream(channel)).unwrap_or(0);
 		ensure!(queued < T::MaxMessagesPerBlock::get() as usize, Error::<T>::TooManyMessages);
-		ensure!(SendsThisBlock::<T>::get() < T::MaxSendsPerBlock::get(), Error::<T>::TooManySends);
+		ensure!(SendsThisBlock::<T>::get() < Self::send_limit(), Error::<T>::TooManySends);
 		Ok(())
 	}
 
@@ -1187,14 +1210,18 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Publish an inbound channel's register on our `Ack` stream: the consumption watermark, the
-	/// grant (zero while suspended or closed), and the closed flag. Updates `state.published`; the
-	/// caller stores `state`.
+	/// grant (zero while suspended or closed), and the closed flag, with the block's sends capped
+	/// at `limit`. Updates `state.published`; the caller stores `state`.
 	///
 	/// TODO(spec-msg): consumption renews credit when a message is enqueued, not when it executes,
 	/// so a busy receiver's `MessageQueue` keeps growing. Publish a zero grant while the
 	/// `SpecMsg(peer)` queue footprint is over a threshold, and republish on
 	/// `QueueChangeHandler`, as HRMP does.
-	fn publish_register(channel: &ChannelId, state: &mut InChannelState) -> Result<(), Error<T>> {
+	fn publish_register(
+		channel: &ChannelId,
+		state: &mut InChannelState,
+		limit: u32,
+	) -> Result<(), Error<T>> {
 		let stream = Self::inbound_stream(channel);
 		let up_to = MessagePosition(InboundFrontier::<T>::get((channel.peer, stream)).leaf_count());
 		let grant = if state.suspended || state.published.closed {
@@ -1204,7 +1231,7 @@ impl<T: Config> Pallet<T> {
 		};
 		let register =
 			Register { version: PROTOCOL_VERSION, up_to, grant, closed: state.published.closed };
-		Self::append_to_stream(Self::ack_stream(channel), register.encode())?;
+		Self::append_within(Self::ack_stream(channel), register.encode(), limit)?;
 		state.published = register;
 		Ok(())
 	}
