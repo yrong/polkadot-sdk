@@ -363,6 +363,9 @@ pub struct Cli<Config: CliConfig> {
 	///
 	/// Peer chains must have distinct chain-spec `protocolId`s: chains sharing one fail each
 	/// other's block-announce handshake and ban the peer, refusing fetches for about a minute.
+	///
+	/// The archive reads each block's state, so run with `--state-pruning archive-canonical`: with
+	/// pruned state, a node that falls behind by more than the pruning window stops serving.
 	#[arg(long)]
 	pub enable_spec_msg: bool,
 
