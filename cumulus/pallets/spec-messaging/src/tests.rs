@@ -984,6 +984,24 @@ fn other_channels_are_never_executed_as_xcm() {
 }
 
 #[test]
+#[should_panic(expected = "Defensive failure")]
+fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
+	new_test_ext().execute_with(|| {
+		accept(0);
+		// Within the pallet's `MaxMsgLen` (1024), over the queue's `MaxMessageLen`.
+		QueueMaxLen::set(512);
+		let _ = SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			inherent(vec![(
+				src(),
+				stream(0),
+				ConsumeItem::Channel { payloads: vec![data_payload(&[0u8; 600])] },
+			)]),
+		);
+	});
+}
+
+#[test]
 fn hrmp_closing_needs_an_open_xcm_channel() {
 	new_test_ext().execute_with(|| {
 		assert_err!(
@@ -1003,6 +1021,153 @@ fn hrmp_closing_needs_an_open_xcm_channel() {
 			assert!(!HrmpClosing::<Test>::contains_key(peer()));
 		}
 	});
+}
+
+/// An outbound channel data stream to a peer, by number.
+fn out_stream(num: u16) -> StreamId {
+	StreamId::Channel { recipient: peer(), domain: 0, num }
+}
+
+#[test]
+fn the_stream_count_changes_only_on_first_touch() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![1]));
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![2]));
+		assert_eq!(StreamCount::<Test>::get(), 1);
+
+		// Drained into its stored frontier, the stream still exists.
+		roll_one_block();
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![3]));
+		assert_eq!(StreamCount::<Test>::get(), 1);
+
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(1), vec![1]));
+		assert_eq!(StreamCount::<Test>::get(), 2);
+	});
+}
+
+#[test]
+fn the_stream_cap_refuses_new_streams_on_every_path() {
+	new_test_ext().execute_with(|| {
+		for num in 0..MaxStreams::get() as u16 {
+			assert_ok!(SpecMessaging::append_to_stream(out_stream(num), vec![1]));
+		}
+		assert_err!(
+			SpecMessaging::append_to_stream(out_stream(999), vec![1]),
+			Error::<Test>::TooManyOutboundStreams
+		);
+		// Opening a channel and accepting one both create a stream.
+		assert_err!(
+			SpecMessaging::open_channel(RuntimeOrigin::root(), peer(), 1, 0),
+			Error::<Test>::TooManyOutboundStreams
+		);
+		assert_err!(
+			SpecMessaging::accept_open_channel(RuntimeOrigin::root(), src(), 0, 0),
+			Error::<Test>::TooManyOutboundStreams
+		);
+
+		// Existing streams keep working.
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![2]));
+		assert_eq!(StreamCount::<Test>::get(), MaxStreams::get());
+	});
+}
+
+#[test]
+fn sends_store_their_leaf_hashes_in_order() {
+	new_test_ext().execute_with(|| {
+		let payloads = [vec![1u8], vec![2, 2], vec![3, 3, 3]];
+		for payload in &payloads {
+			assert_ok!(SpecMessaging::append_to_stream(out_stream(0), payload.clone()));
+		}
+		let expected: Vec<_> = payloads.iter().map(|p| leaf_hash(LEAF_VERSION, p)).collect();
+		assert_eq!(OutboundLeafHashes::<Test>::get(out_stream(0)).into_inner(), expected);
+
+		// The drain folds them into the frontier and clears both queues.
+		roll_one_block();
+		assert!(OutboundLeafHashes::<Test>::iter().next().is_none());
+		assert!(OutboundMessages::<Test>::iter().next().is_none());
+		assert_eq!(OutboundFrontier::<Test>::get(out_stream(0)).leaf_count(), 3);
+	});
+}
+
+#[test]
+fn the_per_block_send_cap_resets_every_block() {
+	new_test_ext().execute_with(|| {
+		// Spread over streams, so the per-stream cap is not what binds.
+		let per_stream = MaxMessagesPerBlock::get();
+		let mut sent = 0;
+		for num in 0.. {
+			for _ in 0..per_stream {
+				if sent == MaxSendsPerBlock::get() {
+					break;
+				}
+				assert_ok!(SpecMessaging::append_to_stream(out_stream(num), vec![1]));
+				sent += 1;
+			}
+			if sent == MaxSendsPerBlock::get() {
+				break;
+			}
+		}
+		assert_err!(
+			SpecMessaging::append_to_stream(out_stream(0), vec![1]),
+			Error::<Test>::TooManySends
+		);
+
+		roll_one_block();
+		assert_eq!(SendsThisBlock::<Test>::get(), 0);
+		assert_ok!(SpecMessaging::append_to_stream(out_stream(0), vec![1]));
+	});
+}
+
+#[test]
+fn can_send_refuses_once_the_block_is_full() {
+	new_test_ext().execute_with(|| {
+		open_and_accepted();
+		SendsThisBlock::<Test>::put(MaxSendsPerBlock::get());
+		assert_err!(SpecMessaging::can_send(&out_channel(), 1), Error::<Test>::TooManySends);
+	});
+}
+
+#[test]
+fn reservation_constants_cover_the_worst_case_proofs() {
+	use cumulus_primitives_spec_messaging::{
+		streams_root::TreeStep, LiftsBySource, MMRExtensionProof, RequiresLift, StreamProof,
+	};
+	let hash = polkadot_core_primitives::Hash::repeat_byte(1);
+	let extension = MMRExtensionProof {
+		leaf_count: cumulus_primitives_spec_messaging::mmr::MAX_MMR_LEAF_COUNT,
+		connecting_nodes: vec![hash; 64],
+	};
+	let tree_proof = StreamProof {
+		steps: vec![TreeStep { split_bit: 63, sibling: hash }; 64].try_into().unwrap(),
+	};
+	assert!(extension.encoded_size() as u64 <= MAX_EXTENSION_PROOF_BYTES);
+	assert!(tree_proof.encoded_size() as u64 <= MAX_TREE_PROOF_BYTES);
+
+	// A whole PoV lift set for one stream fits the per-stream reservation.
+	let lift = RequiresLift { advances: Vec::new(), extension, tree_proof };
+	let lifts = LiftsBySource::try_from(BTreeMap::from([(src(), vec![lift])])).unwrap();
+	assert!(lifts.encoded_size() as u64 <= LIFT_RESERVATION_BYTES);
+}
+
+#[test]
+fn enact_weight_reserves_room_for_lifts() {
+	let register = register(0, TestGrant::get()).encode();
+	let data = inherent(vec![
+		(src(), stream(0), ConsumeItem::Channel { payloads: vec![data_payload(b"a")] }),
+		(src(), stream(1), ConsumeItem::Channel { payloads: vec![data_payload(b"b")] }),
+		(
+			peer(),
+			peer_ack(),
+			ConsumeItem::Events {
+				base: MessagePosition(0),
+				start_peaks: vec![],
+				payloads: vec![register],
+			},
+		),
+	]);
+	// Two channel items and one register read: three lifts and one advance.
+	let reserved = 3 * LIFT_RESERVATION_BYTES + ADVANCE_RESERVATION_BYTES;
+	assert!(crate::enact_weight::<Test>(&data).proof_size() >= reserved);
 }
 
 mod router {

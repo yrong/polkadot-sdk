@@ -16,6 +16,7 @@ codec = { features = ["derive"], workspace = true }
 scale-info = { features = ["derive"], workspace = true }
 
 # Substrate
+frame-benchmarking = { optional = true, workspace = true }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
 sp-io = { workspace = true }
@@ -33,6 +34,9 @@ xcm-builder = { workspace = true }
 cumulus-primitives-core = { workspace = true }
 cumulus-primitives-spec-messaging = { workspace = true }
 
+# Benchmarks build real MMR extension proofs.
+mmr-lib = { optional = true, workspace = true }
+
 [dev-dependencies]
 cumulus-primitives-core = { workspace = true, default-features = true }
 mmr-lib = { workspace = true, default-features = true }
@@ -45,8 +49,10 @@ std = [
 	"codec/std",
 	"cumulus-primitives-core/std",
 	"cumulus-primitives-spec-messaging/std",
+	"frame-benchmarking?/std",
 	"frame-support/std",
 	"frame-system/std",
+	"mmr-lib?/std",
 	"polkadot-core-primitives/std",
 	"polkadot-parachain-primitives/std",
 	"polkadot-primitives/std",
@@ -58,7 +64,9 @@ std = [
 	"xcm/std",
 ]
 runtime-benchmarks = [
+	"dep:mmr-lib",
 	"cumulus-primitives-core/runtime-benchmarks",
+	"frame-benchmarking/runtime-benchmarks",
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
 	"polkadot-parachain-primitives/runtime-benchmarks",

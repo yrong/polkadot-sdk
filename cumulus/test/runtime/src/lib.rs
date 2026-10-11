@@ -368,6 +368,10 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type SelfParaId = ParachainInfo;
 	type MaxMsgLen = ConstU32<{ 100 * 1024 }>;
 	type MaxMessagesPerBlock = ConstU32<256>;
+	// `on_initialize` reserves the end-of-block fold for every stream plus a full block of sends:
+	// about 2.5 KB of PoV each (benchmarked). These caps keep that near 5% of the block.
+	type MaxStreams = ConstU32<128>;
+	type MaxSendsPerBlock = ConstU32<64>;
 	type MaxTouchedStreams = ConstU32<128>;
 	type MaxContextGaps = ConstU32<64>;
 	type DataHandler = ();
@@ -377,6 +381,7 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type ChannelManagementOrigin = EnsureRoot<AccountId>;
 	type DefaultWindowGrant = SpecMsgWindowGrant;
 	type MaxInFlight = SpecMsgWindowGrant;
+	type WeightInfo = ();
 }
 
 impl parachain_info::Config for Runtime {}

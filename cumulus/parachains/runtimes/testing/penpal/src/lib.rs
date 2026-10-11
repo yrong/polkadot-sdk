@@ -693,6 +693,10 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type SelfParaId = ParachainInfo;
 	type MaxMsgLen = SpecMsgMaxMsgLen;
 	type MaxMessagesPerBlock = ConstU32<256>;
+	// `on_initialize` reserves the end-of-block fold for every stream plus a full block of sends:
+	// about 2.5 KB of PoV each (benchmarked). These caps keep that near 5% of the block.
+	type MaxStreams = ConstU32<128>;
+	type MaxSendsPerBlock = ConstU32<64>;
 	type MaxTouchedStreams = ConstU32<128>;
 	type MaxContextGaps = ConstU32<64>;
 	// Execute the XCM channel's payloads under `SpecMsg(source)`, which XCM sees as the sibling.
@@ -705,6 +709,7 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type ChannelManagementOrigin = EnsureRoot<AccountId>;
 	type DefaultWindowGrant = SpecMsgWindowGrant;
 	type MaxInFlight = SpecMsgWindowGrant;
+	type WeightInfo = cumulus_pallet_spec_messaging::weights::SubstrateWeight<Runtime>;
 }
 
 parameter_types! {
@@ -903,6 +908,7 @@ mod benches {
 		[pallet_collator_selection, CollatorSelection]
 		[cumulus_pallet_parachain_system, ParachainSystem]
 		[cumulus_pallet_xcmp_queue, XcmpQueue]
+		[cumulus_pallet_spec_messaging, SpecMessaging]
 		[pallet_utility, Utility]
 	);
 }

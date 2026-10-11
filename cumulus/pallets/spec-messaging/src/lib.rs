@@ -43,22 +43,46 @@ use cumulus_primitives_spec_messaging::{
 use frame_support::{ensure, pallet_prelude::Weight, traits::Get, BoundedVec};
 use polkadot_core_primitives::Hash;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
-use sp_runtime::generic::DigestItem;
+use sp_runtime::{generic::DigestItem, Saturating};
 
 pub use pallet::*;
 pub use xcm_transport::{
 	xcm_channel, EnqueueToXcmQueue, SpecMsgRouter, XCM_CHANNEL_DOMAIN, XCM_CHANNEL_NUM,
 };
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 #[cfg(test)]
 mod mock;
 #[cfg(test)]
 mod tests;
+pub mod weights;
 pub mod xcm_transport;
+
+pub use weights::WeightInfo;
 
 /// The channel protocol version this implementation announces, in every `OpenChannel` signal and
 /// every published register. `0` gates nothing yet.
 pub const PROTOCOL_VERSION: u8 = 0;
+
+/// Worst-case encoded `MMRExtensionProof`: a compact leaf count (at most 9 bytes) and up to 64
+/// connecting hashes with their compact length.
+pub const MAX_EXTENSION_PROOF_BYTES: u64 = 9 + 2 + 64 * 32;
+
+/// Worst-case encoded `StreamProof`: up to 64 trie steps of a split bit and a sibling hash, with
+/// their compact length.
+pub const MAX_TREE_PROOF_BYTES: u64 = 2 + 64 * (1 + 32);
+
+/// PoV reserved per stream an inherent touches: one lift with no advances (an empty advances list,
+/// the extension and the tree proof), plus its source's framing in `LiftsBySource` (`ParaId` and a
+/// compact length). Lifts are attached after authoring, so the inherent reserves room for them
+/// (design § The Messaging Inherent: PoV weight reservation). About 4.2 KB.
+pub const LIFT_RESERVATION_BYTES: u64 =
+	1 + MAX_EXTENSION_PROOF_BYTES + MAX_TREE_PROOF_BYTES + 4 + 2;
+
+/// PoV reserved per read-context gap, which an `Events` item can open at most once: one advance
+/// proof. About 2.1 KB.
+pub const ADVANCE_RESERVATION_BYTES: u64 = MAX_EXTENSION_PROOF_BYTES;
 
 /// Sender-side credit bookkeeping of one outbound channel, kept next to [`OutChannels`] so the
 /// stored view stays exactly the runtime-API type.
@@ -138,6 +162,18 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxMessagesPerBlock: Get<u32>;
 
+		/// Cap on the outbound streams this chain ever creates: one per opened channel, one `Ack`
+		/// stream per accepted channel. Streams are never removed, and every block with sends
+		/// recomputes the `StreamsRoot` from all of them, so this bounds that block's weight and
+		/// PoV. Size it against the PoV budget.
+		#[pallet::constant]
+		type MaxStreams: Get<u32>;
+
+		/// Cap on sends per block, across all streams. With [`Config::MaxStreams`] it bounds the
+		/// end-of-block `StreamsRoot` fold, which `on_initialize` reserves weight for.
+		#[pallet::constant]
+		type MaxSendsPerBlock: Get<u32>;
+
 		/// Per-block cap on streams the inherent may touch; `integrity_test` keeps it
 		/// `<= MAX_COMMITMENT_ENTRIES`.
 		#[pallet::constant]
@@ -168,6 +204,9 @@ pub mod pallet {
 		/// the peer's grant. It bounds the per-channel bookkeeping and the archive's unconfirmed
 		/// tail whatever the peer grants.
 		type MaxInFlight: Get<WindowGrant>;
+
+		/// Weights of this pallet's calls and hooks.
+		type WeightInfo: WeightInfo;
 	}
 
 	/// Per-stream outbound MMR frontiers; reflects state as of the previous block.
@@ -185,6 +224,16 @@ pub mod pallet {
 		ValueQuery,
 	>;
 
+	/// The leaf hashes of [`OutboundMessages`], in the same order. Each payload is hashed once,
+	/// when it is sent, so the end-of-block fold and the next block's drain only fold hashes.
+	#[pallet::storage]
+	pub type OutboundLeafHashes<T: Config> =
+		StorageMap<_, Twox64Concat, StreamId, BoundedVec<Hash, T::MaxMessagesPerBlock>, ValueQuery>;
+
+	/// Sends this block, across all streams; at most [`Config::MaxSendsPerBlock`].
+	#[pallet::storage]
+	pub type SendsThisBlock<T: Config> = StorageValue<_, u32, ValueQuery>;
+
 	/// This block's committed [`StreamsRoot`] (the `Provides` source); transient.
 	#[pallet::storage]
 	pub type BlockStreamsRoot<T: Config> = StorageValue<_, StreamsRoot, OptionQuery>;
@@ -198,6 +247,10 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type InboundFrontier<T: Config> =
 		StorageMap<_, Twox64Concat, (ParaId, StreamId), MmrFrontier, ValueQuery>;
+
+	/// Number of outbound streams ever created, at most [`Config::MaxStreams`].
+	#[pallet::storage]
+	pub type StreamCount<T: Config> = StorageValue<_, u32, ValueQuery>;
 
 	/// Sender side, per outbound channel. The phase is a view: `Opening` until the peer's register
 	/// is first read, which is the acceptance. Entries are never removed.
@@ -283,6 +336,10 @@ pub mod pallet {
 		BadRegister,
 		/// No such channel.
 		UnknownChannel,
+		/// A new outbound stream would exceed [`Config::MaxStreams`].
+		TooManyOutboundStreams,
+		/// This block already holds [`Config::MaxSendsPerBlock`] sends.
+		TooManySends,
 		/// The channel is already closed from this side.
 		AlreadyClosed,
 		/// The inbound channel is already suspended.
@@ -300,11 +357,15 @@ pub mod pallet {
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
 			// Usually the roll-over runs here. A pallet whose `on_initialize` runs first and sends
-			// has already run it; the drain is charged here either way. TODO: benchmark.
+			// has already run it; the drain is charged here either way.
 			let drained = Self::roll_over();
-			T::DbWeight::get().reads_writes(3, 3).saturating_add(
-				T::DbWeight::get().reads_writes(2, 2).saturating_mul(drained.into()),
-			)
+
+			// `on_finalize` cannot report weight, so reserve the fold's worst case now: every
+			// stream, and a full block of sends.
+			T::WeightInfo::drain(drained).saturating_add(T::WeightInfo::commit_streams_root(
+				StreamCount::<T>::get(),
+				T::MaxSendsPerBlock::get(),
+			))
 		}
 
 		fn on_finalize(_n: BlockNumberFor<T>) {
@@ -368,7 +429,7 @@ pub mod pallet {
 		/// is read. A reopen after our own close is `Open` at once; after the peer's close it
 		/// waits for a new register.
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::open_channel())]
 		pub fn open_channel(
 			origin: OriginFor<T>,
 			recipient: ParaId,
@@ -414,7 +475,7 @@ pub mod pallet {
 		/// `Ack` stream: the acceptance as the sender sees it. Either order works; accepting first
 		/// is pre-authorization. Rejecting is never accepting, which costs nothing.
 		#[pallet::call_index(2)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::accept_open_channel())]
 		pub fn accept_open_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -452,7 +513,7 @@ pub mod pallet {
 		/// advisory and safe at any time; [`Pallet::open_channel`] reopens over the same stream.
 		/// With no credit left, just stop sending: abandonment needs no signal.
 		#[pallet::call_index(3)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::close_channel())]
 		pub fn close_channel(
 			origin: OriginFor<T>,
 			recipient: ParaId,
@@ -476,7 +537,7 @@ pub mod pallet {
 		/// grant; `up_to` still reports what we consumed) and stop consuming it. The frontier is
 		/// kept, so [`Pallet::accept_open_channel`] later resumes where consumption stopped.
 		#[pallet::call_index(4)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::close_inbound_channel())]
 		pub fn close_inbound_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -497,7 +558,7 @@ pub mod pallet {
 		/// [`Pallet::consumed_streams`] omits the stream, and the published register grants
 		/// zero. All state stays.
 		#[pallet::call_index(5)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::suspend_inbound_channel())]
 		pub fn suspend_inbound_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -517,7 +578,7 @@ pub mod pallet {
 		/// Resume a suspended inbound channel: republish a real grant. Consumption restarts from
 		/// the kept frontier.
 		#[pallet::call_index(6)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(3, 3))]
+		#[pallet::weight(T::WeightInfo::resume_inbound_channel())]
 		pub fn resume_inbound_channel(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -541,7 +602,7 @@ pub mod pallet {
 		/// or no block with this call can be included. Recorded as an [`Interval`] like any
 		/// consumption.
 		#[pallet::call_index(7)]
-		#[pallet::weight(T::DbWeight::get().reads_writes(4, 4))]
+		#[pallet::weight(skip_weight::<T>())]
 		pub fn skip_inbound_stream(
 			origin: OriginFor<T>,
 			sender: ParaId,
@@ -597,7 +658,7 @@ pub mod pallet {
 		/// execute before an older one still queued from HRMP: where order matters, let that queue
 		/// drain first.
 		#[pallet::call_index(8)]
-		#[pallet::weight((T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational))]
+		#[pallet::weight((T::WeightInfo::set_hrmp_closing(), DispatchClass::Operational))]
 		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
 			T::ChannelManagementOrigin::ensure_origin(origin)?;
 			let open = OutChannels::<T>::get(xcm_channel(peer))
@@ -610,7 +671,7 @@ pub mod pallet {
 		/// Clear the [`HrmpClosing`] flag for `peer`: the router prefers HRMP again whenever an
 		/// HRMP channel is open. XCM already sent over spec-msg is still delivered. Idempotent.
 		#[pallet::call_index(9)]
-		#[pallet::weight((T::DbWeight::get().reads_writes(0, 1), DispatchClass::Operational))]
+		#[pallet::weight((T::WeightInfo::clear_hrmp_closing(), DispatchClass::Operational))]
 		pub fn clear_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
 			T::ChannelManagementOrigin::ensure_origin(origin)?;
 			HrmpClosing::<T>::remove(peer);
@@ -637,11 +698,41 @@ pub mod pallet {
 	}
 }
 
-/// Weight of one `enact_messages`. TODO: benchmark.
+/// Weight of one `skip_inbound_stream`. The skip adds a stream to this block's consumption record,
+/// so the PoV must also carry one lift for it.
+fn skip_weight<T: Config>() -> Weight {
+	T::WeightInfo::skip_inbound_stream()
+		.saturating_add(Weight::from_parts(0, LIFT_RESERVATION_BYTES))
+}
+
+/// Weight of one `enact_messages`, from the inherent's shape: channel items, payloads beyond one
+/// per item, payload bytes, register reads.
 fn enact_weight<T: Config>(data: &MessagingInherentData) -> Weight {
-	T::DbWeight::get()
-		.reads_writes(1, 1)
-		.saturating_mul(1 + data.items.len() as u64)
+	let (mut items, mut payloads, mut bytes, mut reads) = (0u32, 0u32, 0u32, 0u32);
+	for (_, _, item) in &data.items {
+		let item_payloads = match item {
+			ConsumeItem::Channel { payloads } => {
+				items.saturating_inc();
+				payloads
+			},
+			ConsumeItem::Events { payloads, .. } => {
+				reads.saturating_inc();
+				payloads
+			},
+		};
+		payloads = payloads.saturating_add(item_payloads.len() as u32);
+		bytes = item_payloads
+			.iter()
+			.fold(bytes, |sum, payload| sum.saturating_add(payload.len() as u32));
+	}
+	// Room for the lifts the submitter attaches after authoring: one per touched stream, plus one
+	// advance per read-context gap. Charged up front so a candidate with every lift still fits.
+	let streams = u64::from(items.saturating_add(reads));
+	let lift_room = streams
+		.saturating_mul(LIFT_RESERVATION_BYTES)
+		.saturating_add(u64::from(reads).saturating_mul(ADVANCE_RESERVATION_BYTES));
+	T::WeightInfo::enact_messages(items, payloads.saturating_sub(items), bytes, reads)
+		.saturating_add(Weight::from_parts(0, lift_room))
 }
 
 impl<T: Config> Pallet<T> {
@@ -658,11 +749,15 @@ impl<T: Config> Pallet<T> {
 
 		BlockStreamsRoot::<T>::kill();
 		ConsumptionOutbox::<T>::kill();
+		SendsThisBlock::<T>::kill();
+
+		// Drain by the stored leaf hashes.
+		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
 		let mut drained = 0u32;
-		for (stream, messages) in OutboundMessages::<T>::drain() {
+		for (stream, hashes) in OutboundLeafHashes::<T>::drain() {
 			let mut frontier = OutboundFrontier::<T>::get(stream);
-			for payload in &messages {
-				frontier.append(leaf_hash(LEAF_VERSION, payload));
+			for hash in hashes {
+				frontier.append(hash);
 				drained = drained.saturating_add(1);
 			}
 			OutboundFrontier::<T>::insert(stream, frontier);
@@ -672,8 +767,11 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Append `payload` to `stream`'s outbound MMR, returning its stable position. Enforces only
-	/// the consensus hard caps.
-	pub fn append_to_stream(
+	/// the consensus hard caps, and [`Config::MaxStreams`] when this creates the stream.
+	///
+	/// Crate-internal: it skips the channel and credit gates, and would let a caller forge `Signal`
+	/// leaves. Other code sends through [`Pallet::send`] (design § Message Kinds).
+	pub(crate) fn append_to_stream(
 		stream: StreamId,
 		payload: Vec<u8>,
 	) -> Result<MessagePosition, Error<T>> {
@@ -684,9 +782,27 @@ impl<T: Config> Pallet<T> {
 		// Once the root is committed (`parachain-system` does so in its `on_finalize`), a send
 		// would show in `outbound_messages` but not in the root, and no node could serve it.
 		ensure!(!BlockStreamsRoot::<T>::exists(), Error::<T>::RootCommitted);
+		// A stream exists once it has a stored frontier, or sends queued this block.
+		let new_stream = !OutboundFrontier::<T>::contains_key(stream) &&
+			!OutboundMessages::<T>::contains_key(stream);
+		if new_stream {
+			let count = StreamCount::<T>::get();
+			ensure!(count < T::MaxStreams::get(), Error::<T>::TooManyOutboundStreams);
+		}
+		let sends = SendsThisBlock::<T>::get();
+		ensure!(sends < T::MaxSendsPerBlock::get(), Error::<T>::TooManySends);
+
+		// Hash the leaf now, once: the fold and the drain use the stored hash.
+		let hash = leaf_hash(LEAF_VERSION, &payload);
 		let index = OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
 		OutboundMessages::<T>::try_append(stream, payload)
 			.map_err(|()| Error::<T>::TooManyMessages)?;
+		OutboundLeafHashes::<T>::try_append(stream, hash)
+			.map_err(|()| Error::<T>::TooManyMessages)?;
+		SendsThisBlock::<T>::put(sends.saturating_add(1));
+		if new_stream {
+			StreamCount::<T>::mutate(|count| *count = count.saturating_add(1));
+		}
 
 		Ok(MessagePosition(OutboundFrontier::<T>::get(stream).leaf_count() + index))
 	}
@@ -710,10 +826,10 @@ impl<T: Config> Pallet<T> {
 		}
 
 		let mut touched = false;
-		for (stream, messages) in OutboundMessages::<T>::iter() {
+		for (stream, hashes) in OutboundLeafHashes::<T>::iter() {
 			let mut frontier = OutboundFrontier::<T>::get(stream);
-			for payload in &messages {
-				frontier.append(leaf_hash(LEAF_VERSION, payload));
+			for hash in hashes {
+				frontier.append(hash);
 			}
 			entries.insert(stream, frontier.root().0);
 			touched = true;
@@ -910,7 +1026,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Whether [`Pallet::send`] would accept `data_len` bytes on `channel` now: the encoded
 	/// [`SpecMsgKind::Data`] leaf fits [`Config::MaxMsgLen`] and the peer's `max_message_size`, the
-	/// channel is `Open` with credit left, and the stream has room this block. No side effects.
+	/// channel is `Open` with credit left, and the stream and the block have room. No side effects.
 	pub fn can_send(channel: &ChannelId, data_len: usize) -> Result<(), Error<T>> {
 		// The leaf is `SpecMsgKind::Data` SCALE-encoded: a variant byte, the compact length, the
 		// bytes.
@@ -926,6 +1042,7 @@ impl<T: Config> Pallet<T> {
 
 		let queued = OutboundMessages::<T>::decode_len(Self::outbound_stream(channel)).unwrap_or(0);
 		ensure!(queued < T::MaxMessagesPerBlock::get() as usize, Error::<T>::TooManyMessages);
+		ensure!(SendsThisBlock::<T>::get() < T::MaxSendsPerBlock::get(), Error::<T>::TooManySends);
 		Ok(())
 	}
 
