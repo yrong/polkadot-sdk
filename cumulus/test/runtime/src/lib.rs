@@ -351,6 +351,37 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	type ConsensusHook = ConsensusHook;
 	type RelayParentOffset = ConstU32<{ relay_parent_offset() }>;
 	type SchedulingSignatureVerifier = NoVerification;
+	type UmpSignalSource = SpecMessaging;
+}
+
+parameter_types! {
+	/// Large enough never to trigger in tests. `max_message_size` matches `MaxMsgLen`.
+	pub const SpecMsgWindowGrant: cumulus_primitives_spec_messaging::WindowGrant =
+		cumulus_primitives_spec_messaging::WindowGrant {
+			max_messages: 1024,
+			max_bytes: 8 * 1024 * 1024,
+			max_message_size: 100 * 1024,
+		};
+}
+
+impl cumulus_pallet_spec_messaging::Config for Runtime {
+	type SelfParaId = ParachainInfo;
+	type MaxMsgLen = ConstU32<{ 100 * 1024 }>;
+	type MaxMessagesPerBlock = ConstU32<256>;
+	// `on_initialize` reserves the end-of-block fold for every stream plus a full block of sends:
+	// about 2.5 KB of PoV each (benchmarked). These caps keep that near 5% of the block.
+	type MaxStreams = ConstU32<128>;
+	type MaxSendsPerBlock = ConstU32<64>;
+	type MaxTouchedStreams = ConstU32<128>;
+	type MaxContextGaps = ConstU32<64>;
+	type DataHandler = ();
+	// Channel lifecycle is governance-driven on the test chain.
+	type OpenChannelOrigin = EnsureRoot<AccountId>;
+	type AcceptChannelOrigin = EnsureRoot<AccountId>;
+	type ChannelManagementOrigin = EnsureRoot<AccountId>;
+	type DefaultWindowGrant = SpecMsgWindowGrant;
+	type MaxInFlight = SpecMsgWindowGrant;
+	type WeightInfo = ();
 }
 
 impl parachain_info::Config for Runtime {}
@@ -395,6 +426,7 @@ construct_runtime! {
 	{
 		System: frame_system,
 		ParachainSystem: cumulus_pallet_parachain_system,
+		SpecMessaging: cumulus_pallet_spec_messaging,
 		Timestamp: pallet_timestamp,
 		ParachainInfo: parachain_info,
 		Balances: pallet_balances,
@@ -880,6 +912,37 @@ impl_runtime_apis! {
 					RelayStorageKey::Top(test_pallet::relay_alice_account_key()),
 				],
 			}
+		}
+	}
+
+	impl cumulus_primitives_core::SpecMsgApi<Block> for Runtime {
+		fn outbound_messages() -> Vec<(cumulus_primitives_spec_messaging::StreamId, Vec<Vec<u8>>)> {
+			SpecMessaging::outbound_messages()
+		}
+
+		fn consumed_streams() -> alloc::collections::BTreeMap<
+			ParaId,
+			Vec<cumulus_primitives_spec_messaging::ConsumedStream>,
+		> {
+			SpecMessaging::consumed_streams()
+		}
+
+		fn out_channels() -> alloc::collections::BTreeMap<
+			cumulus_primitives_spec_messaging::ChannelId,
+			cumulus_primitives_spec_messaging::OutChannelState,
+		> {
+			SpecMessaging::out_channels()
+		}
+
+		fn in_channels() -> alloc::collections::BTreeMap<
+			cumulus_primitives_spec_messaging::ChannelId,
+			cumulus_primitives_spec_messaging::InChannelState,
+		> {
+			SpecMessaging::in_channels()
+		}
+
+		fn consumption_record() -> cumulus_primitives_spec_messaging::ConsumptionRecord {
+			SpecMessaging::consumption_record()
 		}
 	}
 

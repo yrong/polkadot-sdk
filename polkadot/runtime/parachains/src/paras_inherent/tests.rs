@@ -5181,3 +5181,76 @@ mod sanitizers {
 		}
 	}
 }
+
+#[cfg(test)]
+mod speculative_admission_gate {
+	//! Candidate-level tests for the `check_speculative_messaging` sanitize gate: feature-off drops
+	//! candidates carrying speculative UMP signals; feature-on matches their `Requires` against the
+	//! relay-side provides window.
+	use super::{check_speculative_messaging, default_config};
+	use crate::{
+		inclusion::tests::TestCandidateBuilder,
+		mock::{new_test_ext, Test},
+	};
+	use codec::Encode;
+	use polkadot_primitives::{
+		BackedCandidate, CoreIndex, Id as ParaId, RequiresSet, StreamsRoot, UMPSignal,
+	};
+
+	fn sr(b: u8) -> StreamsRoot {
+		StreamsRoot(polkadot_primitives::Hash::repeat_byte(b))
+	}
+
+	fn requires(source: u32, root: u8) -> RequiresSet {
+		RequiresSet::try_from_iter([(ParaId::from(source), sr(root))]).unwrap()
+	}
+
+	/// A V2 candidate (which auto-carries a `SelectCore` signal), optionally also carrying
+	/// `Provides` / `Requires` speculative signals.
+	fn candidate(
+		para: u32,
+		provides: Option<StreamsRoot>,
+		requires: Option<RequiresSet>,
+	) -> BackedCandidate {
+		let mut builder = TestCandidateBuilder::default();
+		builder.para_id = ParaId::from(para);
+		builder.core_index = Some(CoreIndex(0));
+		let mut ccr = builder.build();
+		if let Some(r) = requires {
+			ccr.commitments.upward_messages.force_push(UMPSignal::Requires(r).encode());
+		}
+		if let Some(p) = provides {
+			ccr.commitments.upward_messages.force_push(UMPSignal::Provides(p).encode());
+		}
+		BackedCandidate::new(ccr.into(), Default::default(), Default::default(), CoreIndex(0))
+	}
+
+	#[test]
+	fn matches_requires_against_window() {
+		new_test_ext(default_config()).execute_with(|| {
+			let source = 1000;
+			crate::inclusion::Pallet::<Test>::record_provides(ParaId::from(source), sr(0xA));
+
+			// `Requires` present in the source's window → kept.
+			assert!(check_speculative_messaging::<Test>(&candidate(
+				2000,
+				None,
+				Some(requires(source, 0xA)),
+			)));
+			// `Requires` with the wrong root → not in window → dropped.
+			assert!(!check_speculative_messaging::<Test>(&candidate(
+				2000,
+				None,
+				Some(requires(source, 0xC)),
+			)));
+			// `Requires` for an unknown source → dropped.
+			assert!(!check_speculative_messaging::<Test>(&candidate(
+				2000,
+				None,
+				Some(requires(9999, 0xA)),
+			)));
+			// No `Requires` (only `Provides`) → nothing to match → kept.
+			assert!(check_speculative_messaging::<Test>(&candidate(2000, Some(sr(0xB)), None)));
+		});
+	}
+}
