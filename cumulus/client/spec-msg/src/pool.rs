@@ -147,11 +147,6 @@ impl SourcePool {
 			.map(|((_, payload), _)| payload)
 	}
 
-	/// The first position at or after `from` that `stream` has no payload for.
-	pub fn contiguous_end(&self, stream: &StreamId, from: u64) -> u64 {
-		from + self.contiguous_from(stream, from).count() as u64
-	}
-
 	/// Drop the payloads of `stream` below `cursor`: consumed on the chain the cursor came from.
 	pub fn prune_payloads(&mut self, stream: &StreamId, cursor: u64) {
 		if let Some(stored) = self.payloads.get_mut(stream) {
