@@ -53,6 +53,10 @@ pub const FETCH_MAX_BYTES: u32 = 1024 * 1024;
 /// Payloads buffered per channel beyond its cursor before fetching pauses.
 pub const MAX_BUFFERED_PAYLOADS: usize = 4096;
 
+/// Payload bytes buffered per channel beyond its cursor before fetching pauses. A sender that
+/// ignores our grant could otherwise send faster than the budget consumes and fill memory.
+pub const MAX_BUFFERED_BYTES: u64 = 8 * 1024 * 1024;
+
 /// How long building the inherent waits for a missing binding before it drops the item.
 pub const INHERENT_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -232,9 +236,13 @@ where
 			let start = {
 				let mut state = self.state.lock();
 				let pool = state.sources.entry(source).or_default();
-				pool.prune_payloads(&stream, consumed.from().0);
-				let end = pool.contiguous_end(&stream, consumed.from().0);
-				(end - consumed.from().0 < MAX_BUFFERED_PAYLOADS as u64).then_some(end)
+				let from = consumed.from().0;
+				pool.prune_payloads(&stream, from);
+				let (count, bytes) = pool
+					.contiguous_from(&stream, from)
+					.fold((0u64, 0u64), |(n, b), p| (n + 1, b + p.len() as u64));
+				(count < MAX_BUFFERED_PAYLOADS as u64 && bytes < MAX_BUFFERED_BYTES)
+					.then_some(from + count)
 			};
 			let Some(start) = start else { continue };
 			let request = MessagesRequest {

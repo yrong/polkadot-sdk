@@ -325,6 +325,27 @@ fn final_blocks_are_not_rebound_to_newer_roots() {
 }
 
 #[test]
+fn buffered_bytes_are_capped_per_channel() {
+	use crate::receiver::{FETCH_MAX_BYTES, MAX_BUFFERED_BYTES};
+	use cumulus_primitives_spec_messaging::MAX_SPECULATIVE_MESSAGE_LEN;
+
+	let sender = Sender::new();
+	let budget = Budget { max_payloads: u32::MAX, max_bytes: u64::MAX, ..Budget::default() };
+	let receiver = receiver(&sender, budget);
+	let chain = Chain::default();
+	// A sender past any grant, with nothing consumed: fetching stops at the cap.
+	let leaves = vec![vec![0u8; MAX_SPECULATIVE_MESSAGE_LEN as usize]; 10];
+	for _ in 0..2 * MAX_BUFFERED_BYTES / u64::from(FETCH_MAX_BYTES) {
+		let root = sender.author(vec![(channel(US), leaves.clone())]);
+		block_on(receiver.on_root(source(), root, &chain.view().sources[&source()]));
+	}
+	let data = block_on(receiver.inherent_data(&chain.view()));
+	let [(_, _, ConsumeItem::Channel { payloads })] = &data.items[..] else { panic!() };
+	let bytes: u64 = payloads.iter().map(|p| p.len() as u64).sum();
+	assert!((MAX_BUFFERED_BYTES..MAX_BUFFERED_BYTES + u64::from(FETCH_MAX_BYTES)).contains(&bytes));
+}
+
+#[test]
 fn the_peaks_before_a_head_rebuild_its_frontier() {
 	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
 	let mut model = Model::default();
