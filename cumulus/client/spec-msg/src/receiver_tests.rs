@@ -346,6 +346,24 @@ fn buffered_bytes_are_capped_per_channel() {
 }
 
 #[test]
+fn a_backlogged_channel_does_not_take_every_block() {
+	use cumulus_primitives_spec_messaging::StreamId;
+	let lane = |num| StreamId::Channel { recipient: US.into(), domain: 0, num };
+	let sender = Sender::new();
+	let root = sender.author(vec![(lane(0), payloads(1, 5)), (lane(1), payloads(2, 5))]);
+	let receiver = receiver(&sender, Budget { max_payloads: 3, ..Budget::default() });
+	let consumed = |num| ConsumedStream::Channel { domain: 0, num, from: MessagePosition(0) };
+	let wants = SourceWants { channels: vec![consumed(0), consumed(1)], registers: Vec::new() };
+	block_on(receiver.on_root(source(), root, &wants));
+	let view = ChainView { sources: BTreeMap::from([(source(), wants)]) };
+
+	// Both channels hold more than a block's budget; each block starts at the next one.
+	let first = |data: MessagingInherentData| data.items[0].1;
+	assert_eq!(first(block_on(receiver.inherent_data(&view))), lane(0));
+	assert_eq!(first(block_on(receiver.inherent_data(&view))), lane(1));
+}
+
+#[test]
 fn the_peaks_before_a_head_rebuild_its_frontier() {
 	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
 	let mut model = Model::default();
