@@ -38,7 +38,7 @@ use cumulus_primitives_spec_messaging::{
 	ConsumptionRecord, InChannelState, Interval, MMRExtensionProof, MessagePosition,
 	MessagingInherentData, MmrFrontier, OutChannelState, Payload, ProvideUmpSignals, Register,
 	RegisterRead, SpecMsgKind, SpecMsgSignal, StreamId, StreamsRoot, WindowGrant,
-	INHERENT_IDENTIFIER, LEAF_VERSION, SPMS_ENGINE_ID,
+	INHERENT_IDENTIFIER, LEAF_VERSION, MAX_SPECULATIVE_MESSAGE_LEN, SPMS_ENGINE_ID,
 };
 use frame_support::{ensure, pallet_prelude::Weight, traits::Get, BoundedVec};
 use polkadot_core_primitives::Hash;
@@ -337,6 +337,11 @@ pub mod pallet {
 			assert!(
 				T::MaxMsgLen::get() <= T::DataHandler::max_len(),
 				"`MaxMsgLen` must not exceed what the `DataHandler` accepts",
+			);
+			// Receivers refuse to fetch a longer leaf, which would stall its channel for good.
+			assert!(
+				T::MaxMsgLen::get() <= MAX_SPECULATIVE_MESSAGE_LEN,
+				"`MaxMsgLen` must not exceed `MAX_SPECULATIVE_MESSAGE_LEN`",
 			);
 		}
 	}
