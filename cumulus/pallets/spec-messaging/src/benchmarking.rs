@@ -37,6 +37,11 @@ fn full_frontier() -> MmrFrontier {
 }
 
 /// An outbound XCM channel to `peer`, `Open` under the runtime's grant with nothing in flight.
+///
+/// TODO(spec-msg): `send` and register reads read and write the in-flight sizes, up to
+/// `MaxInFlight`; seed them at the cap so `send` and `enact_messages` measure the worst case.
+/// The `pallet_xcm` benchmarks also take the HRMP route, as their delivery helper opens HRMP;
+/// add one that opens a spec-msg channel.
 fn open_outbound<T: Config>(peer: ParaId) {
 	OutChannels::<T>::insert(
 		xcm_channel(peer),
