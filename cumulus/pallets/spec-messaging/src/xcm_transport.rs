@@ -94,6 +94,9 @@ impl<Queue: EnqueueMessage<ParaId>> OnSpecMsgData for EnqueueToXcmQueue<Queue> {
 /// - An `Open` channel without capacity is a hard [`SendError::Transport`]: falling through would
 ///   lose the XCM in `XcmpQueue`.
 ///
+/// TODO(spec-msg): the pallet has no congestion fee. Track one per peer, rising while in-flight
+/// bytes exceed half the window, so `Price` can be an `ExponentialPrice` as for HRMP.
+///
 /// `ChannelInfo` is usually `ParachainSystem`, `VersionWrapper` usually `PolkadotXcm` (same
 /// destination `Location` as HRMP, so negotiated versions carry over).
 pub struct SpecMsgRouter<T, ChannelInfo, VersionWrapper, Price>(
