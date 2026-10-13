@@ -160,6 +160,11 @@ where
 
 	/// The first block of the run of API-bearing blocks that ends at `target`, or `None` if
 	/// `target` has no API or that run's start cannot be read.
+	///
+	/// TODO(spec-msg): with pruned state, this and `import` fail for good: a fresh node,
+	/// or one down longer than the pruning window, never serves again. Seed the archive at the
+	/// first block with state from an `outbound_frontiers()` runtime API (peaks and leaf count per
+	/// stream; both floors at the leaf count), then replay from there.
 	fn find_origin(&self, target: Block::Hash) -> Option<Block::Hash> {
 		if !self.has_api(target).unwrap_or(false) {
 			return None;
