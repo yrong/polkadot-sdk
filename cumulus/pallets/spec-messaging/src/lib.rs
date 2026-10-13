@@ -897,8 +897,10 @@ impl<T: Config> Pallet<T> {
 		// of the streams it did not touch. The sends go first, so an idle block reads no
 		// frontier.
 		//
-		// TODO(spec-msg): O(all-streams) per touched block, growing without bound. Replace with the
-		// incremental updater tracked on `streams_root`.
+		// TODO(spec-msg): O(all-streams) per touched block. Replace with the incremental updater
+		// tracked on `streams_root`, which also lets a closed channel's stream leave the
+		// commitment: until then `MaxStreams` caps the channels a chain opens over its lifetime,
+		// and a chain that reaches it can never open another.
 		let mut entries: BTreeMap<StreamId, Hash> = BTreeMap::new();
 		for (stream, hashes) in OutboundLeafHashes::<T>::iter() {
 			let mut frontier = OutboundFrontier::<T>::get(stream);
