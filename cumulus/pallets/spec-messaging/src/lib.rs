@@ -1075,6 +1075,11 @@ impl<T: Config> Pallet<T> {
 	/// Publish an inbound channel's register on our `Ack` stream: the consumption watermark, the
 	/// grant (zero while suspended or closed), and the closed flag. Updates `state.published`; the
 	/// caller stores `state`.
+	///
+	/// TODO(spec-msg): consumption renews credit when a message is enqueued, not when it executes,
+	/// so a busy receiver's `MessageQueue` keeps growing. Publish a zero grant while the
+	/// `SpecMsg(peer)` queue footprint is over a threshold, and republish on
+	/// `QueueChangeHandler`, as HRMP does.
 	fn publish_register(channel: &ChannelId, state: &mut InChannelState) -> Result<(), Error<T>> {
 		let stream = Self::inbound_stream(channel);
 		let up_to = MessagePosition(InboundFrontier::<T>::get((channel.peer, stream)).leaf_count());
