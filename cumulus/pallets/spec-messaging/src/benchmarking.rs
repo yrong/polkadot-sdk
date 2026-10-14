@@ -38,10 +38,8 @@ fn full_frontier() -> MmrFrontier {
 
 /// An outbound XCM channel to `peer`, `Open` under the runtime's grant with nothing in flight.
 ///
-/// TODO(spec-msg): `send` and register reads read and write the in-flight sizes, up to
-/// `MaxInFlight`; seed them at the cap so `send` and `enact_messages` measure the worst case.
-/// The `pallet_xcm` benchmarks also take the HRMP route, as their delivery helper opens HRMP;
-/// add one that opens a spec-msg channel.
+/// TODO(spec-msg): the `pallet_xcm` benchmarks also take the HRMP route, as their delivery helper
+/// opens HRMP; add one that opens a spec-msg channel.
 fn open_outbound<T: Config>(peer: ParaId) {
 	OutChannels::<T>::insert(
 		xcm_channel(peer),
@@ -56,6 +54,28 @@ fn open_outbound<T: Config>(peer: ParaId) {
 			}),
 		},
 	);
+}
+
+/// Put `count` one-byte messages in flight on the outbound channel to `peer`: the vector that
+/// `ensure_credit` reads and `account_send` and `confirm` rewrite, at its worst-case length.
+fn seed_in_flight<T: Config>(peer: ParaId, count: u32) {
+	OutChannelsMeta::<T>::insert(
+		xcm_channel(peer),
+		OutChannelMeta {
+			base: MessagePosition(0),
+			sizes: vec![1u32; count as usize],
+			bytes: u64::from(count),
+			read_at: None,
+		},
+	);
+}
+
+/// The most messages in flight that still leaves credit for one more send.
+fn in_flight_cap<T: Config>() -> u32 {
+	T::MaxInFlight::get()
+		.max_messages
+		.min(T::DefaultWindowGrant::get().max_messages)
+		.saturating_sub(1)
 }
 
 /// Accept the inbound XCM channel from `sender` through the call, as a chain would.
@@ -78,8 +98,12 @@ fn queue_send<T: Config>(stream: StreamId) {
 	OutboundMessages::<T>::insert(stream, BoundedVec::truncate_from(vec![payload]));
 	OutboundLeafHashes::<T>::insert(stream, BoundedVec::truncate_from(vec![hash]));
 	SendsThisBlock::<T>::mutate(|sends| sends.saturating_inc());
-	// The queued send is this block's: its roll-over has run. Start at block 1, which the
-	// harness moves a block-0 setup to before measuring.
+	mark_rolled_over::<T>();
+}
+
+/// The block's roll-over has run, as `on_initialize` does before anything else touches the
+/// block. Start at block 1, which the harness moves a block-0 setup to before measuring.
+fn mark_rolled_over<T: Config>() {
 	let now = frame_system::Pallet::<T>::block_number().max(1u32.into());
 	frame_system::Pallet::<T>::set_block_number(now);
 	RolledOver::<T>::put((now, 0));
@@ -292,9 +316,10 @@ mod benchmarks {
 		for j in 0..r {
 			let peer = sibling::<T>(10_000 + j);
 			open_outbound::<T>(peer);
+			seed_in_flight::<T>(peer, in_flight_cap::<T>());
 			let register = Register {
 				version: PROTOCOL_VERSION,
-				up_to: MessagePosition(0),
+				up_to: MessagePosition(u64::from(in_flight_cap::<T>())),
 				grant: T::DefaultWindowGrant::get(),
 				closed: false,
 			};
@@ -320,20 +345,34 @@ mod benchmarks {
 		_(RawOrigin::None, data);
 
 		assert_eq!(ConsumptionOutbox::<T>::get().len() as u32, c + r);
+		// Each register confirmed everything in flight.
+		for j in 0..r {
+			assert!(OutChannelsMeta::<T>::get(xcm_channel(sibling::<T>(10_000 + j)))
+				.sizes
+				.is_empty());
+		}
 		Ok(())
 	}
 
-	/// One send of `b` bytes on a new stream.
+	/// One send of `b` bytes on a new stream of an open channel, one message short of the
+	/// in-flight cap: the credit check and the in-flight accounting at their worst.
 	#[benchmark]
-	fn send(b: Linear<0, { T::MaxMsgLen::get() }>) {
+	fn send(b: Linear<0, { T::DefaultWindowGrant::get().max_message_size.saturating_sub(8) }>) {
+		let peer = sibling::<T>(0);
+		open_outbound::<T>(peer);
+		seed_in_flight::<T>(peer, in_flight_cap::<T>());
 		let payload = vec![0u8; b as usize];
 
 		#[block]
 		{
-			Pallet::<T>::append_to_stream(stream(0), payload).expect("a first send fits; qed");
+			Pallet::<T>::send(xcm_channel(peer), payload).expect("the channel has credit; qed");
 		}
 
 		assert_eq!(StreamCount::<T>::get(), 1);
+		assert_eq!(
+			OutChannelsMeta::<T>::get(xcm_channel(peer)).sizes.len() as u32,
+			in_flight_cap::<T>() + 1
+		);
 	}
 
 	/// `on_initialize` draining `h` leaf hashes, each in its own stream with a full frontier.
@@ -369,6 +408,8 @@ mod benchmarks {
 		for i in s..s.saturating_add(h) {
 			queue_send::<T>(stream(i));
 		}
+		// Without sends nothing marked the block, and the call would run the whole roll-over.
+		mark_rolled_over::<T>();
 
 		#[block]
 		{
