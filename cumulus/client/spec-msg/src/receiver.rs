@@ -238,6 +238,8 @@ where
 			return;
 		}
 		self.state.lock().sources.entry(source).or_default().push_root(root);
+		log::debug!(target: LOG_TARGET, "New root {root:?} of {source:?}: fetching");
+		let started = std::time::Instant::now();
 		let mut settled = true;
 
 		for consumed in &wants.channels {
@@ -304,6 +306,12 @@ where
 				pool.settled = settled;
 			}
 		}
+		log::debug!(
+			target: LOG_TARGET,
+			"Root {root:?} of {source:?}: fetch {} in {:?}",
+			if settled { "settled" } else { "incomplete" },
+			started.elapsed(),
+		);
 	}
 
 	/// The messaging inherent for a block whose parent has `view`.
@@ -342,6 +350,9 @@ where
 					p.endpoint,
 				);
 			}
+		}
+		if !items.is_empty() {
+			log::debug!(target: LOG_TARGET, "Messaging inherent: {} items", items.len());
 		}
 		MessagingInherentData { items }
 	}
