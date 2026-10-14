@@ -988,6 +988,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Push a sender's `StreamsRoot` into its window, dropping the oldest when full.
 	pub(crate) fn record_provides(source: ParaId, root: StreamsRoot) {
+		log::debug!(target: LOG_TARGET, "Recording provides root {root:?} of para {source:?}");
 		RecentProvides::<T>::mutate(source, |window| {
 			// `remove(0)` shifts at most 128 entries, cheap next to the whole-window decode and
 			// encode this `mutate` already does.
