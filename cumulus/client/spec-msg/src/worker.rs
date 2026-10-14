@@ -213,6 +213,7 @@ where
 			},
 		};
 		let committed = read_streams_root(header.digest());
+		let sent: usize = sends.iter().map(|(_, payloads)| payloads.len()).sum();
 		let result = self.archive.write().import_block(
 			hash,
 			*header.parent_hash(),
@@ -224,6 +225,13 @@ where
 		if let Err(e) = result {
 			log::warn!(target: LOG_TARGET, "Archiving {hash:?} failed: {e:?}");
 			return false;
+		}
+		if sent > 0 {
+			log::debug!(
+				target: LOG_TARGET,
+				"Archived block #{} {hash:?}: {sent} sends, committing {committed:?}",
+				header.number(),
+			);
 		}
 		true
 	}
