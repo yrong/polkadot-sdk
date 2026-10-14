@@ -420,7 +420,19 @@ where
 			upward_message_signals,
 			&spec_msg_inputs,
 		) {
-			Ok(tail) => upward_messages.extend(tail),
+			Ok(tail) => {
+				let consuming =
+					spec_msg_inputs.records.iter().filter(|r| !r.entries.is_empty()).count();
+				if consuming > 0 {
+					tracing::debug!(
+						target: LOG_TARGET,
+						consuming,
+						signals = tail.len(),
+						"Collation carries a `Requires` over the consumption of {consuming} blocks.",
+					);
+				}
+				upward_messages.extend(tail)
+			},
 			Err(error) => {
 				tracing::error!(
 					target: LOG_TARGET,
