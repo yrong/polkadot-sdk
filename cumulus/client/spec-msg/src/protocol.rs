@@ -100,8 +100,15 @@ pub async fn run_request_handler<H, S>(
 {
 	while let Some(IncomingRequest { peer, payload, pending_response }) = requests.next().await {
 		let result = answer(&archive.read(), &payload).ok_or(());
-		if result.is_err() {
-			log::debug!(target: LOG_TARGET, "Refused a spec-msg exchange request from {peer}");
+		match &result {
+			Ok(response) => log::debug!(
+				target: LOG_TARGET,
+				"Served a spec-msg exchange request from {peer}: {} bytes",
+				response.len(),
+			),
+			Err(()) => {
+				log::debug!(target: LOG_TARGET, "Refused a spec-msg exchange request from {peer}")
+			},
 		}
 		let response =
 			OutgoingResponse { result, reputation_changes: Vec::new(), sent_feedback: None };
