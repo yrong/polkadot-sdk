@@ -123,7 +123,7 @@ impl ChainView {
 				.entry(channel.peer)
 				.or_default()
 				.registers
-				.push((stream, state.register));
+				.push((stream, state.register.map(|read| read.register)));
 		}
 		Self { sources, caps: None }
 	}
