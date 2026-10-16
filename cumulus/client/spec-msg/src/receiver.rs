@@ -123,7 +123,7 @@ impl ChainView {
 				.entry(channel.peer)
 				.or_default()
 				.registers
-				.push((stream, state.register));
+				.push((stream, state.register.map(|read| read.register)));
 		}
 		Self { sources, caps: None }
 	}
@@ -396,7 +396,11 @@ where
 					endpoint: head.end_count(),
 					item: ConsumeItem::Events {
 						base: head.base,
-						start_peaks: head.start_peaks.clone(),
+						start_peaks: head
+							.start_peaks
+							.clone()
+							.try_into()
+							.expect("a verified head's peaks fit the bound; qed"),
 						payloads: vec![head.payload.clone()],
 					},
 					root,
