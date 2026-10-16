@@ -390,21 +390,28 @@ fn events_items_other_than_register_reads_are_undeclared() {
 #[test]
 fn an_events_item_at_the_leaf_count_ceiling_is_rejected() {
 	new_test_ext().execute_with(|| {
-		// A message on one stream, then an `Events` item whose hints put the frontier at the
-		// ceiling. Were its payload appended, the record would not decode and would read as empty:
-		// no `Requires`, so the first message would never be checked. The block is invalid instead.
-		let (a, s) = (src(), stream(0));
+		accept(0);
+		open_out_channel();
+		roll_one_block();
+		// A message on an accepted inbound channel, then a register read whose hints put the
+		// frontier at the ceiling. Were the register appended, the record would not decode and
+		// would read as empty: no `Requires`, so the message would never be checked. The block is
+		// invalid instead.
 		let at_ceiling = ConsumeItem::Events {
 			base: MessagePosition(cumulus_primitives_spec_messaging::mmr::MAX_MMR_LEAF_COUNT),
 			start_peaks: vec![polkadot_core_primitives::Hash::zero()],
-			payloads: vec![data_payload(b"reg")],
+			payloads: vec![register(0, TestGrant::get()).encode()],
 		};
 		assert_err!(
 			SpecMessaging::enact_messages(
 				RuntimeOrigin::none(),
 				inherent(vec![
-					(a, s, ConsumeItem::Channel { payloads: vec![data_payload(b"forged")] }),
-					(a, stream(1), at_ceiling),
+					(
+						src(),
+						stream(0),
+						ConsumeItem::Channel { payloads: vec![data_payload(b"forged")] }
+					),
+					(peer(), peer_ack(), at_ceiling),
 				]),
 			),
 			Error::<Test>::BadFrontier
