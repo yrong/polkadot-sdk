@@ -37,7 +37,7 @@ use cumulus_primitives_spec_messaging::{
 	mmr::SpecMerge,
 	streams_root::{gen_stream_proof, streams_root},
 	EventRequest, EventResponse, MMRExtensionProof, MessagesRequest, MessagesResponse,
-	MmrInclusionProof, MmrRoot, StreamId, StreamsRoot, LEAF_VERSION,
+	MmrInclusionProof, MmrRoot, StreamId, StreamsRoot, LEAF_VERSION, MAX_MESSAGES_PER_RESPONSE,
 };
 use mmr_lib::{
 	helper::{get_peaks, leaf_index_to_mmr_size, leaf_index_to_pos},
@@ -49,8 +49,9 @@ use std::collections::BTreeMap;
 const PREFIX: &[u8] = b"spec-msg/archive/v1/";
 
 /// Maximum payloads served per response, whatever the byte budget: each costs a store read, so
-/// tiny leaves under a large budget would make a 1 KiB request cost many reads.
-pub const MAX_LEAVES_PER_RESPONSE: u64 = 1024;
+/// tiny leaves under a large budget would make a 1 KiB request cost many reads. The protocol's
+/// decode bound, so a requester never refuses a full response.
+pub const MAX_LEAVES_PER_RESPONSE: u64 = MAX_MESSAGES_PER_RESPONSE as u64;
 
 /// Errors of the archive's write paths. Serving never errors: it refuses with `None`.
 #[derive(Debug, PartialEq, Eq)]
@@ -470,6 +471,7 @@ where
 			}
 		}
 		let end = start + payloads.len() as u64;
+		let payloads = payloads.try_into().ok()?;
 
 		let nodes = Nodes::new(&self.store, req.stream);
 		let start_peaks = nodes.peaks(start)?;
