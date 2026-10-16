@@ -37,7 +37,7 @@ use cumulus_primitives_spec_messaging::{
 	mmr::SpecMerge,
 	streams_root::{gen_stream_proof, streams_root},
 	EventRequest, EventResponse, MMRExtensionProof, MessagesRequest, MessagesResponse,
-	MmrInclusionProof, StreamId, StreamsRoot, LEAF_VERSION,
+	MmrInclusionProof, MmrRoot, StreamId, StreamsRoot, LEAF_VERSION,
 };
 use mmr_lib::{
 	helper::{get_peaks, leaf_index_to_mmr_size, leaf_index_to_pos},
@@ -326,12 +326,14 @@ where
 					.map_err(|_| ArchiveError::MissingNode)?;
 				batch.insert.push((payload_key(&stream, first + i as u64), payload.clone()));
 			}
-			let root = mmr.get_root().map_err(|_| ArchiveError::MissingNode)?;
+			let leaf_count = first + payloads.len() as u64;
+			let bag = mmr.get_root().map_err(|_| ArchiveError::MissingNode)?;
+			let root = MmrRoot::from_bag(leaf_count, bag).0;
 			mmr.commit().map_err(|_| ArchiveError::MissingNode)?;
 			for (pos, node) in nodes.pending.take() {
 				batch.insert.push((node_key(&stream, pos), node.encode()));
 			}
-			streams.insert(stream, StreamState { leaf_count: first + payloads.len() as u64, root });
+			streams.insert(stream, StreamState { leaf_count, root });
 		}
 
 		let (state, state_at) = if touched {

@@ -246,13 +246,13 @@ where
 			match self.client.runtime_api().out_channels(finalized) {
 				Ok(channels) => {
 					for (channel, state) in channels {
-						if let Some(register) = state.register {
+						if let Some(read) = state.register {
 							let stream = StreamId::Channel {
 								recipient: channel.peer,
 								domain: channel.domain,
 								num: channel.num,
 							};
-							watermarks.insert(stream, register.up_to.0);
+							watermarks.insert(stream, read.register.up_to.0);
 						}
 					}
 				},
