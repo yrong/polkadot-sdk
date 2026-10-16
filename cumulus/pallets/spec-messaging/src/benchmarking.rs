@@ -46,11 +46,14 @@ fn open_outbound<T: Config>(peer: ParaId) {
 		OutChannelState {
 			closed_by_us: false,
 			announced_version: PROTOCOL_VERSION,
-			register: Some(Register {
-				version: PROTOCOL_VERSION,
-				up_to: MessagePosition(0),
-				grant: T::DefaultWindowGrant::get(),
-				closed: false,
+			register: Some(RegisterRead {
+				at: MessagePosition(0),
+				register: Register {
+					version: PROTOCOL_VERSION,
+					up_to: MessagePosition(0),
+					grant: T::DefaultWindowGrant::get(),
+					closed: false,
+				},
 			}),
 		},
 	);
@@ -65,7 +68,6 @@ fn seed_in_flight<T: Config>(peer: ParaId, count: u32) {
 			base: MessagePosition(0),
 			sizes: vec![1u32; count as usize],
 			bytes: u64::from(count),
-			read_at: None,
 		},
 	);
 }
