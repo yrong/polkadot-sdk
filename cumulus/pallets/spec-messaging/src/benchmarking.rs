@@ -233,8 +233,9 @@ mod benchmarks {
 	}
 
 	/// Skip an inbound XCM channel from 4,095 to 8,191 leaves (12 peaks to 13), with the
-	/// consumption record one stream below [`Config::MaxTouchedStreams`]. The extension proof is
-	/// real; verifying it costs O(log n) hashes, so a larger MMR changes little.
+	/// consumption record full and the skip marker one stream below [`Config::MaxTouchedStreams`].
+	/// The extension proof is real; verifying it costs O(log n) hashes, so a larger MMR changes
+	/// little.
 	#[benchmark]
 	fn skip_inbound_stream() -> Result<(), BenchmarkError> {
 		use mmr_lib::{
@@ -276,10 +277,13 @@ mod benchmarks {
 		};
 		InboundFrontier::<T>::insert((sender, xcm_channel_stream::<T>()), old);
 
-		// Other streams already consumed this block, each with a full frontier.
+		// Other streams already consumed and skipped this block. Marked rolled over, or the skip's
+		// own `roll_over` would clear them.
+		mark_rolled_over::<T>();
 		for i in 1..T::MaxTouchedStreams::get() {
 			let interval = Interval { start: MmrFrontier::new().root(), end: full_frontier() };
 			ConsumptionOutbox::<T>::append((sibling::<T>(i), stream(i), interval));
+			SkippedStreams::<T>::append((sibling::<T>(i), stream(i)));
 		}
 
 		#[extrinsic_call]
