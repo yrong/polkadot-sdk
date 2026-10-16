@@ -855,6 +855,28 @@ fn an_oversized_leaf_is_consumed_and_dropped() {
 }
 
 #[test]
+fn a_data_leaf_at_max_msg_len_is_the_largest_sendable() {
+	new_test_ext().execute_with(|| {
+		open_out_channel();
+		roll_one_block();
+		// A grant past `MaxMsgLen`, so the pallet's own bound decides.
+		let grant = WindowGrant { max_message_size: 4 * MaxMsgLen::get(), ..TestGrant::get() };
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			read_register(0, register(0, grant))
+		));
+		// The bound is on the encoded leaf: a variant byte and, at this size, a 2-byte compact
+		// length.
+		let max = MaxMsgLen::get() as usize;
+		assert_err!(
+			SpecMessaging::send(out_channel(), vec![0; max - 2]),
+			Error::<Test>::MessageTooBig
+		);
+		assert_ok!(SpecMessaging::send(out_channel(), vec![0; max - 3]));
+	});
+}
+
+#[test]
 fn a_send_over_the_peers_max_message_size_is_refused() {
 	new_test_ext().execute_with(|| {
 		open_out_channel();
