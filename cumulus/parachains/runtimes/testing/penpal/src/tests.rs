@@ -30,7 +30,8 @@ use cumulus_pallet_parachain_system::{
 use cumulus_pallet_spec_messaging::{xcm_channel, OutChannels, OutboundMessages, PROTOCOL_VERSION};
 use cumulus_primitives_core::AbridgedHrmpChannel;
 use cumulus_primitives_spec_messaging::{
-	MessagePosition, OutChannelState, ProvideUmpSignals, Register, SpecMsgKind, SPMS_ENGINE_ID,
+	MessagePosition, OutChannelState, ProvideUmpSignals, Register, RegisterRead, SpecMsgKind,
+	SPMS_ENGINE_ID,
 };
 use frame_support::{assert_ok, traits::Get};
 use sp_runtime::{generic::DigestItem, BuildStorage};
@@ -69,11 +70,14 @@ fn open_spec_msg_channel() {
 		OutChannelState {
 			closed_by_us: false,
 			announced_version: PROTOCOL_VERSION,
-			register: Some(Register {
-				version: PROTOCOL_VERSION,
-				up_to: MessagePosition(0),
-				grant: SpecMsgWindowGrant::get(),
-				closed: false,
+			register: Some(RegisterRead {
+				at: MessagePosition(0),
+				register: Register {
+					version: PROTOCOL_VERSION,
+					up_to: MessagePosition(0),
+					grant: SpecMsgWindowGrant::get(),
+					closed: false,
+				},
 			}),
 		},
 	);
