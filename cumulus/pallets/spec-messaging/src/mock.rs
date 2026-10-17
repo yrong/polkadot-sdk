@@ -15,7 +15,7 @@
 
 use crate as cumulus_pallet_spec_messaging;
 use cumulus_primitives_spec_messaging::WindowGrant;
-use frame_support::{derive_impl, parameter_types};
+use frame_support::{derive_impl, parameter_types, traits::EnqueueMessage, BoundedSlice};
 use frame_system::EnsureRoot;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::BuildStorage;
@@ -54,13 +54,78 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 	type MaxMessagesPerBlock = MaxMessagesPerBlock;
 	type MaxTouchedStreams = MaxTouchedStreams;
 	type MaxContextGaps = MaxContextGaps;
-	type DataHandler = ();
+	type DataHandler = crate::EnqueueToXcmQueue<RecordingQueue>;
 	type OpenChannelOrigin = EnsureRoot<u64>;
 	type AcceptChannelOrigin = EnsureRoot<u64>;
 	type ChannelManagementOrigin = EnsureRoot<u64>;
 	type DefaultWindowGrant = TestGrant;
 	type MaxInFlight = TestGrant;
 }
+
+parameter_types! {
+	/// Messages [`RecordingQueue`] received: `(origin, message)`.
+	pub static Enqueued: Vec<(ParaId, Vec<u8>)> = Vec::new();
+}
+
+/// Message queue that records what it is given. Its `MaxMessageLen` is the pallet's `MaxMsgLen`,
+/// the least `integrity_test` allows.
+pub struct RecordingQueue;
+
+impl EnqueueMessage<ParaId> for RecordingQueue {
+	type MaxMessageLen = MaxMsgLen;
+
+	fn enqueue_message(message: BoundedSlice<u8, Self::MaxMessageLen>, origin: ParaId) {
+		Enqueued::mutate(|enqueued| enqueued.push((origin, message.to_vec())));
+	}
+
+	fn enqueue_messages<'a>(
+		messages: impl Iterator<Item = BoundedSlice<'a, u8, Self::MaxMessageLen>>,
+		origin: ParaId,
+	) {
+		messages.for_each(|message| Self::enqueue_message(message, origin));
+	}
+
+	fn sweep_queue(_: ParaId) {}
+}
+
+parameter_types! {
+	/// HRMP channel state [`MockHrmp`] reports for every sibling.
+	pub static HrmpState: HrmpChannel = HrmpChannel::Closed;
+}
+
+/// The HRMP channel state tests can set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HrmpChannel {
+	Closed,
+	Ready,
+	Full,
+}
+
+/// HRMP channel info for the XCM router tests: every sibling is in [`HrmpState`].
+pub struct MockHrmp;
+
+impl cumulus_primitives_core::GetChannelInfo for MockHrmp {
+	fn get_channel_status(_: ParaId) -> cumulus_primitives_core::ChannelStatus {
+		use cumulus_primitives_core::ChannelStatus;
+		match HrmpState::get() {
+			HrmpChannel::Closed => ChannelStatus::Closed,
+			HrmpChannel::Ready => ChannelStatus::Ready(1024, 1024),
+			HrmpChannel::Full => ChannelStatus::Full,
+		}
+	}
+
+	fn get_channel_info(_: ParaId) -> Option<cumulus_primitives_core::ChannelInfo> {
+		None
+	}
+}
+
+/// The router as a runtime would wire it, with no fee and no version negotiation.
+pub type Router = crate::SpecMsgRouter<
+	Test,
+	MockHrmp,
+	(),
+	polkadot_runtime_common::xcm_sender::NoPriceForMessageDelivery<ParaId>,
+>;
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
 	let mut ext: sp_io::TestExternalities =
