@@ -4866,6 +4866,7 @@ dependencies = [
  "cumulus-client-consensus-common",
  "cumulus-client-network",
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "cumulus-test-client",
  "cumulus-test-relay-sproof-builder",
  "cumulus-test-runtime",
