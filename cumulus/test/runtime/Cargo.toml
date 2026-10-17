@@ -51,9 +51,11 @@ polkadot-primitives = { workspace = true }
 # Cumulus
 cumulus-pallet-aura-ext = { workspace = true }
 cumulus-pallet-parachain-system = { workspace = true }
+cumulus-pallet-spec-messaging = { workspace = true }
 cumulus-pallet-weight-reclaim = { workspace = true }
 cumulus-primitives-aura = { workspace = true }
 cumulus-primitives-core = { workspace = true }
+cumulus-primitives-spec-messaging = { workspace = true }
 cumulus-primitives-storage-weight-reclaim = { workspace = true }
 parachain-info = { workspace = true }
 
@@ -66,9 +68,11 @@ std = [
 	"codec/std",
 	"cumulus-pallet-aura-ext/std",
 	"cumulus-pallet-parachain-system/std",
+	"cumulus-pallet-spec-messaging/std",
 	"cumulus-pallet-weight-reclaim/std",
 	"cumulus-primitives-aura/std",
 	"cumulus-primitives-core/std",
+	"cumulus-primitives-spec-messaging/std",
 	"cumulus-primitives-storage-weight-reclaim/std",
 	"frame-executive/std",
 	"frame-support/std",
