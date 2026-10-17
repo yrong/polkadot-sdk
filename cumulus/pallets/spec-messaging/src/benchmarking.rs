@@ -422,7 +422,7 @@ mod benchmarks {
 			Pallet::<T>::commit_streams_root();
 		}
 
-		assert_eq!(BlockStreamsRoot::<T>::get().is_some(), h > 0);
+		assert_eq!(Pallet::<T>::current_streams_root().is_some(), h > 0);
 	}
 
 	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
