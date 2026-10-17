@@ -191,11 +191,19 @@ fn root_accumulates_across_blocks_and_multiple_streams() {
 }
 
 #[test]
-fn idle_block_emits_no_root() {
+fn idle_block_emits_no_root_and_rejects_a_later_send() {
 	new_test_ext().execute_with(|| {
 		// No sends this block.
 		assert_eq!(SpecMessaging::commit_streams_root(), None);
 		assert_eq!(SpecMessaging::current_streams_root(), None);
+
+		// A pallet finalized after `parachain-system` sends: its root would never be provided.
+		assert_err!(
+			SpecMessaging::append_to_stream(stream(0), b"a".to_vec()),
+			crate::Error::<Test>::RootCommitted
+		);
+		assert_eq!(SpecMessaging::commit_streams_root(), None);
+		assert!(SpecMessaging::outbound_messages().is_empty());
 	});
 }
 
