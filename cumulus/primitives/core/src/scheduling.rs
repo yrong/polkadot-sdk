@@ -72,7 +72,8 @@ impl SchedulingInfoPayload {
 ///
 /// Single source of truth shared by the collator and the PVF (`validate_block`) so their tails
 /// can't drift. The relay decoder (`CandidateCommitments::ump_signals`) rejects a repeated variant
-/// or any third signal, and parses only the run after the first `UMP_SEPARATOR`.
+/// or more than `MAX_UMP_SIGNALS` signals, and parses only the run after the first
+/// `UMP_SEPARATOR`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SchedulingSignals {
 	select_core: Option<(CoreSelector, ClaimQueueOffset)>,
@@ -100,13 +101,15 @@ impl SchedulingSignals {
 						panic!("Parachain emitted more than one `ApprovedPeer` UMP signal");
 					}
 				},
+				// Parsed by `SpecMessagingSignals` instead.
+				UMPSignal::Provides(_) | UMPSignal::Requires(_) => {},
 			}
 		}
 		signals
 	}
 
-	/// Build the tail from a verified `SignedSchedulingInfo`, replacing the block's own signals
-	/// wholesale. Assumes every `UMPSignal` is a scheduling signal; guarded by
+	/// Build the tail from a verified `SignedSchedulingInfo`, replacing the block's *scheduling*
+	/// signals wholesale. Classify each new `UMPSignal` in
 	/// `all_ump_signals_are_scheduling_signals`.
 	pub fn from_scheduling_info(signed_info: &SignedSchedulingInfo) -> Self {
 		let payload = &signed_info.payload;
@@ -383,6 +386,9 @@ mod tests {
 		fn classify(signal: UMPSignal) {
 			match signal {
 				UMPSignal::SelectCore(..) | UMPSignal::ApprovedPeer(..) => {},
+				// Not scheduling signals: `validate_block` builds them in its own pass on both
+				// paths, so the override dropping them here is intended.
+				UMPSignal::Provides(..) | UMPSignal::Requires(..) => {},
 			}
 		}
 		let _ = classify;
