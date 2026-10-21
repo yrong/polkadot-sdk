@@ -3237,10 +3237,7 @@ mod speculative_provides_window {
 				ParaInclusion::record_provides(source, sr(i as u8));
 			}
 			// The window holds exactly `MAX_PROVIDES_WINDOW_SIZE` entries.
-			assert_eq!(
-				RecentProvides::<Test>::get(source).len(),
-				MAX_PROVIDES_WINDOW_SIZE as usize
-			);
+			assert_eq!(ParaInclusion::provides_len(source), MAX_PROVIDES_WINDOW_SIZE);
 			// The 3 oldest roots were dropped; roots from index 3 onward are retained.
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 0)])).is_err());
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 2)])).is_err());
@@ -3302,14 +3299,14 @@ mod speculative_provides_window {
 			let (staying, leaving) = (ParaId::from(1), ParaId::from(2));
 			ParaInclusion::record_provides(staying, sr(0xA));
 			ParaInclusion::record_provides(leaving, sr(0xB));
-			assert!(!RecentProvides::<Test>::get(leaving).is_empty());
+			assert!(ParaInclusion::provides_len(leaving) > 0);
 
 			// A session change that offboards `leaving` drops its window; `staying` is untouched.
 			let notification = crate::initializer::SessionChangeNotification::default();
 			ParaInclusion::initializer_on_new_session(&notification, &[leaving]);
 
-			assert!(RecentProvides::<Test>::get(leaving).is_empty());
-			assert!(!RecentProvides::<Test>::get(staying).is_empty());
+			assert!(ParaInclusion::provides_len(leaving) == 0);
+			assert!(ParaInclusion::provides_len(staying) > 0);
 		});
 	}
 
@@ -3320,14 +3317,12 @@ mod speculative_provides_window {
 			for src in 1..=3u32 {
 				ParaInclusion::record_provides(ParaId::from(src), sr(src as u8));
 			}
-			assert!(
-				(1..=3u32).all(|src| !RecentProvides::<Test>::get(ParaId::from(src)).is_empty())
-			);
+			assert!((1..=3u32).all(|src| ParaInclusion::provides_len(ParaId::from(src)) > 0));
 
 			// A freeze transition clears the whole map (see `paras_inherent`).
 			ParaInclusion::clear_provides();
 
-			assert!((1..=3u32).all(|src| RecentProvides::<Test>::get(ParaId::from(src)).is_empty()));
+			assert!((1..=3u32).all(|src| ParaInclusion::provides_len(ParaId::from(src)) == 0));
 		});
 	}
 

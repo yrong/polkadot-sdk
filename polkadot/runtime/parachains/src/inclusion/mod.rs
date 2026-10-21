@@ -374,20 +374,21 @@ pub mod pallet {
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
-	/// Per-sender window of recently committed `StreamsRoot`s for speculative messaging, newest
-	/// last, at most [`MAX_PROVIDES_WINDOW_SIZE`]. A receiver's `Requires` matches a root in it.
-	/// Reverted with the chain, cleared on a dispute freeze, dropped when the sender offboards.
-	/// Not cleared by a forced head update (`force_set_current_head`, `force_note_new_head`): that
-	/// is a Root recovery, and undoing what receivers already consumed is an off-chain runbook
-	/// step.
+	/// Per-sender ring bookkeeping: `(head, len)`. `head` is the next write position, `len` the
+	/// number of live roots (at most [`MAX_PROVIDES_WINDOW_SIZE`]).
 	#[pallet::storage]
-	pub(crate) type RecentProvides<T: Config> = StorageMap<
-		_,
-		Twox64Concat,
-		ParaId,
-		BoundedVec<StreamsRoot, ConstU32<MAX_PROVIDES_WINDOW_SIZE>>,
-		ValueQuery,
-	>;
+	pub(crate) type ProvidesCursor<T: Config> =
+		StorageMap<_, Twox64Concat, ParaId, (u32, u32), ValueQuery>;
+
+	/// Every root live in a sender's ring; the O(1) membership check of a `Requires`.
+	#[pallet::storage]
+	pub(crate) type ProvidesMember<T: Config> =
+		StorageDoubleMap<_, Twox64Concat, ParaId, Identity, StreamsRoot, ()>;
+
+	/// Ring position to root; used only to find the oldest root on eviction.
+	#[pallet::storage]
+	pub(crate) type ProvidesQueue<T: Config> =
+		StorageDoubleMap<_, Twox64Concat, ParaId, Twox64Concat, u32, StreamsRoot>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
@@ -509,7 +510,7 @@ impl<T: Config> Pallet<T> {
 		Self::cleanup_outgoing_ump_dispatch_queues(outgoing_paras);
 
 		for outgoing_para in outgoing_paras {
-			RecentProvides::<T>::remove(outgoing_para);
+			Self::remove_provides(*outgoing_para);
 		}
 	}
 
@@ -967,23 +968,30 @@ impl<T: Config> Pallet<T> {
 		);
 	}
 
-	/// Whether `root` is present in `source`'s provides window.
+	/// Whether `root` is present in `source`'s provides ring.
 	fn provides_contains(source: ParaId, root: &StreamsRoot) -> bool {
-		// Scan newest-first: a `requires` almost always references a recent commitment, which sits
-		// at the tail of the drop-oldest window, so this short-circuits sooner on a match.
-		RecentProvides::<T>::get(source).iter().rev().any(|committed| committed == root)
+		ProvidesMember::<T>::contains_key(source, root)
 	}
 
-	/// The newest entry of `source`'s provides window: its latest `StreamsRoot` committed in an
-	/// included candidate, if any.
+	/// The newest root of `source`'s provides ring, if any.
 	pub(crate) fn newest_provides(source: ParaId) -> Option<StreamsRoot> {
-		RecentProvides::<T>::get(source).last().copied()
+		let (head, len) = ProvidesCursor::<T>::get(source);
+		if len == 0 {
+			return None;
+		}
+		let newest = (head + MAX_PROVIDES_WINDOW_SIZE - 1) % MAX_PROVIDES_WINDOW_SIZE;
+		ProvidesQueue::<T>::get(source, newest)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn provides_len(source: ParaId) -> u32 {
+		ProvidesCursor::<T>::get(source).1
 	}
 
 	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
 	/// first miss.
 	pub(crate) fn requires_satisfied(requires: &RequiresSet) -> Result<(), (ParaId, StreamsRoot)> {
-		// One `RecentProvides` read per required source.
+		// One `ProvidesMember` read per required source.
 		for (source, expected) in requires.iter() {
 			if !Self::provides_contains(*source, expected) {
 				return Err((*source, *expected));
@@ -992,21 +1000,42 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Push a sender's `StreamsRoot` into its window, dropping the oldest when full.
+	/// Push a sender's `StreamsRoot` into its ring, evicting the oldest when full.
 	pub(crate) fn record_provides(source: ParaId, root: StreamsRoot) {
 		log::debug!(target: LOG_TARGET, "Recording provides root {root:?} of para {source:?}");
-		RecentProvides::<T>::mutate(source, |window| {
-			// Appending at `len` never fails; a full window evicts its oldest root.
-			let _evicted = window.force_insert_keep_right(window.len(), root);
-		});
+		if ProvidesMember::<T>::contains_key(source, root) {
+			return;
+		}
+		let (head, len) = ProvidesCursor::<T>::get(source);
+		let len = if len == MAX_PROVIDES_WINDOW_SIZE {
+			// The oldest root sits at `head`, the position about to be overwritten.
+			if let Some(oldest) = ProvidesQueue::<T>::take(source, head) {
+				ProvidesMember::<T>::remove(source, oldest);
+			}
+			len
+		} else {
+			len + 1
+		};
+		ProvidesQueue::<T>::insert(source, head, root);
+		ProvidesMember::<T>::insert(source, root, ());
+		ProvidesCursor::<T>::insert(source, ((head + 1) % MAX_PROVIDES_WINDOW_SIZE, len));
 	}
 
-	/// Clear every window, on a dispute freeze. A finalized invalid candidate cannot be reverted,
-	/// so its root would otherwise outlive `force_unfreeze`. Windows refill as senders provide
-	/// again. Returns the weight of the removals.
+	/// Drop one sender's ring.
+	fn remove_provides(source: ParaId) {
+		let _ = ProvidesMember::<T>::clear_prefix(source, u32::MAX, None);
+		let _ = ProvidesQueue::<T>::clear_prefix(source, u32::MAX, None);
+		ProvidesCursor::<T>::remove(source);
+	}
+
 	pub(crate) fn clear_provides() -> Weight {
-		let removed = RecentProvides::<T>::clear(u32::MAX, None);
-		T::DbWeight::get().reads_writes(removed.loops as u64, removed.unique as u64)
+		let members = ProvidesMember::<T>::clear(u32::MAX, None);
+		let queue = ProvidesQueue::<T>::clear(u32::MAX, None);
+		let cursors = ProvidesCursor::<T>::clear(u32::MAX, None);
+		let (loops, unique) = [members, queue, cursors]
+			.iter()
+			.fold((0u64, 0u64), |(l, u), r| (l + r.loops as u64, u + r.unique as u64));
+		T::DbWeight::get().reads_writes(loops, unique)
 	}
 
 	pub(crate) fn relay_dispatch_queue_size(para_id: ParaId) -> (u32, u32) {
