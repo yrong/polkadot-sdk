@@ -560,9 +560,9 @@ where
 		match fetch(&*self.transport, source, &ExchangeRequest::Messages(request)).await {
 			Ok(Verified {
 				response: ExchangeResponse::Messages(response),
-				outcome: ExchangeVerified::Messages(payloads),
+				outcome: ExchangeVerified::Messages,
 			}) => Some((
-				payloads,
+				response.payloads.into_inner(),
 				Binding { extension: response.extension, tree_proof: response.tree_proof },
 			)),
 			_ => None,
@@ -601,12 +601,13 @@ where
 			fetch(&*self.transport, source, &request).await.ok()?;
 		let (
 			ExchangeResponse::Event(response),
-			ExchangeVerified::Event(VerifiedEvent::Head { position, frontier, payload }),
+			ExchangeVerified::Event(VerifiedEvent::Head { position, frontier }),
 		) = (response, outcome)
 		else {
 			return None;
 		};
 		let start_peaks = peaks_before_head(&response, position, &frontier)?;
+		let payload = response.payload;
 		Some((HeadRead { under: root, base: position, start_peaks, payload }, response.tree_proof))
 	}
 }
