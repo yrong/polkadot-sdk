@@ -81,7 +81,7 @@ impl Transport for NetworkTransport {
 
 /// A response that verified under its request's root, with what it proved.
 pub struct Verified {
-	/// The response, for its proofs.
+	/// The response, for its proofs and its payloads; built only after it verified.
 	pub response: ExchangeResponse,
 	/// What the response proved.
 	pub outcome: ExchangeVerified,
