@@ -88,7 +88,8 @@ fn messages(stream: StreamId, start: u64, under: StreamsRoot, max_bytes: u32) ->
 /// Serve and verify; return the verified payloads.
 fn fetch(archive: &TestArchive, req: &MessagesRequest) -> Option<Vec<Vec<u8>>> {
 	let resp = archive.serve_messages(req, u32::MAX)?;
-	Some(verify_messages(req, &resp).expect("a served response verifies"))
+	verify_messages(req, &resp).expect("a served response verifies");
+	Some(resp.payloads.into_inner())
 }
 
 #[test]
@@ -160,8 +161,8 @@ fn events_verify_at_the_head_and_at_a_position() {
 	let head = |under| EventRequest { stream: r, under, at: None };
 	let resp = archive.serve_event(&head(root2)).unwrap();
 	match verify_event(&head(root2), &resp).unwrap() {
-		VerifiedEvent::Head { position, payload, .. } => {
-			assert_eq!((position, payload), (MessagePosition(5), registers[5].clone()))
+		VerifiedEvent::Head { position, .. } => {
+			assert_eq!((position, resp.payload), (MessagePosition(5), registers[5].clone()))
 		},
 		other => panic!("expected a head read, got {other:?}"),
 	}
@@ -176,8 +177,9 @@ fn events_verify_at_the_head_and_at_a_position() {
 	let resp = archive.serve_event(&at).unwrap();
 	assert_eq!(
 		verify_event(&at, &resp).unwrap(),
-		VerifiedEvent::Positional { position: MessagePosition(2), payload: registers[2].clone() }
+		VerifiedEvent::Positional { position: MessagePosition(2) }
 	);
+	assert_eq!(resp.payload, registers[2]);
 	let past = EventRequest { stream: r, under: root1, at: Some(MessagePosition(5)) };
 	assert!(archive.serve_event(&past).is_none());
 }
@@ -316,7 +318,8 @@ fn the_handler_decodes_strictly() {
 	let ExchangeResponse::Messages(resp) = codec::Decode::decode(&mut &answer[..]).unwrap() else {
 		panic!("a messages request gets a messages response");
 	};
-	assert_eq!(verify_messages(&req, &resp).unwrap().len(), 2);
+	verify_messages(&req, &resp).unwrap();
+	assert_eq!(resp.payloads.len(), 2);
 
 	let mut trailing = encoded.clone();
 	trailing.push(0);
