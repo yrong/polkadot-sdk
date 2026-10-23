@@ -19,7 +19,11 @@
 
 use super::*;
 use alloc::vec;
-use cumulus_primitives_spec_messaging::mmr::SpecMerge;
+use cumulus_primitives_spec_messaging::{
+	mmr::{SpecMerge, MAX_MMR_LEAF_COUNT},
+	streams_root::gen_stream_proof,
+	LiftsBySource, RequiresLift, StreamProof, STREAM_ID_LEN,
+};
 use frame_benchmarking::v2::*;
 use frame_support::traits::{EnsureOrigin, Hooks};
 use frame_system::RawOrigin;
@@ -109,6 +113,41 @@ fn mark_rolled_over<T: Config>() {
 	let now = frame_system::Pallet::<T>::block_number().max(1u32.into());
 	frame_system::Pallet::<T>::set_block_number(now);
 	RolledOver::<T>::put((now, 0));
+}
+
+/// A one-leaf frontier.
+fn one_leaf(byte: u8) -> MmrFrontier {
+	MmrFrontier::from_parts(vec![Hash::repeat_byte(byte)], 1).expect("one peak for one leaf; qed")
+}
+
+/// An extension from one leaf to `2^48 - 1` leaves: 48 connecting nodes, the most any extension
+/// takes. The nodes are arbitrary; the verifier derives the root from them.
+fn widest_extension() -> MMRExtensionProof {
+	let to = MAX_MMR_LEAF_COUNT - 1;
+	let nodes = mmr_lib::ancestry_proof::ancestry_proof_positions(
+		mmr_lib::leaf_index_to_mmr_size(0),
+		mmr_lib::leaf_index_to_mmr_size(to - 1),
+	)
+	.expect("valid sizes, the old MMR within the new; qed")
+	.len();
+	MMRExtensionProof {
+		leaf_count: to,
+		connecting_nodes: BoundedVec::truncate_from(vec![Hash::repeat_byte(2); nodes]),
+	}
+}
+
+/// `key`'s tree proof at its deepest: the tree also holds every key one bit away from `key` that
+/// is still a valid `StreamId`, so the walk takes one step per such bit.
+fn deepest_tree_proof(key: StreamId, root: Hash) -> StreamProof {
+	let mut entries = BTreeMap::from([(key, root)]);
+	for bit in 0..STREAM_ID_LEN * 8 {
+		let mut other = key.to_bytes();
+		other[bit / 8] ^= 0x80 >> (bit % 8);
+		if let Ok(other) = StreamId::from_bytes(other) {
+			entries.insert(other, Hash::repeat_byte(3));
+		}
+	}
+	gen_stream_proof(&entries, key).expect("key is in the tree; qed").1
 }
 
 #[benchmarks]
@@ -425,6 +464,60 @@ mod benchmarks {
 		}
 
 		assert_eq!(Pallet::<T>::current_streams_root().is_some(), h > 0);
+	}
+
+	/// `build_requires` over the lifts one block can need: `s` streams, and `g` more whose read
+	/// context moved since the previous block, each stream from its own source. Every extension
+	/// and tree proof is at its largest. This runs in `validate_block`, not in the block.
+	#[benchmark]
+	fn build_requires(
+		s: Linear<1, { T::MaxTouchedStreams::get().saturating_sub(T::MaxContextGaps::get()) }>,
+		g: Linear<0, { T::MaxContextGaps::get() }>,
+	) -> Result<(), BenchmarkError> {
+		let key = xcm_channel_stream::<T>();
+		let (mut previous, mut this) = (ConsumptionRecord::default(), ConsumptionRecord::default());
+		let mut lifts = BTreeMap::new();
+		for i in 0..s.saturating_add(g) {
+			let source = sibling::<T>(i);
+			let start = one_leaf(1);
+			previous
+				.entries
+				.entry(source)
+				.or_default()
+				.insert(key, Interval { start: start.root(), end: start.clone() });
+			let mut advances = Vec::new();
+			let mut endpoint = start;
+			if i >= s {
+				// A gap: this block's read context is a proven forward extension of the previous.
+				let advance = widest_extension();
+				let next =
+					advance.verify(&endpoint).map_err(|_| BenchmarkError::Stop("advance"))?;
+				endpoint = one_leaf(4);
+				this.entries
+					.entry(source)
+					.or_default()
+					.insert(key, Interval { start: next, end: endpoint.clone() });
+				advances.push(advance);
+			}
+			let extension = widest_extension();
+			let current =
+				extension.verify(&endpoint).map_err(|_| BenchmarkError::Stop("extension"))?;
+			let tree_proof = deepest_tree_proof(key, current.0);
+			lifts.insert(source, vec![RequiresLift { advances, extension, tree_proof }]);
+		}
+		let lifts =
+			LiftsBySource::try_from(lifts).map_err(|_| BenchmarkError::Stop("too many sources"))?;
+		let records = [previous, this];
+		let requires;
+
+		#[block]
+		{
+			requires = cumulus_primitives_spec_messaging::build_requires(&records, &lifts);
+		}
+
+		let requires = requires.map_err(|_| BenchmarkError::Stop("lift failed"))?;
+		assert_eq!(requires.map(|set| set.len() as u32), Some(s.saturating_add(g)));
+		Ok(())
 	}
 
 	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
