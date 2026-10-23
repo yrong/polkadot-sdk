@@ -53,3 +53,14 @@ impl sp_runtime::traits::Convert<ParaId, AggregateMessageOrigin> for ParaIdToSib
 		AggregateMessageOrigin::Sibling(para_id)
 	}
 }
+
+/// Convert a sibling `ParaId` to the `AggregateMessageOrigin` of its Speculative Messaging queue.
+///
+/// Spec-msg gets its own queue book, separate from the HRMP one: HRMP backpressure
+/// ([`NarrowOriginToSibling`]) never pauses it.
+pub struct ParaIdToSpecMsg;
+impl sp_runtime::traits::Convert<ParaId, AggregateMessageOrigin> for ParaIdToSpecMsg {
+	fn convert(para_id: ParaId) -> AggregateMessageOrigin {
+		AggregateMessageOrigin::SpecMsg(para_id)
+	}
+}

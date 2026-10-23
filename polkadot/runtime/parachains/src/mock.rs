@@ -295,6 +295,7 @@ impl crate::hrmp::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type ChannelManager = frame_system::EnsureRoot<u64>;
 	type Currency = pallet_balances::Pallet<Test>;
+	type DepositProvider = Hrmp;
 	type DefaultChannelSizeAndCapacityWithSystem = DefaultChannelSizeAndCapacityWithSystem;
 	type VersionWrapper = TestUsesOnlyStoredVersionWrapper;
 	type WeightInfo = crate::hrmp::TestWeightInfo;
@@ -624,8 +625,11 @@ impl SendXcm for DummyXcmSender {
 pub struct InclusionWeightInfo;
 
 impl crate::inclusion::WeightInfo for InclusionWeightInfo {
-	fn enact_candidate(_u: u32, _h: u32, _c: u32) -> Weight {
+	fn enact_candidate(_u: u32, _h: u32, _c: u32, _p: u32) -> Weight {
 		Weight::from_parts(1024 * 1024, 0)
+	}
+	fn requires_satisfied(_r: u32) -> Weight {
+		Weight::zero()
 	}
 }
 
