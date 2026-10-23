@@ -79,8 +79,7 @@ pub struct Budget {
 }
 
 impl Default for Budget {
-	/// About 13 ms of per-payload and 90 ms of enqueue weight at the benchmarked rates (~50 µs per
-	/// payload, ~36 ms per 100 KiB of XCM).
+	/// Sized against the benchmarked per-payload and enqueue weights.
 	fn default() -> Self {
 		Self { max_streams: 16, max_reads: 8, max_payloads: 256, max_bytes: 256 * 1024 }
 	}
