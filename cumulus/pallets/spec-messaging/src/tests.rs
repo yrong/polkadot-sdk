@@ -1250,7 +1250,7 @@ fn other_channels_are_never_executed_as_xcm() {
 fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
 	new_test_ext().execute_with(|| {
 		accept(0);
-		// Within the pallet's `MaxMsgLen` (1024), over the queue's `MaxMessageLen`.
+		// Within the pallet's `MaxMsgLen`, over the queue's `MaxMessageLen`.
 		QueueMaxLen::set(512);
 		let _ = SpecMessaging::enact_messages(
 			RuntimeOrigin::none(),

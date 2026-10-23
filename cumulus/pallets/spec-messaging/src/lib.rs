@@ -67,23 +67,21 @@ pub use weights::WeightInfo;
 /// every published register. `0` gates nothing yet.
 pub const PROTOCOL_VERSION: u8 = 0;
 
-/// Worst-case encoded `MMRExtensionProof`: a compact leaf count (at most 9 bytes) and up to 64
-/// connecting hashes with their compact length.
+/// Worst-case encoded `MMRExtensionProof`.
 pub const MAX_EXTENSION_PROOF_BYTES: u64 = 9 + 2 + 64 * 32;
 
-/// Worst-case encoded `StreamProof`: up to 64 trie steps of a split bit and a sibling hash, with
-/// their compact length.
+/// Worst-case encoded `StreamProof`.
 pub const MAX_TREE_PROOF_BYTES: u64 = 2 + 64 * (1 + 32);
 
 /// PoV reserved per stream an inherent touches: one lift with no advances (an empty advances list,
 /// the extension and the tree proof), plus its source's framing in `LiftsBySource` (`ParaId` and a
 /// compact length). Lifts are attached after authoring, so the inherent reserves room for them
-/// (design § The Messaging Inherent: PoV weight reservation). About 4.2 KB.
+/// (design § The Messaging Inherent: PoV weight reservation).
 pub const LIFT_RESERVATION_BYTES: u64 =
 	1 + MAX_EXTENSION_PROOF_BYTES + MAX_TREE_PROOF_BYTES + 4 + 2;
 
 /// PoV reserved per read-context gap, which an `Events` item can open at most once: one advance
-/// proof. About 2.1 KB.
+/// proof.
 pub const ADVANCE_RESERVATION_BYTES: u64 = MAX_EXTENSION_PROOF_BYTES;
 
 /// Sender-side credit bookkeeping of one outbound channel, kept next to [`OutChannels`] so the
