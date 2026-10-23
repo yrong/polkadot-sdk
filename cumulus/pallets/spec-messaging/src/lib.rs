@@ -38,7 +38,7 @@ use cumulus_primitives_spec_messaging::{
 	ConsumptionRecord, InChannelState, Interval, MMRExtensionProof, MessagePosition,
 	MessagingInherentData, MmrFrontier, OutChannelState, Payload, ProvideUmpSignals, Register,
 	RegisterRead, SpecMsgKind, SpecMsgSignal, StreamId, StreamsRoot, WindowGrant,
-	INHERENT_IDENTIFIER, LEAF_VERSION, SPMS_ENGINE_ID,
+	INHERENT_IDENTIFIER, LEAF_VERSION, MAX_SPECULATIVE_MESSAGE_LEN, SPMS_ENGINE_ID,
 };
 use frame_support::{ensure, pallet_prelude::Weight, traits::Get, BoundedVec};
 use polkadot_core_primitives::Hash;
@@ -46,6 +46,9 @@ use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::generic::DigestItem;
 
 pub use pallet::*;
+pub use xcm_transport::{
+	xcm_channel, EnqueueToXcmQueue, SpecMsgRouter, XCM_CHANNEL_DOMAIN, XCM_CHANNEL_NUM,
+};
 
 const LOG_TARGET: &str = "runtime::spec-msg";
 
@@ -53,6 +56,7 @@ const LOG_TARGET: &str = "runtime::spec-msg";
 mod mock;
 #[cfg(test)]
 mod tests;
+pub mod xcm_transport;
 
 /// The channel protocol version this implementation announces, in every `OpenChannel` signal and
 /// every published register. `0` gates nothing yet.
@@ -89,10 +93,17 @@ impl OutChannelMeta {
 	}
 }
 
-/// Sink for consumed `Data` payloads. `()` drops them; the real handler lands with the XCM layer.
+/// Sink for consumed `Data` payloads. `()` drops them; [`EnqueueToXcmQueue`] executes the XCM
+/// channel's payloads as XCM.
 pub trait OnSpecMsgData {
 	/// One `Data` payload, consumed in order at `position` of `(source, stream)`.
 	fn on_data(source: ParaId, stream: StreamId, position: MessagePosition, data: Vec<u8>);
+
+	/// The longest `data` this handler accepts; `integrity_test` keeps [`Config::MaxMsgLen`] within
+	/// it, so no consumed payload is dropped for its size.
+	fn max_len() -> u32 {
+		u32::MAX
+	}
 }
 
 impl OnSpecMsgData for () {
@@ -145,8 +156,8 @@ pub mod pallet {
 		/// creates permanent state this pallet does not price.
 		type AcceptChannelOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
-		/// Origin allowed to suspend and resume an inbound channel, and to skip a stalled one
-		/// ahead ([`Pallet::skip_inbound_stream`]).
+		/// Origin allowed to suspend and resume an inbound channel, to skip a stalled one ahead
+		/// ([`Pallet::skip_inbound_stream`]), and to flag an HRMP cutover.
 		type ChannelManagementOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
 		/// The send-window credit every published register grants.
@@ -215,6 +226,13 @@ pub mod pallet {
 	#[pallet::storage]
 	#[pallet::unbounded]
 	pub type SkippedStreams<T: Config> = StorageValue<_, Vec<(ParaId, StreamId)>, ValueQuery>;
+
+	/// Siblings whose HRMP channel is being closed in favour of spec-msg. While a sibling is
+	/// flagged, [`SpecMsgRouter`] treats its HRMP channel as closed: new XCM goes over spec-msg,
+	/// while `XcmpQueue` keeps draining what HRMP already queued. See
+	/// [`Pallet::set_hrmp_closing`].
+	#[pallet::storage]
+	pub type HrmpClosing<T: Config> = StorageMap<_, Twox64Concat, ParaId, (), OptionQuery>;
 
 	/// This block's consumption intervals; grouped/sorted by [`Pallet::consumption_record`],
 	/// cleared next block. Bounded by [`Config::MaxTouchedStreams`].
@@ -315,6 +333,15 @@ pub mod pallet {
 			assert!(
 				T::DefaultWindowGrant::get().max_message_size <= T::MaxMsgLen::get(),
 				"`DefaultWindowGrant::max_message_size` must not exceed `MaxMsgLen`",
+			);
+			assert!(
+				T::MaxMsgLen::get() <= T::DataHandler::max_len(),
+				"`MaxMsgLen` must not exceed what the `DataHandler` accepts",
+			);
+			// Receivers refuse to fetch a longer leaf, which would stall its channel for good.
+			assert!(
+				T::MaxMsgLen::get() <= MAX_SPECULATIVE_MESSAGE_LEN,
+				"`MaxMsgLen` must not exceed `MAX_SPECULATIVE_MESSAGE_LEN`",
 			);
 		}
 	}
@@ -612,6 +639,34 @@ pub mod pallet {
 			Self::publish_register(&channel, &mut state)?;
 			InChannels::<T>::insert(channel, state);
 			Self::deposit_event(Event::StreamSkipped { channel, from, to });
+			Ok(())
+		}
+
+		/// Flag the HRMP channel to `peer` as closing: new XCM goes over spec-msg while HRMP
+		/// drains. Needs our spec-msg XCM channel to `peer` `Open`. Cutover: open spec-msg both
+		/// ways, then batch this call with the relay's `hrmp.close_channel`, which takes effect
+		/// next session. Clear with [`Pallet::clear_hrmp_closing`] before reopening HRMP.
+		/// Idempotent. The two transports feed separate queues, so a new XCM over spec-msg can
+		/// execute before an older one still queued from HRMP: where order matters, let that queue
+		/// drain first.
+		#[pallet::call_index(8)]
+		#[pallet::weight((T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational))]
+		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
+			T::ChannelManagementOrigin::ensure_origin(origin)?;
+			let open = OutChannels::<T>::get(xcm_channel(peer))
+				.is_some_and(|state| state.phase() == ChannelPhase::Open);
+			ensure!(open, Error::<T>::ChannelNotOpen);
+			HrmpClosing::<T>::insert(peer, ());
+			Ok(())
+		}
+
+		/// Clear the [`HrmpClosing`] flag for `peer`: the router prefers HRMP again whenever an
+		/// HRMP channel is open. XCM already sent over spec-msg is still delivered. Idempotent.
+		#[pallet::call_index(9)]
+		#[pallet::weight((T::DbWeight::get().reads_writes(0, 1), DispatchClass::Operational))]
+		pub fn clear_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
+			T::ChannelManagementOrigin::ensure_origin(origin)?;
+			HrmpClosing::<T>::remove(peer);
 			Ok(())
 		}
 	}
@@ -951,14 +1006,32 @@ impl<T: Config> Pallet<T> {
 		StreamId::Ack { recipient: channel.peer, domain: channel.domain, num: channel.num }
 	}
 
-	/// Send `data` on an outbound channel as a [`SpecMsgKind::Data`] leaf, returning its position.
-	/// The channel must be `Open` with credit left in the peer's granted window. On error, nothing
-	/// changes.
-	pub fn send(channel: ChannelId, data: Vec<u8>) -> Result<MessagePosition, Error<T>> {
+	/// Whether [`Pallet::send`] would accept `data_len` bytes on `channel` now: the encoded
+	/// [`SpecMsgKind::Data`] leaf fits [`Config::MaxMsgLen`] and the peer's `max_message_size`, the
+	/// channel is `Open` with credit left, and the stream has room this block. No side effects.
+	pub fn can_send(channel: &ChannelId, data_len: usize) -> Result<(), Error<T>> {
+		// The leaf is `SpecMsgKind::Data` SCALE-encoded: a variant byte, the compact length, the
+		// bytes.
+		let len = u32::try_from(data_len).map_err(|_| Error::<T>::MessageTooBig)?;
+		let leaf_len = (data_len as u64)
+			.saturating_add(1)
+			.saturating_add(codec::Compact(len).encoded_size() as u64);
+		ensure!(leaf_len <= u64::from(T::MaxMsgLen::get()), Error::<T>::MessageTooBig);
+
 		let state = OutChannels::<T>::get(channel).ok_or(Error::<T>::ChannelNotOpen)?;
 		ensure!(state.phase() == ChannelPhase::Open, Error::<T>::ChannelNotOpen);
+		Self::ensure_credit(channel, &state, leaf_len as usize)?;
+
+		let queued = OutboundMessages::<T>::decode_len(Self::outbound_stream(channel)).unwrap_or(0);
+		ensure!(queued < T::MaxMessagesPerBlock::get() as usize, Error::<T>::TooManyMessages);
+		Ok(())
+	}
+
+	/// Send `data` on an outbound channel as a [`SpecMsgKind::Data`] leaf, returning its position.
+	/// Fails, changing nothing, unless [`Pallet::can_send`] holds.
+	pub fn send(channel: ChannelId, data: Vec<u8>) -> Result<MessagePosition, Error<T>> {
+		Self::can_send(&channel, data.len())?;
 		let payload = SpecMsgKind::Data(data).encode();
-		Self::ensure_credit(&channel, &state, payload.len())?;
 		let size = payload.len() as u32;
 		let position = Self::append_to_stream(Self::outbound_stream(&channel), payload)?;
 		OutChannelsMeta::<T>::mutate(channel, |meta| meta.account_send(size));
@@ -1002,6 +1075,11 @@ impl<T: Config> Pallet<T> {
 	/// Publish an inbound channel's register on our `Ack` stream: the consumption watermark, the
 	/// grant (zero while suspended or closed), and the closed flag. Updates `state.published`; the
 	/// caller stores `state`.
+	///
+	/// TODO(spec-msg): consumption renews credit when a message is enqueued, not when it executes,
+	/// so a busy receiver's `MessageQueue` keeps growing. Publish a zero grant while the
+	/// `SpecMsg(peer)` queue footprint is over a threshold, and republish on
+	/// `QueueChangeHandler`, as HRMP does.
 	fn publish_register(channel: &ChannelId, state: &mut InChannelState) -> Result<(), Error<T>> {
 		let stream = Self::inbound_stream(channel);
 		let up_to = MessagePosition(InboundFrontier::<T>::get((channel.peer, stream)).leaf_count());
