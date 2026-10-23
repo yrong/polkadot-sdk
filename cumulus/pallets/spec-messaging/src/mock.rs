@@ -40,6 +40,9 @@ pub const SELF_PARA: u32 = 2000;
 parameter_types! {
 	pub const MaxMsgLen: u32 = 1024;
 	pub const MaxMessagesPerBlock: u32 = 16;
+	/// Small, so tests can reach the cap.
+	pub const MaxStreams: u32 = 16;
+	pub const MaxSendsPerBlock: u32 = 64;
 	pub const MaxTouchedStreams: u32 = 8;
 	pub const MaxContextGaps: u32 = 4;
 	pub SelfParaId: ParaId = ParaId::from(SELF_PARA);
@@ -52,6 +55,8 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 	type SelfParaId = SelfParaId;
 	type MaxMsgLen = MaxMsgLen;
 	type MaxMessagesPerBlock = MaxMessagesPerBlock;
+	type MaxStreams = MaxStreams;
+	type MaxSendsPerBlock = MaxSendsPerBlock;
 	type MaxTouchedStreams = MaxTouchedStreams;
 	type MaxContextGaps = MaxContextGaps;
 	type DataHandler = crate::EnqueueToXcmQueue<RecordingQueue>;
@@ -60,19 +65,22 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 	type ChannelManagementOrigin = EnsureRoot<u64>;
 	type DefaultWindowGrant = TestGrant;
 	type MaxInFlight = TestGrant;
+	type WeightInfo = ();
 }
 
 parameter_types! {
 	/// Messages [`RecordingQueue`] received: `(origin, message)`.
 	pub static Enqueued: Vec<(ParaId, Vec<u8>)> = Vec::new();
+	/// [`RecordingQueue`]'s `MaxMessageLen`: above the pallet's `MaxMsgLen` by default, so every
+	/// consumed payload fits. The oversize test lowers it.
+	pub static QueueMaxLen: u32 = 2048;
 }
 
-/// Message queue that records what it is given. Its `MaxMessageLen` is the pallet's `MaxMsgLen`,
-/// the least `integrity_test` allows.
+/// Message queue that records what it is given, bounded by [`QueueMaxLen`].
 pub struct RecordingQueue;
 
 impl EnqueueMessage<ParaId> for RecordingQueue {
-	type MaxMessageLen = MaxMsgLen;
+	type MaxMessageLen = QueueMaxLen;
 
 	fn enqueue_message(message: BoundedSlice<u8, Self::MaxMessageLen>, origin: ParaId) {
 		Enqueued::mutate(|enqueued| enqueued.push((origin, message.to_vec())));
