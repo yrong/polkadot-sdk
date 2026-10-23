@@ -41,8 +41,7 @@ use std::{
 };
 
 /// How long block boundaries, and the proof material of streams without a watermark, are kept:
-/// the design's 25 h serving horizon (§ Liftability), mirroring relay-chain availability
-/// retention.
+/// the design's serving horizon (§ Liftability), mirroring relay-chain availability retention.
 pub const SERVING_HORIZON: Duration = Duration::from_secs(25 * 60 * 60);
 
 fn now() -> u64 {

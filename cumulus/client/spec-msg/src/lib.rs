@@ -21,7 +21,7 @@
 //! - [`run_archiver`]: keeps the archive current through reorgs and retention.
 //! - [`exchange_protocol_config`] and [`run_request_handler`]: the `/spec-msg/exchange/1` protocol.
 //!
-//! Design: paritytech/polkadot-sdk#12659 (v0.5).
+//! Design: paritytech/polkadot-sdk#12659.
 
 #![warn(missing_docs)]
 
