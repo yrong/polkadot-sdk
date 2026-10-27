@@ -3249,6 +3249,32 @@ mod speculative_provides_window {
 	}
 
 	#[test]
+	fn ring_links_stay_in_insertion_order_through_repeats_and_eviction() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let source = ParaId::from(1000);
+			let window = MAX_PROVIDES_WINDOW_SIZE as u8;
+			for i in 0..window {
+				ParaInclusion::record_provides(source, sr(i));
+			}
+			// A repeated live root is skipped and keeps its place.
+			ParaInclusion::record_provides(source, sr(1));
+			assert_eq!(
+				ParaInclusion::provides_roots(source),
+				(0..window).map(sr).collect::<Vec<_>>()
+			);
+
+			// Two pushes evict the two oldest; an evicted root can come back as the newest.
+			ParaInclusion::record_provides(source, sr(window));
+			ParaInclusion::record_provides(source, sr(0));
+			let expected: Vec<_> = (2..=window).chain([0]).map(sr).collect();
+			assert_eq!(ParaInclusion::provides_roots(source), expected);
+			assert_eq!(ParaInclusion::provides_len(source), MAX_PROVIDES_WINDOW_SIZE);
+			assert_eq!(ParaInclusion::newest_provides(source), Some(sr(0)));
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 1)])).is_err());
+		});
+	}
+
+	#[test]
 	fn requires_satisfied_needs_all_sources_and_exact_roots() {
 		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
 			let (a, b) = (ParaId::from(1), ParaId::from(2));

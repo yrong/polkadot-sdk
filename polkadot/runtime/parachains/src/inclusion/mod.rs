@@ -374,21 +374,15 @@ pub mod pallet {
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
-	/// Per-sender ring bookkeeping: `(head, len)`. `head` is the next write position, `len` the
-	/// number of live roots (at most [`MAX_PROVIDES_WINDOW_SIZE`]).
+	/// The ends and length of each sender's provides ring.
 	#[pallet::storage]
-	pub(crate) type ProvidesCursor<T: Config> =
-		StorageMap<_, Twox64Concat, ParaId, (u32, u32), ValueQuery>;
+	pub(crate) type ProvidesCursor<T: Config> = StorageMap<_, Twox64Concat, ParaId, RingCursor>;
 
-	/// Every root live in a sender's ring; the O(1) membership check of a `Requires`.
+	/// Every root live in a sender's ring, mapped to the next root in insertion order; the newest
+	/// maps to itself. A `Requires` check is one `contains_key`.
 	#[pallet::storage]
 	pub(crate) type ProvidesMember<T: Config> =
-		StorageDoubleMap<_, Twox64Concat, ParaId, Identity, StreamsRoot, ()>;
-
-	/// Ring position to root; used only to find the oldest root on eviction.
-	#[pallet::storage]
-	pub(crate) type ProvidesQueue<T: Config> =
-		StorageDoubleMap<_, Twox64Concat, ParaId, Twox64Concat, u32, StreamsRoot>;
+		StorageDoubleMap<_, Twox64Concat, ParaId, Identity, StreamsRoot, StreamsRoot>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
@@ -399,6 +393,20 @@ const LOG_TARGET: &str = "runtime::inclusion";
 /// Length of a sender's provides window. It must cover the authoring→inclusion pipeline, including
 /// elastic-scaling bursts, with ample slack.
 pub const MAX_PROVIDES_WINDOW_SIZE: u32 = 128;
+
+// Eviction deletes `oldest` before linking `newest`, which would recreate it if they were one root.
+const _: () = assert!(MAX_PROVIDES_WINDOW_SIZE >= 2);
+
+/// A sender's provides ring: a singly linked list of [`ProvidesMember`] entries.
+#[derive(Encode, Decode, Clone, Copy, PartialEq, Eq, Debug, TypeInfo)]
+pub(crate) struct RingCursor {
+	/// Evicted next.
+	oldest: StreamsRoot,
+	/// Pushed last.
+	newest: StreamsRoot,
+	/// Live roots, at most [`MAX_PROVIDES_WINDOW_SIZE`].
+	len: u32,
+}
 
 /// The reason that a candidate's outputs were rejected for.
 #[derive(Debug)]
@@ -975,17 +983,26 @@ impl<T: Config> Pallet<T> {
 
 	/// The newest root of `source`'s provides ring, if any.
 	pub(crate) fn newest_provides(source: ParaId) -> Option<StreamsRoot> {
-		let (head, len) = ProvidesCursor::<T>::get(source);
-		if len == 0 {
-			return None;
-		}
-		let newest = (head + MAX_PROVIDES_WINDOW_SIZE - 1) % MAX_PROVIDES_WINDOW_SIZE;
-		ProvidesQueue::<T>::get(source, newest)
+		ProvidesCursor::<T>::get(source).map(|cursor| cursor.newest)
 	}
 
 	#[cfg(test)]
 	pub(crate) fn provides_len(source: ParaId) -> u32 {
-		ProvidesCursor::<T>::get(source).1
+		ProvidesCursor::<T>::get(source).map_or(0, |cursor| cursor.len)
+	}
+
+	/// `source`'s ring from oldest to newest, following the links.
+	#[cfg(test)]
+	pub(crate) fn provides_roots(source: ParaId) -> Vec<StreamsRoot> {
+		let Some(cursor) = ProvidesCursor::<T>::get(source) else { return Vec::new() };
+		let mut roots = vec![cursor.oldest];
+		while let Some(next) = ProvidesMember::<T>::get(source, roots[roots.len() - 1]) {
+			if next == roots[roots.len() - 1] {
+				break;
+			}
+			roots.push(next);
+		}
+		roots
 	}
 
 	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
@@ -1003,36 +1020,40 @@ impl<T: Config> Pallet<T> {
 	/// Push a sender's `StreamsRoot` into its ring, evicting the oldest when full.
 	pub(crate) fn record_provides(source: ParaId, root: StreamsRoot) {
 		log::debug!(target: LOG_TARGET, "Recording provides root {root:?} of para {source:?}");
+		// Skipping a live root is required: re-linking it would strand every root after it.
 		if ProvidesMember::<T>::contains_key(source, root) {
 			return;
 		}
-		let (head, len) = ProvidesCursor::<T>::get(source);
-		let len = if len == MAX_PROVIDES_WINDOW_SIZE {
-			// The oldest root sits at `head`, the position about to be overwritten.
-			if let Some(oldest) = ProvidesQueue::<T>::take(source, head) {
-				ProvidesMember::<T>::remove(source, oldest);
-			}
-			len
-		} else {
-			len + 1
+		let Some(cursor) = ProvidesCursor::<T>::get(source) else {
+			ProvidesMember::<T>::insert(source, root, root);
+			ProvidesCursor::<T>::insert(source, RingCursor { oldest: root, newest: root, len: 1 });
+			return;
 		};
-		ProvidesQueue::<T>::insert(source, head, root);
-		ProvidesMember::<T>::insert(source, root, ());
-		ProvidesCursor::<T>::insert(source, ((head + 1) % MAX_PROVIDES_WINDOW_SIZE, len));
+		let (oldest, len) = if cursor.len == MAX_PROVIDES_WINDOW_SIZE {
+			// The evicted root's link names the next oldest.
+			let Some(next) = ProvidesMember::<T>::take(source, cursor.oldest) else {
+				defensive!("provides ring of para {:?} lost its oldest root", source);
+				return;
+			};
+			(next, cursor.len)
+		} else {
+			(cursor.oldest, cursor.len + 1)
+		};
+		ProvidesMember::<T>::insert(source, cursor.newest, root);
+		ProvidesMember::<T>::insert(source, root, root);
+		ProvidesCursor::<T>::insert(source, RingCursor { oldest, newest: root, len });
 	}
 
 	/// Drop one sender's ring.
 	fn remove_provides(source: ParaId) {
 		let _ = ProvidesMember::<T>::clear_prefix(source, u32::MAX, None);
-		let _ = ProvidesQueue::<T>::clear_prefix(source, u32::MAX, None);
 		ProvidesCursor::<T>::remove(source);
 	}
 
 	pub(crate) fn clear_provides() -> Weight {
 		let members = ProvidesMember::<T>::clear(u32::MAX, None);
-		let queue = ProvidesQueue::<T>::clear(u32::MAX, None);
 		let cursors = ProvidesCursor::<T>::clear(u32::MAX, None);
-		let (loops, unique) = [members, queue, cursors]
+		let (loops, unique) = [members, cursors]
 			.iter()
 			.fold((0u64, 0u64), |(l, u), r| (l + r.loops as u64, u + r.unique as u64));
 		T::DbWeight::get().reads_writes(loops, unique)
