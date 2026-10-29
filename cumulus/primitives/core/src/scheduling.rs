@@ -72,7 +72,8 @@ impl SchedulingInfoPayload {
 ///
 /// Single source of truth shared by the collator and the PVF (`validate_block`) so their tails
 /// can't drift. The relay decoder (`CandidateCommitments::ump_signals`) rejects a repeated variant
-/// or any third signal, and parses only the run after the first `UMP_SEPARATOR`.
+/// or more than `MAX_UMP_SIGNALS` signals, and parses only the run after the first
+/// `UMP_SEPARATOR`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SchedulingSignals {
 	select_core: Option<(CoreSelector, ClaimQueueOffset)>,
@@ -100,14 +101,16 @@ impl SchedulingSignals {
 						panic!("Parachain emitted more than one `ApprovedPeer` UMP signal");
 					}
 				},
+				// Parsed by `SpecMessagingSignals` instead.
+				UMPSignal::Provides(_) | UMPSignal::Requires(_) => {},
 			}
 		}
 		signals
 	}
 
-	/// Build the tail from a verified `SignedSchedulingInfo`, replacing the block's own signals
-	/// wholesale. Assumes every `UMPSignal` is a scheduling signal; guarded by
-	/// `all_ump_signals_are_scheduling_signals`.
+	/// Build the tail from a verified `SignedSchedulingInfo`, replacing the block's *scheduling*
+	/// signals wholesale. Classify each new `UMPSignal` in
+	/// `every_ump_signal_is_classified`.
 	pub fn from_scheduling_info(signed_info: &SignedSchedulingInfo) -> Self {
 		let payload = &signed_info.payload;
 		Self {
@@ -218,7 +221,7 @@ mod tests {
 	use alloc::vec;
 	use codec::Encode;
 	use polkadot_primitives::{
-		ApprovedPeerId, ClaimQueueOffset, CoreSelector, UMPSignal, UMP_SEPARATOR,
+		ApprovedPeerId, ClaimQueueOffset, CoreSelector, Hash, StreamsRoot, UMPSignal, UMP_SEPARATOR,
 	};
 
 	fn peer(byte: u8) -> ApprovedPeerId {
@@ -372,17 +375,34 @@ mod tests {
 		assert!(!SchedulingSignals::from_scheduling_info(&signed).into_ump_messages().is_empty());
 	}
 
-	/// Compile-time tripwire for [`SchedulingSignals::from_scheduling_info`]: it wholesale-replaces
-	/// the UMP tail with only the scheduling signals, which is correct only while *every*
-	/// `UMPSignal` variant is a scheduling signal. This exhaustive match (no `_` arm) stops
-	/// compiling the moment a new variant is added — decide then whether `from_scheduling_info`
-	/// must first become selective (merge the block's non-scheduling signals) so it is not
-	/// silently dropped on resubmissions.
 	#[test]
-	fn all_ump_signals_are_scheduling_signals() {
+	fn an_override_keeps_the_blocks_provides() {
+		// A resubmission replaces only the scheduling signals; `Provides` comes from its own pass.
+		use crate::spec_messaging::{ump_signal_tail, SpecMessagingSignals};
+		let provides = UMPSignal::Provides(StreamsRoot(Hash::repeat_byte(4))).encode();
+		let raw =
+			vec![UMPSignal::SelectCore(CoreSelector(0), ClaimQueueOffset(0)).encode(), provides];
+		let signed = signed_with(CoreSelector(1), 1, peer(0xCC));
+
+		let tail = ump_signal_tail(
+			SchedulingSignals::from_scheduling_info(&signed),
+			SpecMessagingSignals::build(&raw, &[], None).unwrap(),
+		);
+		let mut expected = SchedulingSignals::from_scheduling_info(&signed).into_ump_messages();
+		expected.push(raw[1].clone());
+		assert_eq!(tail, expected);
+	}
+
+	/// Stops compiling when a `UMPSignal` variant is added. Then decide whether it must survive
+	/// [`SchedulingSignals::from_scheduling_info`], which keeps only scheduling signals.
+	#[test]
+	fn every_ump_signal_is_classified() {
 		fn classify(signal: UMPSignal) {
 			match signal {
 				UMPSignal::SelectCore(..) | UMPSignal::ApprovedPeer(..) => {},
+				// Not scheduling signals: `validate_block` builds them in its own pass on both
+				// paths, so the override dropping them here is intended.
+				UMPSignal::Provides(..) | UMPSignal::Requires(..) => {},
 			}
 		}
 		let _ = classify;

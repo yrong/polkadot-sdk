@@ -155,7 +155,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: alloc::borrow::Cow::Borrowed("westend"),
 	impl_name: alloc::borrow::Cow::Borrowed("parity-westend"),
 	authoring_version: 2,
-	spec_version: 1_024_001,
+	spec_version: 1_025_002,
 	impl_version: 0,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 27,
@@ -1148,6 +1148,7 @@ impl parachains_hrmp::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type ChannelManager = EnsureRoot<AccountId>;
 	type Currency = Balances;
+	type DepositProvider = Hrmp;
 	type DefaultChannelSizeAndCapacityWithSystem = ActiveConfigHrmpChannelSizeAndCapacityRatio<
 		Runtime,
 		HrmpChannelSizeAndCapacityWithSystemRatio,
@@ -2003,7 +2004,7 @@ sp_api::impl_runtime_apis! {
 		}
 	}
 
-	#[api_version(16)]
+	#[api_version(17)]
 	impl polkadot_primitives::runtime_api::ParachainHost<Block> for Runtime {
 		fn validators() -> Vec<ValidatorId> {
 			parachains_runtime_api_impl::validators::<Runtime>()
@@ -2200,6 +2201,10 @@ sp_api::impl_runtime_apis! {
 			relay_parent: Hash,
 		) -> Option<polkadot_primitives::vstaging::RelayParentInfo<Hash, BlockNumber>> {
 			parachains_staging_runtime_api_impl::ancestor_relay_parent_info::<Runtime>(session_index, relay_parent)
+		}
+
+		fn newest_included_provides(para_id: ParaId) -> Option<polkadot_primitives::StreamsRoot> {
+			parachains_staging_runtime_api_impl::newest_included_provides::<Runtime>(para_id)
 		}
 	}
 

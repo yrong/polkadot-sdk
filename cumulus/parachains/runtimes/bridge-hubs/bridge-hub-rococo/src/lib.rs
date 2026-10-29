@@ -240,7 +240,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: alloc::borrow::Cow::Borrowed("bridge-hub-rococo"),
 	impl_name: alloc::borrow::Cow::Borrowed("bridge-hub-rococo"),
 	authoring_version: 1,
-	spec_version: 1_024_001,
+	spec_version: 1_025_002,
 	impl_version: 0,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 6,
@@ -387,6 +387,7 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	type ConsensusHook = ConsensusHook;
 	type RelayParentOffset = ConstU32<RELAY_PARENT_OFFSET>;
 	type SchedulingSignatureVerifier = ();
+	type UmpSignalSource = ();
 }
 
 type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
