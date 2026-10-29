@@ -126,8 +126,8 @@ mod benchmarks {
 		let mut commitments =
 			create_candidate_commitments::<T>(para, head_data, max_len, u, h, c != 0);
 
-		// With `p`, carry a `Provides` into a full window, so the record reads the whole window,
-		// drops the oldest root and writes it back.
+		// With `p`, carry a `Provides` into a full ring, so the record evicts the oldest root and
+		// pushes the new one.
 		if p != 0 {
 			commitments.upward_messages.force_push(UMP_SEPARATOR);
 			commitments
@@ -179,12 +179,11 @@ mod benchmarks {
 			RequiresSet::try_from_iter((0..r).map(|i| (ParaId::from(i), root(i as u64))))
 				.expect("at most MAX_COMMITMENT_ENTRIES entries; qed");
 		for (source, required) in requires.iter() {
-			let window: Vec<_> = core::iter::once(*required)
-				.chain((1..MAX_PROVIDES_WINDOW_SIZE).map(|filler| root(u64::MAX - filler as u64)))
-				.collect();
-			let window: BoundedVec<_, ConstU32<MAX_PROVIDES_WINDOW_SIZE>> =
-				window.try_into().expect("exactly MAX_PROVIDES_WINDOW_SIZE roots; qed");
-			RecentProvides::<T>::insert(*source, window);
+			// Oldest first, so the required root is the oldest of a full ring.
+			Pallet::<T>::record_provides(*source, *required);
+			for filler in 1..MAX_PROVIDES_WINDOW_SIZE {
+				Pallet::<T>::record_provides(*source, root(u64::MAX - filler as u64));
+			}
 		}
 
 		#[block]

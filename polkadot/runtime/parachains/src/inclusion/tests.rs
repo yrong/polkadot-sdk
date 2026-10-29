@@ -3237,10 +3237,7 @@ mod speculative_provides_window {
 				ParaInclusion::record_provides(source, sr(i as u8));
 			}
 			// The window holds exactly `MAX_PROVIDES_WINDOW_SIZE` entries.
-			assert_eq!(
-				RecentProvides::<Test>::get(source).len(),
-				MAX_PROVIDES_WINDOW_SIZE as usize
-			);
+			assert_eq!(ParaInclusion::provides_len(source), MAX_PROVIDES_WINDOW_SIZE);
 			// The 3 oldest roots were dropped; roots from index 3 onward are retained.
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 0)])).is_err());
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 2)])).is_err());
@@ -3248,6 +3245,32 @@ mod speculative_provides_window {
 			assert!(
 				ParaInclusion::requires_satisfied(&requires(&[(1000, (total - 1) as u8)])).is_ok()
 			);
+		});
+	}
+
+	#[test]
+	fn ring_links_stay_in_insertion_order_through_repeats_and_eviction() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let source = ParaId::from(1000);
+			let window = MAX_PROVIDES_WINDOW_SIZE as u8;
+			for i in 0..window {
+				ParaInclusion::record_provides(source, sr(i));
+			}
+			// A repeated live root is skipped and keeps its place.
+			ParaInclusion::record_provides(source, sr(1));
+			assert_eq!(
+				ParaInclusion::provides_roots(source),
+				(0..window).map(sr).collect::<Vec<_>>()
+			);
+
+			// Two pushes evict the two oldest; an evicted root can come back as the newest.
+			ParaInclusion::record_provides(source, sr(window));
+			ParaInclusion::record_provides(source, sr(0));
+			let expected: Vec<_> = (2..=window).chain([0]).map(sr).collect();
+			assert_eq!(ParaInclusion::provides_roots(source), expected);
+			assert_eq!(ParaInclusion::provides_len(source), MAX_PROVIDES_WINDOW_SIZE);
+			assert_eq!(ParaInclusion::newest_provides(source), Some(sr(0)));
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 1)])).is_err());
 		});
 	}
 
@@ -3302,14 +3325,14 @@ mod speculative_provides_window {
 			let (staying, leaving) = (ParaId::from(1), ParaId::from(2));
 			ParaInclusion::record_provides(staying, sr(0xA));
 			ParaInclusion::record_provides(leaving, sr(0xB));
-			assert!(!RecentProvides::<Test>::get(leaving).is_empty());
+			assert!(ParaInclusion::provides_len(leaving) > 0);
 
 			// A session change that offboards `leaving` drops its window; `staying` is untouched.
 			let notification = crate::initializer::SessionChangeNotification::default();
 			ParaInclusion::initializer_on_new_session(&notification, &[leaving]);
 
-			assert!(RecentProvides::<Test>::get(leaving).is_empty());
-			assert!(!RecentProvides::<Test>::get(staying).is_empty());
+			assert!(ParaInclusion::provides_len(leaving) == 0);
+			assert!(ParaInclusion::provides_len(staying) > 0);
 		});
 	}
 
@@ -3320,14 +3343,12 @@ mod speculative_provides_window {
 			for src in 1..=3u32 {
 				ParaInclusion::record_provides(ParaId::from(src), sr(src as u8));
 			}
-			assert!(
-				(1..=3u32).all(|src| !RecentProvides::<Test>::get(ParaId::from(src)).is_empty())
-			);
+			assert!((1..=3u32).all(|src| ParaInclusion::provides_len(ParaId::from(src)) > 0));
 
 			// A freeze transition clears the whole map (see `paras_inherent`).
 			ParaInclusion::clear_provides();
 
-			assert!((1..=3u32).all(|src| RecentProvides::<Test>::get(ParaId::from(src)).is_empty()));
+			assert!((1..=3u32).all(|src| ParaInclusion::provides_len(ParaId::from(src)) == 0));
 		});
 	}
 
@@ -3368,16 +3389,20 @@ mod speculative_provides_window {
 						let pushed = root(next(distinct_roots));
 						ParaInclusion::record_provides(source, pushed);
 						let window = model.entry(source).or_default();
-						window.push_back(pushed);
-						if window.len() > MAX_PROVIDES_WINDOW_SIZE as usize {
-							window.pop_front();
+						// The ring skips a root it already holds.
+						if !window.contains(&pushed) {
+							window.push_back(pushed);
+							if window.len() > MAX_PROVIDES_WINDOW_SIZE as usize {
+								window.pop_front();
+							}
 						}
 					},
 				}
 
 				for source in &sources {
 					let window = model.get(source).cloned().unwrap_or_default();
-					assert_eq!(RecentProvides::<Test>::get(source).len(), window.len());
+					assert_eq!(ParaInclusion::provides_roots(*source), Vec::from(window.clone()));
+					assert_eq!(ParaInclusion::provides_len(*source) as usize, window.len());
 					assert_eq!(ParaInclusion::newest_provides(*source), window.back().copied());
 					let probe = root(next(distinct_roots));
 					let set = RequiresSet::try_from_iter([(*source, probe)]).unwrap();

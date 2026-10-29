@@ -2454,7 +2454,7 @@ mod enter {
 			.unwrap();
 			assert!(inclusion::Pallet::<Test>::requires_satisfied(&requires).is_ok());
 			// Para 1's concluding candidate provided nothing.
-			assert!(!inclusion::RecentProvides::<Test>::contains_key(ParaId::from(1)));
+			assert!(inclusion::Pallet::<Test>::provides_len(ParaId::from(1)) == 0);
 		});
 	}
 
@@ -2497,8 +2497,8 @@ mod enter {
 			assert_ok!(Pallet::<Test>::enter(frame_system::RawOrigin::None.into(), data));
 
 			assert_eq!(crate::disputes::Frozen::<Test>::get(), Some(now - 2));
-			assert!(!inclusion::RecentProvides::<Test>::contains_key(sender_a));
-			assert!(!inclusion::RecentProvides::<Test>::contains_key(sender_b));
+			assert!(inclusion::Pallet::<Test>::provides_len(sender_a) == 0);
+			assert!(inclusion::Pallet::<Test>::provides_len(sender_b) == 0);
 		});
 	}
 
