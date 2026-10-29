@@ -3389,16 +3389,20 @@ mod speculative_provides_window {
 						let pushed = root(next(distinct_roots));
 						ParaInclusion::record_provides(source, pushed);
 						let window = model.entry(source).or_default();
-						window.push_back(pushed);
-						if window.len() > MAX_PROVIDES_WINDOW_SIZE as usize {
-							window.pop_front();
+						// The ring skips a root it already holds.
+						if !window.contains(&pushed) {
+							window.push_back(pushed);
+							if window.len() > MAX_PROVIDES_WINDOW_SIZE as usize {
+								window.pop_front();
+							}
 						}
 					},
 				}
 
 				for source in &sources {
 					let window = model.get(source).cloned().unwrap_or_default();
-					assert_eq!(RecentProvides::<Test>::get(source).len(), window.len());
+					assert_eq!(ParaInclusion::provides_roots(*source), Vec::from(window.clone()));
+					assert_eq!(ParaInclusion::provides_len(*source) as usize, window.len());
 					assert_eq!(ParaInclusion::newest_provides(*source), window.back().copied());
 					let probe = root(next(distinct_roots));
 					let set = RequiresSet::try_from_iter([(*source, probe)]).unwrap();
