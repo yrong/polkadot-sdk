@@ -115,6 +115,9 @@ pub enum AggregateMessageOrigin {
 	///
 	/// This is used by the HRMP queue.
 	Sibling(ParaId),
+	/// The message came from a sibling para-chain over Speculative Messaging. It converts to the
+	/// same `Location` as [`Self::Sibling`], so XCM cannot tell the two transports apart.
+	SpecMsg(ParaId),
 }
 
 impl From<AggregateMessageOrigin> for Location {
@@ -122,7 +125,9 @@ impl From<AggregateMessageOrigin> for Location {
 		match origin {
 			AggregateMessageOrigin::Here => Location::here(),
 			AggregateMessageOrigin::Parent => Location::parent(),
-			AggregateMessageOrigin::Sibling(id) => Location::new(1, Junction::Parachain(id.into())),
+			AggregateMessageOrigin::Sibling(id) | AggregateMessageOrigin::SpecMsg(id) => {
+				Location::new(1, Junction::Parachain(id.into()))
+			},
 		}
 	}
 }
@@ -780,5 +785,20 @@ sp_api::decl_runtime_apis! {
 		/// reads among them: `MaxTouchedStreams` and `MaxContextGaps`. An inherent over either
 		/// fails the block, so the node plans within them.
 		fn consumption_caps() -> (u32, u32);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn spec_msg_origin_is_the_sibling_location() {
+		// The XCM executor must not be able to tell spec-msg from HRMP.
+		let id = ParaId::from(2000u32);
+		assert_eq!(
+			Location::from(AggregateMessageOrigin::SpecMsg(id)),
+			Location::from(AggregateMessageOrigin::Sibling(id))
+		);
 	}
 }
