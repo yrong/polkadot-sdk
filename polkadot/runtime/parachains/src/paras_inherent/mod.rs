@@ -425,6 +425,9 @@ impl<T: Config> Pallet<T> {
 			all_weight_after
 		};
 
+		// To detect a fresh freeze below.
+		let was_frozen = T::DisputesHandler::is_frozen();
+
 		// Note that `process_checked_multi_dispute_data` will iterate and import each
 		// dispute; so the input here must be reasonably bounded,
 		// which is guaranteed by the checks and weight limitation above.
@@ -439,6 +442,13 @@ impl<T: Config> Pallet<T> {
 		METRICS.on_disputes_imported(checked_disputes_sets.len() as u64);
 
 		set_scrapable_on_chain_disputes::<T>(current_session, checked_disputes_sets.clone());
+
+		// A fresh freeze clears the provides windows (see `clear_provides`).
+		let mut checked_disputes_sets_consumed_weight = checked_disputes_sets_consumed_weight;
+		if !was_frozen && T::DisputesHandler::is_frozen() {
+			checked_disputes_sets_consumed_weight = checked_disputes_sets_consumed_weight
+				.saturating_add(inclusion::Pallet::<T>::clear_provides());
+		}
 
 		if T::DisputesHandler::is_frozen() {
 			// Relay chain freeze, at this point we will not include any parachain blocks.
@@ -1161,7 +1171,46 @@ fn sanitize_backed_candidates<T: crate::inclusion::Config>(
 		&allowed_scheduling_parents,
 	);
 
+	// Drop a candidate whose `Requires` miss the provides windows, with its descendants. Last, so
+	// only candidates that pass every other filter cost the window reads.
+	retain_candidates::<T, _, _>(&mut backed_candidates_with_core, |_, (candidate, _)| {
+		check_speculative_messaging::<T>(candidate)
+	});
+
 	backed_candidates_with_core
+}
+
+/// Whether to keep a candidate: every root its `Requires` names must be in the stored provides
+/// windows (inclusion tier). Malformed signals are rejected elsewhere.
+fn check_speculative_messaging<T: crate::inclusion::Config>(
+	candidate: &BackedCandidate<T::Hash>,
+) -> bool {
+	let Ok(signals) = candidate.candidate().commitments.ump_signals() else {
+		return true;
+	};
+
+	if let Some(requires) = signals.requires() {
+		if let Err((source, root)) = crate::inclusion::Pallet::<T>::requires_satisfied(requires) {
+			log::debug!(
+				target: LOG_TARGET,
+				"Dropping candidate {:?} for para {:?}: requires root {:?} not in source {:?}'s provides window.",
+				candidate.candidate().hash(),
+				candidate.descriptor().para_id(),
+				root,
+				source,
+			);
+			return false;
+		}
+		log::debug!(
+			target: LOG_TARGET,
+			"Candidate {:?} for para {:?}: requires {:?} found in the provides windows.",
+			candidate.candidate().hash(),
+			candidate.descriptor().para_id(),
+			requires,
+		);
+	}
+
+	true
 }
 
 fn count_backed_candidates<B>(backed_candidates: &BTreeMap<ParaId, Vec<B>>) -> usize {
