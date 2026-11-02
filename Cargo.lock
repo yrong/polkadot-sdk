@@ -5424,6 +5424,7 @@ version = "0.1.0"
 dependencies = [
  "cumulus-primitives-core",
  "cumulus-primitives-spec-messaging",
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "log",
@@ -5854,6 +5855,7 @@ dependencies = [
  "cumulus-primitives-core",
  "cumulus-primitives-spec-messaging",
  "cumulus-primitives-storage-weight-reclaim",
+ "frame-benchmarking",
  "frame-executive",
  "frame-support",
  "frame-system",
@@ -5865,6 +5867,7 @@ dependencies = [
  "pallet-glutton",
  "pallet-message-queue",
  "pallet-session",
+ "pallet-staking",
  "pallet-sudo",
  "pallet-timestamp",
  "pallet-transaction-payment",
@@ -5888,6 +5891,7 @@ dependencies = [
  "sp-transaction-pool",
  "sp-version 29.0.0",
  "staging-parachain-info",
+ "staging-xcm-builder",
  "substrate-wasm-builder",
  "tracing",
 ]
