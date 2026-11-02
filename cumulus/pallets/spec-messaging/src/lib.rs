@@ -16,8 +16,8 @@
 //! # Speculative Messaging pallet
 //!
 //! Sender: accumulates outbound streams (per-stream MMR frontiers) and commits one [`StreamsRoot`]
-//! per block, emitted as the `Provides` UMP signal ([`ProvideConsumptionRecord`]) and an
-//! [`SPMS_ENGINE_ID`] digest. Receiver: consumes fetched inbound payloads through
+//! per block as an [`SPMS_ENGINE_ID`] digest; `validate_block` emits the bundle's last one as the
+//! `Provides` UMP signal. Receiver: consumes fetched inbound payloads through
 //! [`Call::enact_messages`] by recomputation into channel frontiers, writing the block's
 //! [`ConsumptionRecord`]. The inherent carries no proofs; the PoV lift binds the endpoint.
 //!
@@ -1303,10 +1303,6 @@ impl<T: Config> Pallet<T> {
 }
 
 impl<T: Config> ProvideConsumptionRecord for Pallet<T> {
-	fn provides_root() -> Option<StreamsRoot> {
-		Self::commit_streams_root()
-	}
-
 	fn consumption_record() -> ConsumptionRecord {
 		Self::consumption_record()
 	}
