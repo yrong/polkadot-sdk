@@ -20,9 +20,11 @@
 
 use cumulus_primitives_core::{
 	bundle_provides, ump_signal_tail, CollationInfo, CollectCollationInfo, ParachainBlockData,
-	SchedulingProof, SchedulingSignals, SignedSchedulingInfo, SpecMessagingSignals,
+	SchedulingProof, SchedulingSignals, SignedSchedulingInfo, SpecMessagingError,
+	SpecMessagingSignals,
 };
 
+use cumulus_primitives_spec_messaging::{ConsumptionRecord, LiftsBySource};
 use polkadot_primitives::{StreamsRoot, UMP_SEPARATOR};
 use sc_client_api::BlockBackend;
 use sp_api::{ApiExt, ProvideRuntimeApi, StorageProof};
@@ -37,6 +39,22 @@ use std::sync::Arc;
 /// The logging target.
 const LOG_TARGET: &str = "cumulus-collator";
 
+/// What the speculative-messaging node side supplies for a collation: the blocks' consumption
+/// records, in bundle order, and the lifts binding them to committed source roots.
+#[derive(Debug, Default)]
+pub struct SpecMsgInputs {
+	/// One record per block, in bundle order.
+	pub records: Vec<ConsumptionRecord>,
+	/// The lifts the PoV carries; empty when the blocks consumed nothing.
+	pub lifts: LiftsBySource,
+}
+
+/// Supplies [`SpecMsgInputs`] for a collation's blocks. Nodes that run speculative messaging set
+/// one with [`CollatorService::with_spec_msg_assembler`]; without one, a collation carries no
+/// records and no lifts, which is correct for blocks that consumed nothing.
+pub type SpecMsgAssembler<Block> =
+	Arc<dyn Fn(&[Block]) -> Result<SpecMsgInputs, String> + Send + Sync>;
+
 /// Split a block's upward messages at the first `UMP_SEPARATOR`, dropping any further separators
 /// from the signal tail, as `validate_block` does.
 fn split_at_separator(messages: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
@@ -48,25 +66,27 @@ fn split_at_separator(messages: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 
 /// Build the candidate's UMP signal tail. The blocks' signals pass through unchanged, or a signed
 /// scheduling info replaces them; either way the `Provides` that `validate_block` derives from the
-/// blocks' digests follows. No records or lifts are sourced yet, so no `Requires`.
+/// blocks' digests and the `Requires` it synthesizes from the same records and lifts follow. `Err`
+/// only when those records and lifts do not synthesize, which `validate_block` would reject.
 fn signal_tail(
 	signed_scheduling_info: Option<&SignedSchedulingInfo>,
 	provides: Option<StreamsRoot>,
 	signals: Vec<Vec<u8>>,
-) -> Vec<Vec<u8>> {
-	let spec_messaging = SpecMessagingSignals::build(provides, &[], &[], None)
-		.expect("no block signals, records or lifts to reject; qed");
+	inputs: &SpecMsgInputs,
+) -> Result<Vec<Vec<u8>>, SpecMessagingError> {
+	let spec_messaging =
+		SpecMessagingSignals::build(provides, &[], &inputs.records, Some(&inputs.lifts))?;
 	if let Some(signed_info) = signed_scheduling_info {
-		return ump_signal_tail(
+		return Ok(ump_signal_tail(
 			SchedulingSignals::from_scheduling_info(signed_info),
 			spec_messaging,
-		);
+		));
 	}
 	let spec_messaging = spec_messaging.into_ump_messages();
 	if signals.is_empty() && spec_messaging.is_empty() {
-		return Vec::new();
+		return Ok(Vec::new());
 	}
-	core::iter::once(UMP_SEPARATOR).chain(signals).chain(spec_messaging).collect()
+	Ok(core::iter::once(UMP_SEPARATOR).chain(signals).chain(spec_messaging).collect())
 }
 
 /// Utility functions generally applicable to writing collators for Cumulus.
@@ -120,6 +140,7 @@ pub struct CollatorService<Block: BlockT, BS, RA> {
 	block_status: Arc<BS>,
 	announce_block: Arc<dyn Fn(Block::Hash, Option<Vec<u8>>) + Send + Sync>,
 	runtime_api: Arc<RA>,
+	spec_msg_assembler: Option<SpecMsgAssembler<Block>>,
 }
 
 impl<Block: BlockT, BS, RA> Clone for CollatorService<Block, BS, RA> {
@@ -128,6 +149,7 @@ impl<Block: BlockT, BS, RA> Clone for CollatorService<Block, BS, RA> {
 			block_status: self.block_status.clone(),
 			announce_block: self.announce_block.clone(),
 			runtime_api: self.runtime_api.clone(),
+			spec_msg_assembler: self.spec_msg_assembler.clone(),
 		}
 	}
 }
@@ -145,7 +167,14 @@ where
 		announce_block: Arc<dyn Fn(Block::Hash, Option<Vec<u8>>) + Send + Sync>,
 		runtime_api: Arc<RA>,
 	) -> Self {
-		Self { block_status, announce_block, runtime_api }
+		Self { block_status, announce_block, runtime_api, spec_msg_assembler: None }
+	}
+
+	/// Supply speculative-messaging records and lifts to every collation. Only nodes that run
+	/// speculative messaging need this.
+	pub fn with_spec_msg_assembler(mut self, assembler: SpecMsgAssembler<Block>) -> Self {
+		self.spec_msg_assembler = Some(assembler);
+		self
 	}
 
 	/// Checks the status of the given block hash in the Parachain.
@@ -325,7 +354,35 @@ where
 			scheduling_proof.as_ref().and_then(|p| p.signed_scheduling_info.clone());
 
 		let provides = bundle_provides(blocks.iter().map(|block| block.header().digest()));
-		let block_data = ParachainBlockData::<Block>::new(blocks, compact_proof, scheduling_proof);
+
+		// The speculative-messaging inputs for these blocks. A collation `validate_block` would
+		// reject is not worth submitting, so a failure skips it.
+		let spec_msg_inputs = match &self.spec_msg_assembler {
+			Some(assemble) => match assemble(&blocks) {
+				Ok(inputs) => inputs,
+				Err(error) => {
+					tracing::error!(
+						target: LOG_TARGET,
+						%error,
+						"Failed to assemble speculative-messaging lifts; not submitting the collation.",
+					);
+					return None;
+				},
+			},
+			None => SpecMsgInputs::default(),
+		};
+
+		// Lifts ride in the PoV, which needs the V3 format; without them, keep the older ones.
+		let block_data = if spec_msg_inputs.lifts.is_empty() {
+			ParachainBlockData::<Block>::new(blocks, compact_proof, scheduling_proof)
+		} else {
+			ParachainBlockData::<Block>::new_with_lifts(
+				blocks,
+				compact_proof,
+				scheduling_proof,
+				spec_msg_inputs.lifts.clone(),
+			)
+		};
 
 		let pov = polkadot_node_primitives::maybe_compress_pov(PoV {
 			block_data: BlockData(if api_version >= 3 {
@@ -344,11 +401,35 @@ where
 			}),
 		});
 
-		upward_messages.extend(signal_tail(
+		// Emit the UMP signal tail, as `validate_block` will.
+		match signal_tail(
 			signed_scheduling_info.as_ref(),
 			provides,
 			upward_message_signals,
-		));
+			&spec_msg_inputs,
+		) {
+			Ok(tail) => {
+				let consuming =
+					spec_msg_inputs.records.iter().filter(|r| !r.entries.is_empty()).count();
+				if consuming > 0 {
+					tracing::debug!(
+						target: LOG_TARGET,
+						consuming,
+						signals = tail.len(),
+						"Collation carries a `Requires` over the consumption of {consuming} blocks.",
+					);
+				}
+				upward_messages.extend(tail)
+			},
+			Err(error) => {
+				tracing::error!(
+					target: LOG_TARGET,
+					%error,
+					"Not submitting a collation `validate_block` would reject.",
+				);
+				return None;
+			},
+		}
 
 		let upward_messages = upward_messages
 			.try_into()
@@ -459,17 +540,61 @@ mod tests {
 		}
 	}
 
-	/// What `validate_block` emits for the same inputs, with no records and no lifts.
+	/// What `validate_block` emits for the same signals, records and lifts.
 	fn pvf_tail(
 		signed_info: Option<&SignedSchedulingInfo>,
 		provides: Option<StreamsRoot>,
 		raw: &[Vec<u8>],
+		inputs: &SpecMsgInputs,
 	) -> Vec<Vec<u8>> {
 		let scheduling = match signed_info {
 			Some(signed_info) => SchedulingSignals::from_scheduling_info(signed_info),
 			None => SchedulingSignals::from_block_signals(raw),
 		};
-		ump_signal_tail(scheduling, SpecMessagingSignals::build(provides, raw, &[], None).unwrap())
+		let spec_messaging =
+			SpecMessagingSignals::build(provides, raw, &inputs.records, Some(&inputs.lifts))
+				.unwrap();
+		ump_signal_tail(scheduling, spec_messaging)
+	}
+
+	fn no_inputs() -> SpecMsgInputs {
+		SpecMsgInputs::default()
+	}
+
+	/// A block that consumed `n` messages of one channel stream from source 2000, and the identity
+	/// lift binding them to the source's committed `StreamsRoot`.
+	fn consumed(n: u64) -> (SpecMsgInputs, StreamsRoot) {
+		use cumulus_primitives_spec_messaging::{
+			streams_root::{gen_stream_proof, streams_root},
+			Interval, MmrExtensionProof, MmrFrontier, MmrRoot, RequiresLift, StreamId,
+		};
+		use std::collections::BTreeMap;
+
+		let source = ParaId::from(2000u32);
+		let stream = StreamId::Channel { recipient: ParaId::from(1000u32), domain: 0, num: 0 };
+		let mut frontier = MmrFrontier::new();
+		for i in 0..n {
+			frontier.append(Hash::from_low_u64_be(i + 1));
+		}
+		let entries = BTreeMap::from([(stream, frontier.root().0)]);
+		let committed = streams_root(&entries).unwrap();
+		let (_, tree_proof) = gen_stream_proof(&entries, stream).unwrap();
+		let record = ConsumptionRecord {
+			entries: BTreeMap::from([(
+				source,
+				BTreeMap::from([(
+					stream,
+					Interval { start: MmrRoot(Hash::zero()), end: frontier },
+				)]),
+			)]),
+		};
+		let lift = RequiresLift {
+			advances: Vec::new(),
+			extension: MmrExtensionProof::identity(),
+			tree_proof,
+		};
+		let lifts = LiftsBySource::try_from(BTreeMap::from([(source, vec![lift])])).unwrap();
+		(SpecMsgInputs { records: vec![record], lifts }, committed)
 	}
 
 	fn block_signals() -> Vec<Vec<u8>> {
@@ -487,10 +612,16 @@ mod tests {
 	fn plain_collation_matches_validate_block() {
 		let raw = block_signals();
 		for provides in [None, root()] {
-			assert_eq!(signal_tail(None, provides, raw.clone()), pvf_tail(None, provides, &raw));
+			assert_eq!(
+				signal_tail(None, provides, raw.clone(), &no_inputs()).unwrap(),
+				pvf_tail(None, provides, &raw, &no_inputs())
+			);
 		}
 		// `Provides` alone still gets its separator.
-		assert_eq!(signal_tail(None, root(), Vec::new()), pvf_tail(None, root(), &[]));
+		assert_eq!(
+			signal_tail(None, root(), Vec::new(), &no_inputs()).unwrap(),
+			pvf_tail(None, root(), &[], &no_inputs())
+		);
 	}
 
 	#[test]
@@ -498,8 +629,8 @@ mod tests {
 		let raw = block_signals();
 		let signed_info = signed(5, peer(0xBB));
 
-		let tail = signal_tail(Some(&signed_info), root(), raw.clone());
-		assert_eq!(tail, pvf_tail(Some(&signed_info), root(), &raw));
+		let tail = signal_tail(Some(&signed_info), root(), raw.clone(), &no_inputs()).unwrap();
+		assert_eq!(tail, pvf_tail(Some(&signed_info), root(), &raw, &no_inputs()));
 		// The signed scheduling signals replace the block's; its `Provides` stays.
 		assert_eq!(
 			tail,
@@ -514,15 +645,15 @@ mod tests {
 
 	#[test]
 	fn no_signals_emit_nothing() {
-		assert!(signal_tail(None, None, Vec::new()).is_empty());
+		assert!(signal_tail(None, None, Vec::new(), &no_inputs()).unwrap().is_empty());
 	}
 
 	#[test]
 	fn resubmission_without_block_signals_matches_validate_block() {
 		let signed_info = signed(2, peer(0xCC));
 		assert_eq!(
-			signal_tail(Some(&signed_info), None, Vec::new()),
-			pvf_tail(Some(&signed_info), None, &[])
+			signal_tail(Some(&signed_info), None, Vec::new(), &no_inputs()).unwrap(),
+			pvf_tail(Some(&signed_info), None, &[], &no_inputs())
 		);
 	}
 
@@ -535,7 +666,7 @@ mod tests {
 				.unwrap();
 		let raw = vec![UMPSignal::Requires(requires).encode(), vec![0xFF]];
 		assert_eq!(
-			signal_tail(None, root(), raw.clone()),
+			signal_tail(None, root(), raw.clone(), &no_inputs()).unwrap(),
 			core::iter::once(UMP_SEPARATOR)
 				.chain(raw)
 				.chain([UMPSignal::Provides(StreamsRoot(Hash::repeat_byte(7))).encode()])
@@ -563,5 +694,37 @@ mod tests {
 		);
 		// A separator with nothing after it yields no signals.
 		assert_eq!(split_at_separator(vec![vec![]]), (vec![], vec![]));
+	}
+
+	#[test]
+	fn a_consuming_collation_appends_requires_like_validate_block() {
+		let raw = block_signals();
+		let (inputs, committed) = consumed(5);
+		let tail = signal_tail(None, None, raw.clone(), &inputs).unwrap();
+		assert_eq!(tail, pvf_tail(None, None, &raw, &inputs));
+		// `Requires` comes last and names the source's committed root.
+		let requires = RequiresSet::try_from_iter([(ParaId::from(2000u32), committed)]).unwrap();
+		assert_eq!(tail.last(), Some(&UMPSignal::Requires(requires).encode()));
+	}
+
+	#[test]
+	fn a_consuming_resubmission_matches_validate_block() {
+		let raw = block_signals();
+		let signed_info = signed(3, peer(0xDD));
+		let (inputs, _) = consumed(2);
+		assert_eq!(
+			signal_tail(Some(&signed_info), None, raw.clone(), &inputs).unwrap(),
+			pvf_tail(Some(&signed_info), None, &raw, &inputs)
+		);
+	}
+
+	#[test]
+	fn records_without_lifts_are_not_submitted() {
+		let (mut inputs, _) = consumed(1);
+		inputs.lifts = LiftsBySource::default();
+		assert!(matches!(
+			signal_tail(None, None, block_signals(), &inputs),
+			Err(SpecMessagingError::RequiresSynthesis(_))
+		));
 	}
 }
