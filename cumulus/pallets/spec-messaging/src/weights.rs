@@ -65,6 +65,8 @@ pub trait WeightInfo {
 	fn clean_offboarded_peer(n: u32, ) -> Weight;
 	fn set_hrmp_closing() -> Weight;
 	fn clear_hrmp_closing() -> Weight;
+	fn pause_inbound_channel() -> Weight;
+	fn resume_inbound_channel() -> Weight;
 }
 
 /// Weights for `cumulus_pallet_spec_messaging` using the Substrate node and recommended hardware.
@@ -577,6 +579,26 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 		Weight::from_parts(2_430_000, 0)
 			.saturating_add(T::DbWeight::get().writes(1_u64))
 	}
+	/// Storage: `SpecMessaging::PausedInbound` (r:0 w:1)
+	/// Proof: `SpecMessaging::PausedInbound` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn pause_inbound_channel() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `0`
+		//  Estimated: `0`
+		// Minimum execution time: 2_340_000 picoseconds.
+		Weight::from_parts(2_620_000, 0)
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
+	/// Storage: `SpecMessaging::PausedInbound` (r:0 w:1)
+	/// Proof: `SpecMessaging::PausedInbound` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn resume_inbound_channel() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `0`
+		//  Estimated: `0`
+		// Minimum execution time: 2_349_000 picoseconds.
+		Weight::from_parts(2_610_000, 0)
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
 }
 
 // For backwards compatibility and tests.
@@ -1086,6 +1108,26 @@ impl WeightInfo for () {
 		//  Estimated: `0`
 		// Minimum execution time: 2_190_000 picoseconds.
 		Weight::from_parts(2_430_000, 0)
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	/// Storage: `SpecMessaging::PausedInbound` (r:0 w:1)
+	/// Proof: `SpecMessaging::PausedInbound` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn pause_inbound_channel() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `0`
+		//  Estimated: `0`
+		// Minimum execution time: 2_340_000 picoseconds.
+		Weight::from_parts(2_620_000, 0)
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	/// Storage: `SpecMessaging::PausedInbound` (r:0 w:1)
+	/// Proof: `SpecMessaging::PausedInbound` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn resume_inbound_channel() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `0`
+		//  Estimated: `0`
+		// Minimum execution time: 2_349_000 picoseconds.
+		Weight::from_parts(2_610_000, 0)
 			.saturating_add(RocksDbWeight::get().writes(1_u64))
 	}
 }
