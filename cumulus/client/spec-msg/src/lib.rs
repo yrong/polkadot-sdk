@@ -33,6 +33,7 @@ pub mod archive;
 pub mod fetch;
 pub mod pool;
 pub mod protocol;
+mod rebase;
 pub mod receiver;
 pub mod relay;
 pub mod service;
