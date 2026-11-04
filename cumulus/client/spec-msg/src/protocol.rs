@@ -68,8 +68,11 @@ pub const MAX_RESPONSE_SIZE: u64 = MAX_PAYLOAD_BYTES as u64 + MAX_FRAMING_BYTES;
 const INBOUND_QUEUE_SIZE: usize = 1024;
 
 /// Requests queued per peer. Beyond it a peer's requests are refused, so one peer cannot fill the
-/// queue and starve the others.
-const MAX_QUEUED_PER_PEER: usize = 4;
+/// queue and starve the others. A receiver building its inherent asks for every missing binding
+/// at once, up to [`crate::receiver::Budget`]'s `max_streams` (16) to the same peer, alongside its
+/// other fetches: twice that leaves room. Queued requests are at most [`MAX_REQUEST_SIZE`] each,
+/// and only one response per peer is in flight, so this costs little memory.
+const MAX_QUEUED_PER_PEER: usize = 32;
 
 /// Request timeout.
 const TIMEOUT: Duration = Duration::from_secs(10);
