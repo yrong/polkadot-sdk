@@ -23,6 +23,9 @@
 //! - [`fetch()`]: the requester, which verifies each response before accepting it.
 //! - [`run_watermark_reader`]: reads recipients' registers under finalized roots, so the archive
 //!   prunes a channel only below what the recipient confirmed.
+//! - [`Receiver`]: fetches under each source's newest included root, keeps what verifies, builds
+//!   the messaging inherent within a [`Budget`] and assembles each candidate's lifts.
+//! - [`run_receiver`], [`inherent_data`] and [`assembler`]: its ties to the chain and collator.
 //!
 //! Design: paritytech/polkadot-sdk#12659.
 
@@ -30,18 +33,23 @@
 
 pub mod archive;
 pub mod fetch;
+pub mod pool;
 pub mod protocol;
+pub mod receiver;
 pub mod relay;
+pub mod service;
 pub mod store;
 pub mod worker;
 
 pub use archive::{Archive, ArchiveError, Tip};
 pub use fetch::{fetch, NetworkTransport, RequestError, Transport};
 pub use protocol::{fetch_protocol_config, run_request_handler, PROTOCOL_NAME};
+pub use receiver::{Budget, ChainView, Receiver, SourceWants};
 pub use relay::{
 	newest_included_provides, relay_has_api, FinalizedRoots, RelayFinalizedRoots,
 	NEWEST_INCLUDED_PROVIDES, NEWEST_INCLUDED_PROVIDES_VERSION,
 };
+pub use service::{assembler, inherent_data, run_receiver};
 pub use store::{ArchiveStore, AuxArchiveStore, Batch, MemoryStore};
 pub use worker::{run_archiver, run_watermark_reader, SERVING_HORIZON};
 
@@ -50,5 +58,7 @@ pub const LOG_TARGET: &str = "spec-msg";
 
 #[cfg(test)]
 mod archive_model;
+#[cfg(test)]
+mod receiver_tests;
 #[cfg(test)]
 mod tests;
