@@ -81,9 +81,21 @@ pub struct SourcePool {
 	pub(crate) read_under: BTreeMap<(StreamId, u64), StreamsRoot>,
 	/// Per channel stream, the leaf count the source had at the last successful fetch.
 	pub(crate) reach: BTreeMap<StreamId, u64>,
+	/// The relay chain has no root for the source: nothing new is planned from it. Its roots,
+	/// bindings and advances stay, for blocks already built.
+	pub(crate) forgotten: bool,
 }
 
 impl SourcePool {
+	/// Stop feeding new consumption from this source.
+	pub fn forget(&mut self) {
+		self.payloads.clear();
+		self.heads.clear();
+		self.reach.clear();
+		self.settled = false;
+		self.forgotten = true;
+	}
+
 	/// The newest root.
 	pub fn newest_root(&self) -> Option<StreamsRoot> {
 		self.roots.back().copied()
@@ -91,6 +103,7 @@ impl SourcePool {
 
 	/// Note `root` as the newest. Bindings under roots that fall out are dropped.
 	pub fn push_root(&mut self, root: StreamsRoot) {
+		self.forgotten = false;
 		if self.newest_root() == Some(root) {
 			return;
 		}
