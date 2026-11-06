@@ -26,7 +26,6 @@
 use crate::{
 	fetch::{fetch, RequestError, Transport},
 	pool::{Binding, HeadRead, SourcePool},
-	rebase::rebase,
 	LOG_TARGET,
 };
 use codec::{DecodeAll, MaxEncodedLen};
@@ -1085,7 +1084,7 @@ fn rebased_binding(
 		if leaves.len() != wanted {
 			return None;
 		}
-		let extension = rebase(end, &leaves, &binding.extension)?;
+		let extension = binding.extension.rebase(end, &leaves)?;
 		Some(Binding { extension, tree_proof: binding.tree_proof.clone() })
 	})
 }
