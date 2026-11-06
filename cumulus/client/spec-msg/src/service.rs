@@ -28,7 +28,7 @@
 use crate::{
 	fetch::Transport,
 	receiver::{ChainView, Receiver, SourceWants},
-	relay::{newest_included_provides, relay_has_api},
+	relay::{answered_newest_included_provides, relay_has_api},
 	LOG_TARGET,
 };
 use cumulus_client_collator::service::{SpecMsgAssembler, SpecMsgInputs};
@@ -92,9 +92,10 @@ pub(crate) trait Chains: Send + Sync {
 	/// The consumption view at the own chain's best block; `None` without `SpecMsgApi`.
 	fn view(&self) -> Option<ChainView>;
 
-	/// `source`'s newest included root as of relay block `head`; `None` also when the relay
+	/// `source`'s newest included root as of relay block `head`. `Ok(None)` is the relay runtime
+	/// answering that it has none; `Err` when it did not answer, e.g. the call failed or the
 	/// runtime lacks the API.
-	async fn root(&self, head: PHash, source: ParaId) -> Option<StreamsRoot>;
+	async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()>;
 }
 
 /// [`Chains`] read from the node's client and relay chain interface.
@@ -115,11 +116,11 @@ where
 		chain_view(&*self.client, self.client.info().best_hash)
 	}
 
-	async fn root(&self, head: PHash, source: ParaId) -> Option<StreamsRoot> {
+	async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()> {
 		if !relay_has_api(&*self.relay, head).await {
-			return None;
+			return Err(());
 		}
-		newest_included_provides(&*self.relay, head, source).await
+		answered_newest_included_provides(&*self.relay, head, source).await
 	}
 }
 
@@ -209,8 +210,10 @@ pub(crate) async fn drive<H, T, S>(
 	let mut rounds = FuturesUnordered::new();
 	let mut gap_fetches = FuturesUnordered::new();
 	let round = |source: ParaId, head: PHash, wants: SourceWants| async move {
-		if let Some(root) = chains.root(head, source).await {
-			receiver.on_root(source, root, &wants).await;
+		match chains.root(head, source).await {
+			Ok(Some(root)) => receiver.on_root(source, root, &wants).await,
+			Ok(None) => receiver.forget(&source),
+			Err(()) => {},
 		}
 		source
 	};
@@ -482,6 +485,8 @@ mod tests {
 	struct TestChains {
 		view: ChainView,
 		roots: Mutex<BTreeMap<(PHash, ParaId), StreamsRoot>>,
+		/// While set, the relay chain gives no answer.
+		failing: AtomicBool,
 	}
 
 	#[async_trait::async_trait]
@@ -490,8 +495,11 @@ mod tests {
 			Some(self.view.clone())
 		}
 
-		async fn root(&self, head: PHash, source: ParaId) -> Option<StreamsRoot> {
-			self.roots.lock().get(&(head, source)).copied()
+		async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()> {
+			if self.failing.load(Ordering::SeqCst) {
+				return Err(());
+			}
+			Ok(self.roots.lock().get(&(head, source)).copied())
 		}
 	}
 
@@ -530,6 +538,7 @@ mod tests {
 			let chains = Arc::new(TestChains {
 				view: ChainView::new(consumed, 16),
 				roots: Mutex::new(BTreeMap::new()),
+				failing: AtomicBool::new(false),
 			});
 			let peers = Arc::new(Peers(sources.iter().map(|id| (*id, Source::new())).collect()));
 			let receiver = Arc::new(Receiver::new(US.into(), Budget::default(), peers.clone()));
@@ -599,6 +608,29 @@ mod tests {
 		h.finality.unbounded_send((1, h.chains.view.clone())).unwrap();
 		h.pool.run_until_stalled();
 		assert!(!h.receiver.is_live(&1));
+	}
+
+	#[test]
+	fn a_source_the_relay_has_no_root_for_is_forgotten() {
+		let mut h = Harness::new();
+		let root = h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
+		h.relay_block(1, &[(live(), root)]);
+		assert!(h.receiver.is_settled(&live(), &root, h.wants(live())));
+
+		// The relay block has no root for it, as for an offboarding para.
+		h.relay_block(2, &[]);
+		assert!(!h.receiver.is_settled(&live(), &root, h.wants(live())));
+	}
+
+	#[test]
+	fn a_relay_chain_that_does_not_answer_leaves_the_source_alone() {
+		let mut h = Harness::new();
+		let root = h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
+		h.relay_block(1, &[(live(), root)]);
+
+		h.chains.failing.store(true, Ordering::SeqCst);
+		h.relay_block(2, &[]);
+		assert!(h.receiver.is_settled(&live(), &root, h.wants(live())));
 	}
 
 	#[test]

@@ -267,6 +267,13 @@ where
 		self.state.lock().sources.get(source).and_then(SourcePool::newest_root)
 	}
 
+	/// Stop consuming from `source`, so the next block is built without it.
+	pub fn forget(&self, source: &ParaId) {
+		if let Some(pool) = self.state.lock().sources.get_mut(source) {
+			pool.forget();
+		}
+	}
+
 	/// Whether the record of block `hash` is noted and not final yet.
 	#[cfg(test)]
 	pub(crate) fn is_live(&self, hash: &H) -> bool {
@@ -598,7 +605,7 @@ where
 		let rotation = self.rotation.fetch_add(1, Ordering::Relaxed);
 		let state = self.state.lock();
 		let newest = |source: &ParaId| {
-			let pool = state.sources.get(source)?;
+			let pool = state.sources.get(source).filter(|pool| !pool.forgotten)?;
 			Some((pool, pool.newest_root()?))
 		};
 
