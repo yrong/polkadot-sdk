@@ -778,6 +778,29 @@ fn a_full_buffer_of_an_abandoned_sender_fork_is_replaced() {
 }
 
 #[test]
+fn a_forgotten_source_is_not_consumed_from() {
+	let sender = Sender::new();
+	let receiver = receiver(&sender, Budget::default());
+	let chain = Chain::default();
+	let root = sender.author(vec![(channel(US), payloads(1, 2))]);
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	receiver.forget(&source());
+	assert!(block_on(receiver.inherent_data(&chain.view(), &[])).is_empty());
+}
+
+#[test]
+fn a_block_built_before_its_source_is_forgotten_still_assembles() {
+	let sender = Sender::new();
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let root = sender.author(vec![(channel(US), payloads(1, 2))]);
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	let record = chain.block(&receiver);
+	receiver.forget(&source());
+	assert_eq!(requires(&receiver, &[record]), Some(root));
+}
+
+#[test]
 fn payloads_ahead_of_an_older_root_are_kept() {
 	let sender = Sender::new();
 	let receiver = receiver(&sender, Budget::default());
