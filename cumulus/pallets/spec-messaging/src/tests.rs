@@ -1772,6 +1772,516 @@ fn register_publishes_carried_over_are_charged_next_block() {
 	});
 }
 
+mod xcm_layer {
+	use super::*;
+	use crate::xcm_transport::xcm_channel;
+	use ::xcm::{
+		latest::{
+			send_xcm, Instruction::ClearOrigin, Junction::Parachain, Location, SendError, SendXcm,
+			Xcm,
+		},
+		VersionedLocation, VersionedXcm,
+	};
+	use xcm_builder::InspectMessageQueues;
+
+	fn sibling() -> Location {
+		Location::new(1, [Parachain(u32::from(out_channel().recipient))])
+	}
+
+	fn xcm() -> Xcm<()> {
+		Xcm(vec![ClearOrigin])
+	}
+
+	fn xcm_in() -> InChannelId {
+		InChannelId { sender: src(), domain: 0, num: 0 }
+	}
+
+	/// The outbound XCM channel to the peer, open with credit.
+	fn open_xcm_channel() {
+		opened(xcm_channel(out_channel().recipient), 1, 1024);
+	}
+
+	/// `validate` declined: it says `NotApplicable` and hands both arguments back.
+	fn declines(dest: Location) {
+		let (mut d, mut m) = (Some(dest.clone()), Some(xcm()));
+		assert_eq!(Router::validate(&mut d, &mut m), Err(SendError::NotApplicable));
+		assert_eq!((d, m), (Some(dest), Some(xcm())));
+	}
+
+	#[test]
+	fn xcm_channel_data_is_enqueued_under_its_channel() {
+		new_test_ext().execute_with(|| {
+			let ch = xcm_in();
+			accept(ch);
+			let payloads = vec![hello(1), data(b"xcm-1"), data(b"xcm-2")];
+			assert_ok!(SpecMessaging::enact_messages(
+				RuntimeOrigin::none(),
+				channel_item(ch, payloads)
+			));
+			// `Data` in order, verbatim; the `Hello` is the channel layer's, not XCM.
+			assert_eq!(Enqueued::get(), vec![(ch, b"xcm-1".to_vec()), (ch, b"xcm-2".to_vec())]);
+		});
+	}
+
+	#[test]
+	fn other_channels_are_never_executed_as_xcm() {
+		new_test_ext().execute_with(|| {
+			let ch = InChannelId { sender: src(), domain: 1, num: 0 };
+			accept(ch);
+			assert_ok!(SpecMessaging::enact_messages(
+				RuntimeOrigin::none(),
+				channel_item(ch, vec![hello(1), data(b"not xcm")])
+			));
+			// Consumed, but not handed to the XCM queue.
+			assert_eq!(InChannels::<Test>::get(ch).unwrap().frontier.leaf_count(), 2);
+			assert!(Enqueued::get().is_empty());
+		});
+	}
+
+	#[test]
+	#[should_panic(expected = "Defensive failure")]
+	fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
+		new_test_ext().execute_with(|| {
+			let ch = xcm_in();
+			accept(ch);
+			// Within the pallet's `MaxMsgLen`, over the queue's `MaxMessageLen`.
+			QueueMaxLen::set(512);
+			let _ = SpecMessaging::enact_messages(
+				RuntimeOrigin::none(),
+				channel_item(ch, vec![hello(1), data(&[0u8; 600])]),
+			);
+		});
+	}
+
+	#[test]
+	fn enact_weight_includes_the_data_handlers_weight() {
+		use crate::{OnSpecMsgData, WeightInfo};
+		new_test_ext().execute_with(|| {
+			let ch = xcm_in();
+			let (small, big) = (data(b"a"), data(&[0u8; 500]));
+			let (small_len, big_len) = (small.len() as u32, big.len() as u32);
+			let weight = |payload| crate::enact_weight::<Test>(&channel_item(ch, vec![payload]));
+
+			// One channel and one payload each, so the weights differ in the bytes and the
+			// handler's share.
+			let handler =
+				|len| <<Test as Config>::DataHandler as OnSpecMsgData>::on_data_weight(len);
+			let bytes = |len| <() as WeightInfo>::enact_bytes(len);
+			assert_eq!(
+				weight(big) - weight(small),
+				bytes(big_len) - bytes(small_len) + handler(big_len) - handler(small_len)
+			);
+			assert_eq!(
+				handler(big_len) - handler(small_len),
+				Weight::from_parts(u64::from(big_len - small_len), 0)
+			);
+		});
+	}
+
+	#[test]
+	fn a_full_delivery_queue_stops_consuming_its_channel() {
+		new_test_ext().execute_with(|| {
+			let ch = xcm_in();
+			accept(ch);
+			assert!(SpecMessaging::consumed_streams().channels.contains_key(&ch));
+			READY_PAGES.with(|p| p.set(MaxQueueFootprint::get()));
+			assert!(!SpecMessaging::consumed_streams().channels.contains_key(&ch));
+		});
+	}
+
+	#[test]
+	fn integrity_rejects_a_data_handler_smaller_than_max_msg_len() {
+		new_test_ext().execute_with(|| {
+			QueueMaxLen::set(MaxMsgLen::get());
+			<SpecMessaging as frame_support::traits::Hooks<u64>>::integrity_test();
+		});
+	}
+
+	#[test]
+	#[should_panic(expected = "data handler's `max_len`")]
+	fn integrity_fails_when_the_queue_cannot_hold_max_msg_len() {
+		new_test_ext().execute_with(|| {
+			QueueMaxLen::set(MaxMsgLen::get() - 1);
+			<SpecMessaging as frame_support::traits::Hooks<u64>>::integrity_test();
+		});
+	}
+
+	#[test]
+	fn hrmp_closing_needs_an_open_xcm_channel() {
+		new_test_ext().execute_with(|| {
+			let peer = out_channel().recipient;
+			assert_err!(
+				SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer),
+				Error::<Test>::NotOpen
+			);
+			open_xcm_channel();
+			assert!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::signed(1), peer).is_err());
+
+			// Setting and clearing are idempotent.
+			for _ in 0..2 {
+				assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer));
+				assert!(HrmpClosing::<Test>::contains_key(peer));
+			}
+			for _ in 0..2 {
+				assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer));
+				assert!(!HrmpClosing::<Test>::contains_key(peer));
+			}
+		});
+	}
+
+	#[test]
+	fn pausing_an_inbound_channel_follows_the_flag() {
+		use frame_support::traits::QueuePausedQuery;
+		new_test_ext().execute_with(|| {
+			let channel = xcm_in();
+			let other = InChannelId { num: channel.num + 1, ..channel };
+			let (sender, domain, num) = (channel.sender, channel.domain, channel.num);
+			assert!(SpecMessaging::pause_inbound_channel(
+				RuntimeOrigin::signed(1),
+				sender,
+				domain,
+				num
+			)
+			.is_err());
+			assert!(SpecMessaging::resume_inbound_channel(
+				RuntimeOrigin::signed(1),
+				sender,
+				domain,
+				num
+			)
+			.is_err());
+			assert!(!SpecMessaging::is_paused(&channel));
+
+			// Pausing and resuming are idempotent.
+			for _ in 0..2 {
+				assert_ok!(SpecMessaging::pause_inbound_channel(
+					RuntimeOrigin::root(),
+					sender,
+					domain,
+					num
+				));
+				assert!(PausedInbound::<Test>::contains_key(channel));
+				assert!(SpecMessaging::is_paused(&channel));
+				assert!(!SpecMessaging::is_paused(&other));
+			}
+			for _ in 0..2 {
+				assert_ok!(SpecMessaging::resume_inbound_channel(
+					RuntimeOrigin::root(),
+					sender,
+					domain,
+					num
+				));
+				assert!(!SpecMessaging::is_paused(&channel));
+			}
+		});
+	}
+
+	#[test]
+	fn other_destinations_are_not_applicable() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			declines(Location::parent());
+			declines(Location::new(1, [Parachain(1), Parachain(2)]));
+		});
+	}
+
+	#[test]
+	fn hrmp_wins_while_it_exists() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			for state in [HrmpChannel::Ready, HrmpChannel::Full] {
+				HrmpState::set(state);
+				declines(sibling());
+			}
+		});
+	}
+
+	#[test]
+	fn without_an_open_spec_msg_channel_it_falls_through() {
+		new_test_ext().execute_with(|| {
+			declines(sibling());
+			// Wanted, but the peer has not accepted yet.
+			want_open(xcm_channel(out_channel().recipient));
+			declines(sibling());
+		});
+	}
+
+	#[test]
+	fn xcm_goes_over_the_open_channel_and_dry_runs_see_it() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+
+			// The leaf is the `VersionedXcm`, bare, as `Data` on the XCM channel.
+			let sent = sent_on(xcm_channel(out_channel().recipient).data_stream());
+			assert_eq!(
+				sent.last(),
+				Some(&ChannelMessage::Data(VersionedXcm::<()>::from(xcm()).encode()).encode())
+			);
+			assert_eq!(
+				Router::get_messages(),
+				vec![(VersionedLocation::from(sibling()), vec![VersionedXcm::from(xcm())])]
+			);
+			Router::clear_messages();
+			assert!(Router::get_messages().is_empty());
+		});
+	}
+
+	#[test]
+	fn a_delivery_charges_the_send_weight() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			let before = System::block_weight().total();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+
+			let sent = sent_on(xcm_channel(out_channel().recipient).data_stream());
+			let Ok(ChannelMessage::Data(data)) = ChannelMessage::decode_all(&mut &sent[0][..])
+			else {
+				panic!("XCM travels as a `Data` leaf");
+			};
+			assert_eq!(
+				System::block_weight().total() - before,
+				SpecMessaging::send_weight(data.len() as u32)
+			);
+		});
+	}
+
+	#[test]
+	fn a_dry_run_on_a_block_that_committed_a_root_can_send() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			// The block ends: its root is committed, as in the state a dry run executes on.
+			SpecMessaging::on_finalize(System::block_number());
+			assert!(BlockStreamsRoot::<Test>::exists());
+
+			Router::clear_messages();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+		});
+	}
+
+	/// `validate` on the router, its error or `Ok(())`.
+	fn validate() -> Result<(), SendError> {
+		let (mut d, mut m) = (Some(sibling()), Some(xcm()));
+		Router::validate(&mut d, &mut m).map(|_| ())
+	}
+
+	#[test]
+	fn validate_refuses_a_send_after_the_root_is_committed() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			SpecMessaging::commit_streams_root();
+			// A pallet's `on_finalize` after ours: `deliver` would fail after fees were taken.
+			assert!(validate().is_err());
+			assert!(send_xcm::<Router>(sibling(), xcm()).is_err());
+			assert!(sent_on(xcm_channel(out_channel().recipient).data_stream()).is_empty());
+		});
+	}
+
+	#[test]
+	fn validate_refuses_a_send_before_initialization() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			// `on_runtime_upgrade` of the next block runs before `System::initialize`.
+			SpecMessaging::on_finalize(System::block_number());
+			let _ = System::finalize();
+			// Without the last block's root, only the unset phase refuses the send.
+			BlockStreamsRoot::<Test>::kill();
+			assert_err!(
+				SpecMessaging::send(xcm_channel(out_channel().recipient), Vec::new()),
+				Error::<Test>::NotInitialized
+			);
+			assert!(validate().is_err());
+		});
+	}
+
+	#[test]
+	fn a_dry_run_on_a_finalized_block_can_send() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			// Runtime APIs run on the finalized state: the root is committed and the execution
+			// phase is unset.
+			SpecMessaging::on_finalize(System::block_number());
+			let _ = System::finalize();
+
+			Router::clear_messages();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(Router::get_messages().len(), 1);
+		});
+	}
+
+	#[test]
+	fn a_send_before_our_on_initialize_sees_a_fresh_block() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			let per_stream = MaxMessagesPerBlock::get();
+			for i in 0..SpecMessaging::send_limit() {
+				assert_ok!(SpecMessaging::append_to_stream(
+					stream((i / per_stream) as u16),
+					b"x".to_vec()
+				));
+			}
+			assert!(validate().is_err());
+
+			// A pallet's `on_initialize` before ours, as `MessageQueue` servicing XCM: neither
+			// the last block's root nor its sends are this block's.
+			let n = System::block_number();
+			SpecMessaging::on_finalize(n);
+			System::initialize(&(n + 1), &Default::default(), &Default::default());
+			assert_ok!(validate());
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+		});
+	}
+
+	#[test]
+	fn a_closing_hrmp_channel_diverts_new_xcm_to_spec_msg() {
+		new_test_ext().execute_with(|| {
+			let peer = out_channel().recipient;
+			open_xcm_channel();
+			HrmpState::set(HrmpChannel::Ready);
+			declines(sibling());
+
+			// Flagged: HRMP only drains, new XCM goes over spec-msg.
+			assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(Router::get_messages().len(), 1);
+
+			// Cleared (a rollback): HRMP wins again.
+			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer));
+			declines(sibling());
+		});
+	}
+
+	#[test]
+	fn an_open_channel_without_credit_is_a_hard_error() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			// `MaxInFlight` is 4, and nothing is confirmed.
+			for _ in 0..MaxInFlight::get() {
+				assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			}
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("spec-msg XCM channel has no capacity"))
+			);
+		});
+	}
+
+	#[test]
+	fn a_send_past_the_block_limit_is_a_hard_error() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			// A transaction's send.
+			System::note_finished_initialize();
+			let weights: frame_system::limits::BlockWeights =
+				<Test as frame_system::Config>::BlockWeights::get();
+			let limit = weights.get(DispatchClass::Normal).max_total.unwrap();
+			let len = VersionedXcm::from(xcm()).encode().len() as u32;
+			let room = limit.saturating_sub(SpecMessaging::send_weight(len));
+			frame_system::BlockWeight::<Test>::mutate(|w| w.set(room, DispatchClass::Normal));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("block has no room for the spec-msg send"))
+			);
+		});
+	}
+
+	#[test]
+	fn a_send_past_the_block_weight_is_a_hard_error() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			// A transaction's send in a block that hooks filled: the normal class is empty, but the
+			// block has room for one send only.
+			System::note_finished_initialize();
+			let weights: frame_system::limits::BlockWeights =
+				<Test as frame_system::Config>::BlockWeights::get();
+			let len = VersionedXcm::from(xcm()).encode().len() as u32;
+			let room = weights.max_block.saturating_sub(SpecMessaging::send_weight(len));
+			frame_system::BlockWeight::<Test>::mutate(|w| w.set(room, DispatchClass::Mandatory));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("block has no room for the spec-msg send"))
+			);
+			assert!(System::block_weight().total().all_lte(weights.max_block));
+		});
+	}
+
+	/// The block's weight per class.
+	fn used() -> frame_support::dispatch::PerDispatchClass<Weight> {
+		frame_system::BlockWeight::<Test>::get()
+	}
+
+	#[test]
+	fn a_hook_send_is_charged_to_the_mandatory_class_without_normal_room() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			// Transactions filled the normal class; `MessageQueue::on_idle` then services an XCM
+			// that sends over spec-msg.
+			let weights: frame_system::limits::BlockWeights =
+				<Test as frame_system::Config>::BlockWeights::get();
+			let normal = weights.get(DispatchClass::Normal).max_total.unwrap();
+			frame_system::BlockWeight::<Test>::mutate(|w| w.set(normal, DispatchClass::Normal));
+			System::note_finished_extrinsics();
+
+			let before = used();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			let len = VersionedXcm::from(xcm()).encode().len() as u32;
+			assert_eq!(*used().get(DispatchClass::Normal), *before.get(DispatchClass::Normal));
+			assert_eq!(
+				*used().get(DispatchClass::Mandatory) - *before.get(DispatchClass::Mandatory),
+				SpecMessaging::send_weight(len)
+			);
+		});
+	}
+
+	#[test]
+	fn a_hook_send_past_the_block_weight_is_still_sent() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			// `MessageQueue::on_initialize` has already been charged the whole block: the XCM it
+			// executes was metered there, and a refused send would trap its assets.
+			let weights: frame_system::limits::BlockWeights =
+				<Test as frame_system::Config>::BlockWeights::get();
+			frame_system::BlockWeight::<Test>::mutate(|w| {
+				w.set(weights.max_block, DispatchClass::Mandatory)
+			});
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(Router::get_messages()[0].1.len(), 2);
+			// The block's caps still bound it.
+			for _ in 2..MaxInFlight::get() {
+				assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			}
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("spec-msg XCM channel has no capacity"))
+			);
+		});
+	}
+
+	#[test]
+	fn a_dry_run_after_a_full_block_can_send() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			let weights: frame_system::limits::BlockWeights =
+				<Test as frame_system::Config>::BlockWeights::get();
+			frame_system::BlockWeight::<Test>::mutate(|w| {
+				w.set(weights.max_block, DispatchClass::Normal)
+			});
+			SpecMessaging::on_finalize(System::block_number());
+			let _ = System::finalize();
+
+			// A dry run models a fresh block: the last block's weight is not its own.
+			Router::clear_messages();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(Router::get_messages().len(), 1);
+		});
+	}
+}
+
 /// A channel that wants to open and applied an `Accepting` register for versions `min..=max`.
 fn awaiting_hello(num: u16, min: u8, max: u8) -> OutChannelId {
 	let ch = OutChannelId { recipient: ParaId::from(1000u32), domain: 0, num };
