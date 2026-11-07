@@ -19,8 +19,9 @@
 //!
 //! - **New best block:** rewind past retracted blocks, then archive each enacted block's sends,
 //!   during major sync too.
-//! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. This needs that
-//!   history's state; without it the node logs and stays idle.
+//! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. If that block's
+//!   state is pruned (warp sync, or spec-msg enabled late), seed the archive at the newest
+//!   finalized block instead: each stream is then served from its leaf count there.
 //! - **Finality:** apply retention with the watermarks [`run_watermark_reader`] has confirmed.
 
 use crate::{
@@ -148,7 +149,16 @@ where
 				}
 			},
 			None => {
-				let Some(origin) = self.find_origin(target) else { return };
+				let origin = match self.find_origin(target) {
+					Some(Origin::Start(origin)) => origin,
+					Some(Origin::Pruned) => {
+						if self.seed() {
+							self.follow(target);
+						}
+						return;
+					},
+					None => return,
+				};
 				let mut chain = vec![target];
 				while chain.last() != Some(&origin) {
 					let Some(parent) = chain
@@ -174,14 +184,9 @@ where
 		}
 	}
 
-	/// The first block of the run of API-bearing blocks that ends at `target`, or `None` if
-	/// `target` has no API or that run's start cannot be read.
-	///
-	/// TODO(spec-msg): with pruned state, this and `import` fail for good: a fresh node,
-	/// or one down longer than the pruning window, never serves again. Seed the archive at the
-	/// first block with state from an `outbound_frontiers()` runtime API (peaks and leaf count per
-	/// stream; both floors at the leaf count), then replay from there.
-	fn find_origin(&mut self, target: Block::Hash) -> Option<Block::Hash> {
+	/// Where the run of API-bearing blocks that ends at `target` starts, or `None` if `target` has
+	/// no API or a runtime version cannot be read.
+	fn find_origin(&mut self, target: Block::Hash) -> Option<Origin<Block::Hash>> {
 		if !self.has_api(target).unwrap_or(false) {
 			return None;
 		}
@@ -189,16 +194,13 @@ where
 		loop {
 			let header = self.client.header(origin).ok().flatten()?;
 			if header.number().is_zero() {
-				return Some(origin);
+				return Some(Origin::Start(origin));
 			}
 			let parent = *header.parent_hash();
 			match self.has_api(parent) {
 				Ok(true) => origin = parent,
-				Ok(false) => return Some(origin),
-				Err(e) if state_unavailable(&e) => {
-					self.unavailable(parent, &e);
-					return None;
-				},
+				Ok(false) => return Some(Origin::Start(origin)),
+				Err(e) if state_unavailable(&e) => return Some(Origin::Pruned),
 				Err(e) => {
 					log::warn!(
 						target: LOG_TARGET,
@@ -209,6 +211,43 @@ where
 				},
 			}
 		}
+	}
+
+	/// Seed the empty archive at the newest finalized block, whose state the node keeps, from its
+	/// `outbound_frontiers()`. `false` if that failed.
+	fn seed(&mut self) -> bool {
+		let hash = self.client.info().finalized_hash;
+		let Ok(Some(header)) = self.client.header(hash) else {
+			log::warn!(target: LOG_TARGET, "Missing header {hash:?}");
+			return false;
+		};
+		let frontiers = match self.client.runtime_api().outbound_frontiers(hash) {
+			Ok(frontiers) => frontiers,
+			Err(e) => {
+				log::warn!(target: LOG_TARGET, "outbound_frontiers at {hash:?} failed: {e}");
+				return false;
+			},
+		};
+		let streams = frontiers.len();
+		let result = self.archive.write().seed(
+			hash,
+			*header.parent_hash(),
+			(*header.number()).saturated_into(),
+			now(),
+			frontiers,
+			read_streams_root(header.digest()),
+		);
+		if let Err(e) = result {
+			log::warn!(target: LOG_TARGET, "Seeding the archive at {hash:?} failed: {e:?}");
+			return false;
+		}
+		log::info!(
+			target: LOG_TARGET,
+			"The state where spec-msg starts is pruned: seeded the archive at #{} ({hash:?}) with \
+			 {streams} streams. Their earlier leaves are not served.",
+			header.number(),
+		);
+		true
 	}
 
 	/// Archive one block. `false` stops the current walk; the next best block retries.
@@ -292,6 +331,14 @@ where
 			log::warn!(target: LOG_TARGET, "Archive retention failed: {e:?}");
 		}
 	}
+}
+
+/// Where the archive starts on an empty store.
+enum Origin<H> {
+	/// The first block of the run of API-bearing blocks.
+	Start(H),
+	/// The run starts below the oldest block whose state is kept.
+	Pruned,
 }
 
 /// Whether a runtime call failed because the block's state is gone, e.g. pruned.
