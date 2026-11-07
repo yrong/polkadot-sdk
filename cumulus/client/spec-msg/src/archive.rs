@@ -44,7 +44,7 @@ use mmr_lib::{
 	MMRStoreReadOps, MMRStoreWriteOps, MMR,
 };
 use polkadot_core_primitives::Hash;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const PREFIX: &[u8] = b"spec-msg/archive/v1/";
 
@@ -60,6 +60,8 @@ pub enum ArchiveError {
 	NotChild,
 	/// Only an empty archive can be seeded.
 	NotEmpty,
+	/// Backfilled leaves do not lead to the stored peaks at the stream's floor.
+	Diverged,
 	/// A block the operation needs is not archived.
 	UnknownBlock,
 	/// An MMR node the operation needs is missing.
@@ -182,6 +184,11 @@ fn oldest_key() -> Vec<u8> {
 
 fn pruned_state_key() -> Vec<u8> {
 	key(b'x', &[])
+}
+
+/// The seeded streams whose leaves below the floor may still be owed (see [`Archive::seed`]).
+fn backfill_key() -> Vec<u8> {
+	key(b'k', &[])
 }
 
 /// One stream's MMR nodes, read from the store with an overlay for nodes written but not yet
@@ -382,8 +389,9 @@ where
 
 	/// Start an empty archive at `hash` from every stream's frontier there, for a node without the
 	/// state of earlier blocks. Only the peaks are stored, so each stream is served from its leaf
-	/// count at `hash` on. The root over the frontiers is indexed unless `hash`'s header commits a
-	/// different one; without a digest it is the root the last sending block committed.
+	/// count at `hash` on, until [`Self::backfill`] fills what it owes below. The root over the
+	/// frontiers is indexed unless `hash`'s header commits a different one; without a digest it is
+	/// the root the last sending block committed.
 	pub fn seed(
 		&mut self,
 		hash: H,
@@ -399,6 +407,7 @@ where
 
 		let mut batch = Batch::default();
 		let mut streams = BTreeMap::new();
+		let mut backfill = BTreeSet::new();
 		for (stream, frontier) in frontiers {
 			let leaf_count = frontier.leaf_count();
 			if leaf_count == 0 {
@@ -411,7 +420,9 @@ where
 			let floors = Floors { payload: leaf_count, node: leaf_count };
 			batch.insert.push((floors_key(&stream), floors.encode()));
 			streams.insert(stream, StreamState { leaf_count, root: frontier.root().0 });
+			backfill.insert(stream);
 		}
+		batch.insert.push((backfill_key(), backfill.encode()));
 
 		let entries = streams.iter().map(|(s, state)| (*s, state.root)).collect();
 		let recomputed = streams_root(&entries);
@@ -439,6 +450,90 @@ where
 		self.tip = Some(tip);
 		self.streams = streams;
 		Ok(())
+	}
+
+	/// The seeded streams not yet backfilled or found complete.
+	pub(crate) fn backfill_pending(&self) -> BTreeSet<StreamId> {
+		self.store
+			.get(&backfill_key())
+			.and_then(|v| BTreeSet::decode(&mut &v[..]).ok())
+			.unwrap_or_default()
+	}
+
+	/// `stream` owes nothing below its floor.
+	pub(crate) fn backfill_done(&mut self, stream: &StreamId) -> Result<(), ArchiveError> {
+		let mut batch = Batch::default();
+		self.clear_backfill(&mut batch, stream);
+		self.store.commit(batch).map_err(ArchiveError::Store)
+	}
+
+	fn clear_backfill(&self, batch: &mut Batch, stream: &StreamId) {
+		let mut pending = self.backfill_pending();
+		pending.remove(stream);
+		if pending.is_empty() {
+			batch.delete.push(backfill_key());
+		} else {
+			batch.insert.push((backfill_key(), pending.encode()));
+		}
+	}
+
+	/// The leaf below which `stream` serves no payload.
+	pub(crate) fn payload_floor(&self, stream: &StreamId) -> u64 {
+		self.floors(stream).payload
+	}
+
+	/// The root `hash` is served under, and `stream`'s leaf count there.
+	pub(crate) fn served_at(&self, hash: &H, stream: &StreamId) -> Option<(StreamsRoot, u64)> {
+		let at = self.boundary(hash)?.state_at?;
+		let state = self.block_state(&at)?;
+		Some((state.root?, state.stream(stream)?.leaf_count))
+	}
+
+	/// Store a seeded stream's `payloads` from `start` up to its floor, with `frontier` the
+	/// stream's frontier at `start`, and lower both floors to `start`. The leaves must lead from
+	/// `frontier` to the peaks stored at the floor, else nothing is written.
+	pub(crate) fn backfill(
+		&mut self,
+		stream: StreamId,
+		frontier: &MmrFrontier,
+		payloads: &[Vec<u8>],
+	) -> Result<(), ArchiveError> {
+		let start = frontier.leaf_count();
+		let floors = self.floors(&stream);
+		if floors.payload != floors.node || start + payloads.len() as u64 != floors.node {
+			return Err(ArchiveError::Diverged);
+		}
+
+		let mut batch = Batch::default();
+		let nodes = Nodes::new(&self.store, stream);
+		{
+			let mut pending = nodes.pending.borrow_mut();
+			for (pos, peak) in get_peaks(mmr_size(start)).into_iter().zip(frontier.peaks()) {
+				pending.insert(pos, *peak);
+			}
+		}
+		let mut mmr = nodes.mmr(start);
+		for (i, payload) in payloads.iter().enumerate() {
+			mmr.push(leaf_hash(payload)).map_err(|_| ArchiveError::MissingNode)?;
+			batch.insert.push((payload_key(&stream, start + i as u64), payload.clone()));
+		}
+		mmr.commit().map_err(|_| ArchiveError::MissingNode)?;
+		let built = nodes.pending.take();
+		let stored = Nodes::new(&self.store, stream);
+		let linked = get_peaks(mmr_size(floors.node))
+			.into_iter()
+			.all(|pos| built.get(&pos).is_some() && built.get(&pos) == stored.get(pos).as_ref());
+		if !linked {
+			return Err(ArchiveError::Diverged);
+		}
+		for (pos, node) in built {
+			batch.insert.push((node_key(&stream, pos), node.encode()));
+		}
+		batch
+			.insert
+			.push((floors_key(&stream), Floors { payload: start, node: start }.encode()));
+		self.clear_backfill(&mut batch, &stream);
+		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
 	/// Rewind to `ancestor` after a reorg: forget every block above it and every leaf they added.
@@ -596,14 +691,16 @@ where
 		})
 	}
 
-	/// The channels at `finalized` that still hold payloads above their floor.
+	/// The channels at `finalized` that still hold payloads above their floor, or may owe a
+	/// backfill below it: their watermark decides both.
 	pub fn unconfirmed_channels(&self, finalized: &H) -> Vec<StreamId> {
+		let backfill = self.backfill_pending();
 		self.state_at(finalized)
 			.unwrap_or_default()
 			.into_iter()
 			.filter(|(stream, state)| {
 				matches!(stream, StreamId::Channel { .. }) &&
-					state.leaf_count > self.floors(stream).payload
+					(state.leaf_count > self.floors(stream).payload || backfill.contains(stream))
 			})
 			.map(|(stream, _)| stream)
 			.collect()

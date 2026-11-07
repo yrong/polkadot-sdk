@@ -21,12 +21,14 @@
 //!   during major sync too.
 //! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. If that block's
 //!   state is pruned (warp sync, or spec-msg enabled late), seed the archive at the newest
-//!   finalized block instead: each stream is then served from its leaf count there.
+//!   finalized block instead: each stream is then served from its leaf count there, until
+//!   [`run_watermark_reader`] backfills what it owes below from the own chain's peers.
 //! - **Finality:** apply retention with the watermarks [`run_watermark_reader`] has confirmed.
 
 use crate::{
 	archive::Archive,
-	fetch::{fetch, Transport},
+	fetch::{fetch, RequestError, Transport},
+	protocol::MAX_PAYLOAD_BYTES,
 	relay::FinalizedRoots,
 	store::ArchiveStore,
 	LOG_TARGET,
@@ -34,8 +36,8 @@ use crate::{
 use codec::{Decode, DecodeAll, Encode};
 use cumulus_primitives_core::{ParaId, SpecMsgApi};
 use cumulus_primitives_spec_messaging::{
-	streams_root::read_streams_root, MessagesRequest, Register, StreamId,
-	MAX_SPECULATIVE_MESSAGE_LEN,
+	streams_root::read_streams_root, FetchError, MessagePosition, MessagesRequest, MmrFrontier,
+	Register, StreamId, StreamsRoot, MAX_SPECULATIVE_MESSAGE_LEN,
 };
 use futures::{select, FutureExt, StreamExt};
 use parking_lot::{Mutex, RwLock};
@@ -347,7 +349,8 @@ fn state_unavailable(error: &sp_api::ApiError) -> bool {
 }
 
 /// Read the recipients' registers after each parachain finality notification, so the archiver can
-/// prune channels. Only the newest notification is processed after a round.
+/// prune channels, then backfill a seeded archive. Only the newest notification is processed after
+/// a round.
 pub async fn run_watermark_reader<Block, C, S, T, R>(
 	client: Arc<C>,
 	archive: Arc<RwLock<Archive<Block::Hash, S>>>,
@@ -368,7 +371,109 @@ pub async fn run_watermark_reader<Block, C, S, T, R>(
 			finalized = newer;
 		}
 		read_watermarks(&archive, &finalized.hash, &watermarks, us, &*transport, &*roots).await;
+		backfill(&archive, &finalized.hash, &watermarks, us, &*transport).await;
 	}
+}
+
+/// One round: fetch from the own chain's peers what each seeded stream owes below its floor. A
+/// channel owes its leaves from its watermark, once read; any other stream its head. Fetched under
+/// `finalized`'s root, which the own peers still hold. A stream that fails waits for the next
+/// round.
+pub(crate) async fn backfill<H, S, T>(
+	archive: &RwLock<Archive<H, S>>,
+	finalized: &H,
+	watermarks: &Mutex<BTreeMap<StreamId, u64>>,
+	us: ParaId,
+	transport: &T,
+) where
+	H: Encode + Decode + Copy + Eq + std::fmt::Debug,
+	S: ArchiveStore,
+	T: Transport + ?Sized,
+{
+	let pending = archive.read().backfill_pending();
+	for stream in pending {
+		let (served, floor) = {
+			let archive = archive.read();
+			(archive.served_at(finalized, &stream), archive.payload_floor(&stream))
+		};
+		let Some((under, count)) = served else { continue };
+		let target = match stream {
+			StreamId::Channel { .. } => match watermarks.lock().get(&stream) {
+				Some(mark) => *mark,
+				None => continue,
+			},
+			_ => count.saturating_sub(1),
+		};
+		let result = if target >= floor {
+			archive.write().backfill_done(&stream)
+		} else {
+			let Some((frontier, payloads)) =
+				fetch_range(transport, us, stream, under, target, floor).await
+			else {
+				log::debug!(target: LOG_TARGET, "No own peer served {stream:?} below {floor}");
+				continue;
+			};
+			let result = archive.write().backfill(stream, &frontier, &payloads);
+			if result.is_ok() {
+				log::info!(
+					target: LOG_TARGET,
+					"Backfilled {stream:?} from {} up to {floor}",
+					frontier.leaf_count(),
+				);
+			}
+			result
+		};
+		if let Err(e) = result {
+			log::warn!(target: LOG_TARGET, "Backfilling {stream:?} failed: {e:?}");
+		}
+	}
+}
+
+/// `stream`'s leaves from `start` up to `end` under `under`, with the frontier before the first.
+/// If every peer has pruned below `start`, it starts from the lowest leaf one still holds.
+async fn fetch_range<T: Transport + ?Sized>(
+	transport: &T,
+	us: ParaId,
+	stream: StreamId,
+	under: StreamsRoot,
+	start: u64,
+	end: u64,
+) -> Option<(MmrFrontier, Vec<Vec<u8>>)> {
+	let (mut at, mut frontier, mut payloads) = (start, None, Vec::new());
+	while at < end {
+		let request = MessagesRequest {
+			stream,
+			under,
+			start: Some(MessagePosition(at)),
+			max_bytes: MAX_PAYLOAD_BYTES,
+		};
+		match fetch(transport, us, &request, None).await {
+			Ok(response) => {
+				let taken = response.payloads.len().min((end - at) as usize);
+				if taken == 0 {
+					return None;
+				}
+				frontier.get_or_insert(response.frontier);
+				payloads.extend(response.payloads.into_iter().take(taken));
+				at += taken as u64;
+			},
+			Err(RequestError::Unserved { refusals }) if frontier.is_none() => {
+				let lowest = refusals
+					.iter()
+					.filter_map(|(_, error)| match error {
+						FetchError::OutsideHorizon { lowest } => Some(lowest.0),
+						_ => None,
+					})
+					.min()?;
+				if lowest <= at || lowest >= end {
+					return None;
+				}
+				at = lowest;
+			},
+			Err(_) => return None,
+		}
+	}
+	Some((frontier?, payloads))
 }
 
 /// One round: for each channel of `us` that still holds payloads at `finalized`, read the
