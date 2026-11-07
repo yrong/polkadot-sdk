@@ -158,6 +158,36 @@ fn honest(archive: &Arc<TestArchive>) -> (PeerId, TestPeer) {
 }
 
 #[test]
+fn a_seeded_archive_serves_each_stream_from_its_leaf_count() {
+	// Before the seed block the chain sent 5 leaves on a channel and 3 on an ack stream.
+	let mut model = Model::default();
+	let before = model.send(&[(channel(1), payloads(1, 5)), (ack(2), payloads(2, 3))]);
+	let frontiers: Vec<_> = model
+		.0
+		.iter()
+		.map(|(stream, sent)| (*stream, frontier_at(sent, sent.len())))
+		.collect();
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	// The seed block sent nothing, so its header has no digest.
+	archive.seed(10, 9, 10, 0, frontiers.clone(), None).unwrap();
+
+	assert_eq!(served(&archive, &messages(channel(1), 5, before, u32::MAX)), Ok(vec![]));
+	assert_eq!(
+		served(&archive, &messages(channel(1), 4, before, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(5) })
+	);
+	assert_eq!(
+		served(&archive, &head(ack(2), before, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
+	);
+
+	// Later blocks build on the seeded peaks.
+	let after = import(&mut archive, &mut model, 11, vec![(channel(1), payloads(3, 2))]);
+	assert_eq!(served(&archive, &messages(channel(1), 5, after, u32::MAX)), Ok(payloads(3, 2)));
+	assert_eq!(archive.seed(12, 11, 12, 0, frontiers, None), Err(ArchiveError::NotEmpty));
+}
+
+#[test]
 fn messages_verify_under_every_served_root() {
 	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
 	let mut model = Model::default();
