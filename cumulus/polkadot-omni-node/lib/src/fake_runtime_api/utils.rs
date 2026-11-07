@@ -281,6 +281,13 @@ macro_rules! impl_node_runtime_apis {
 					unimplemented!()
 				}
 
+				fn outbound_frontiers() -> Vec<(
+					cumulus_primitives_spec_messaging::StreamId,
+					cumulus_primitives_spec_messaging::MmrFrontier,
+				)> {
+					unimplemented!()
+				}
+
 				fn consumed_streams() -> cumulus_primitives_spec_messaging::ConsumedStreams {
 					unimplemented!()
 				}
