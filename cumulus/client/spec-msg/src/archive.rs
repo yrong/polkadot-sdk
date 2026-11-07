@@ -58,6 +58,8 @@ pub const MAX_LEAVES_PER_RESPONSE: u64 = MAX_MESSAGES_PER_RESPONSE as u64;
 pub enum ArchiveError {
 	/// The block is not a child of the archive's tip.
 	NotChild,
+	/// Only an empty archive can be seeded.
+	NotEmpty,
 	/// A block the operation needs is not archived.
 	UnknownBlock,
 	/// An MMR node the operation needs is missing.
@@ -368,6 +370,67 @@ where
 			batch.insert.push((state_key(&hash), state.encode()));
 		}
 		let boundary = Boundary { number, parent, imported_at, state_at };
+		batch.insert.push((boundary_key(&hash), boundary.encode()));
+		let tip = Tip { hash, number };
+		batch.insert.push((tip_key(), tip.encode()));
+		self.store.commit(batch).map_err(ArchiveError::Store)?;
+
+		self.tip = Some(tip);
+		self.streams = streams;
+		Ok(())
+	}
+
+	/// Start an empty archive at `hash` from every stream's frontier there, for a node without the
+	/// state of earlier blocks. Only the peaks are stored, so each stream is served from its leaf
+	/// count at `hash` on. The root over the frontiers is indexed unless `hash`'s header commits a
+	/// different one; without a digest it is the root the last sending block committed.
+	pub fn seed(
+		&mut self,
+		hash: H,
+		parent: H,
+		number: u64,
+		imported_at: u64,
+		frontiers: Vec<(StreamId, MmrFrontier)>,
+		committed: Option<StreamsRoot>,
+	) -> Result<(), ArchiveError> {
+		if self.tip.is_some() {
+			return Err(ArchiveError::NotEmpty);
+		}
+
+		let mut batch = Batch::default();
+		let mut streams = BTreeMap::new();
+		for (stream, frontier) in frontiers {
+			let leaf_count = frontier.leaf_count();
+			if leaf_count == 0 {
+				continue;
+			}
+			let positions = get_peaks(mmr_size(leaf_count));
+			for (pos, peak) in positions.into_iter().zip(frontier.peaks()) {
+				batch.insert.push((node_key(&stream, pos), peak.encode()));
+			}
+			let floors = Floors { payload: leaf_count, node: leaf_count };
+			batch.insert.push((floors_key(&stream), floors.encode()));
+			streams.insert(stream, StreamState { leaf_count, root: frontier.root().0 });
+		}
+
+		let entries = streams.iter().map(|(s, state)| (*s, state.root)).collect();
+		let recomputed = streams_root(&entries);
+		let root = if committed.is_none() || committed == recomputed {
+			recomputed
+		} else {
+			log::warn!(
+				target: LOG_TARGET,
+				"Seed block {number} ({hash:?}): StreamsRoot {recomputed:?} over its frontiers \
+				 differs from the header's {committed:?}; seeded but not served",
+			);
+			None
+		};
+		if let Some(root) = root {
+			batch.insert.push((root_key(&root), hash.encode()));
+		}
+		let state = BlockState { root, streams: streams.clone().into_iter().collect() };
+		batch.insert.push((state_key(&hash), state.encode()));
+		let boundary = Boundary { number, parent, imported_at, state_at: Some(hash) };
 		batch.insert.push((boundary_key(&hash), boundary.encode()));
 		let tip = Tip { hash, number };
 		batch.insert.push((tip_key(), tip.encode()));
