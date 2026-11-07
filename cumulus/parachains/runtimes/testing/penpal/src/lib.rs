@@ -1257,6 +1257,13 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 			SpecMessaging::outbound_messages()
 		}
 
+		fn outbound_frontiers() -> Vec<(
+			cumulus_primitives_spec_messaging::StreamId,
+			cumulus_primitives_spec_messaging::MmrFrontier,
+		)> {
+			SpecMessaging::outbound_frontiers()
+		}
+
 		fn consumed_streams() -> cumulus_primitives_spec_messaging::ConsumedStreams {
 			SpecMessaging::consumed_streams()
 		}
