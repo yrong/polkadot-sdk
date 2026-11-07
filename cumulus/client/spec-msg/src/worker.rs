@@ -17,7 +17,8 @@
 
 //! The archiver: keeps the [`Archive`] current.
 //!
-//! - **New best block:** rewind past retracted blocks, then archive each enacted block's sends.
+//! - **New best block:** rewind past retracted blocks, then archive each enacted block's sends,
+//!   during major sync too.
 //! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. This needs that
 //!   history's state; without it the node logs and stays idle.
 //! - **Finality:** apply retention with the watermarks [`run_watermark_reader`] has confirmed.
@@ -76,7 +77,9 @@ pub async fn run_archiver<Block, C, S>(
 	C::Api: SpecMsgApi<Block>,
 	S: ArchiveStore,
 {
-	let mut imports = client.import_notification_stream().fuse();
+	// Every import, major sync included. A notification pins its block's state until it is
+	// dropped, so state pruning cannot remove a block's sends before they are archived.
+	let mut imports = client.every_import_notification_stream().fuse();
 	let mut finality = client.finality_notification_stream().fuse();
 	let mut archiver = Archiver { client, archive, watermarks, stuck_at: None };
 	archiver.follow(archiver.client.info().best_hash);
