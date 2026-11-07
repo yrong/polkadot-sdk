@@ -1515,6 +1515,20 @@ impl<T: Config> Pallet<T> {
 		messages
 	}
 
+	/// Every outbound stream's frontier after this block's sends, in [`StreamId`] order. A stream
+	/// first sent in this block has no [`OutboundFrontier`] entry until the next roll-over.
+	pub fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)> {
+		let mut frontiers: BTreeMap<StreamId, MmrFrontier> =
+			OutboundFrontier::<T>::iter().collect();
+		for (stream, hashes) in OutboundLeafHashes::<T>::iter() {
+			let frontier = frontiers.entry(stream).or_default();
+			for hash in hashes {
+				frontier.append(hash);
+			}
+		}
+		frontiers.into_iter().collect()
+	}
+
 	/// The inbound streams and registers the node should fetch.
 	pub fn consumed_streams() -> ConsumedStreams {
 		let mut consumed = ConsumedStreams::default();

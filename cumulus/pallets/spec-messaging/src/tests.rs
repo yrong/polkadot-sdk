@@ -312,6 +312,24 @@ fn outbound_messages_lists_this_blocks_sends_sorted() {
 }
 
 #[test]
+fn outbound_frontiers_are_what_the_next_roll_over_stores() {
+	new_test_ext().execute_with(|| {
+		let (old, new) = (stream(0), stream(1));
+		SpecMessaging::append_to_stream(old, b"a".to_vec()).unwrap();
+		roll_one_block();
+		SpecMessaging::append_to_stream(old, b"b".to_vec()).unwrap();
+		SpecMessaging::append_to_stream(new, b"c".to_vec()).unwrap();
+		assert!(!OutboundFrontier::<Test>::contains_key(new));
+
+		let frontiers = SpecMessaging::outbound_frontiers();
+		roll_one_block();
+		let stored: Vec<_> = [old, new].map(|s| (s, OutboundFrontier::<Test>::get(s))).into();
+		assert_eq!(frontiers, stored);
+		assert_eq!(frontiers[0].1.leaf_count(), 2);
+	});
+}
+
+#[test]
 fn accept_transitions_to_accepting_and_publishes_at_block_end() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(SpecMessaging::accept_open_channel(RuntimeOrigin::root(), src(), 0, 0));

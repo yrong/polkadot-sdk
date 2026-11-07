@@ -35,7 +35,9 @@ pub mod parachain_block_data;
 pub mod scheduling;
 pub mod spec_messaging;
 
-use cumulus_primitives_spec_messaging::{ConsumedStreams, ConsumptionRecord, StreamId};
+use cumulus_primitives_spec_messaging::{
+	ConsumedStreams, ConsumptionRecord, MmrFrontier, StreamId,
+};
 pub use parachain_block_data::ParachainBlockData;
 pub use polkadot_core_primitives::InboundDownwardMessage;
 pub use polkadot_parachain_primitives::primitives::{
@@ -758,6 +760,10 @@ sp_api::decl_runtime_apis! {
 		/// This block's sends, per stream, in canonical `StreamId` order with payloads in send
 		/// order. What a collator appends to its archive. Empty for an idle block.
 		fn outbound_messages() -> Vec<(StreamId, Vec<Vec<u8>>)>;
+
+		/// Every outbound stream's frontier after this block's sends, in `StreamId` order. A node
+		/// without the state of earlier blocks seeds its archive from it.
+		fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)>;
 
 		/// Everything the inherent provider should fetch, and from which position on.
 		fn consumed_streams() -> ConsumedStreams;
