@@ -22,7 +22,7 @@ use crate::{
 	fetch::{fetch, RequestError, Transport},
 	protocol,
 	store::ArchiveStore,
-	worker::read_watermarks,
+	worker::{backfill, read_watermarks},
 	Archive, ArchiveError, FinalizedRoots, MemoryStore,
 };
 use codec::{Decode, Encode};
@@ -155,6 +155,66 @@ fn run_fetch(
 
 fn honest(archive: &Arc<TestArchive>) -> (PeerId, TestPeer) {
 	(PeerId::random(), TestPeer { archive: archive.clone(), tamper: false })
+}
+
+/// A chain that sent 5 leaves on `channel(1)`, 3 on `ack(2)` and 2 on `channel(3)` before block
+/// 10: an archive seeded there, and one that archived the history as block 1.
+fn seeded_and_full() -> (TestArchive, Arc<TestArchive>, Model, StreamsRoot) {
+	let mut model = Model::default();
+	let sends =
+		vec![(channel(1), payloads(1, 5)), (ack(2), payloads(2, 3)), (channel(3), payloads(3, 2))];
+	let mut full = TestArchive::open(Arc::new(MemoryStore::default()));
+	let root = import(&mut full, &mut model, 1, sends);
+	let frontiers = model
+		.0
+		.iter()
+		.map(|(stream, sent)| (*stream, frontier_at(sent, sent.len())))
+		.collect();
+	let mut seeded = TestArchive::open(Arc::new(MemoryStore::default()));
+	seeded.seed(10, 9, 10, 0, frontiers, None).unwrap();
+	(seeded, Arc::new(full), model, root)
+}
+
+#[test]
+fn a_backfill_must_lead_to_the_seeded_peaks() {
+	let (mut seeded, _, model, root) = seeded_and_full();
+	let sent = &model.0[&channel(1)];
+
+	let mut forged = sent[2..].to_vec();
+	forged[0][0] ^= 0xFF;
+	let frontier = frontier_at(sent, 2);
+	assert_eq!(seeded.backfill(channel(1), &frontier, &forged), Err(ArchiveError::Diverged));
+	assert_eq!(seeded.backfill(channel(1), &frontier, &sent[2..4]), Err(ArchiveError::Diverged));
+	assert_eq!(
+		served(&seeded, &messages(channel(1), 2, root, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(5) })
+	);
+
+	seeded.backfill(channel(1), &frontier, &sent[2..]).unwrap();
+	assert_eq!(served(&seeded, &messages(channel(1), 2, root, u32::MAX)), Ok(sent[2..].to_vec()));
+	assert!(!seeded.backfill_pending().contains(&channel(1)));
+}
+
+#[test]
+fn a_round_backfills_each_seeded_stream_from_own_peers() {
+	let (seeded, full, model, root) = seeded_and_full();
+	let seeded = RwLock::new(seeded);
+	let transport = ArchiveTransport(vec![honest(&full)]);
+	// `channel(1)` is confirmed up to 2, `channel(3)` past its floor; `channel(1)` before the
+	// watermark is read waits.
+	let watermarks = Mutex::new(BTreeMap::from([(channel(3), 2)]));
+	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+	assert_eq!(seeded.read().backfill_pending(), [channel(1)].into());
+
+	watermarks.lock().insert(channel(1), 2);
+	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+	let seeded = seeded.read();
+	assert!(seeded.backfill_pending().is_empty());
+	assert_eq!(
+		served(&seeded, &messages(channel(1), 2, root, u32::MAX)),
+		Ok(model.0[&channel(1)][2..].to_vec())
+	);
+	assert_eq!(served(&seeded, &head(ack(2), root, u32::MAX)), Ok(vec![payloads(2, 3)[2].clone()]));
 }
 
 #[test]
