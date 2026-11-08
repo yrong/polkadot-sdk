@@ -22,6 +22,7 @@ use cumulus_primitives_spec_messaging::{
 };
 use cumulus_zombienet_sdk_helpers::{assert_para_throughput, open_hrmp_channel};
 use std::{collections::BTreeMap, future::Future, time::Duration};
+use zombienet_orchestrator::network::node::LogLineCountOptions;
 use zombienet_sdk::{
 	subxt::{
 		self,
@@ -35,7 +36,7 @@ use zombienet_sdk::{
 		OnlineClient, PolkadotConfig,
 	},
 	subxt_signer::sr25519::dev,
-	NetworkConfig, NetworkConfigBuilder,
+	AddCollatorOptions, LocalFileSystem, Network, NetworkConfig, NetworkConfigBuilder,
 };
 
 const SENDER: u32 = 2000;
@@ -47,6 +48,11 @@ const RECEIVER_P2P_PORT: u16 = 30_501;
 const RELAY_RPC_PORT: u16 = 30_510;
 const SENDER_RPC_PORT: u16 = 30_511;
 const RECEIVER_RPC_PORT: u16 = 30_512;
+/// A full node of the sender chain that joins late, and the only one the receiver fetches from.
+const LATE_NODE: &str = "eve";
+const LATE_P2P_PORT: u16 = 30_502;
+/// The late node's state pruning window, in blocks: short, so the test passes it quickly.
+const LATE_PRUNING: u32 = 16;
 
 /// The XCM channel `SENDER -> RECEIVER`, as the receiver names it.
 fn in_channel() -> InChannelId {
@@ -79,7 +85,8 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 			connect(RECEIVER_RPC_PORT).await?,
 		)
 	} else {
-		let network = initialize_network(build_network_config()?).await?;
+		let network =
+			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT))?).await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -111,14 +118,32 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 
 	open_spec_msg_channel(&sender, &receiver).await?;
 
+	send_and_follow(&relay, &sender, &receiver).await?;
+
+	let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
+	wait_for("both chains to finalize one more block with messaging live", || {
+		advanced(&sender, &receiver, (now.0 + 1, now.1 + 1))
+	})
+	.await?;
+
+	Ok(())
+}
+
+/// Send an XCM `SENDER -> RECEIVER` over the open channel and follow it to execution, logging
+/// checkpoints 2 to 6.
+async fn send_and_follow(
+	relay: &OnlineClient<PolkadotConfig>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
 	log::info!("Sending an XCM {SENDER} -> {RECEIVER}");
 	// Subscribe first: the receiver may consume the message before the send is finalized. The
 	// stream starts at the block finalized now, which predates the send. Skip every block up to the
 	// best one now: a block that consumes the message comes later, and an earlier one that is not
 	// yet finalized, such as the one that consumed the open signal, is not the message.
-	let before_send = receiver.blocks().at(best_hash(&receiver).await?).await?.number();
+	let before_send = receiver.blocks().at(best_hash(receiver).await?).await?.number();
 	let receiver_blocks = receiver.blocks().subscribe_finalized().await?;
-	let sent = sender.blocks().at(sudo(&sender, send_xcm_to(RECEIVER)).await?).await?;
+	let sent = sender.blocks().at(sudo(sender, send_xcm_to(RECEIVER)).await?).await?;
 	let root = committed_root(&sent)
 		.ok_or_else(|| anyhow!("send block #{} commits no `StreamsRoot`", sent.number()))?;
 	let id = event_field(&sent, "PolkadotXcm", "Sent", "message_id")
@@ -140,7 +165,7 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 
 	wait_for("the relay chain to hold that root in the sender's provides window", || async {
 		let newest: Option<H256> = call_at(
-			&relay,
+			relay,
 			None,
 			"ParachainHost_newest_included_provides",
 			&ParaId::from(SENDER).encode(),
@@ -155,14 +180,107 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 		relay.blocks().at_latest().await?.number(),
 	);
 
-	follow_delivery(&receiver, receiver_blocks, before_send, id, root, &committed).await?;
+	follow_delivery(receiver, receiver_blocks, before_send, id, root, &committed).await?;
+	Ok(())
+}
 
-	let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
-	wait_for("both chains to finalize one more block with messaging live", || {
-		advanced(&sender, &receiver, (now.0 + 1, now.1 + 1))
+/// How the late node syncs the sender chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Join {
+	/// Major sync, executing every block.
+	Full,
+	/// Warp sync: state only from the warp target on.
+	Warp,
+}
+
+/// A late sender-chain node that prunes state, and alone serves the receiver, opens the channel:
+/// the receiver consumes the `Hello` the sender sent before the node joined, then an XCM. The node
+/// major-syncs and archives each block's sends while its import notification pins the state.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_late_full_sync_node_serves_history() -> Result<(), anyhow::Error> {
+	late_node_serves_history(Join::Full).await
+}
+
+/// As [`spec_msg_late_full_sync_node_serves_history`], but the node warp-syncs: it seeds its
+/// archive at its finalized block and backfills the `Hello` from the sender collator.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_late_warp_sync_node_serves_history() -> Result<(), anyhow::Error> {
+	late_node_serves_history(Join::Warp).await
+}
+
+async fn late_node_serves_history(join: Join) -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let mut network = initialize_network(build_network_config((LATE_NODE, LATE_P2P_PORT))?).await?;
+	// Both late-node tests bind the same ports: free them before the next one starts.
+	let result = late_node_steps(&mut network, join).await;
+	network.destroy().await?;
+	result
+}
+
+async fn late_node_steps(
+	network: &mut Network<LocalFileSystem>,
+	join: Join,
+) -> Result<(), anyhow::Error> {
+	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+	let sender: OnlineClient<PolkadotConfig> =
+		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+	let receiver: OnlineClient<PolkadotConfig> =
+		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+	let start = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
+	wait_for("both chains to finalize a block", || {
+		advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
 	})
 	.await?;
 
+	// The receiver accepts and the sender sends `Hello`, which nothing serves the receiver yet.
+	submit_open(&sender, &receiver).await?;
+	wait_for("the sender to send `Hello`", || async {
+		let (_, out_channels) = channel_states(&sender, &receiver).await?;
+		Ok(out_channels.get(&out_channel()).is_some_and(|state| state.open.is_some()))
+	})
+	.await?;
+	let hello = sender.blocks().at(best_hash(&sender).await?).await?.number();
+	wait_for("the sender to finalize past the late node's pruning window", || async {
+		Ok(finalized_number(&sender).await? > hello + LATE_PRUNING + 4)
+	})
+	.await?;
+
+	log::info!("Adding {LATE_NODE}, a {join:?}-syncing full node of {SENDER}");
+	let mut args: Vec<zombienet_sdk::Arg> = vec![
+		("-lsync=info,spec-msg=debug").into(),
+		("--enable-spec-msg").into(),
+		("--state-pruning", LATE_PRUNING.to_string().as_str()).into(),
+		("--spec-msg-peer", peer_arg(SENDER, SENDER_COLLATOR, SENDER_P2P_PORT)?.as_str()).into(),
+		("--spec-msg-peer", peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?.as_str())
+			.into(),
+		("--relay-chain-rpc-urls", "{{ZOMBIE:alice:ws_uri}}").into(),
+	];
+	if join == Join::Warp {
+		args.push(("--sync=warp").into());
+	}
+	let options = AddCollatorOptions {
+		is_validator: false,
+		args,
+		p2p_port: Some(LATE_P2P_PORT),
+		..Default::default()
+	};
+	network.add_collator(LATE_NODE, options, SENDER).await?;
+
+	wait_opened(&sender, &receiver).await?;
+	log::info!("{LATE_NODE} served the `Hello` from #{hello}: the channel is open");
+	send_and_follow(&relay, &sender, &receiver).await?;
+
+	// How the late node got the history: seeded and backfilled after a warp sync, else not.
+	let node = network.get_node(LATE_NODE)?;
+	let seeded = if join == Join::Warp { 1 } else { 0 };
+	for (pattern, count) in [("seeded the archive", seeded), ("Backfilled Channel", seeded)] {
+		let options = LogLineCountOptions::new(move |n| n == count, Duration::from_secs(10), false);
+		if !node.wait_log_line_count_with_timeout(pattern, false, options).await?.success() {
+			return Err(anyhow!("{LATE_NODE} logged \"{pattern}\" other than {count} times"));
+		}
+	}
 	Ok(())
 }
 
@@ -193,7 +311,8 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 
-	let network = initialize_network(build_network_config()?).await?;
+	let network =
+		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT))?).await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -464,49 +583,8 @@ async fn open_spec_msg_channel(
 	{
 		log::info!("Channel {SENDER} -> {RECEIVER} is already open: skipping the open");
 	} else {
-		log::info!("Opening channel {SENDER} -> {RECEIVER}");
-		// Either order works, so submit both at once; the wait below polls best blocks.
-		let open = sudo_in_block(
-			sender,
-			Value::unnamed_variant(
-				"SpecMessaging",
-				[Value::named_variant(
-					"open_channel",
-					[
-						("recipient", Value::u128(RECEIVER.into())),
-						("domain", Value::u128(0)),
-						("num", Value::u128(0)),
-					],
-				)],
-			),
-		);
-		let accept = sudo_in_block(
-			receiver,
-			Value::unnamed_variant(
-				"SpecMessaging",
-				[Value::named_variant(
-					"accept_open_channel",
-					[
-						("sender", Value::u128(SENDER.into())),
-						("domain", Value::u128(0)),
-						("num", Value::u128(0)),
-					],
-				)],
-			),
-		);
-		tokio::try_join!(open, accept)?;
-
-		// The handshake takes two register reads: the sender reads `Accepting` and sends `Hello`,
-		// the receiver consumes it and publishes `Opened`, and the sender's read of that opens the
-		// session. Best blocks, not finalized: finality adds about 30 s, and checkpoints 3 to 6
-		// still prove inclusion, backing and finality of the send.
-		wait_for("the sender to read the receiver's `Opened` register", || async {
-			let (_, out_channels) = channel_states(sender, receiver).await?;
-			Ok(out_channels
-				.get(&out_channel())
-				.is_some_and(|state| state.open.is_some_and(|session| session.opened)))
-		})
-		.await?;
+		submit_open(sender, receiver).await?;
+		wait_opened(sender, receiver).await?;
 	}
 
 	let (in_channels, out_channels) = channel_states(sender, receiver).await?;
@@ -526,6 +604,65 @@ async fn open_spec_msg_channel(
 		}
 	}
 	Ok(())
+}
+
+/// Submit the sender's `open_channel` and the receiver's `accept_open_channel` for the XCM
+/// channel `SENDER -> RECEIVER`.
+async fn submit_open(
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	log::info!("Opening channel {SENDER} -> {RECEIVER}");
+	// Either order works, so submit both at once; the wait below polls best blocks.
+	let open = sudo_in_block(
+		sender,
+		Value::unnamed_variant(
+			"SpecMessaging",
+			[Value::named_variant(
+				"open_channel",
+				[
+					("recipient", Value::u128(RECEIVER.into())),
+					("domain", Value::u128(0)),
+					("num", Value::u128(0)),
+				],
+			)],
+		),
+	);
+	let accept = sudo_in_block(
+		receiver,
+		Value::unnamed_variant(
+			"SpecMessaging",
+			[Value::named_variant(
+				"accept_open_channel",
+				[
+					("sender", Value::u128(SENDER.into())),
+					("domain", Value::u128(0)),
+					("num", Value::u128(0)),
+				],
+			)],
+		),
+	);
+	tokio::try_join!(open, accept)?;
+
+	Ok(())
+}
+
+/// Wait until the channel `SENDER -> RECEIVER` carries sends.
+async fn wait_opened(
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	// The handshake takes two register reads: the sender reads `Accepting` and sends `Hello`,
+	// the receiver consumes it and publishes `Opened`, and the sender's read of that opens the
+	// session. Best blocks, not finalized: finality adds about 30 s, and checkpoints 3 to 6
+	// still prove inclusion, backing and finality of the send.
+	wait_for("the sender to read the receiver's `Opened` register", || async {
+		let (_, out_channels) = channel_states(sender, receiver).await?;
+		Ok(out_channels
+			.get(&out_channel())
+			.is_some_and(|state| state.open.is_some_and(|session| session.opened)))
+	})
+	.await
 }
 
 /// `PolkadotXcm::send` of `[UnsubscribeVersion]` to sibling `para`. Penpal's barrier admits it
@@ -853,10 +990,12 @@ fn peer_arg(para: u32, name: &str, port: u16) -> Result<String, anyhow::Error> {
 	Ok(format!("{para}=/ip4/127.0.0.1/tcp/{port}/ws/p2p/{peer_id}"))
 }
 
-fn build_network_config() -> Result<NetworkConfig, anyhow::Error> {
+/// The network; the receiver fetches the sender's streams from `sender_node`, a node name and its
+/// p2p port.
+fn build_network_config(sender_node: (&str, u16)) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
-	let to_sender = peer_arg(SENDER, SENDER_COLLATOR, SENDER_P2P_PORT)?;
+	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
 	let collator_args = |peer: &str| -> Vec<zombienet_sdk::Arg> {
 		vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
