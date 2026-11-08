@@ -42,7 +42,7 @@ parameter_types! {
 	// A finite proof limit, which `MaxBundleStreams` must cover.
 	pub MockBlockWeights: frame_system::limits::BlockWeights =
 		frame_system::limits::BlockWeights::with_sensible_defaults(
-			Weight::from_parts(2 * WEIGHT_REF_TIME_PER_SECOND, 1 << 20),
+			Weight::from_parts(2 * WEIGHT_REF_TIME_PER_SECOND, 2 << 20),
 			sp_runtime::Perbill::from_percent(75),
 		);
 }
@@ -55,7 +55,7 @@ parameter_types! {
 	pub const MaxInFlight: u32 = 4;
 	pub const MaxSendsPerBlock: u32 = 32;
 	pub const MaxTouchedStreams: u32 = 8;
-	pub const MaxBundleStreams: u32 = 512;
+	pub const MaxBundleStreams: u32 = 1024;
 	pub const MaxInboundMessagesPerItem: u32 = 16;
 	pub const MaxHelloPassPerBlock: u32 = 2;
 	pub const MaxMessageSize: u32 = 1024;
