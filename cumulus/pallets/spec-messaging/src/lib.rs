@@ -664,7 +664,9 @@ pub mod pallet {
 				if budget.streams.contains(&stream) {
 					continue;
 				}
-				let Ok(skip) = Self::admit_register_read(channel_id, &lossy) else {
+				let Ok(AdmittedRegisterRead { skip, .. }) =
+					Self::admit_register_read(channel_id, &lossy)
+				else {
 					continue;
 				};
 				let Ok(bytes) = Self::lift_reservation(&budget, stream, skip) else {
@@ -899,6 +901,17 @@ struct AdmittedChannelItem {
 	state: InChannelState,
 	payloads: Vec<Payload>,
 	data_messages: Vec<(MessagePosition, Vec<u8>)>,
+}
+
+/// A register read that passed admission.
+struct AdmittedRegisterRead {
+	/// The read's gap from where the previous read ended, if there was one.
+	skip: Option<(u64, u64)>,
+	state: OutChannelState,
+	register: Register,
+	read_pos: MessagePosition,
+	/// The frontier after the read.
+	end: MmrFrontier,
 }
 
 impl<T: Config> Pallet<T> {
@@ -1352,12 +1365,11 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
-	/// Validate a register read for admission. Returns the read's gap from where the previous read
-	/// ended, if there was one.
+	/// Validate a register read for admission.
 	fn admit_register_read(
 		channel_id: OutChannelId,
 		lossy: &LossyRead,
-	) -> Result<Option<(u64, u64)>, Error<T>> {
+	) -> Result<AdmittedRegisterRead, Error<T>> {
 		let Some(state) = OutChannels::<T>::get(channel_id) else {
 			return Err(Error::<T>::UnknownChannel);
 		};
@@ -1405,7 +1417,8 @@ impl<T: Config> Pallet<T> {
 			},
 		}
 
-		Ok(state.register.map(|r| (r.position.0 + 1, read_pos.0)))
+		let skip = state.register.map(|r| (r.position.0 + 1, read_pos.0));
+		Ok(AdmittedRegisterRead { skip, state, register, read_pos, end: frontier })
 	}
 
 	/// Consume an inbound channel item in `enact_messages`.
@@ -1442,26 +1455,15 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Consume a register read item in `enact_messages`. Returns the read's gap, as
-	/// [`Self::admit_register_read`].
+	/// Consume a register read item in `enact_messages`. Returns the read's gap
+	/// ([`AdmittedRegisterRead::skip`]).
 	fn consume_register_item(
 		channel_id: OutChannelId,
 		lossy: LossyRead,
 	) -> Result<Option<(u64, u64)>, Error<T>> {
-		let skip = Self::admit_register_read(channel_id, &lossy)?;
-		let mut state = OutChannels::<T>::get(channel_id).ok_or(Error::<T>::UnknownChannel)?;
-		let [payload] = lossy.payloads.as_slice() else {
-			return Err(Error::<T>::BadRegister);
-		};
-		let register =
-			Register::decode_all(&mut &payload[..]).map_err(|_| Error::<T>::BadRegister)?;
-
-		let mut frontier = lossy.frontier;
-		let read_pos = MessagePosition(frontier.leaf_count());
-		let start = frontier.root();
-		frontier
-			.try_append(leaf_hash_with_version(LEAF_VERSION, payload))
-			.map_err(|_| Error::<T>::BadFrontier)?;
+		let AdmittedRegisterRead { skip, mut state, register, read_pos, end } =
+			Self::admit_register_read(channel_id, &lossy)?;
+		let start = lossy.frontier.root();
 
 		state.register = Some(AppliedRegister { position: read_pos, register });
 		match register.status {
@@ -1496,11 +1498,7 @@ impl<T: Config> Pallet<T> {
 
 		OutChannels::<T>::insert(channel_id, state);
 		let foreign_ack = channel_id.peer_ack_stream(T::SelfParaId::get());
-		ConsumptionOutbox::<T>::append((
-			foreign_ack.0,
-			foreign_ack.1,
-			Interval { start, end: frontier },
-		));
+		ConsumptionOutbox::<T>::append((foreign_ack.0, foreign_ack.1, Interval { start, end }));
 		Ok(skip)
 	}
 
