@@ -10,7 +10,8 @@
 //!
 //! The delivery test logs one checkpoint per protocol step, each read from chain state: the
 //! sender's committed root, the relay's provides window, the receiver's consumption record, and
-//! the executed XCM.
+//! the executed XCM. It then sends a batch larger than the receiver admits per block, which the
+//! receiver consumes over several blocks cut short of what its node planned.
 
 use crate::utils::initialize_network;
 use anyhow::anyhow;
@@ -119,6 +120,7 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	open_spec_msg_channel(&sender, &receiver).await?;
 
 	send_and_follow(&relay, &sender, &receiver).await?;
+	send_batch_and_follow(&sender, &receiver).await?;
 
 	let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
 	wait_for("both chains to finalize one more block with messaging live", || {
@@ -181,6 +183,119 @@ async fn send_and_follow(
 	);
 
 	follow_delivery(receiver, receiver_blocks, before_send, id, root, &committed).await?;
+	Ok(())
+}
+
+/// XCMs in the batch: more than twice penpal's `MaxInboundMessagesPerItem`.
+const BATCH: u64 = 20;
+const MAX_PER_ITEM: u64 = 8;
+
+/// Send `BATCH` XCMs `SENDER -> RECEIVER` in one block and follow them to execution. The
+/// receiver's node binds the channel only at the batch's end; the runtime admits `MAX_PER_ITEM`
+/// per block, so the blocks before the last end at cut endpoints whose lifts the node rebases.
+/// Each of them is finalized, so the relay accepted its `Requires`.
+async fn send_batch_and_follow(
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	log::info!("Sending {BATCH} XCMs {SENDER} -> {RECEIVER} in one block");
+	let stream = in_channel().sender_data_stream(RECEIVER.into()).1;
+	let mut consumed = channel_map::<InChannelId, InChannelState>(receiver, "InChannels")
+		.await?
+		.get(&in_channel())
+		.map(|state| state.frontier.leaf_count())
+		.ok_or_else(|| anyhow!("{RECEIVER} has no inbound channel from {SENDER}"))?;
+	let end = consumed + BATCH;
+	let before_send = receiver.blocks().at(best_hash(receiver).await?).await?.number();
+	let mut blocks = receiver.blocks().subscribe_finalized().await?;
+	let calls = (0..BATCH).map(|_| send_xcm_to(RECEIVER)).collect::<Vec<_>>();
+	let batch = Value::unnamed_variant(
+		"Utility",
+		[Value::named_variant("batch_all", [("calls", Value::unnamed_composite(calls))])],
+	);
+	let sent = sender.blocks().at(sudo(sender, batch).await?).await?;
+	let mut ids = Vec::new();
+	for event in sent.events().await?.iter() {
+		let event = event?;
+		if event.pallet_name() == "PolkadotXcm" && event.variant_name() == "Sent" {
+			ids.extend(event.field_values()?.at("message_id").map(flatten));
+		}
+	}
+	if ids.len() as u64 != BATCH {
+		return Err(anyhow!(
+			"{SENDER} block #{} sent {} XCMs, not {BATCH}",
+			sent.number(),
+			ids.len()
+		));
+	}
+	log::info!("{SENDER} block #{} sent leaves {}..{end}", sent.number(), end - BATCH);
+
+	let mut cuts = 0;
+	let mut processed = Vec::new();
+	let follow = async {
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			if block.number() <= before_send {
+				continue;
+			}
+			let record: ConsumptionRecord =
+				call_at(receiver, Some(block.hash()), "SpecMsgApi_consumption_record", &[]).await?;
+			let reached = record.entries.get(&ParaId::from(SENDER)).and_then(|streams| {
+				streams
+					.iter()
+					.find_map(|(s, interval)| (*s == stream).then(|| interval.end.leaf_count()))
+			});
+			if let Some(reached) = reached {
+				if reached - consumed > MAX_PER_ITEM {
+					return Err(anyhow!(
+						"{RECEIVER} block #{} consumed {consumed}..{reached}, over {MAX_PER_ITEM}",
+						block.number(),
+					));
+				}
+				if reached < end {
+					cuts += 1;
+				}
+				log::info!(
+					"{RECEIVER} block #{} consumed leaves {consumed}..{reached} and is finalized",
+					block.number(),
+				);
+				consumed = reached;
+			}
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
+					continue;
+				}
+				let values = event.field_values()?;
+				let Some(id) = values.at("id").map(flatten).filter(|id| ids.contains(id)) else {
+					continue;
+				};
+				let fields = format!("{values:?}");
+				if !fields.contains("SpecMsg") || !fields.contains("Bool(true)") {
+					return Err(anyhow!("XCM {id:?} not executed over spec-msg: {fields}"));
+				}
+				processed.push(id);
+			}
+			if processed.len() == ids.len() {
+				return Ok(());
+			}
+		}
+		Err(anyhow!("receiver block subscription ended"))
+	};
+	tokio::time::timeout(Duration::from_secs(300), follow)
+		.await
+		.map_err(|_| anyhow!("the batch was not executed within 5 minutes"))??;
+
+	if processed != ids {
+		return Err(anyhow!("the batch executed out of order"));
+	}
+	if consumed != end || cuts < 2 {
+		return Err(anyhow!("consumed up to {consumed} of {end} with {cuts} cut blocks"));
+	}
+	log::info!(
+		"All {BATCH} XCMs executed in order over {} consuming blocks, {cuts} of them cut short",
+		cuts + 1,
+	);
 	Ok(())
 }
 
