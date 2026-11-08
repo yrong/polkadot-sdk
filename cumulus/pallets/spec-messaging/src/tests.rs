@@ -1177,57 +1177,6 @@ fn without_bundle_info_create_inherent_reads_a_register_every_block() {
 }
 
 #[test]
-fn create_inherent_trims_to_the_proof_budget() {
-	new_test_ext().execute_with(|| {
-		let ch = in_channel();
-		assert_ok!(SpecMessaging::accept_open_channel(
-			RuntimeOrigin::root(),
-			ch.sender,
-			ch.domain,
-			ch.num
-		));
-		let payloads = vec![
-			ChannelMessage::Hello { session: 1, version: 1 }.encode(),
-			ChannelMessage::Data(vec![1; 100]).encode(),
-			ChannelMessage::Data(vec![2; 100]).encode(),
-		];
-		let mut inherent = InherentData::new();
-		inherent
-			.put_data(
-				INHERENT_IDENTIFIER,
-				&MessagingInherentData {
-					channels: BTreeMap::from([(ch, payloads.clone())]),
-					..Default::default()
-				},
-			)
-			.unwrap();
-
-		let fixed = first_lift_bytes() +
-			ch.encoded_size() as u64 +
-			Compact::<u32>::max_encoded_len() as u64;
-		let two = fixed + (payloads[0].encoded_size() + payloads[1].encoded_size()) as u64;
-		let weights: frame_system::limits::BlockWeights =
-			<Test as frame_system::Config>::BlockWeights::get();
-		let max = weights.max_block.proof_size();
-		let kept = |budget: u64| {
-			frame_system::BlockWeight::<Test>::kill();
-			System::register_extra_weight_unchecked(
-				Weight::from_parts(0, max - budget),
-				DispatchClass::Mandatory,
-			);
-			match SpecMessaging::create_inherent(&inherent) {
-				Some(Call::enact_messages { data }) => data.channels[&ch].len(),
-				_ => 0,
-			}
-		};
-
-		assert_eq!(kept(two), 2);
-		assert_eq!(kept(two - 1), 1);
-		assert_eq!(kept(fixed), 0);
-	});
-}
-
-#[test]
 fn create_inherent_trims_to_the_remaining_ref_time() {
 	new_test_ext().execute_with(|| {
 		let ch = in_channel();
@@ -1264,6 +1213,53 @@ fn create_inherent_trims_to_the_remaining_ref_time() {
 		assert_eq!(kept(weight(3, true) - 1), (2, true));
 		assert_eq!(kept(weight(3, false) - 1), (2, false));
 		assert_eq!(kept(weight(1, false) - 1), (0, false));
+	});
+}
+
+#[test]
+fn create_inherent_counts_its_own_proof_size() {
+	new_test_ext().execute_with(|| {
+		let ch = in_channel();
+		accept(ch);
+		want_open(out_channel());
+		let payloads = vec![hello(1), data(&[1; 100]), data(&[2; 100])];
+		let read = register_read(0);
+		let max = <Test as frame_system::Config>::BlockWeights::get().max_block.proof_size();
+		// What `data` takes of the block's proof: its lifts and encoded items, and the storage
+		// proof the inherent is charged for.
+		let needs = |data: &MessagingInherentData| {
+			let channels: u64 = data
+				.channels
+				.iter()
+				.map(|(ch, payloads)| {
+					first_lift_bytes() +
+						ch.encoded_size() as u64 +
+						Compact::<u32>::max_encoded_len() as u64 +
+						payloads.iter().map(|p| p.encoded_size() as u64).sum::<u64>()
+				})
+				.sum();
+			let registers: u64 = data
+				.registers
+				.iter()
+				.map(|r| first_lift_bytes() + r.encoded_size() as u64)
+				.sum();
+			channels + registers + enact_weight::<Test>(data).proof_size()
+		};
+		let kept = |offered: &MessagingInherentData, left: u64| {
+			frame_system::BlockWeight::<Test>::kill();
+			System::register_extra_weight_unchecked(
+				Weight::from_parts(0, max - left),
+				DispatchClass::Mandatory,
+			);
+			created(offered).unwrap_or_default()
+		};
+
+		let three = channel_item(ch, payloads.clone());
+		let two = channel_item(ch, payloads[..2].to_vec());
+		assert_eq!(kept(&three, needs(&three)), three);
+		assert_eq!(kept(&three, needs(&three) - 1), two);
+		assert_eq!(kept(&read, needs(&read)), read);
+		assert_eq!(kept(&read, needs(&read) - 1), MessagingInherentData::default());
 	});
 }
 
