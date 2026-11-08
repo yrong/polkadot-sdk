@@ -284,6 +284,18 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type PausedInbound<T: Config> = StorageMap<_, Twox64Concat, InChannelId, (), OptionQuery>;
 
+	/// The factor that multiplies the base delivery fee of [`SpecMsgRouter`]'s XCM to a sibling.
+	/// It rises while that sibling's XCM channel is congested.
+	#[pallet::storage]
+	pub type DeliveryFeeFactor<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		ParaId,
+		sp_runtime::FixedU128,
+		ValueQuery,
+		polkadot_runtime_parachains::GetMinFeeFactor<Pallet<T>>,
+	>;
+
 	/// Whether `enact_messages` ran this block; cleared next block.
 	#[pallet::storage]
 	pub type Enacted<T: Config> = StorageValue<_, (), OptionQuery>;
