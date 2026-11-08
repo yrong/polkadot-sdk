@@ -635,7 +635,8 @@ pub mod pallet {
 			let us = T::SelfParaId::get();
 			let mut budget = BundleBudget::load::<T>();
 			let mut remaining = Self::proof_budget(inherent_data);
-			// The call is mandatory, so nothing refuses it past the block's ref time: keep within.
+			// The call is mandatory, so nothing refuses it past the block's ref time or proof size:
+			// keep within both, counting the storage proof the call is charged for.
 			let ref_time = T::BlockWeights::get()
 				.max_block
 				.ref_time()
@@ -674,7 +675,10 @@ pub mod pallet {
 				};
 				let cost = bytes.saturating_add((channel_id, &lossy).encoded_size() as u64);
 				let item = EnactTally { registers: tally.registers.saturating_add(1), ..tally };
-				if cost > remaining || item.weight::<T>().ref_time() > ref_time {
+				let weight = item.weight::<T>();
+				if cost.saturating_add(weight.proof_size()) > remaining ||
+					weight.ref_time() > ref_time
+				{
 					continue;
 				}
 				remaining -= cost;
@@ -709,7 +713,10 @@ pub mod pallet {
 					let next = cost.saturating_add(payload.encoded_size() as u64);
 					let mut next_item = item;
 					next_item.add_payload::<T>(payload);
-					if next > remaining || next_item.weight::<T>().ref_time() > ref_time {
+					let weight = next_item.weight::<T>();
+					if next.saturating_add(weight.proof_size()) > remaining ||
+						weight.ref_time() > ref_time
+					{
 						break;
 					}
 					cost = next;
