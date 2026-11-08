@@ -727,7 +727,9 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxSendsPerBlock = ConstU32<1024>;
 	type MaxTouchedStreams = ConstU32<14>;
 	type MaxBundleStreams = ConstU32<3000>;
-	type MaxInboundMessagesPerItem = ConstU32<256>;
+	// Below `MaxInFlight`: a backlog is consumed over several blocks, each cut short of the item
+	// the node planned, which the e2e test relies on.
+	type MaxInboundMessagesPerItem = ConstU32<8>;
 	type MaxHelloPassPerBlock = ConstU32<8>;
 	type SupportedVersions = SpecMsgSupportedVersions;
 	type MaxMessageSize = ConstU32<102400>;
