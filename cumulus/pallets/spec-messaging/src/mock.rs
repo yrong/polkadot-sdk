@@ -152,12 +152,23 @@ impl cumulus_primitives_core::GetChannelInfo for MockHrmp {
 	}
 }
 
-/// The router as a runtime would wire it, with no fee and no version negotiation.
+parameter_types! {
+	pub FeeAssetId: xcm::latest::AssetId = xcm::latest::AssetId(xcm::latest::Location::here());
+	pub const BaseDeliveryFee: u128 = 1_000;
+	pub const ByteFee: u128 = 1;
+}
+
+/// The router as a runtime would wire it, with no version negotiation.
 pub type Router = crate::SpecMsgRouter<
 	Test,
 	MockHrmp,
 	(),
-	polkadot_runtime_common::xcm_sender::NoPriceForMessageDelivery<ParaId>,
+	polkadot_runtime_common::xcm_sender::ExponentialPrice<
+		FeeAssetId,
+		BaseDeliveryFee,
+		ByteFee,
+		SpecMessaging,
+	>,
 >;
 
 std::thread_local! {

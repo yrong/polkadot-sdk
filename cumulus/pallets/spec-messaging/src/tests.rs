@@ -1796,6 +1796,7 @@ mod xcm_layer {
 		},
 		VersionedLocation, VersionedXcm,
 	};
+	use sp_runtime::FixedU128;
 	use xcm_builder::InspectMessageQueues;
 
 	fn sibling() -> Location {
@@ -2164,6 +2165,41 @@ mod xcm_layer {
 			// Cleared (a rollback): HRMP wins again.
 			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer));
 			declines(sibling());
+		});
+	}
+
+	#[test]
+	fn the_delivery_fee_rises_while_more_than_half_the_window_is_unconfirmed() {
+		new_test_ext().execute_with(|| {
+			let peer = out_channel().recipient;
+			open_xcm_channel();
+			let price = || {
+				let (mut d, mut m) = (Some(sibling()), Some(xcm()));
+				Router::validate(&mut d, &mut m).unwrap().1
+			};
+			let factor = || DeliveryFeeFactor::<Test>::get(peer);
+			let (one, step) = (FixedU128::from_u32(1), FixedU128::from_rational(105, 100));
+			let base = price();
+			// `MaxInFlight` is 4: two unconfirmed sends are half of it.
+			for _ in 0..2 {
+				assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			}
+			assert_eq!(factor(), one);
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(factor(), step);
+			assert!(price() > base);
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(factor(), step * step);
+
+			// The peer confirms all four: each send that leaves half or less lowers the factor.
+			OutChannels::<Test>::mutate(xcm_channel(peer), |state| {
+				state.as_mut().unwrap().register.as_mut().unwrap().register.up_to =
+					MessagePosition(4);
+			});
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(factor(), step);
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!((factor(), price()), (one, base));
 		});
 	}
 
