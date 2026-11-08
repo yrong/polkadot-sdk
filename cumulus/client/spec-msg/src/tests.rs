@@ -218,6 +218,30 @@ fn a_round_backfills_each_seeded_stream_from_own_peers() {
 }
 
 #[test]
+fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
+	let (seeded, _, model, root) = seeded_and_full();
+	let sent = &model.0[&channel(1)];
+	// Two peers that kept `channel(1)` from 3 and from 4 only.
+	let pruned = |from: usize| {
+		let (mut peer, ..) = seeded_and_full();
+		peer.backfill(channel(1), &frontier_at(sent, from), &sent[from..]).unwrap();
+		(PeerId::random(), TestPeer { archive: Arc::new(peer), tamper: false })
+	};
+	let transport = ArchiveTransport(vec![pruned(4), pruned(3)]);
+	let seeded = RwLock::new(seeded);
+	let watermarks = Mutex::new(BTreeMap::from([(channel(1), 1)]));
+	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+
+	let seeded = seeded.read();
+	assert!(!seeded.backfill_pending().contains(&channel(1)));
+	assert_eq!(served(&seeded, &messages(channel(1), 3, root, u32::MAX)), Ok(sent[3..].to_vec()));
+	assert_eq!(
+		served(&seeded, &messages(channel(1), 1, root, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
+	);
+}
+
+#[test]
 fn a_seeded_archive_serves_each_stream_from_its_leaf_count() {
 	// Before the seed block the chain sent 5 leaves on a channel and 3 on an ack stream.
 	let mut model = Model::default();
