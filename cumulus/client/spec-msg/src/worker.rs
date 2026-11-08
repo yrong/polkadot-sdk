@@ -85,7 +85,12 @@ pub async fn run_archiver<Block, C, S>(
 	let mut imports = client.every_import_notification_stream().fuse();
 	let mut finality = client.finality_notification_stream().fuse();
 	let mut archiver = Archiver { client, archive, watermarks, stuck_at: None };
-	archiver.follow(archiver.client.info().best_hash);
+	// A fresh node's best block is genesis. Wait for its first import instead: a warp-synced node
+	// would archive genesis and then find every block after it without state, and never seed.
+	let info = archiver.client.info();
+	if !info.best_number.is_zero() {
+		archiver.follow(info.best_hash);
+	}
 	loop {
 		select! {
 			import = imports.next() => match import {
