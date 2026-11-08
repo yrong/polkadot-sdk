@@ -20,8 +20,9 @@
 //! channel.
 
 use crate::{
-	channel_policy::OutChannelPolicy, BlockStreamsRoot, Config, Error, HrmpClosing, OnSpecMsgData,
-	OutChannels, OutboundLeafHashes, OutboundMessages, Pallet, QueueFootprintQuery, SendsThisBlock,
+	channel_policy::OutChannelPolicy, BlockStreamsRoot, Config, DeliveryFeeFactor, Error,
+	HrmpClosing, OnSpecMsgData, OutChannels, OutboundLeafHashes, OutboundMessages, Pallet,
+	QueueFootprintQuery, SendsThisBlock,
 };
 use alloc::vec::Vec;
 use codec::{DecodeAll, DecodeLimit, Encode};
@@ -39,7 +40,8 @@ use frame_support::{
 use frame_system::Phase;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use polkadot_runtime_common::xcm_sender::PriceForMessageDelivery;
-use sp_runtime::traits::Convert;
+use polkadot_runtime_parachains::FeeTracker;
+use sp_runtime::{traits::Convert, FixedU128};
 use xcm::{latest::prelude::*, VersionedLocation, VersionedXcm, WrapVersion, MAX_XCM_DECODE_DEPTH};
 use xcm_builder::InspectMessageQueues;
 
@@ -132,6 +134,8 @@ impl<T: Config> frame_support::traits::QueuePausedQuery<InChannelId> for crate::
 /// - Otherwise the XCM goes over the spec-msg XCM channel if it is open, else falls through.
 /// - An open channel without capacity is a hard [`SendError::Transport`]: falling through would
 ///   lose the XCM in `XcmpQueue`.
+/// - `Price` is usually `ExponentialPrice` over [`Pallet`], which tracks the channel's congestion
+///   in [`DeliveryFeeFactor`].
 /// - Each delivery charges [`Pallet::send_weight`] to the block. A transaction's send goes to the
 ///   normal class, and one it would push past that class's limit or the block's is a hard
 ///   [`SendError::Transport`] too: the transaction fails and reverts. A hook's send, such as XCM
@@ -209,12 +213,43 @@ where
 
 	fn deliver((channel, encoded): Self::Ticket) -> Result<XcmHash, SendError> {
 		let hash = sp_io::hashing::blake2_256(&encoded);
-		let weight = Pallet::<T>::send_weight(encoded.len() as u32);
-		Pallet::<T>::send(channel, encoded)
+		let len = encoded.len();
+		let weight = Pallet::<T>::send_weight(len as u32)
+			.saturating_add(T::DbWeight::get().reads_writes(1, 1));
+		let position = Pallet::<T>::send(channel, encoded)
 			.map_err(|_| SendError::Transport("spec-msg XCM send failed"))?;
+		track_congestion::<T>(channel, position, len);
 		// Not a call, so nothing else charges the send and the commit it causes.
 		frame_system::Pallet::<T>::register_extra_weight_unchecked(weight, send_class::<T>());
 		Ok(hash)
+	}
+}
+
+/// Raise the channel's [`DeliveryFeeFactor`] after a send that leaves more than half of
+/// `MaxInFlight` unconfirmed, and lower it after one that does not. The window is shared by every
+/// user of the chain, so whoever holds it past half pays more for each further send, as HRMP prices
+/// a channel's queue.
+fn track_congestion<T: Config>(channel: OutChannelId, sent: MessagePosition, len: usize) {
+	let up_to = OutChannels::<T>::get(channel)
+		.and_then(|state| state.register)
+		.map_or(0, |r| r.register.up_to.0);
+	let in_flight = sent.0.saturating_add(1).saturating_sub(up_to);
+	if in_flight > u64::from(T::MaxInFlight::get() / 2) {
+		Pallet::<T>::increase_fee_factor(channel.recipient, len as u128);
+	} else {
+		Pallet::<T>::decrease_fee_factor(channel.recipient);
+	}
+}
+
+impl<T: Config> FeeTracker for Pallet<T> {
+	type Id = ParaId;
+
+	fn get_fee_factor(id: ParaId) -> FixedU128 {
+		DeliveryFeeFactor::<T>::get(id)
+	}
+
+	fn set_fee_factor(id: ParaId, val: FixedU128) {
+		DeliveryFeeFactor::<T>::insert(id, val);
 	}
 }
 
