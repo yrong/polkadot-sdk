@@ -461,9 +461,7 @@ pub type XcmRouter = WithUniqueTopic<(
 		Runtime,
 		ParachainSystem,
 		PolkadotXcm,
-		polkadot_runtime_common::xcm_sender::NoPriceForMessageDelivery<
-			cumulus_primitives_core::ParaId,
-		>,
+		ExponentialPrice<FeeAssetId, BaseDeliveryFee, TransactionByteFee, crate::SpecMessaging>,
 	>,
 	// ..and XCMP to communicate with the sibling chains.
 	XcmpQueue,
