@@ -18,7 +18,7 @@
 //! The archive against a reference model, under random imports, reorgs, finality with retention
 //! and restarts.
 //!
-//! The model keeps every stream in full along the current chain and derives what design § 5 says
+//! The model keeps every stream in full along the current chain and derives what the design says
 //! must stay servable:
 //! - a channel from its finalized watermark up;
 //! - any other stream from its first leaf sent in a kept block, and the head under every kept root
