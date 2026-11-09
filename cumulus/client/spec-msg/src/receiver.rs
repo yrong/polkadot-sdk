@@ -817,10 +817,25 @@ where
 		let sources: Vec<ParaId> = state.sources.keys().copied().collect();
 		for source in sources {
 			let live = state.live_endpoints(&source);
+			let cursors = finalized.sources.get(&source).map(|wants| self.cursors(wants));
 			if let Some(pool) = state.sources.get_mut(&source) {
-				pool.retain_endpoints(&live);
+				pool.retain_endpoints(&live, &cursors.unwrap_or_default());
 			}
 		}
+	}
+
+	/// The leaf count each stream of `wants` is consumed up to: a channel's stored frontier, a
+	/// register's read cursor.
+	fn cursors(&self, wants: &SourceWants) -> BTreeMap<StreamId, u64> {
+		let channels = wants
+			.channels
+			.iter()
+			.map(|(id, stored)| (id.sender_data_stream(self.us).1, stored.leaf_count()));
+		let registers = wants
+			.registers
+			.iter()
+			.map(|(id, cursor)| (id.peer_ack_stream(self.us).1, cursor.0));
+		channels.chain(registers).collect()
 	}
 
 	/// The lifts for a candidate whose blocks have `records`, in bundle order. Per source, the
