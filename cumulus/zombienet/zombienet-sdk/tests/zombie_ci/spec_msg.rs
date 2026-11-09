@@ -11,7 +11,9 @@
 //! The delivery test logs one checkpoint per protocol step, each read from chain state: the
 //! sender's committed root, the relay's provides window, the receiver's consumption record, and
 //! the executed XCM. It then sends a batch larger than the receiver admits per block, which the
-//! receiver consumes over several blocks cut short of what its node planned.
+//! receiver consumes over several blocks cut short of what its node planned; stops the sender's
+//! collator while the receiver holds a backlog; and fills the receiver's queue until the sender's
+//! window is full, so the sender refuses sends and raises its fee.
 
 use crate::utils::initialize_network;
 use anyhow::anyhow;
@@ -19,7 +21,7 @@ use codec::{Decode, Encode};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	streams_root::streams_root, ConsumptionRecord, InChannelId, InChannelState, MmrFrontier,
-	MmrRoot, OutChannelId, OutChannelState, StreamId, SPMS_ENGINE_ID,
+	OutChannelId, OutChannelState, StreamId, SPMS_ENGINE_ID,
 };
 use cumulus_zombienet_sdk_helpers::{assert_para_throughput, open_hrmp_channel};
 use std::{collections::BTreeMap, future::Future, time::Duration};
@@ -69,13 +71,19 @@ fn flag(name: &str) -> bool {
 	std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Whether to run the delivery test's step `name`: every step unless `SPEC_MSG_STEPS` lists some,
+/// comma-separated (`deliver`, `batch`, `outage`, `backpressure`), to rerun only failing ones.
+fn step(name: &str) -> bool {
+	std::env::var("SPEC_MSG_STEPS").map_or(true, |steps| steps.split(',').any(|s| s.trim() == name))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 
-	let (_network, relay, sender, receiver) = if flag("SPEC_MSG_ATTACH") {
+	let (network, relay, sender, receiver) = if flag("SPEC_MSG_ATTACH") {
 		log::info!("Attaching to standby network on ports {RELAY_RPC_PORT}..={RECEIVER_RPC_PORT}");
 		let connect =
 			|port| OnlineClient::<PolkadotConfig>::from_url(format!("ws://127.0.0.1:{port}"));
@@ -119,8 +127,21 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 
 	open_spec_msg_channel(&sender, &receiver).await?;
 
-	send_and_follow(&relay, &sender, &receiver).await?;
-	send_batch_and_follow(&sender, &receiver).await?;
+	if step("deliver") {
+		send_and_follow(&relay, &sender, &receiver).await?;
+	}
+	if step("batch") {
+		send_batch_and_follow(&sender, &receiver).await?;
+	}
+	if step("outage") {
+		match &network {
+			Some(network) => outage_and_follow(network, &sender, &receiver).await?,
+			None => log::info!("Attached: no network handle to pause a collator, skipping it"),
+		}
+	}
+	if step("backpressure") {
+		backpressure_and_follow(&sender, &receiver).await?;
+	}
 
 	let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
 	wait_for("both chains to finalize one more block with messaging live", || {
@@ -160,7 +181,7 @@ async fn send_and_follow(
 		sent.number(),
 	);
 	let committed = committed_stream_roots(&sent).await?;
-	let entries = committed.iter().map(|(stream, r)| (*stream, r.0)).collect();
+	let entries = committed.iter().map(|(stream, f)| (*stream, f.root().0)).collect();
 	if streams_root(&entries).map(|r| r.0 .0) != Some(root.0) {
 		return Err(anyhow!("{SENDER}'s stream state does not rebuild the committed root"));
 	}
@@ -297,6 +318,309 @@ async fn send_batch_and_follow(
 		cuts + 1,
 	);
 	Ok(())
+}
+
+/// XCMs the receiver holds when the sender's collator stops: several blocks' worth.
+const BACKLOG: u64 = 32;
+
+/// Send `BACKLOG` XCMs, and once the receiver consumed the first of them, so its node has
+/// fetched them all, stop the sender chain's only collator. The receiver consumes the rest from
+/// what its node holds, rebasing each block's lift locally, and the relay chain accepts those
+/// blocks against the sender root it included before. Then resume the collator.
+async fn outage_and_follow(
+	network: &Network<LocalFileSystem>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	let start = inbound_count(receiver).await?;
+	let end = start + BACKLOG;
+	let mut blocks = receiver.blocks().subscribe_finalized().await?;
+	let calls = (0..BACKLOG).map(|_| send_xcm_to(RECEIVER)).collect::<Vec<_>>();
+	let batch = Value::unnamed_variant(
+		"Utility",
+		[Value::named_variant("batch_all", [("calls", Value::unnamed_composite(calls))])],
+	);
+	let ids = sudo_sent(sender, batch).await?;
+	log::info!("{SENDER} sent leaves {start}..{end}");
+
+	// Pause once the receiver's best block consumed some: its node fetched the whole backlog.
+	let collator = network.get_node(SENDER_COLLATOR)?;
+	let mut paused_at = start;
+	for _ in 0..120 {
+		paused_at = inbound_count(receiver).await?;
+		if paused_at > start {
+			break;
+		}
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+	if paused_at == start || paused_at == end {
+		return Err(anyhow!(
+			"{RECEIVER} consumed up to {paused_at} of {start}..{end} before a pause"
+		));
+	}
+	collator.pause().await?;
+	log::info!(
+		"Paused {SENDER_COLLATOR}, {SENDER}'s only collator, with leaf {paused_at} consumed"
+	);
+
+	let mut processed = Vec::new();
+	let follow = async {
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			processed.extend(processed_ids(&block, &ids).await?);
+			if processed.len() == ids.len() {
+				return Ok(block.number());
+			}
+		}
+		Err(anyhow!("receiver block subscription ended"))
+	};
+	let followed = tokio::time::timeout(Duration::from_secs(240), follow).await;
+	collator.resume().await?;
+	let done = followed.map_err(|_| {
+		anyhow!("{} of {BACKLOG} XCMs executed within 4 minutes of the outage", processed.len())
+	})??;
+	if processed != ids {
+		return Err(anyhow!("the backlog executed out of order"));
+	}
+	log::info!(
+		"While {SENDER_COLLATOR} was paused, {RECEIVER} consumed leaves {paused_at}..{end} from \
+		 what its node held; all {BACKLOG} executed in order by block #{done}"
+	);
+	Ok(())
+}
+
+/// Bytes of each large XCM in the backpressure step: over half a message queue page, so each
+/// takes a page.
+const LARGE_XCM: usize = 60 * 1024;
+/// Large XCMs that fill penpal's `MaxQueueFootprint` (48 pages), and a few more.
+const LARGE_COUNT: usize = 56;
+/// Penpal's `MaxInFlight`.
+const MAX_IN_FLIGHT: u64 = 128;
+
+/// Pause the receiver's queue, fill it with large XCMs until its consumption stops, then fill the
+/// sender's window with small ones until it refuses: the receiver's `Ack` stopped, so the sender
+/// raises its fee. Resume, check that the receiver consumes the whole stream and its queue settles
+/// every message, and that a send with the window drained lowers the fee.
+async fn backpressure_and_follow(
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	let queue = |call: &str| {
+		Value::unnamed_variant(
+			"SpecMessaging",
+			[Value::unnamed_variant(
+				call,
+				[Value::u128(SENDER.into()), Value::u128(0), Value::u128(0)],
+			)],
+		)
+	};
+	sudo(receiver, queue("pause_inbound_channel")).await?;
+	log::info!("{RECEIVER} paused its queue for {SENDER}'s channel");
+
+	let mut large = 0;
+	for chunk in 0..LARGE_COUNT / 8 {
+		let calls = (0..8).map(|i| send_large_xcm_to(RECEIVER, (chunk * 8 + i) as u8));
+		large += force_batch(sender, calls.collect()).await?.len();
+	}
+	log::info!("{SENDER} sent {large} XCMs of {LARGE_XCM} bytes");
+
+	let mut refused = false;
+	for _ in 0..40 {
+		let sent = force_batch(sender, (0..32).map(|_| send_xcm_to(RECEIVER)).collect()).await?;
+		let in_flight = in_flight(sender).await?;
+		log::info!("{SENDER} sent {} small XCMs, {in_flight} in flight", sent.len());
+		if in_flight > MAX_IN_FLIGHT {
+			return Err(anyhow!("{in_flight} in flight, over the window of {MAX_IN_FLIGHT}"));
+		}
+		refused = sent.is_empty() && in_flight == MAX_IN_FLIGHT;
+		if refused {
+			break;
+		}
+	}
+	if !refused {
+		return Err(anyhow!("the sender never refused a send"));
+	}
+	let raised = fee_factor(sender).await?;
+	if raised <= FEE_FACTOR_ONE {
+		return Err(anyhow!("the fee factor did not rise: {raised}"));
+	}
+	let held = queued(receiver).await?;
+	if held == 0 {
+		return Err(anyhow!("{RECEIVER}'s paused queue reads as empty"));
+	}
+	log::info!(
+		"{SENDER} refuses sends with {MAX_IN_FLIGHT} in flight, fee factor {raised}; {RECEIVER} \
+		 stopped consuming at leaf {} with {held} XCMs in its paused queue",
+		inbound_count(receiver).await?,
+	);
+
+	// Ids of sends in a block that is later retracted change when the sends are included again,
+	// so delivery is checked on the stream instead: the receiver consumes all of it, in order as
+	// the PVF checks, and its queue for the channel settles every message.
+	sudo(receiver, queue("resume_inbound_channel")).await?;
+	log::info!("{RECEIVER} resumed its queue");
+	let sent = sent_count(sender).await?;
+	let mut drained = false;
+	for _ in 0..50 {
+		let (consumed, queued) = (inbound_count(receiver).await?, queued(receiver).await?);
+		log::info!("{RECEIVER} consumed {consumed} of {sent} leaves, {queued} XCMs in its queue");
+		if consumed == sent && queued == 0 {
+			drained = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_secs(6)).await;
+	}
+	if !drained {
+		return Err(anyhow!(
+			"{RECEIVER} did not consume and settle {SENDER}'s stream in 5 minutes"
+		));
+	}
+	log::info!("{RECEIVER} consumed all {sent} leaves and settled every XCM in its queue");
+
+	wait_for("the sender to read that its window drained", || async {
+		Ok(in_flight(sender).await? <= MAX_IN_FLIGHT / 2)
+	})
+	.await?;
+	sudo(sender, send_xcm_to(RECEIVER)).await?;
+	let lowered = fee_factor(sender).await?;
+	if lowered >= raised {
+		return Err(anyhow!("the fee factor did not fall: {raised} then {lowered}"));
+	}
+	log::info!("A send with the window drained lowered the fee factor from {raised} to {lowered}");
+	Ok(())
+}
+
+/// Dispatch `calls` as root in one `Utility::force_batch`, in a best block; the ids of the XCMs
+/// it sent.
+async fn force_batch(
+	sender: &OnlineClient<PolkadotConfig>,
+	calls: Vec<Value>,
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+	let batch = Value::unnamed_variant(
+		"Utility",
+		[Value::named_variant("force_batch", [("calls", Value::unnamed_composite(calls))])],
+	);
+	sudo_sent(sender, batch).await
+}
+
+/// The XCMs that came over spec-msg and that `block`'s message queue settled, in order:
+/// processed, failed or set aside as overweight. Each is its id if among `ids`, else `None`: an
+/// XCM refused before execution, as the large ones are, is named by its hash, not its topic.
+async fn settled_ids(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	ids: &[Vec<u8>],
+) -> Result<Vec<Option<Vec<u8>>>, anyhow::Error> {
+	let mut settled = Vec::new();
+	for event in block.events().await?.iter() {
+		let event = event?;
+		let settles = ["Processed", "ProcessingFailed", "OverweightEnqueued"];
+		if event.pallet_name() != "MessageQueue" || !settles.contains(&event.variant_name()) {
+			continue;
+		}
+		let values = event.field_values()?;
+		if !format!("{values:?}").contains("SpecMsg") {
+			continue;
+		}
+		settled.push(values.at("id").map(flatten).filter(|id| ids.contains(id)));
+	}
+	Ok(settled)
+}
+
+/// The ids among `ids` that `block`'s message queue settled over spec-msg, in order.
+async fn processed_ids(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	ids: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+	Ok(settled_ids(block, ids).await?.into_iter().flatten().collect())
+}
+
+/// The leaves the receiver consumed from the sender's channel, at its best block.
+async fn inbound_count(receiver: &OnlineClient<PolkadotConfig>) -> Result<u64, anyhow::Error> {
+	channel_map::<InChannelId, InChannelState>(receiver, "InChannels")
+		.await?
+		.get(&in_channel())
+		.map(|state| state.frontier.leaf_count())
+		.ok_or_else(|| anyhow!("{RECEIVER} has no inbound channel from {SENDER}"))
+}
+
+/// `FixedU128`'s one.
+const FEE_FACTOR_ONE: u128 = 1_000_000_000_000_000_000;
+
+/// The sender's delivery fee factor towards the receiver, at its best block.
+async fn fee_factor(sender: &OnlineClient<PolkadotConfig>) -> Result<u128, anyhow::Error> {
+	let query = subxt::dynamic::storage(
+		"SpecMessaging",
+		"DeliveryFeeFactor",
+		vec![Value::u128(RECEIVER.into())],
+	);
+	let value = sender.storage().at(best_hash(sender).await?).fetch(&query).await?;
+	match value {
+		Some(value) => Ok(u128::decode(&mut &value.into_encoded()[..])?),
+		None => Ok(FEE_FACTOR_ONE),
+	}
+}
+
+/// The leaves the sender has sent on the channel, at its best block.
+async fn sent_count(sender: &OnlineClient<PolkadotConfig>) -> Result<u64, anyhow::Error> {
+	let stream = out_channel().data_stream();
+	let frontiers: Vec<(StreamId, MmrFrontier)> =
+		call_at(sender, Some(best_hash(sender).await?), "SpecMsgApi_outbound_frontiers", &[])
+			.await?;
+	Ok(frontiers
+		.iter()
+		.find_map(|(s, frontier)| (*s == stream).then(|| frontier.leaf_count()))
+		.unwrap_or_default())
+}
+
+/// The messages the receiver's queue for the channel holds, at its best block.
+async fn queued(receiver: &OnlineClient<PolkadotConfig>) -> Result<u64, anyhow::Error> {
+	let origin = Value::unnamed_variant(
+		"SpecMsg",
+		[Value::named_composite([
+			("sender", Value::u128(SENDER.into())),
+			("domain", Value::u128(0)),
+			("num", Value::u128(0)),
+		])],
+	);
+	let query = subxt::dynamic::storage("MessageQueue", "BookStateFor", vec![origin]);
+	let book = receiver.storage().at(best_hash(receiver).await?).fetch(&query).await?;
+	let Some(book) = book else { return Ok(0) };
+	let book = book.to_value()?;
+	book.at("message_count")
+		.and_then(|count| count.as_u128())
+		.map(|count| count as u64)
+		.ok_or_else(|| anyhow!("no `message_count` in the queue's book"))
+}
+
+/// The sender's leaves on the channel that the receiver has not confirmed, at its best block.
+async fn in_flight(sender: &OnlineClient<PolkadotConfig>) -> Result<u64, anyhow::Error> {
+	let sent = sent_count(sender).await?;
+	let up_to = channel_map::<OutChannelId, OutChannelState>(sender, "OutChannels")
+		.await?
+		.get(&out_channel())
+		.and_then(|state| state.register.as_ref().map(|applied| applied.register.up_to.0))
+		.unwrap_or_default();
+	Ok(sent.saturating_sub(up_to))
+}
+
+/// `PolkadotXcm::send` of a `LARGE_XCM`-byte XCM to `para`: a `Transact` of a `System::remark`,
+/// which the receiver weighs and then refuses at its barrier.
+fn send_large_xcm_to(para: u32, tag: u8) -> Value {
+	// `System` is pallet 0 and `remark` its call 0 on penpal.
+	let call = [vec![0u8, 0u8], vec![tag; LARGE_XCM].encode()].concat();
+	let transact = Value::named_variant(
+		"Transact",
+		[
+			("origin_kind", Value::unnamed_variant("SovereignAccount", [])),
+			("fallback_max_weight", Value::unnamed_variant("None", [])),
+			("call", Value::named_composite([("encoded", Value::from_bytes(call))])),
+		],
+	);
+	let message = Value::unnamed_variant("V5", [Value::unnamed_composite([transact])]);
+	Value::unnamed_variant(
+		"PolkadotXcm",
+		[Value::named_variant("send", [("dest", sibling(para)), ("message", message)])],
+	)
 }
 
 /// How the late node syncs the sender chain.
@@ -780,10 +1104,9 @@ async fn wait_opened(
 	.await
 }
 
-/// `PolkadotXcm::send` of `[UnsubscribeVersion]` to sibling `para`. Penpal's barrier admits it
-/// from any origin, and it executes without paying or sending anything back.
-fn send_xcm_to(para: u32) -> Value {
-	let dest = Value::unnamed_variant(
+/// The `VersionedLocation` of sibling `para`.
+fn sibling(para: u32) -> Value {
+	Value::unnamed_variant(
 		"V5",
 		[Value::named_composite([
 			("parents", Value::u128(1)),
@@ -798,7 +1121,13 @@ fn send_xcm_to(para: u32) -> Value {
 				),
 			),
 		])],
-	);
+	)
+}
+
+/// `PolkadotXcm::send` of `[UnsubscribeVersion]` to sibling `para`. Penpal's barrier admits it
+/// from any origin, and it executes without paying or sending anything back.
+fn send_xcm_to(para: u32) -> Value {
+	let dest = sibling(para);
 	let message = Value::unnamed_variant(
 		"V5",
 		[Value::unnamed_composite([Value::unnamed_composite([Value::unnamed_variant(
@@ -815,7 +1144,7 @@ fn send_xcm_to(para: u32) -> Value {
 /// Dispatch `call` as root with `Sudo::sudo`, signed by Alice, and check the inner result. Returns
 /// the finalized block that holds it.
 async fn sudo(client: &OnlineClient<PolkadotConfig>, call: Value) -> Result<H256, anyhow::Error> {
-	submit_sudo(client, call, true).await
+	Ok(submit_sudo(client, call, true).await?.0)
 }
 
 /// Dispatch `call` as root like [`sudo`], but return once the call is in a best block.
@@ -823,24 +1152,43 @@ async fn sudo_in_block(
 	client: &OnlineClient<PolkadotConfig>,
 	call: Value,
 ) -> Result<H256, anyhow::Error> {
-	submit_sudo(client, call, false).await
+	Ok(submit_sudo(client, call, false).await?.0)
 }
 
+/// Dispatch `call` as root like [`sudo_in_block`]; the ids of the XCMs it sent. Only the call's
+/// own events count: its block may hold an earlier call too.
+async fn sudo_sent(
+	client: &OnlineClient<PolkadotConfig>,
+	call: Value,
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+	Ok(submit_sudo(client, call, false).await?.1)
+}
+
+/// The block that holds the call, and the ids of the XCMs the call sent.
 async fn submit_sudo(
 	client: &OnlineClient<PolkadotConfig>,
 	call: Value,
 	finalized: bool,
-) -> Result<H256, anyhow::Error> {
+) -> Result<(H256, Vec<Vec<u8>>), anyhow::Error> {
 	let alice = dev::alice();
 	// The nonce is read at the best block. subxt reads it at the finalized block, which an earlier
-	// call that is only in a best block has not reached: the next call would reuse its nonce.
-	let nonce: u32 = call_at(
+	// call that is only in a best block has not reached: the next call would reuse its nonce. The
+	// best block can lag too, after a reorg, so it is at least one past the last one used here.
+	static USED: std::sync::Mutex<BTreeMap<H256, u32>> = std::sync::Mutex::new(BTreeMap::new());
+	let at_best: u32 = call_at(
 		client,
 		Some(best_hash(client).await?),
 		"AccountNonceApi_account_nonce",
 		&alice.public_key().0.encode(),
 	)
 	.await?;
+	let nonce = {
+		let mut used = USED.lock().expect("not poisoned; qed");
+		let last = used.get(&client.genesis_hash());
+		let nonce = last.map_or(at_best, |last| at_best.max(last + 1));
+		used.insert(client.genesis_hash(), nonce);
+		nonce
+	};
 	let params = PolkadotExtrinsicParamsBuilder::new().immortal().nonce(nonce.into()).build();
 	let tx = subxt::dynamic::tx("Sudo", "sudo", vec![call]);
 	let mut progress =
@@ -854,14 +1202,18 @@ async fn submit_sudo(
 			TxStatus::Dropped { message } => return Err(anyhow!("sudo tx failed: {message}")),
 			_ => continue,
 		};
+		let mut sent = Vec::new();
 		for event in in_block.wait_for_success().await?.iter() {
 			let event = event?;
+			if event.pallet_name() == "PolkadotXcm" && event.variant_name() == "Sent" {
+				sent.extend(event.field_values()?.at("message_id").map(flatten));
+			}
 			if event.pallet_name() == "Sudo" && event.variant_name() == "Sudid" {
 				let fields = format!("{:?}", event.field_values()?);
 				if fields.contains("Err") {
 					return Err(anyhow!("sudo dispatch failed: {fields}"));
 				}
-				return Ok(in_block.block_hash());
+				return Ok((in_block.block_hash(), sent));
 			}
 		}
 		return Err(anyhow!("no `Sudo::Sudid` in block {:?}", in_block.block_hash()));
@@ -970,7 +1322,7 @@ fn committed_root(block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>) -
 /// parent's state, plus the leaves the block sent.
 async fn committed_stream_roots(
 	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
-) -> Result<BTreeMap<StreamId, MmrRoot>, anyhow::Error> {
+) -> Result<BTreeMap<StreamId, MmrFrontier>, anyhow::Error> {
 	let storage = block.storage();
 	let mut frontiers = BTreeMap::new();
 	let query = subxt::dynamic::storage("SpecMessaging", "OutboundFrontier", Vec::<Value>::new());
@@ -989,10 +1341,7 @@ async fn committed_stream_roots(
 			frontier.append(leaf.into());
 		}
 	}
-	Ok(frontiers
-		.into_iter()
-		.map(|(stream, frontier)| (stream, frontier.root()))
-		.collect())
+	Ok(frontiers)
 }
 
 /// Poll `check` until it holds, or fail.
@@ -1014,7 +1363,7 @@ where
 
 /// Follow the receiver's finalized blocks after `before_send` until the XCM executes, logging the
 /// block that consumed the sender's stream and the one that executed the XCM. The consumption must
-/// end at the stream root that `root`, the send block's `StreamsRoot`, commits (`committed`), and
+/// reach the stream entry that `root`, the send block's `StreamsRoot`, commits (`committed`), and
 /// the executed XCM must carry the sent message `id`.
 async fn follow_delivery(
 	receiver: &OnlineClient<PolkadotConfig>,
@@ -1022,7 +1371,7 @@ async fn follow_delivery(
 	before_send: u32,
 	id: H256,
 	root: H256,
-	committed: &BTreeMap<StreamId, MmrRoot>,
+	committed: &BTreeMap<StreamId, MmrFrontier>,
 ) -> Result<(), anyhow::Error> {
 	log::info!("Following {RECEIVER}'s finalized blocks");
 	let mut consumed = false;
@@ -1038,9 +1387,15 @@ async fn follow_delivery(
 						.await?;
 				if let Some(streams) = record.entries.get(&ParaId::from(SENDER)) {
 					for (stream, interval) in streams {
-						if committed.get(stream) != Some(&interval.end.root()) {
+						// The sender may send again before the receiver consumes: the block then
+						// reaches past the sent leaf, under a newer root.
+						let reaches = committed.get(stream).is_some_and(|sent| {
+							interval.end.leaf_count() > sent.leaf_count() ||
+								interval.end.root() == sent.root()
+						});
+						if !reaches {
 							return Err(anyhow!(
-								"{RECEIVER} block #{} consumed {stream:?} up to leaf {}, not to \
+								"{RECEIVER} block #{} consumed {stream:?} up to leaf {}, short of \
 								 the entry {root:?} commits",
 								block.number(),
 								interval.end.leaf_count(),
@@ -1048,7 +1403,7 @@ async fn follow_delivery(
 						}
 						log::info!(
 							"Checkpoint 4/6, consume: {RECEIVER} block #{} consumed {stream:?} up \
-							 to leaf {}, fetched from {SENDER}'s collator. It ends at the stream \
+							 to leaf {}, fetched from {SENDER}'s collator. It reaches the stream \
 							 root `StreamsRoot` {root:?} commits; its consumption record becomes \
 							 the candidate's `Requires`",
 							block.number(),
