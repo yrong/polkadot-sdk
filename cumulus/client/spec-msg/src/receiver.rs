@@ -862,6 +862,10 @@ where
 			let cursors = finalized.sources.get(&source).map(|wants| self.cursors(wants));
 			if let Some(pool) = state.sources.get_mut(&source) {
 				pool.retain_endpoints(&live, &cursors.unwrap_or_default());
+				// A forgotten source's payloads served only the blocks built before.
+				if pool.forgotten && live.is_empty() {
+					pool.payloads.clear();
+				}
 			}
 		}
 	}

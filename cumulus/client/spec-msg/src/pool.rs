@@ -82,14 +82,14 @@ pub struct SourcePool {
 	/// Per channel stream, the leaf count the source had at the last successful fetch.
 	pub(crate) reach: BTreeMap<StreamId, u64>,
 	/// The relay chain has no root for the source: nothing new is planned from it. Its roots,
-	/// bindings and advances stay, for blocks already built.
+	/// bindings, advances and payloads stay, for blocks already built: a cut one lifts by
+	/// rebasing over the payloads.
 	pub(crate) forgotten: bool,
 }
 
 impl SourcePool {
 	/// Stop feeding new consumption from this source.
 	pub fn forget(&mut self) {
-		self.payloads.clear();
 		self.heads.clear();
 		self.reach.clear();
 		self.settled = false;
