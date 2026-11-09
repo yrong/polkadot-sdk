@@ -258,6 +258,11 @@ async fn serve<H, S>(
 			}
 			continue;
 		};
+		// The network gave up on it, e.g. at its timeout while it waited in the queue.
+		if pending_response.is_canceled() {
+			queue.release(peer);
+			continue;
+		}
 		let response = match answer(&archive.read(), &payload) {
 			Some(response) if in_flight_bytes + response.len() <= limits.max_bytes => response,
 			Some(response) => {
@@ -534,5 +539,49 @@ mod tests {
 		drop(tx);
 		futures::executor::block_on(run_request_handler(archive, rx));
 		assert!(futures::executor::block_on(response).unwrap().result.is_ok());
+	}
+
+	#[test]
+	fn a_request_the_network_dropped_is_not_answered() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		struct Counting(MemoryStore, AtomicUsize);
+		impl ArchiveStore for Counting {
+			fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+				self.1.fetch_add(1, Ordering::SeqCst);
+				self.0.get(key)
+			}
+			fn commit(&self, batch: crate::store::Batch) -> Result<(), String> {
+				self.0.commit(batch)
+			}
+		}
+		let store = Arc::new(Counting(MemoryStore::default(), AtomicUsize::new(0)));
+		let mut archive = Archive::<u64, _>::open(store.clone());
+		let stream = channel(2000);
+		let sends = vec![(stream, vec![vec![7; 1024]; 8])];
+		let root = Model::default().send(&sends);
+		archive.import_block(1, 0, 1, 0, sends, Some(root)).unwrap();
+		let payload = messages(stream, 0, root, u32::MAX).encode();
+
+		let (requests, inbound) = async_channel::bounded(64);
+		let mut pool = LocalPool::new();
+		pool.spawner()
+			.spawn_local(serve(Arc::new(RwLock::new(archive)), inbound, InFlightLimits::default()))
+			.unwrap();
+		let peer = PeerId::random();
+		let (incoming, mut first) = request(peer, payload.clone());
+		requests.try_send(incoming).unwrap();
+		pool.run_until_stalled();
+		let mut first = answered(&mut first).expect("served");
+		// Ten more wait behind it, and the network gives up on them.
+		for _ in 0..10 {
+			let (incoming, response) = request(peer, payload.clone());
+			requests.try_send(incoming).unwrap();
+			drop(response);
+		}
+		pool.run_until_stalled();
+		let reads = store.1.load(Ordering::SeqCst);
+		first.sent_feedback.take().unwrap().send(()).unwrap();
+		pool.run_until_stalled();
+		assert_eq!(store.1.load(Ordering::SeqCst), reads, "no archive reads for dropped requests");
 	}
 }
