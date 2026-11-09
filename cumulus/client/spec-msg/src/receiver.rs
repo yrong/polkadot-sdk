@@ -351,14 +351,11 @@ where
 						},
 						// An older root, e.g. after a relay chain reorg: consume only what it
 						// commits, and keep the rest for a newer root.
-						Held::EndsWithin(count) => {
-							self.state
-								.lock()
-								.sources
-								.entry(source)
-								.or_default()
-								.reach
-								.insert(stream, count);
+						Held::EndsWithin(count, binding) => {
+							let mut state = self.state.lock();
+							let pool = state.sources.entry(source).or_default();
+							pool.reach.insert(stream, count);
+							pool.insert_binding(stream, count, root, binding);
 						},
 						Held::Unknown => {},
 					}
@@ -516,7 +513,17 @@ where
 			return Held::Unknown;
 		}
 		match extended(stored, held) {
-			Some(expected) if expected == known => Held::EndsWithin(known.leaf_count()),
+			// The head read is the stream's entry under `root`: the identity extension at its end.
+			Some(expected) if expected == known => Held::EndsWithin(
+				known.leaf_count(),
+				Binding {
+					extension: MmrExtensionProof {
+						leaf_count: known.leaf_count(),
+						connecting_nodes: Default::default(),
+					},
+					tree_proof: head.tree_proof,
+				},
+			),
 			Some(_) => Held::Stale,
 			None => Held::Unknown,
 		}
@@ -968,8 +975,8 @@ where
 enum Held {
 	/// Another fork's: drop them.
 	Stale,
-	/// The stream's, but it ends within them at this leaf count.
-	EndsWithin(u64),
+	/// The stream's, but it ends within them at this leaf count, bound there.
+	EndsWithin(u64, Binding),
 	/// Nothing verified tells.
 	Unknown,
 }
