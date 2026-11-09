@@ -17,7 +17,8 @@
 
 //! The receiver against a model of its source, the relay chain and its own chain, under random
 //! sends, source forks, relay reorgs (back to older roots too), runtime cuts, rounds that fail, a
-//! lying peer, and finality that lands between building a block and noting it.
+//! lying peer, node restarts, finality that lands between building a block and noting it, and the
+//! source offboarding.
 //!
 //! The relay chain includes a prefix of the source's blocks; a receiver block counts only while
 //! its `Requires` is among the included roots, and is reverted when a relay reorg drops its root.
@@ -223,6 +224,11 @@ struct World {
 	next_payload: u32,
 	/// No new source blocks get included: a catch-up runs.
 	quiet: bool,
+	budget: Budget,
+	/// The relay chain answers that it has no root for the source: it is offboarding.
+	offboarded: bool,
+	/// The relay chain answers so between building the next block and noting it.
+	offboard_next: bool,
 	built: usize,
 	consuming: usize,
 	reverted: usize,
@@ -241,6 +247,9 @@ impl World {
 		Self {
 			rng: Rng(seed),
 			receiver: Receiver::new(US.into(), budget, peers.clone()),
+			budget,
+			offboarded: false,
+			offboard_next: false,
 			peers,
 			blocks: Vec::new(),
 			every_root: Vec::new(),
@@ -311,6 +320,10 @@ impl World {
 
 	/// A relay block: the receiver fetches under the newest included root.
 	fn round(&mut self) {
+		if self.offboarded {
+			self.receiver.forget(&source());
+			return;
+		}
 		let Some(block) = self.included.checked_sub(1).map(|i| &self.blocks[i]) else { return };
 		let root = block.root;
 		let wants = self.tip().view().sources.remove(&source()).unwrap_or_default();
@@ -371,7 +384,10 @@ impl World {
 		chain.hash = self.next_hash;
 		self.next_hash += 1;
 		// A relay block and a finality notification may arrive before the import is noted.
-		if self.rng.chance(30) {
+		if self.offboard_next {
+			self.offboard_next = false;
+			self.receiver.forget(&source());
+		} else if self.rng.chance(30) {
 			if self.quiet {
 				self.round();
 			} else {
@@ -388,6 +404,10 @@ impl World {
 		));
 		self.built += 1;
 
+		assert!(
+			!self.offboarded || record.entries.is_empty(),
+			"consumed from a source the relay chain has no root for",
+		);
 		let Some(streams) = record.entries.get(&source()) else {
 			self.unfinalized.push(Included { chain, root_block: 0 });
 			return;
@@ -421,6 +441,32 @@ impl World {
 		);
 		let acks = included.map_or(0, |block| block.acks);
 		assert!(tip.cursor() <= acks, "read a register the included stream does not have");
+	}
+
+	/// The node restarts: a fresh receiver, with nothing but what the chain and its peers hold.
+	fn restart(&mut self) {
+		self.receiver = Receiver::new(US.into(), self.budget, self.peers.clone());
+	}
+
+	/// The source offboards with a backlog the receiver holds: a block planned just before the
+	/// relay chain answers that it has no root still assembles, and the receiver then builds
+	/// blocks that consume nothing from the source.
+	fn offboard(&mut self) {
+		*self.peers.down.write() = false;
+		for _ in 0..3 {
+			self.source_block();
+		}
+		self.included = self.blocks.len();
+		self.round();
+		self.offboard_next = true;
+		self.build();
+		self.offboarded = true;
+		for _ in 0..20 {
+			self.round();
+			self.build();
+			self.relay_finalize();
+			self.check();
+		}
 	}
 
 	/// With what the relay chain includes final and no new source blocks, the receiver consumes
@@ -475,6 +521,7 @@ fn the_receiver_matches_a_model_under_reorgs_cuts_and_failing_peers() {
 					let outage = world.rng.chance(50);
 					world.catch_up(outage);
 				},
+				67..=68 => world.restart(),
 				_ => world.build(),
 			}
 			world.check();
@@ -482,6 +529,7 @@ fn the_receiver_matches_a_model_under_reorgs_cuts_and_failing_peers() {
 		world.catch_up(true);
 		world.include();
 		world.catch_up(false);
+		world.offboard();
 		assert!(world.consuming > 50, "seed {seed:#x}: only {} consuming blocks", world.consuming);
 		eprintln!(
 			"seed {seed:#x}: {} blocks built, {} consuming, {} reverted, {} source blocks",
