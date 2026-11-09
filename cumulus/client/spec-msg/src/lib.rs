@@ -23,8 +23,6 @@
 //! - [`fetch()`]: the requester, which verifies each response before accepting it.
 //! - [`run_watermark_reader`]: reads recipients' registers under finalized roots, so the archive
 //!   prunes a channel only below what the recipient confirmed.
-//!
-//! Design: paritytech/polkadot-sdk#12659.
 
 #![warn(missing_docs)]
 
