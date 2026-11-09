@@ -301,7 +301,7 @@ fn a_block_consumes_what_verified_and_lifts_to_the_newest_root() {
 }
 
 #[test]
-fn a_budget_cut_ends_mid_stream_and_lifts_from_a_proofs_only_response() {
+fn a_budget_cut_ends_mid_stream_and_lifts_from_the_held_binding() {
 	let sender = Sender::new();
 	let root = sender.author(vec![(channel(US), payloads(1, 5))]);
 	let budget = Budget { max_payloads: 2, ..Budget::default() };
@@ -311,14 +311,8 @@ fn a_budget_cut_ends_mid_stream_and_lifts_from_a_proofs_only_response() {
 	block_on(receiver.on_root(source(), root, &chain.wants()));
 	let first = chain.block(&receiver);
 	assert_eq!(chain.frontier.leaf_count(), 2);
-	// The endpoint is behind the root: its lift came from a request for proofs only.
-	let proofs = MessagesRequest {
-		stream: channel(US),
-		under: root,
-		start: Some(MessagePosition(2)),
-		max_bytes: 0,
-	};
-	assert!(sender.requests(channel(US)).contains(&proofs));
+	// The endpoint is behind the root: its lift is rebased from the held one, with no request.
+	assert!(sender.requests(channel(US)).iter().all(|request| request.max_bytes > 0));
 	assert_eq!(requires(&receiver, &[first.clone()]), Some(root));
 
 	// The next block continues from the stored frontier; the two form one bundle.
@@ -1155,4 +1149,20 @@ fn an_older_root_after_a_relay_reorg_consumes_what_it_commits() {
 	block_on(receiver.on_root(source(), root2, &chain.wants()));
 	chain.block(&receiver);
 	assert_eq!(chain.frontier.leaf_count(), 10);
+}
+
+#[test]
+fn a_backlog_is_consumed_without_waiting_while_the_source_hangs() {
+	let sender = Sender::new();
+	let root = sender.author(vec![(channel(US), payloads(1, 10))]);
+	let receiver = receiver(&sender, Budget { max_payloads: 2, ..Budget::default() });
+	let mut chain = Chain::default();
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	// The source's peers stop answering: each request hangs.
+	*sender.delay.write() = std::time::Duration::from_secs(2);
+	let started = std::time::Instant::now();
+	chain.block(&receiver);
+	let waited = started.elapsed();
+	assert_eq!(chain.frontier.leaf_count(), 2, "the held backlog is consumed");
+	assert!(waited < crate::receiver::INHERENT_FETCH_TIMEOUT, "waited {waited:?}");
 }

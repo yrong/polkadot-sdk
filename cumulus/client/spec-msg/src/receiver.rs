@@ -544,9 +544,13 @@ where
 			.into_iter()
 			.filter_map(|((source, stream), end)| Some((source, stream, end, *roots.get(&source)?)))
 			.collect();
+		// A binding at the endpoint, or a later one to rebase from over the pooled payloads: an
+		// item the budget cuts short of what the pool holds needs no fetch.
 		let bound = |p: &Planned| {
-			self.state.lock().sources.get(&p.source).is_some_and(|pool| {
-				pool.binding(&p.stream, p.endpoint.leaf_count(), &p.root).is_some()
+			let state = self.state.lock();
+			state.sources.get(&p.source).is_some_and(|pool| {
+				pool.binding(&p.stream, p.endpoint.leaf_count(), &p.root).is_some() ||
+					lifts_to(pool, &p.stream, &p.endpoint, &p.root)
 			})
 		};
 		let liftable =
