@@ -57,6 +57,8 @@ pub const LOG_TARGET: &str = "spec-msg";
 #[cfg(test)]
 mod archive_model;
 #[cfg(test)]
+mod receiver_model;
+#[cfg(test)]
 mod receiver_tests;
 #[cfg(test)]
 mod tests;
