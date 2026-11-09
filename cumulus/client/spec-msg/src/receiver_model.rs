@@ -17,8 +17,8 @@
 
 //! The receiver against a model of its source, the relay chain and its own chain, under random
 //! sends, source forks, relay reorgs (back to older roots too), runtime cuts, rounds that fail, a
-//! lying peer, node restarts, finality that lands between building a block and noting it, and the
-//! source offboarding.
+//! lying peer, node restarts, finality that lands between building a block and noting it, the
+//! source offboarding, and blocks bundled into one candidate.
 //!
 //! The relay chain includes a prefix of the source's blocks; a receiver block counts only while
 //! its `Requires` is among the included roots, and is reverted when a relay reorg drops its root.
@@ -199,6 +199,12 @@ impl Chain {
 	}
 }
 
+/// A built block of the bundle not yet assembled.
+struct Built {
+	chain: Chain,
+	record: ConsumptionRecord,
+}
+
 /// A receiver block the relay chain included, with the root its `Requires` named.
 struct Included {
 	chain: Chain,
@@ -220,6 +226,8 @@ struct World {
 	/// Our finalized chain, and the blocks above it.
 	finalized: Chain,
 	unfinalized: Vec<Included>,
+	/// The blocks of the bundle being built, one candidate once it closes.
+	bundle: Vec<Built>,
 	next_hash: u64,
 	next_payload: u32,
 	/// No new source blocks get included: a catch-up runs.
@@ -257,6 +265,7 @@ impl World {
 			relay_final: 0,
 			finalized: Chain::default(),
 			unfinalized: Vec::new(),
+			bundle: Vec::new(),
 			next_hash: 1,
 			next_payload: 0,
 			quiet: false,
@@ -349,8 +358,11 @@ impl World {
 			.iter()
 			.position(|block| block.root_block > self.included)
 			.unwrap_or(self.unfinalized.len());
-		self.reverted += self.unfinalized.len() - keep;
-		self.unfinalized.truncate(keep);
+		if keep < self.unfinalized.len() {
+			// The open bundle builds on a reverted block: it is on the abandoned fork too.
+			self.reverted += self.unfinalized.len() - keep + std::mem::take(&mut self.bundle).len();
+			self.unfinalized.truncate(keep);
+		}
 		self.round();
 	}
 
@@ -364,11 +376,15 @@ impl World {
 		self.receiver.on_finalized(self.finalized.number, &self.finalized.view());
 	}
 
-	/// Build, maybe cut, note and assemble one block; keep it if the relay chain includes its
-	/// root.
+	/// Build, maybe cut, and note one block. It extends the open bundle, of up to four blocks, or
+	/// closes it and starts the next.
 	fn build(&mut self) {
-		let parent = self.tip().clone();
-		let mut data = block_on(self.receiver.inherent_data(&parent.view(), &[]));
+		if self.bundle.len() >= 4 || !self.rng.chance(60) {
+			self.close_bundle();
+		}
+		let parent = self.bundle.last().map_or_else(|| self.tip().clone(), |b| b.chain.clone());
+		let earlier: Vec<_> = self.bundle.iter().map(|b| b.record.clone()).collect();
+		let mut data = block_on(self.receiver.inherent_data(&parent.view(), &earlier));
 		// `create_inherent` may admit a prefix of a channel item, or drop a register read.
 		if let Some(payloads) = data.channels.get_mut(&in_id()) {
 			if payloads.len() > 1 && self.rng.chance(40) {
@@ -379,6 +395,17 @@ impl World {
 		if self.rng.chance(10) {
 			data.registers.clear();
 		}
+		let ack = out_id().peer_ack_stream(US.into()).1;
+		assert!(
+			data.registers.is_empty() ||
+				!earlier.iter().any(|record| {
+					record
+						.entries
+						.get(&source())
+						.is_some_and(|s| s.iter().any(|(id, _)| *id == ack))
+				}),
+			"the planner offered a register the bundle read already",
+		);
 		let (mut chain, record) = parent.enact(&data);
 		chain.number = parent.number + 1;
 		chain.hash = self.next_hash;
@@ -395,56 +422,91 @@ impl World {
 			}
 			self.receiver.on_finalized(self.finalized.number, &self.finalized.view());
 		}
+		let extends = !earlier.is_empty();
 		block_on(self.receiver.on_block(
 			chain.hash,
 			parent.hash,
 			chain.number,
-			false,
+			extends,
 			record.clone(),
 		));
 		self.built += 1;
-
 		assert!(
 			!self.offboarded || record.entries.is_empty(),
 			"consumed from a source the relay chain has no root for",
 		);
-		let Some(streams) = record.entries.get(&source()) else {
-			self.unfinalized.push(Included { chain, root_block: 0 });
+		self.bundle.push(Built { chain, record });
+	}
+
+	/// Assemble the open bundle as one candidate: its blocks count if the relay chain includes the
+	/// root its `Requires` names.
+	fn close_bundle(&mut self) {
+		let bundle = std::mem::take(&mut self.bundle);
+		if bundle.is_empty() {
 			return;
-		};
-		self.consuming += 1;
-		let lifts = self.receiver.assemble(std::slice::from_ref(&record)).unwrap_or_else(|e| {
-			panic!("a block built from the pool's material does not assemble: {e}; {streams:?}")
-		});
-		let requires = build_requires(std::slice::from_ref(&record), &lifts)
-			.expect("the lifts verify as the PVF checks them")
-			.expect("a consuming block requires a root");
-		let root = *requires.get(source()).expect("one source");
-		assert!(self.every_root.contains(&root), "requires a root the source never committed");
-		match self.blocks[..self.included].iter().position(|block| block.root == root) {
-			Some(i) => self.unfinalized.push(Included { chain, root_block: i + 1 }),
-			// Its root is not included on this relay fork: the candidate is dropped.
-			None => self.reverted += 1,
 		}
+		let records: Vec<_> = bundle.iter().map(|b| b.record.clone()).collect();
+		let root_block = if records.iter().all(|record| record.entries.is_empty()) {
+			Some(0)
+		} else {
+			self.consuming += 1;
+			let lifts = match self.receiver.assemble(&records) {
+				Ok(lifts) => lifts,
+				// A relay reorg and a source fork can leave the bundle consuming leaves the
+				// included stream no longer has: no root lifts it, and none would be accepted.
+				Err(_) if !self.on_included_fork(&bundle[bundle.len() - 1].chain) => {
+					self.reverted += bundle.len();
+					return;
+				},
+				Err(e) => panic!(
+					"a bundle of {} blocks on the included fork does not assemble: {e}",
+					records.len()
+				),
+			};
+			let requires = build_requires(&records, &lifts)
+				.expect("the lifts verify as the PVF checks them")
+				.expect("a consuming bundle requires a root");
+			let root = *requires.get(source()).expect("one source");
+			assert!(self.every_root.contains(&root), "requires a root the source never committed");
+			self.blocks[..self.included]
+				.iter()
+				.position(|block| block.root == root)
+				.map(|i| i + 1)
+		};
+		match root_block {
+			Some(root_block) => self
+				.unfinalized
+				.extend(bundle.into_iter().map(|b| Included { chain: b.chain, root_block })),
+			// Its root is not included on this relay fork: the candidate is dropped.
+			None => self.reverted += bundle.len(),
+		}
+	}
+
+	/// Whether `chain` consumed a prefix of the included stream and read no register past it.
+	fn on_included_fork(&self, chain: &Chain) -> bool {
+		let included = self.included.checked_sub(1).map(|i| &self.blocks[i]);
+		let stream = included.map_or(&[][..], |block| &block.channel[..]);
+		let acks = included.map_or(0, |block| block.acks);
+		chain.consumed.len() <= stream.len() &&
+			chain.consumed[..] == stream[..chain.consumed.len()] &&
+			chain.cursor() <= acks
 	}
 
 	/// Our chain consumed a prefix of the included stream, and read no register past it.
 	fn check(&self) {
 		let tip = self.tip();
-		let included = self.included.checked_sub(1).map(|i| &self.blocks[i]);
-		let stream = included.map_or(&[][..], |block| &block.channel[..]);
 		assert!(
-			tip.consumed.len() <= stream.len() && tip.consumed[..] == stream[..tip.consumed.len()],
-			"consumed {} payloads that are not the included stream's first {}",
+			self.on_included_fork(tip),
+			"consumed {} payloads or read at {:?} past the included stream",
 			tip.consumed.len(),
-			stream.len(),
+			tip.read_at,
 		);
-		let acks = included.map_or(0, |block| block.acks);
-		assert!(tip.cursor() <= acks, "read a register the included stream does not have");
 	}
 
 	/// The node restarts: a fresh receiver, with nothing but what the chain and its peers hold.
 	fn restart(&mut self) {
+		// The open bundle's lift material is gone with the pool: its blocks are never collated.
+		self.reverted += std::mem::take(&mut self.bundle).len();
 		self.receiver = Receiver::new(US.into(), self.budget, self.peers.clone());
 	}
 
@@ -467,6 +529,7 @@ impl World {
 			self.relay_finalize();
 			self.check();
 		}
+		self.close_bundle();
 	}
 
 	/// With what the relay chain includes final and no new source blocks, the receiver consumes
@@ -474,6 +537,7 @@ impl World {
 	/// down.
 	fn catch_up(&mut self, outage: bool) {
 		*self.peers.down.write() = false;
+		self.close_bundle();
 		self.relay_finalize();
 		let Some(block) = self.included.checked_sub(1).map(|i| &self.blocks[i]) else { return };
 		let (want, acks) = (block.channel.len(), block.acks);
@@ -484,6 +548,7 @@ impl World {
 		for _ in 0..want + 40 {
 			self.round();
 			self.build();
+			self.close_bundle();
 			self.relay_finalize();
 			self.check();
 			let tip = self.tip();
