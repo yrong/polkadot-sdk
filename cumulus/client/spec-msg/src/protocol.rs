@@ -55,9 +55,9 @@ pub const MAX_REQUEST_SIZE: u64 = 1024;
 /// larger cap would only let peers that ask for more pin more of [`MAX_IN_FLIGHT_BYTES`].
 pub const MAX_PAYLOAD_BYTES: u32 = 1024 * 1024;
 
-/// Room in a response for everything but the payload bytes: the result envelope, the frontier and
-/// the extension (48 hashes each at most), the tree proof (64 steps) and up to
-/// `MAX_MESSAGES_PER_RESPONSE` payload length prefixes. About 9.3 KiB at worst.
+/// Room in a response for everything but the payload bytes: the result envelope, the frontier,
+/// the extension, the tree proof and up to `MAX_MESSAGES_PER_RESPONSE` payload length prefixes,
+/// each at its largest. `a_full_response_fits_the_response_size` checks the worst case fits.
 const MAX_FRAMING_BYTES: u64 = 16 * 1024;
 
 /// Maximum encoded response size, enforced by the network before decode: the payload cap and the
