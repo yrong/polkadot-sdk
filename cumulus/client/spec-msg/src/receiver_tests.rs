@@ -1097,3 +1097,40 @@ fn a_cut_endpoint_keeps_its_lift_material_past_finality() {
 	receiver.on_finalized(0, &Chain::default().view());
 	assert_eq!(requires(&receiver, &[record]), Some(root1));
 }
+
+#[test]
+fn a_register_read_assembles_when_finality_lands_before_its_import() {
+	let sender = Sender::new();
+	let root1 =
+		sender.author(vec![(channel(US), payloads(1, 5)), (ack(US), vec![register(0).encode()])]);
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let wants = chain.wants();
+	block_on(receiver.on_root(source(), root1, &wants));
+	// Built under root1, not imported yet.
+	let data = block_on(receiver.inherent_data(&chain.view(), &[]));
+	let record = chain.enact(&data);
+	// A newer root moves the `Ack` head, and an earlier block is finalized.
+	let root2 = sender.author(vec![(ack(US), vec![register(1).encode()])]);
+	block_on(receiver.on_root(source(), root2, &wants));
+	receiver.on_finalized(0, &Chain::default().view());
+	assert_eq!(requires(&receiver, &[record]), Some(root1));
+}
+
+#[test]
+fn a_channel_item_assembles_when_finality_lands_before_its_import() {
+	let sender = Sender::new();
+	let root1 = sender.author(vec![(channel(US), payloads(1, 5))]);
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let wants = chain.wants();
+	block_on(receiver.on_root(source(), root1, &wants));
+	let data = block_on(receiver.inherent_data(&chain.view(), &[]));
+	let record = chain.enact(&data);
+	// A newer root's round binds nothing yet, and an earlier block is finalized.
+	let root2 = sender.author(vec![(channel(US), payloads(2, 1))]);
+	*sender.down.write() = true;
+	block_on(receiver.on_root(source(), root2, &wants));
+	receiver.on_finalized(0, &Chain::default().view());
+	assert_eq!(requires(&receiver, &[record]), Some(root1));
+}
