@@ -1134,3 +1134,25 @@ fn a_channel_item_assembles_when_finality_lands_before_its_import() {
 	receiver.on_finalized(0, &Chain::default().view());
 	assert_eq!(requires(&receiver, &[record]), Some(root1));
 }
+
+#[test]
+fn an_older_root_after_a_relay_reorg_consumes_what_it_commits() {
+	let sender = Sender::new();
+	let root1 = sender.author(vec![(channel(US), payloads(1, 5))]);
+	let root2 = sender.author(vec![(channel(US), payloads(2, 5))]);
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let wants = chain.wants();
+	block_on(receiver.on_root(source(), root1, &wants));
+	block_on(receiver.on_root(source(), root2, &wants));
+	// The relay chain reorgs to a fork where only root1 is included.
+	block_on(receiver.on_root(source(), root1, &wants));
+	let record = chain.block(&receiver);
+	assert_eq!(chain.frontier.leaf_count(), 5);
+	assert_eq!(requires(&receiver, &[record]), Some(root1));
+
+	// Root2 is included again: the payloads past root1 were kept.
+	block_on(receiver.on_root(source(), root2, &chain.wants()));
+	chain.block(&receiver);
+	assert_eq!(chain.frontier.leaf_count(), 10);
+}
