@@ -740,7 +740,8 @@ fn samples() -> usize {
 /// prefers HRMP, so the same send goes over XCMP. Each phase sends one unmeasured message to
 /// confirm the path, then [`SAMPLES`] messages one at a time, each processed before the next is
 /// sent. A sample is the time from the sender block holding `PolkadotXcm::Sent` to the receiver
-/// block holding the matching `MessageQueue::Processed`, by `Timestamp::Now` and by relay parent.
+/// block holding the matching `MessageQueue::Processed`, in relay blocks between their relay
+/// parents. Not in milliseconds: with slot-based authoring, block timestamps step in Aura slots.
 ///
 /// A measurement, not a check: run it by hand with `--ignored`.
 #[tokio::test(flavor = "multi_thread")]
@@ -782,10 +783,9 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 	Ok(())
 }
 
-/// One delivery: milliseconds and relay blocks from send to processing.
+/// One delivery: relay blocks from send to processing.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
-	millis: u64,
 	relay_blocks: u32,
 	/// Relay parent of the send block.
 	sent_relay: u32,
@@ -864,9 +864,8 @@ async fn measure(
 			return Err(anyhow!("sample {i} arrived under {arrived}, expected {origin}"));
 		}
 		log::info!(
-			"{origin} sample {i}: {} ms, {} relay blocks; sent #{} (relay parent #{}), included at \
-			 relay #{}, processed #{} (relay parent #{})",
-			sample.millis,
+			"{origin} sample {i}: {} relay blocks; sent #{} (relay parent #{}), included at relay #{}, \
+			 processed #{} (relay parent #{})",
 			sample.relay_blocks,
 			sample.sent_block,
 			sample.sent_relay,
@@ -893,7 +892,7 @@ async fn deliver(
 		.await?
 		.map(|id| flatten(&id))
 		.ok_or_else(|| anyhow!("no `PolkadotXcm::Sent` in the send block"))?;
-	let (sent_at, sent_relay) = when(&sent_in).await?;
+	let sent_relay = relay_parent(&sent_in).await?;
 
 	let wait = async {
 		while let Some(block) = arrivals.next().await {
@@ -914,9 +913,8 @@ async fn deliver(
 					Some(ValueDef::Variant(variant)) => variant.name.clone(),
 					_ => return Err(anyhow!("no origin in {fields:?}")),
 				};
-				let (processed_at, processed_relay) = when(&block).await?;
+				let processed_relay = relay_parent(&block).await?;
 				let sample = Sample {
-					millis: processed_at.saturating_sub(sent_at),
 					relay_blocks: processed_relay.saturating_sub(sent_relay),
 					sent_relay,
 					included_relay: included_at(inclusions, sent_in.hash()).await?,
@@ -950,25 +948,21 @@ async fn event_field(
 	Ok(None)
 }
 
-/// A block's `Timestamp::Now` and relay parent number.
-async fn when(
+/// A block's relay parent number.
+async fn relay_parent(
 	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
-) -> Result<(u64, u32), anyhow::Error> {
-	let storage = block.storage();
-	let read = |pallet: &'static str, item: &'static str| {
-		let storage = storage.clone();
-		async move {
-			let query = subxt::dynamic::storage(pallet, item, Vec::<Value>::new());
-			storage
-				.fetch(&query)
-				.await?
-				.map(|value| value.into_encoded())
-				.ok_or_else(|| anyhow!("{pallet}::{item} is empty"))
-		}
-	};
-	let now = u64::decode(&mut &read("Timestamp", "Now").await?[..])?;
-	let relay = u32::decode(&mut &read("ParachainSystem", "LastRelayChainBlockNumber").await?[..])?;
-	Ok((now, relay))
+) -> Result<u32, anyhow::Error> {
+	let query = subxt::dynamic::storage(
+		"ParachainSystem",
+		"LastRelayChainBlockNumber",
+		Vec::<Value>::new(),
+	);
+	let value = block
+		.storage()
+		.fetch(&query)
+		.await?
+		.ok_or_else(|| anyhow!("ParachainSystem::LastRelayChainBlockNumber is empty"))?;
+	Ok(u32::decode(&mut &value.into_encoded()[..])?)
 }
 
 /// All integers in `value`, depth first, as bytes: a byte array or hash of any nesting.
@@ -996,7 +990,6 @@ fn report(path: &str, samples: &[Sample]) {
 		)
 	}
 	let of = |f: fn(&Sample) -> i64| samples.iter().map(f).collect::<Vec<_>>();
-	log::info!("{path}: {}", stats("ms", of(|s| s.millis as i64)));
 	log::info!("{path}: {}", stats("relay blocks", of(|s| s.relay_blocks.into())));
 	log::info!(
 		"{path}: {}",
@@ -1472,6 +1465,7 @@ fn build_network_config(sender_node: (&str, u16)) -> Result<NetworkConfig, anyho
 			  runtime::spec-msg=debug,runtime::parachain-system=debug")
 				.into(),
 			("--force-authoring").into(),
+			("--authoring", "slot-based").into(),
 			("--enable-spec-msg").into(),
 			("--spec-msg-peer", peer).into(),
 		]
