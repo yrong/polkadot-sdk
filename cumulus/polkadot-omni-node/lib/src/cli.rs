@@ -361,14 +361,16 @@ pub struct Cli<Config: CliConfig> {
 	/// Peer chains must have distinct chain-spec `protocolId`s: chains sharing one fail each
 	/// other's block-announce handshake and ban the peer, refusing fetches for about a minute.
 	///
-	/// The archive reads each block's state, so run with `--state-pruning archive-canonical`: with
-	/// pruned state, a node that falls behind by more than the pruning window stops serving.
+	/// Pruned state is fine: a node archives each block's sends while its import pins the state,
+	/// and a node whose start state is pruned seeds the archive and backfills it from its own
+	/// chain's peers.
 	#[arg(long)]
 	pub enable_spec_msg: bool,
 
-	/// A collator of a source chain to fetch speculative messages from, as
-	/// `<PARA_ID>=<MULTIADDR>`. The address must end in `/p2p/<PEER_ID>`. Repeat it for more
-	/// peers; peers of one source are tried in turn, starting from a different one each round.
+	/// A node to fetch speculative messages from, as `<PARA_ID>=<MULTIADDR>`: a collator of a
+	/// source chain, or with this chain's own id, a peer to backfill the archive from. The address
+	/// must end in `/p2p/<PEER_ID>`. Repeat it for more peers; peers of one chain are tried in
+	/// turn, starting from a different one each round.
 	///
 	/// Only relevant when `--enable-spec-msg` is used.
 	#[arg(long, value_name = "PARA_ID=MULTIADDR", value_parser = parse_spec_msg_peer)]
