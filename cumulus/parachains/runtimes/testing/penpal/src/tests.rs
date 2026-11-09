@@ -15,8 +15,8 @@
 // limitations under the License.
 
 //! The Speculative Messaging wiring of penpal: the router's place in `XcmRouter` (HRMP wins while
-//! it exists, spec-msg only over an open channel), the `SPMS` digest it causes, and the message
-//! queue's room for consumed payloads.
+//! it exists, spec-msg only over an open channel), the `SPMS` digest it causes, the message
+//! queue's room for consumed payloads, junk and overweight XCM on a channel, and a send flood.
 
 use crate::{xcm_config::XcmRouter, PolkadotXcm, Runtime, RuntimeOrigin, SpecMessaging};
 use codec::DecodeAll;
@@ -25,7 +25,7 @@ use cumulus_pallet_parachain_system::{
 	RelevantMessagingState,
 };
 use cumulus_pallet_spec_messaging::{xcm_channel, OutChannels, OutboundMessages};
-use cumulus_primitives_core::{AbridgedHrmpChannel, AggregateMessageOrigin, InChannelId};
+use cumulus_primitives_core::{AbridgedHrmpChannel, AggregateMessageOrigin, InChannelId, ParaId};
 use cumulus_primitives_spec_messaging::{
 	AppliedRegister, ChannelMessage, MessagePosition, OpenSession, OutChannelState, Register,
 	RegisterStatus, SessionParams, SPMS_ENGINE_ID,
@@ -213,5 +213,139 @@ fn an_xcm_one_framing_short_of_the_bound_is_the_largest_that_fits() {
 		// may not pass the protocol's 102,400-byte bound: an XCM at the HRMP maximum does not fit.
 		assert_ok!(SpecMessaging::can_send(xcm_channel(SIBLING.into()), 102_395));
 		assert!(SpecMessaging::can_send(xcm_channel(SIBLING.into()), 102_396).is_err());
+	});
+}
+
+/// Hand `payloads` to the pallet's data handler as the XCM channel from [`SIBLING`] consumes them.
+fn consume(payloads: &[Vec<u8>]) {
+	use cumulus_pallet_spec_messaging::OnSpecMsgData;
+	let stream = cumulus_primitives_spec_messaging::StreamId::Channel {
+		recipient: crate::ParachainInfo::parachain_id(),
+		domain: 0,
+		num: 0,
+	};
+	for (i, payload) in payloads.iter().enumerate() {
+		<Runtime as cumulus_pallet_spec_messaging::Config>::DataHandler::on_data(
+			SIBLING.into(),
+			stream,
+			MessagePosition(i as u64),
+			payload.clone(),
+		);
+	}
+}
+
+fn queue_events() -> Vec<pallet_message_queue::Event<Runtime>> {
+	frame_system::Pallet::<Runtime>::events()
+		.into_iter()
+		.filter_map(|record| match record.event {
+			crate::RuntimeEvent::MessageQueue(event) => Some(event),
+			_ => None,
+		})
+		.collect()
+}
+
+#[test]
+fn junk_and_overweight_xcm_do_not_hold_up_the_channel() {
+	use codec::Encode;
+	use frame_support::traits::ServiceQueues;
+	use pallet_message_queue::Event;
+	new_test_ext().execute_with(|| {
+		let set_code = crate::RuntimeCall::System(frame_system::Call::set_code { code: vec![] });
+		let transact = Transact {
+			origin_kind: OriginKind::Superuser,
+			call: set_code.encode().into(),
+			fallback_max_weight: None,
+		};
+		// Weighed past what the queue may spend on one message.
+		let overweight = Xcm::<()>(vec![transact.clone(), transact]);
+		let payloads = [
+			VersionedXcm::from(xcm()).encode(),
+			vec![0xff; 64],
+			VersionedXcm::from(overweight).encode(),
+			VersionedXcm::from(Xcm::<()>(vec![ClearOrigin, ClearOrigin])).encode(),
+		];
+		consume(&payloads);
+		<crate::MessageQueue as ServiceQueues>::service_queues(
+			crate::MessageQueueServiceWeight::get(),
+		);
+
+		// Each is settled in order, and the queue moves past the junk and the overweight one.
+		let index = |id: sp_core::H256| {
+			payloads.iter().position(|p| sp_io::hashing::blake2_256(p) == id.0).unwrap()
+		};
+		let settled: Vec<_> = queue_events()
+			.into_iter()
+			.map(|event| match event {
+				Event::Processed { id, .. } => (index(id), "processed"),
+				Event::ProcessingFailed { id, .. } => (index(id), "failed"),
+				Event::OverweightEnqueued { id, .. } => (index(id.into()), "overweight"),
+				other => panic!("unexpected {other:?}"),
+			})
+			.collect();
+		assert_eq!(settled, [(0, "processed"), (1, "failed"), (2, "overweight"), (3, "processed")]);
+	});
+}
+
+/// End the block as its hooks do and start the next, past initialization.
+fn next_block() {
+	use frame_support::traits::Hooks;
+	let number = frame_system::Pallet::<Runtime>::block_number();
+	<SpecMessaging as Hooks<_>>::on_finalize(number);
+	frame_system::Pallet::<Runtime>::initialize(
+		&(number + 1),
+		&Default::default(),
+		&Default::default(),
+	);
+	<SpecMessaging as Hooks<_>>::on_initialize(number + 1);
+	frame_system::Pallet::<Runtime>::note_finished_initialize();
+}
+
+/// The topics of this block's sends on the XCM channel to [`SIBLING`], in order.
+fn sent_topics() -> Vec<u8> {
+	let stream = xcm_channel(SIBLING.into()).data_stream();
+	OutboundMessages::<Runtime>::get(stream)
+		.iter()
+		.map(|leaf| {
+			let Ok(ChannelMessage::Data(data)) = ChannelMessage::decode_all(&mut &leaf[..]) else {
+				panic!("XCM travels as a `Data` leaf");
+			};
+			let message: Xcm<()> =
+				VersionedXcm::<()>::decode_all(&mut &data[..]).unwrap().try_into().unwrap();
+			match message.0.last() {
+				Some(SetTopic(topic)) => topic[0],
+				other => panic!("no topic: {other:?}"),
+			}
+		})
+		.collect()
+}
+
+#[test]
+fn a_send_flood_stops_at_the_in_flight_window_in_order_and_raises_the_fee() {
+	use cumulus_pallet_spec_messaging::DeliveryFeeFactor;
+	new_test_ext().execute_with(|| {
+		open_spec_msg_channel();
+		frame_system::Pallet::<Runtime>::note_finished_initialize();
+		let window: u32 = <Runtime as cumulus_pallet_spec_messaging::Config>::MaxInFlight::get();
+		let topic = |n: u8| Xcm::<()>(vec![ClearOrigin, SetTopic([n; 32])]);
+		let mut sent = Vec::new();
+		// 200 sends, as a batch keeps trying them: a block that has no room ends, the window
+		// that is full refuses for good.
+		for n in 0..200u8 {
+			match send_xcm::<XcmRouter>(sibling(), topic(n)) {
+				Ok(_) => {},
+				Err(SendError::Transport("block has no room for the spec-msg send")) => {
+					sent.extend(sent_topics());
+					next_block();
+					assert_ok!(send_xcm::<XcmRouter>(sibling(), topic(n)));
+				},
+				Err(e) => {
+					assert_eq!(e, SendError::Transport("spec-msg XCM channel has no capacity"));
+					assert_eq!(sent.len() + sent_topics().len(), window as usize, "at send {n}");
+				},
+			}
+		}
+		sent.extend(sent_topics());
+		assert_eq!(sent, (0..window as u8).collect::<Vec<_>>(), "every accepted send, in order");
+		assert!(DeliveryFeeFactor::<Runtime>::get(ParaId::from(SIBLING)) > 1.into());
 	});
 }
