@@ -329,22 +329,38 @@ where
 			let mut result = self.fetch_channel(source, stream, root, &frontier, max_bytes).await;
 			if start > cursor {
 				if let Err(error) = &result {
-					if self.held_is_stale(source, stream, stored, root, error).await {
-						log::debug!(
-							target: LOG_TARGET,
-							"{stream:?} of {source:?} under {root:?} is another fork's from \
-							 {cursor}: fetching it again",
-						);
-						// One statement: a guard `drop`ped by hand still makes the future `!Send`.
-						self.state
-							.lock()
-							.sources
-							.entry(source)
-							.or_default()
-							.drop_payloads_from(&stream, cursor);
-						start = cursor;
-						result =
-							self.fetch_channel(source, stream, root, stored, FETCH_MAX_BYTES).await;
+					match self.held_against(source, stream, stored, root, error).await {
+						Held::Stale => {
+							log::debug!(
+								target: LOG_TARGET,
+								"{stream:?} of {source:?} under {root:?} is another fork's from \
+								 {cursor}: fetching it again",
+							);
+							// One statement: a guard `drop`ped by hand still makes the future
+							// `!Send`.
+							self.state
+								.lock()
+								.sources
+								.entry(source)
+								.or_default()
+								.drop_payloads_from(&stream, cursor);
+							start = cursor;
+							result = self
+								.fetch_channel(source, stream, root, stored, FETCH_MAX_BYTES)
+								.await;
+						},
+						// An older root, e.g. after a relay chain reorg: consume only what it
+						// commits, and keep the rest for a newer root.
+						Held::EndsWithin(count) => {
+							self.state
+								.lock()
+								.sources
+								.entry(source)
+								.or_default()
+								.reach
+								.insert(stream, count);
+						},
+						Held::Unknown => {},
 					}
 				}
 			}
@@ -452,28 +468,28 @@ where
 		fetch(&self.transport, source, &request, Some(frontier)).await
 	}
 
-	/// Whether the payloads the pool holds of the channel `stream` from `stored` are another
-	/// fork's than the stream's under `root`, once the fetch from their end failed with `error`.
-	/// Only a response that verifies under `root` tells: one with another frontier where they end,
-	/// or a head that ends within them where they do not. A peer that refuses or lies proves
-	/// nothing, so it cannot make the pool drop payloads that are the stream's.
-	async fn held_is_stale(
+	/// How the payloads the pool holds of the channel `stream` from `stored` relate to the stream
+	/// under `root`, once the fetch from their end failed with `error`. Only a response that
+	/// verifies under `root` tells: one with another frontier where they end, or a head that ends
+	/// within them. A peer that refuses or lies proves nothing, so it cannot make the pool drop
+	/// payloads that are the stream's.
+	async fn held_against(
 		&self,
 		source: ParaId,
 		stream: StreamId,
 		stored: &MmrFrontier,
 		root: StreamsRoot,
 		error: &RequestError,
-	) -> bool {
+	) -> Held {
 		let beyond_head = match error {
-			RequestError::Diverged => return true,
+			RequestError::Diverged => return Held::Stale,
 			RequestError::Unserved { refusals } => {
 				refusals.iter().any(|(_, refusal)| *refusal == FetchError::BeyondHead)
 			},
 			RequestError::NoPeers => false,
 		};
 		if !beyond_head {
-			return false;
+			return Held::Unknown;
 		}
 		// The stream may end within the payloads held: compare where its head ends.
 		let request = MessagesRequest {
@@ -482,17 +498,28 @@ where
 			start: None,
 			max_bytes: MAX_SPECULATIVE_MESSAGE_LEN,
 		};
-		let Ok(head) = fetch(&self.transport, source, &request, None).await else { return false };
-		let Some(known) = extended(&head.frontier, head.payloads.iter()) else { return false };
-		let Some(within) = known.leaf_count().checked_sub(stored.leaf_count()) else {
-			return false;
+		let Ok(head) = fetch(&self.transport, source, &request, None).await else {
+			return Held::Unknown;
 		};
-		let Ok(within) = usize::try_from(within) else { return false };
+		let Some(known) = extended(&head.frontier, head.payloads.iter()) else {
+			return Held::Unknown;
+		};
+		let Some(within) = known.leaf_count().checked_sub(stored.leaf_count()) else {
+			return Held::Unknown;
+		};
+		let Ok(within) = usize::try_from(within) else { return Held::Unknown };
 		let state = self.state.lock();
-		let Some(pool) = state.sources.get(&source) else { return false };
+		let Some(pool) = state.sources.get(&source) else { return Held::Unknown };
 		let held: Vec<_> =
 			pool.contiguous_from(&stream, stored.leaf_count()).take(within).collect();
-		held.len() == within && extended(stored, held).is_some_and(|expected| expected != known)
+		if held.len() != within {
+			return Held::Unknown;
+		}
+		match extended(stored, held) {
+			Some(expected) if expected == known => Held::EndsWithin(known.leaf_count()),
+			Some(_) => Held::Stale,
+			None => Held::Unknown,
+		}
 	}
 
 	/// The messaging inherent for a block whose parent has `view`. `bundle` holds the records of
@@ -667,8 +694,12 @@ where
 			}
 			let Some((pool, root)) = newest(source) else { continue };
 			let stream = id.sender_data_stream(self.us).1;
+			// Up to what the newest root commits.
+			let reach = pool.reach.get(&stream).map_or(usize::MAX, |reach| {
+				usize::try_from(reach.saturating_sub(stored.leaf_count())).unwrap_or(usize::MAX)
+			});
 			let mut taken = Vec::new();
-			for payload in pool.contiguous_from(&stream, stored.leaf_count()) {
+			for payload in pool.contiguous_from(&stream, stored.leaf_count()).take(reach) {
 				let len = payload.len() as u64;
 				if payloads >= max_payloads || bytes + len > max_bytes {
 					break;
@@ -927,6 +958,16 @@ where
 			.map_err(|_| RequestError::Unserved { refusals: Vec::new() })?;
 		Ok((HeadRead { under: root, frontier: response.frontier, payload }, response.tree_proof))
 	}
+}
+
+/// How held channel payloads relate to the stream under a root.
+enum Held {
+	/// Another fork's: drop them.
+	Stale,
+	/// The stream's, but it ends within them at this leaf count.
+	EndsWithin(u64),
+	/// Nothing verified tells.
+	Unknown,
 }
 
 /// The last endpoint of each stream in `records`, a bundle's in order, by source.
