@@ -370,7 +370,8 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxSendsPerBlock = ConstU32<1024>;
 	type MaxTouchedStreams = ConstU32<14>;
 	type MaxBundleStreams = ConstU32<3000>;
-	type MaxInboundMessagesPerItem = ConstU32<256>;
+	// A full inherent of 100 KiB messages, with its worst-case commit, must fit the 10 MiB PoV.
+	type MaxInboundMessagesPerItem = ConstU32<4>;
 	type MaxHelloPassPerBlock = ConstU32<8>;
 	type SupportedVersions = SpecMsgSupportedVersions;
 	type MaxMessageSize = ConstU32<{ 100 * 1024 }>;
