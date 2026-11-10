@@ -72,7 +72,8 @@ fn flag(name: &str) -> bool {
 }
 
 /// Whether to run the delivery test's step `name`: every step unless `SPEC_MSG_STEPS` lists some,
-/// comma-separated (`deliver`, `batch`, `outage`, `backpressure`), to rerun only failing ones.
+/// comma-separated (`deliver`, `batch`, `limits`, `outage`, `backpressure`), to rerun only failing
+/// ones.
 fn step(name: &str) -> bool {
 	std::env::var("SPEC_MSG_STEPS").map_or(true, |steps| steps.split(',').any(|s| s.trim() == name))
 }
@@ -95,7 +96,8 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 		)
 	} else {
 		let network =
-			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT))?).await?;
+			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
+				.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -766,7 +768,8 @@ async fn late_node_serves_history(join: Join) -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let mut network = initialize_network(build_network_config((LATE_NODE, LATE_P2P_PORT))?).await?;
+	let mut network =
+		initialize_network(build_network_config((LATE_NODE, LATE_P2P_PORT), false)?).await?;
 	// Both late-node tests bind the same ports: free them before the next one starts.
 	let result = late_node_steps(&mut network, join).await;
 	network.destroy().await?;
@@ -867,7 +870,8 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 	);
 
 	let network =
-		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT))?).await?;
+		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
+			.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -949,6 +953,216 @@ async fn included_at(inclusions: &Inclusions, head: H256) -> Result<u32, anyhow:
 		tokio::time::sleep(Duration::from_secs(1)).await;
 	}
 	Err(anyhow!("no inclusion of {head:?} seen"))
+}
+
+/// The longest the fork test sends traffic while waiting for both rare events:
+/// `SPEC_MSG_FORK_SECS`, 1200 by default.
+fn fork_secs() -> u64 {
+	std::env::var("SPEC_MSG_FORK_SECS")
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(1200)
+}
+
+/// What the fork test saw on the relay chain.
+#[derive(Default)]
+struct ForkLog {
+	/// Every relay block imported, with its number and the sender heads it included.
+	imported: BTreeMap<H256, (u32, Vec<[u8; 32]>)>,
+	finalized: std::collections::BTreeSet<H256>,
+	finalized_number: u32,
+	/// `newest_included_provides(SENDER)` at best blocks, each distinct root once, in order.
+	roots: Vec<H256>,
+	/// Best blocks whose newest root was one seen before the latest: the receiver's root went
+	/// back.
+	backs: u32,
+}
+
+/// Relay blocks below the finalized height a block counts as settled at. A fork often re-includes
+/// an abandoned block's candidate a block or two later.
+const SETTLED_DEPTH: u32 = 3;
+
+impl ForkLog {
+	/// Up to `SETTLED_DEPTH` below the last finalized block: the relay blocks seen, those
+	/// abandoned, those of them that included a sender candidate, and the sender heads they
+	/// included that the final chain never did, each a sender block its chain reorged away.
+	fn counts(&self) -> (usize, usize, usize, usize) {
+		let settled_at = self.finalized_number.saturating_sub(SETTLED_DEPTH);
+		let settled: Vec<_> = self.imported.iter().filter(|(_, (n, _))| *n <= settled_at).collect();
+		let (finalized, abandoned): (Vec<_>, Vec<_>) =
+			settled.iter().partition(|(hash, _)| self.finalized.contains(hash));
+		let canonical: std::collections::BTreeSet<_> =
+			finalized.iter().flat_map(|(_, (_, heads))| heads.iter()).collect();
+		let with_inclusion = abandoned.iter().filter(|(_, (_, heads))| !heads.is_empty()).count();
+		let dropped: std::collections::BTreeSet<_> = abandoned
+			.iter()
+			.flat_map(|(_, (_, heads))| heads.iter())
+			.filter(|head| !canonical.contains(head))
+			.collect();
+		(settled.len(), abandoned.len(), with_inclusion, dropped.len())
+	}
+}
+
+/// Delivery through relay reorgs. Both relay validators claim most slots as primary, so the relay
+/// chain forks at most heights and reorgs revert sender inclusions. The sender sends XCMs until
+/// two rarer events have both happened: the receiver's newest sender root went back to an earlier
+/// one, and the sender's chain reorged away a block a relay fork had included. Then the receiver
+/// must consume and settle the whole stream: its frontier equals the sender's, so it consumed the
+/// same leaves, in the same order.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let network =
+		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), true)?).await?;
+	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+	let sender: OnlineClient<PolkadotConfig> =
+		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+	let receiver: OnlineClient<PolkadotConfig> =
+		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+	let start = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
+	wait_for("both chains to finalize a block", || {
+		advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
+	})
+	.await?;
+	open_spec_msg_channel(&sender, &receiver).await?;
+
+	let log = std::sync::Arc::new(std::sync::Mutex::new(ForkLog::default()));
+	let mut all = relay.blocks().subscribe_all().await?;
+	let mut finalized = relay.blocks().subscribe_finalized().await?;
+	let mut best = relay.blocks().subscribe_best().await?;
+	let (l1, l2, l3, r3) = (log.clone(), log.clone(), log.clone(), relay.clone());
+	tokio::spawn(async move {
+		while let Some(Ok(block)) = all.next().await {
+			let mut heads = Vec::new();
+			if let Ok(events) = block.events().await {
+				for event in events.iter().flatten() {
+					if event.pallet_name() != "ParaInclusion" ||
+						event.variant_name() != "CandidateIncluded"
+					{
+						continue;
+					}
+					let Ok(fields) = event.field_values() else { continue };
+					let para = fields.at(0).and_then(|r| r.at("descriptor")).and_then(|d| {
+						d.at("para_id")
+							.and_then(|id| id.at(0).or(Some(id)))
+							.and_then(|v| v.as_u128())
+					});
+					if para == Some(SENDER.into()) {
+						if let Some(head) = fields.at(1) {
+							heads.push(sp_crypto_hashing::blake2_256(&flatten(head)));
+						}
+					}
+				}
+			}
+			l1.lock().unwrap().imported.insert(block.hash(), (block.number(), heads));
+		}
+	});
+	tokio::spawn(async move {
+		while let Some(Ok(block)) = finalized.next().await {
+			let mut log = l2.lock().unwrap();
+			log.finalized.insert(block.hash());
+			log.finalized_number = log.finalized_number.max(block.number());
+		}
+	});
+	tokio::spawn(async move {
+		while let Some(Ok(block)) = best.next().await {
+			let Ok(Some(root)) = call_at::<Option<H256>>(
+				&r3,
+				Some(block.hash()),
+				"ParachainHost_newest_included_provides",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await
+			else {
+				continue;
+			};
+			let mut log = l3.lock().unwrap();
+			if log.roots.last() == Some(&root) {
+				continue;
+			}
+			if log.roots.contains(&root) {
+				log.backs += 1;
+				log::info!("Relay best #{}: the sender's newest root went back", block.number());
+			} else {
+				log.roots.push(root);
+			}
+		}
+	});
+
+	let report = |log: &ForkLog| {
+		let (seen, abandoned, with_inclusion, dropped) = log.counts();
+		format!(
+			"{seen} relay blocks settled, {abandoned} abandoned, {with_inclusion} of those included \
+			 a {SENDER} candidate, {dropped} {SENDER} heads reorged away; the newest root went back \
+			 {} times",
+			log.backs,
+		)
+	};
+	let deadline = std::time::Instant::now() + Duration::from_secs(fork_secs());
+	let mut batches = 0u32;
+	loop {
+		let covered = {
+			let log = log.lock().unwrap();
+			log.backs > 0 && log.counts().3 > 0
+		};
+		if covered {
+			break;
+		}
+		if std::time::Instant::now() >= deadline {
+			return Err(anyhow!(
+				"no root went back and no sender block was reorged away within {} s: {}",
+				fork_secs(),
+				report(&log.lock().unwrap()),
+			));
+		}
+		match force_batch(&sender, (0..3).map(|_| send_xcm_to(RECEIVER)).collect()).await {
+			Ok(_) => batches += 1,
+			Err(error) => log::warn!("A batch of sends failed: {error}"),
+		}
+		tokio::time::sleep(Duration::from_secs(6)).await;
+	}
+	log::info!("After {batches} batches of 3 XCMs: {}", report(&log.lock().unwrap()));
+
+	let stream = out_channel().data_stream();
+	let mut delivered = None;
+	for _ in 0..60 {
+		let frontiers: Vec<(StreamId, MmrFrontier)> =
+			call_at(&sender, Some(best_hash(&sender).await?), "SpecMsgApi_outbound_frontiers", &[])
+				.await?;
+		let sent = frontiers.into_iter().find_map(|(s, f)| (s == stream).then_some(f));
+		let consumed = channel_map::<InChannelId, InChannelState>(&receiver, "InChannels")
+			.await?
+			.remove(&in_channel())
+			.map(|state| state.frontier);
+		if sent.is_some() && sent == consumed && queued(&receiver).await? == 0 {
+			delivered = sent;
+			break;
+		}
+		tokio::time::sleep(Duration::from_secs(5)).await;
+	}
+	let Some(frontier) = delivered else {
+		return Err(anyhow!("{RECEIVER} did not consume and settle {SENDER}'s stream"));
+	};
+	// A head counted as reorged away early may be included later: count again once every block
+	// seen has settled.
+	let last = log.lock().unwrap().imported.values().map(|(n, _)| *n).max().unwrap_or_default();
+	wait_for("every relay block seen to settle", || async {
+		Ok(finalized_number(&relay).await? >= last + SETTLED_DEPTH)
+	})
+	.await?;
+	let log = log.lock().unwrap();
+	if log.counts().3 == 0 {
+		return Err(anyhow!("once settled, no sender block was reorged away: {}", report(&log)));
+	}
+	log::info!("Settled: {}", report(&log));
+	log::info!(
+		"{RECEIVER} consumed {SENDER}'s stream to leaf {}, the same frontier the sender holds, \
+		 and settled every XCM",
+		frontier.leaf_count(),
+	);
+	Ok(())
 }
 
 /// Send one warm-up message that must arrive under `origin`, then [`SAMPLES`] measured ones.
@@ -1570,7 +1784,12 @@ fn peer_arg(para: u32, name: &str, port: u16) -> Result<String, anyhow::Error> {
 
 /// The network; the receiver fetches the sender's streams from `sender_node`, a node name and its
 /// p2p port.
-fn build_network_config(sender_node: (&str, u16)) -> Result<NetworkConfig, anyhow::Error> {
+/// With `relay_forks`, both relay validators claim most slots as primary (BABE `c` = 99/100, which
+/// must stay below 1), so the relay chain forks at most heights.
+fn build_network_config(
+	sender_node: (&str, u16),
+	relay_forks: bool,
+) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
@@ -1594,8 +1813,18 @@ fn build_network_config(sender_node: (&str, u16)) -> Result<NetworkConfig, anyho
 	// - penpal 2001: dave, collator, fetching from charlie
 	NetworkConfigBuilder::new()
 		.with_relaychain(|r| {
-			r.with_chain("rococo-local")
-				.with_default_command("polkadot")
+			let r = r.with_chain("rococo-local");
+			let r = if relay_forks {
+				r.with_genesis_overrides(serde_json::json!({
+					"babe": { "epochConfig": {
+						"c": [99, 100],
+						"allowed_slots": "PrimaryAndSecondaryVRFSlots",
+					} },
+				}))
+			} else {
+				r
+			};
+			r.with_default_command("polkadot")
 				.with_default_image(images.polkadot.as_str())
 				.with_default_args(vec![
 					("-lparachain=debug,runtime::inclusion=debug,runtime::inclusion-inherent=debug")
