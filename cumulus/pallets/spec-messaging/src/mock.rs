@@ -95,6 +95,8 @@ parameter_types! {
 	pub static QueueMaxLen: u32 = 2048;
 	/// HRMP channel state [`MockHrmp`] reports for every sibling.
 	pub static HrmpState: HrmpChannel = HrmpChannel::Closed;
+	/// Proof size [`EnqueueWeight`] charges per payload; the block-weight integrity test raises it.
+	pub static EnqueueProof: u64 = 0;
 }
 
 /// Weight of enqueueing a payload: one picosecond per byte, so tests can see it charged.
@@ -102,7 +104,7 @@ pub struct EnqueueWeight;
 
 impl sp_runtime::traits::Convert<u32, Weight> for EnqueueWeight {
 	fn convert(len: u32) -> Weight {
-		Weight::from_parts(u64::from(len), 0)
+		Weight::from_parts(u64::from(len), EnqueueProof::get())
 	}
 }
 

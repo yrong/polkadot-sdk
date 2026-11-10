@@ -1922,6 +1922,18 @@ mod xcm_layer {
 	}
 
 	#[test]
+	#[should_panic(expected = "the messaging inherent the caps allow")]
+	fn integrity_fails_when_the_caps_allow_an_inherent_over_the_block() {
+		new_test_ext().execute_with(|| {
+			// A full inherent then charges more proof than the mock block holds.
+			let payloads = MaxTouchedStreams::get() * MaxInboundMessagesPerItem::get();
+			let max = <Test as frame_system::Config>::BlockWeights::get().max_block;
+			EnqueueProof::set(max.proof_size() / u64::from(payloads) + 1);
+			<SpecMessaging as frame_support::traits::Hooks<u64>>::integrity_test();
+		});
+	}
+
+	#[test]
 	fn hrmp_closing_needs_an_open_xcm_channel() {
 		new_test_ext().execute_with(|| {
 			let peer = out_channel().recipient;
