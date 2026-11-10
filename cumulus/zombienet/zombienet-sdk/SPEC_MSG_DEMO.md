@@ -140,3 +140,11 @@ The test sets the node log filters in `build_network_config`, at `debug` level. 
 `spec_msg_vs_hrmp_latency -- --ignored --nocapture` replaces `spec_msg_delivers -- --nocapture`. It compares
 spec-msg with HRMP on the same chains. It takes 10 samples per path by default: set `SPEC_MSG_SAMPLES=2` for a
 short check (about 8 minutes). It boots its own network, so it does not use the two-step flow.
+
+## Relay forks
+
+`spec_msg_survives_relay_forks -- --nocapture` boots a network where both relay validators claim most slots as
+primary, so the relay chain forks at most heights and reorgs revert sender inclusions. It sends XCMs until the
+receiver's newest sender root has gone back at least once and a sender block was reorged away, then checks that the
+receiver consumed the same leaves as the sender sent, in order, and settled them. Coverage usually comes within a
+few minutes; `SPEC_MSG_FORK_SECS` caps the wait (1200 by default).
