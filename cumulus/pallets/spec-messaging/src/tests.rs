@@ -2046,19 +2046,38 @@ mod xcm_layer {
 	fn a_delivery_charges_the_send_weight() {
 		new_test_ext().execute_with(|| {
 			open_xcm_channel();
+			let len = VersionedXcm::from(xcm()).encode().len() as u32;
+			let first = SpecMessaging::send_weight(xcm_out(), len);
 			let before = System::block_weight().total();
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
-
-			let sent = sent_on(xcm_channel(out_channel().recipient).data_stream());
-			let Ok(ChannelMessage::Data(data)) = ChannelMessage::decode_all(&mut &sent[0][..])
-			else {
-				panic!("XCM travels as a `Data` leaf");
-			};
-			assert_eq!(
-				System::block_weight().total() - before,
-				SpecMessaging::send_weight(data.len() as u32)
-			);
+			assert_eq!(System::block_weight().total() - before, first);
 		});
+	}
+
+	#[test]
+	fn only_a_streams_first_send_of_the_block_pays_for_the_fold() {
+		new_test_ext().execute_with(|| {
+			open_xcm_channel();
+			let len = VersionedXcm::from(xcm()).encode().len() as u32;
+			let first = SpecMessaging::send_weight(xcm_out(), len);
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+
+			// The stream is touched now: a further send adds a leaf, not a fold.
+			let again = SpecMessaging::send_weight(xcm_out(), len);
+			assert!(again.all_lt(first));
+			let before = System::block_weight().total();
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(System::block_weight().total() - before, again);
+
+			// The next block folds the stream again.
+			System::set_block_number(System::block_number() + 1);
+			assert_eq!(SpecMessaging::send_weight(xcm_out(), len), first);
+		});
+	}
+
+	/// The XCM channel to [`sibling`].
+	fn xcm_out() -> OutChannelId {
+		xcm_channel(out_channel().recipient)
 	}
 
 	#[test]
@@ -2228,7 +2247,7 @@ mod xcm_layer {
 				<Test as frame_system::Config>::BlockWeights::get();
 			let limit = weights.get(DispatchClass::Normal).max_total.unwrap();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let room = limit.saturating_sub(SpecMessaging::send_weight(len));
+			let room = limit.saturating_sub(SpecMessaging::send_weight(xcm_out(), len));
 			frame_system::BlockWeight::<Test>::mutate(|w| w.set(room, DispatchClass::Normal));
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 			assert_eq!(
@@ -2248,7 +2267,7 @@ mod xcm_layer {
 			let weights: frame_system::limits::BlockWeights =
 				<Test as frame_system::Config>::BlockWeights::get();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let room = weights.max_block.saturating_sub(SpecMessaging::send_weight(len));
+			let room = weights.max_block.saturating_sub(SpecMessaging::send_weight(xcm_out(), len));
 			frame_system::BlockWeight::<Test>::mutate(|w| w.set(room, DispatchClass::Mandatory));
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 			assert_eq!(
@@ -2277,12 +2296,13 @@ mod xcm_layer {
 			System::note_finished_extrinsics();
 
 			let before = used();
-			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
+			let send = SpecMessaging::send_weight(xcm_out(), len);
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 			assert_eq!(*used().get(DispatchClass::Normal), *before.get(DispatchClass::Normal));
 			assert_eq!(
 				*used().get(DispatchClass::Mandatory) - *before.get(DispatchClass::Mandatory),
-				SpecMessaging::send_weight(len)
+				send
 			);
 		});
 	}

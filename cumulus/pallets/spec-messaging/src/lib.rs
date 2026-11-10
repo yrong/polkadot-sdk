@@ -1233,10 +1233,22 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Weight of [`Self::send`] for `data_len` bytes, with the end-of-block work it causes. Callers
-	/// charge it: `send` is not a call.
-	pub fn send_weight(data_len: u32) -> Weight {
-		T::WeightInfo::send(data_len).saturating_add(commit_weight::<T>(1, 0))
+	/// Weight of [`Self::send`] for `data_len` bytes on `channel`, with the end-of-block work it
+	/// causes. Callers charge it before the send: `send` is not a call. The commit folds a stream
+	/// once per block, so only the stream's first send of the block pays for the fold.
+	pub fn send_weight(channel: OutChannelId, data_len: u32) -> Weight {
+		let now = frame_system::Pallet::<T>::block_number();
+		// Before this block's roll-over, the stored hashes are the last block's.
+		let touched = RolledOver::<T>::get().is_some_and(|(at, _)| at == now) &&
+			OutboundLeafHashes::<T>::decode_len(channel.data_stream()).unwrap_or(0) > 0;
+		let commit = if touched {
+			// One more leaf appended to the stream's frontier, which the drain's slope covers: it
+			// makes the same append and reads and writes the frontier too.
+			T::WeightInfo::on_initialize(1).saturating_sub(T::WeightInfo::on_initialize(0))
+		} else {
+			commit_weight::<T>(1, 0)
+		};
+		T::WeightInfo::send(data_len).saturating_add(commit)
 	}
 
 	/// Whether [`Self::send`] would accept `data_len` bytes on `channel` now: the block is

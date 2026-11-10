@@ -200,7 +200,7 @@ where
 		if send_class::<T>() == DispatchClass::Normal {
 			let weights = T::BlockWeights::get();
 			let limit = weights.get(DispatchClass::Normal).max_total.unwrap_or(weights.max_block);
-			let send = Pallet::<T>::send_weight(encoded.len() as u32);
+			let send = Pallet::<T>::send_weight(channel, encoded.len() as u32);
 			let used = frame_system::BlockWeight::<T>::get();
 			if !used.get(DispatchClass::Normal).saturating_add(send).all_lte(limit) ||
 				!used.total().saturating_add(send).all_lte(weights.max_block)
@@ -214,7 +214,7 @@ where
 	fn deliver((channel, encoded): Self::Ticket) -> Result<XcmHash, SendError> {
 		let hash = sp_io::hashing::blake2_256(&encoded);
 		let len = encoded.len();
-		let weight = Pallet::<T>::send_weight(len as u32)
+		let weight = Pallet::<T>::send_weight(channel, len as u32)
 			.saturating_add(T::DbWeight::get().reads_writes(1, 1));
 		let position = Pallet::<T>::send(channel, encoded)
 			.map_err(|_| SendError::Transport("spec-msg XCM send failed"))?;
