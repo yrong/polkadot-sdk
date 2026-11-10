@@ -133,6 +133,9 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	if step("batch") {
 		send_batch_and_follow(&sender, &receiver).await?;
 	}
+	if step("limits") {
+		largest_and_follow(&sender, &receiver).await?;
+	}
 	if step("outage") {
 		match &network {
 			Some(network) => outage_and_follow(network, &sender, &receiver).await?,
@@ -389,6 +392,118 @@ async fn outage_and_follow(
 	Ok(())
 }
 
+/// Penpal's `MaxMsgLen`: the largest leaf a channel carries.
+const MAX_LEAF: usize = 102_400;
+/// The remark length that makes [`send_large_xcm_to`]'s leaf exactly `MAX_LEAF` bytes: the `Data`
+/// envelope (5 bytes), the versioned XCM around the `Transact` (10), the remark call (5), and the
+/// `SetTopic` penpal's `WithUniqueTopic` router appends (33).
+const LARGEST_REMARK: usize = MAX_LEAF - 53;
+/// XCMs in the limits step: more than one fetch response holds (1 MiB), and several blocks of the
+/// receiver node's default byte budget.
+const LARGEST_COUNT: u64 = 12;
+/// The receiver node's default byte budget per block (`Budget::max_bytes`): two largest leaves.
+const NODE_MAX_BYTES: usize = 256 * 1024;
+
+/// Send one XCM a byte over the largest the channel carries, which the router refuses, then
+/// `LARGEST_COUNT` of the largest. Check each leaf is exactly `MAX_LEAF` bytes, and follow them:
+/// every receiver block consumes at most what the node's byte budget holds, is finalized, so the
+/// relay accepted its `Requires`, and the queue settles them all.
+async fn largest_and_follow(
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	let before = sent_count(sender).await?;
+	let too_large = send_large_xcm_to(RECEIVER, 0, LARGEST_REMARK + 1);
+	if !force_batch(sender, vec![too_large]).await?.is_empty() ||
+		sent_count(sender).await? != before
+	{
+		return Err(anyhow!("a leaf of {} bytes was sent", MAX_LEAF + 1));
+	}
+	log::info!("{SENDER}'s router refused an XCM whose leaf is {} bytes", MAX_LEAF + 1);
+
+	let stream = in_channel().sender_data_stream(RECEIVER.into()).1;
+	let mut consumed = inbound_count(receiver).await?;
+	let end = consumed + LARGEST_COUNT;
+	let before_send = receiver.blocks().at(best_hash(receiver).await?).await?.number();
+	let mut blocks = receiver.blocks().subscribe_finalized().await?;
+	let calls = (0..LARGEST_COUNT).map(|i| send_large_xcm_to(RECEIVER, i as u8, LARGEST_REMARK));
+	let batch = Value::unnamed_variant(
+		"Utility",
+		[Value::named_variant("batch_all", [("calls", Value::unnamed_composite(calls))])],
+	);
+	let (hash, ids) = submit_sudo(sender, batch, true).await?;
+	let sends: Vec<(StreamId, Vec<Vec<u8>>)> =
+		call_at(sender, Some(hash), "SpecMsgApi_outbound_messages", &[]).await?;
+	let leaves = sends
+		.iter()
+		.find_map(|(s, leaves)| (*s == out_channel().data_stream()).then_some(leaves))
+		.ok_or_else(|| anyhow!("the send block holds no leaves on the channel"))?;
+	if ids.len() as u64 != LARGEST_COUNT || leaves.iter().any(|leaf| leaf.len() != MAX_LEAF) {
+		return Err(anyhow!(
+			"sent {} XCMs with leaves of {:?} bytes, not {LARGEST_COUNT} of {MAX_LEAF}",
+			ids.len(),
+			leaves.iter().map(Vec::len).collect::<Vec<_>>(),
+		));
+	}
+	log::info!("{SENDER} sent leaves {}..{end} of exactly {MAX_LEAF} bytes", end - LARGEST_COUNT);
+
+	let per_block = (NODE_MAX_BYTES / MAX_LEAF) as u64;
+	let mut cuts = 0;
+	let follow = async {
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			if block.number() <= before_send {
+				continue;
+			}
+			let record: ConsumptionRecord =
+				call_at(receiver, Some(block.hash()), "SpecMsgApi_consumption_record", &[]).await?;
+			let reached = record.entries.get(&ParaId::from(SENDER)).and_then(|streams| {
+				streams
+					.iter()
+					.find_map(|(s, interval)| (*s == stream).then(|| interval.end.leaf_count()))
+			});
+			let Some(reached) = reached else { continue };
+			// Only the batch's leaves are the largest: `pallet-xcm` may add a small one after them.
+			let largest = reached.min(end) - consumed.min(end);
+			if largest > per_block {
+				return Err(anyhow!(
+					"{RECEIVER} block #{} consumed {largest} of the largest leaves, over the \
+					 node's budget of {per_block}",
+					block.number(),
+				));
+			}
+			if reached < end {
+				cuts += 1;
+			}
+			log::info!(
+				"{RECEIVER} block #{} consumed leaves {consumed}..{reached} and is finalized",
+				block.number(),
+			);
+			consumed = reached;
+			if consumed >= end {
+				return Ok(());
+			}
+		}
+		Err(anyhow!("receiver block subscription ended"))
+	};
+	tokio::time::timeout(Duration::from_secs(300), follow)
+		.await
+		.map_err(|_| anyhow!("consumed up to {consumed} of {end} within 5 minutes"))??;
+	if cuts < 2 {
+		return Err(anyhow!("only {cuts} blocks were cut short by the node's byte budget"));
+	}
+	wait_for("the receiver's queue to settle every XCM", || async {
+		Ok(queued(receiver).await? == 0)
+	})
+	.await?;
+	log::info!(
+		"All {LARGEST_COUNT} largest XCMs consumed over {} finalized blocks, at most {per_block} \
+		 each, and settled",
+		cuts + 1,
+	);
+	Ok(())
+}
+
 /// Bytes of each large XCM in the backpressure step: over half a message queue page, so each
 /// takes a page.
 const LARGE_XCM: usize = 60 * 1024;
@@ -419,7 +534,7 @@ async fn backpressure_and_follow(
 
 	let mut large = 0;
 	for chunk in 0..LARGE_COUNT / 8 {
-		let calls = (0..8).map(|i| send_large_xcm_to(RECEIVER, (chunk * 8 + i) as u8));
+		let calls = (0..8).map(|i| send_large_xcm_to(RECEIVER, (chunk * 8 + i) as u8, LARGE_XCM));
 		large += force_batch(sender, calls.collect()).await?.len();
 	}
 	log::info!("{SENDER} sent {large} XCMs of {LARGE_XCM} bytes");
@@ -603,11 +718,11 @@ async fn in_flight(sender: &OnlineClient<PolkadotConfig>) -> Result<u64, anyhow:
 	Ok(sent.saturating_sub(up_to))
 }
 
-/// `PolkadotXcm::send` of a `LARGE_XCM`-byte XCM to `para`: a `Transact` of a `System::remark`,
-/// which the receiver weighs and then refuses at its barrier.
-fn send_large_xcm_to(para: u32, tag: u8) -> Value {
+/// `PolkadotXcm::send` to `para` of a `Transact` of a `System::remark` of `len` bytes, which the
+/// receiver weighs and then refuses at its barrier.
+fn send_large_xcm_to(para: u32, tag: u8, len: usize) -> Value {
 	// `System` is pallet 0 and `remark` its call 0 on penpal.
-	let call = [vec![0u8, 0u8], vec![tag; LARGE_XCM].encode()].concat();
+	let call = [vec![0u8, 0u8], vec![tag; len].encode()].concat();
 	let transact = Value::named_variant(
 		"Transact",
 		[
