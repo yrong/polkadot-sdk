@@ -18,6 +18,7 @@ pub use penpal_runtime::{
 };
 
 mod genesis;
+pub mod spec_msg;
 pub use genesis::{genesis, PenpalAssetOwner, PenpalSudoAccount, ED, PARA_ID_A, PARA_ID_B};
 
 // Substrate
@@ -52,6 +53,7 @@ decl_test_parachains! {
 			LocationToAccountId: penpal_runtime::xcm_config::LocationToAccountId,
 			ParachainInfo: penpal_runtime::ParachainInfo,
 			MessageOrigin: cumulus_primitives_core::AggregateMessageOrigin,
+			AdditionalInherentCode: crate::spec_msg::SpecMsgTransport,
 		},
 		pallets = {
 			PolkadotXcm: penpal_runtime::PolkadotXcm,
@@ -75,6 +77,7 @@ decl_test_parachains! {
 			LocationToAccountId: penpal_runtime::xcm_config::LocationToAccountId,
 			ParachainInfo: penpal_runtime::ParachainInfo,
 			MessageOrigin: cumulus_primitives_core::AggregateMessageOrigin,
+			AdditionalInherentCode: crate::spec_msg::SpecMsgTransport,
 		},
 		pallets = {
 			PolkadotXcm: penpal_runtime::PolkadotXcm,
