@@ -217,6 +217,65 @@ mod benchmarks {
 		Ok(())
 	}
 
+	/// The XCM channel to the peer is open, so the flag is set.
+	#[benchmark]
+	fn set_hrmp_closing() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let peer = sibling::<T>(0);
+		open_outbound::<T>(xcm_channel(peer));
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, peer);
+
+		assert!(HrmpClosing::<T>::contains_key(peer));
+		Ok(())
+	}
+
+	/// The flag is set, so the call removes an entry.
+	#[benchmark]
+	fn clear_hrmp_closing() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let peer = sibling::<T>(0);
+		HrmpClosing::<T>::insert(peer, ());
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, peer);
+
+		assert!(!HrmpClosing::<T>::contains_key(peer));
+		Ok(())
+	}
+
+	/// The flag is not set yet, so the call inserts an entry.
+	#[benchmark]
+	fn pause_inbound_channel() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let channel = InChannelId { sender: sibling::<T>(0), domain: 0, num: 0 };
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, channel.sender, channel.domain, channel.num);
+
+		assert!(PausedInbound::<T>::contains_key(channel));
+		Ok(())
+	}
+
+	/// The flag is set, so the call removes an entry.
+	#[benchmark]
+	fn resume_inbound_channel() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let channel = InChannelId { sender: sibling::<T>(0), domain: 0, num: 0 };
+		PausedInbound::<T>::insert(channel, ());
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, channel.sender, channel.domain, channel.num);
+
+		assert!(!PausedInbound::<T>::contains_key(channel));
+		Ok(())
+	}
+
 	/// Reaccepting a closed channel whose frontier is wide.
 	#[benchmark]
 	fn accept_open_channel() -> Result<(), BenchmarkError> {
