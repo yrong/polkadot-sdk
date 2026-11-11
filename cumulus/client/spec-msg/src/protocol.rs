@@ -429,6 +429,27 @@ mod tests {
 	}
 
 	#[test]
+	fn a_receivers_burst_is_fully_served() {
+		use crate::receiver::Budget;
+		// Building an inherent asks for up to `max_streams` bindings at once, all to one peer.
+		let burst = Budget::default().max_streams as usize;
+		let mut handler = Handler::new(InFlightLimits::default());
+		let peer = PeerId::random();
+		let mut responses: Vec<_> = (0..burst).map(|_| handler.request(peer)).collect();
+		let mut previous = answered(&mut responses[0]).expect("served");
+		assert!(previous.result.is_ok());
+		for waiting in &mut responses[1..] {
+			assert!(answered(waiting).is_none(), "queued, not refused");
+		}
+		for waiting in &mut responses[1..] {
+			previous.sent_feedback.take().unwrap().send(()).unwrap();
+			handler.pool.run_until_stalled();
+			previous = answered(waiting).expect("served once the previous response is sent");
+			assert!(previous.result.is_ok());
+		}
+	}
+
+	#[test]
 	fn a_peer_is_served_again_once_its_response_is_sent() {
 		let mut handler = Handler::new(InFlightLimits::default());
 		let (a, b) = (PeerId::random(), PeerId::random());

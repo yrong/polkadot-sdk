@@ -274,6 +274,32 @@ macro_rules! impl_node_runtime_apis {
 					unimplemented!()
 				}
 			}
+
+			impl cumulus_primitives_core::SpecMsgApi<$block> for $runtime {
+				fn outbound_messages(
+				) -> Vec<(cumulus_primitives_spec_messaging::StreamId, Vec<Vec<u8>>)> {
+					unimplemented!()
+				}
+
+				fn outbound_frontiers() -> Vec<(
+					cumulus_primitives_spec_messaging::StreamId,
+					cumulus_primitives_spec_messaging::MmrFrontier,
+				)> {
+					unimplemented!()
+				}
+
+				fn consumed_streams() -> cumulus_primitives_spec_messaging::ConsumedStreams {
+					unimplemented!()
+				}
+
+				fn max_touched_streams() -> u32 {
+					unimplemented!()
+				}
+
+				fn consumption_record() -> cumulus_primitives_spec_messaging::ConsumptionRecord {
+					unimplemented!()
+				}
+			}
 		}
 	};
 }
