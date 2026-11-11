@@ -296,6 +296,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 
 const RELAY_PARENT_OFFSET: u32 = 1;
 
+/// Blocks per relay chain block, as Asset Hub Westend builds: with one core, the collator puts all
+/// of them in one PoV.
+const BLOCK_PROCESSING_VELOCITY: u32 = 3;
+
 // Unit = the base number of indivisible units for balances
 pub const UNIT: Balance = 1_000_000_000_000;
 pub const MILLIUNIT: Balance = 1_000_000_000;
@@ -1251,6 +1255,12 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 
 		fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
 			genesis_config_presets::preset_names()
+		}
+	}
+
+	impl cumulus_primitives_core::TargetBlockRate<Block> for Runtime {
+		fn target_block_rate() -> u32 {
+			BLOCK_PROCESSING_VELOCITY
 		}
 	}
 
