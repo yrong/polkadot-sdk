@@ -17,8 +17,8 @@
 
 use crate::utils::initialize_network;
 use anyhow::anyhow;
-use codec::{Decode, Encode};
-use cumulus_primitives_core::ParaId;
+use codec::{Decode, DecodeAll, Encode};
+use cumulus_primitives_core::{CumulusDigestItem, ParaId, CUMULUS_CONSENSUS_ID};
 use cumulus_primitives_spec_messaging::{
 	streams_root::streams_root, ConsumptionRecord, InChannelId, InChannelState, MmrFrontier,
 	OutChannelId, OutChannelState, StreamId, SPMS_ENGINE_ID,
@@ -1172,6 +1172,170 @@ async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
 		 and settled every XCM",
 		frontier.leaf_count(),
 	);
+	Ok(())
+}
+
+/// How long the bundle test sends traffic: `SPEC_MSG_BUNDLE_SECS`, 120 by default.
+fn bundle_secs() -> u64 {
+	std::env::var("SPEC_MSG_BUNDLE_SECS")
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(120)
+}
+
+/// One finalized block seen by the bundle test: its number, its index in its PoV's bundle, and
+/// whether its consumption record holds anything from `from`.
+#[derive(Clone, Copy, Debug)]
+struct BundleBlock {
+	number: u32,
+	index: Option<u8>,
+	consumed: bool,
+}
+
+/// The block's index in its PoV's bundle, from the `BlockBundleInfo` pre-runtime digest.
+fn bundle_index(block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>) -> Option<u8> {
+	block.header().digest.logs.iter().find_map(|item| match item {
+		DigestItem::PreRuntime(id, payload) if *id == CUMULUS_CONSENSUS_ID => {
+			match CumulusDigestItem::decode_all(&mut &payload[..]).ok()? {
+				CumulusDigestItem::BlockBundleInfo(info) => Some(info.index),
+				_ => None,
+			}
+		},
+		_ => None,
+	})
+}
+
+/// Record every finalized block of `client` with its bundle index and whether it consumed from
+/// `from`.
+fn track_bundles(
+	client: OnlineClient<PolkadotConfig>,
+	from: u32,
+) -> std::sync::Arc<std::sync::Mutex<Vec<BundleBlock>>> {
+	let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+	let out = seen.clone();
+	tokio::spawn(async move {
+		let Ok(mut blocks) = client.blocks().subscribe_finalized().await else { return };
+		while let Some(Ok(block)) = blocks.next().await {
+			let record: Option<ConsumptionRecord> =
+				call_at(&client, Some(block.hash()), "SpecMsgApi_consumption_record", &[])
+					.await
+					.ok();
+			let consumed = record.is_some_and(|r| {
+				r.entries.get(&ParaId::from(from)).is_some_and(|streams| !streams.is_empty())
+			});
+			let entry =
+				BundleBlock { number: block.number(), index: bundle_index(&block), consumed };
+			out.lock().unwrap().push(entry);
+		}
+	});
+	seen
+}
+
+/// Split `blocks`, in number order, into PoV bundles: a new bundle starts at index 0 or at a
+/// block without a bundle index.
+fn bundles(blocks: &[BundleBlock]) -> Vec<Vec<BundleBlock>> {
+	let mut sorted = blocks.to_vec();
+	sorted.sort_by_key(|b| b.number);
+	let mut out: Vec<Vec<BundleBlock>> = Vec::new();
+	for block in sorted {
+		match (block.index, out.last_mut()) {
+			(Some(i), Some(last)) if i > 0 => last.push(block),
+			_ => out.push(vec![block]),
+		}
+	}
+	out
+}
+
+/// Penpal builds three blocks per relay block on one core, so each PoV bundles them, as Asset Hub
+/// Westend does. The sender sends batches for `SPEC_MSG_BUNDLE_SECS`, so the receiver consumes in
+/// several blocks of one bundle, whose single `Requires` the relay must accept. The sender reads
+/// the receiver's register at most once per bundle. The receiver must consume and settle the whole
+/// stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let network =
+		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
+			.await?;
+	let sender: OnlineClient<PolkadotConfig> =
+		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+	let receiver: OnlineClient<PolkadotConfig> =
+		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+	let start = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
+	wait_for("both chains to finalize a block", || {
+		advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
+	})
+	.await?;
+	open_spec_msg_channel(&sender, &receiver).await?;
+
+	let consuming = track_bundles(receiver.clone(), SENDER);
+	let reading = track_bundles(sender.clone(), RECEIVER);
+	let deadline = std::time::Instant::now() + Duration::from_secs(bundle_secs());
+	let mut batches = 0u32;
+	while std::time::Instant::now() < deadline {
+		match force_batch(&sender, (0..20).map(|_| send_xcm_to(RECEIVER)).collect()).await {
+			Ok(_) => batches += 1,
+			Err(error) => log::warn!("A batch of sends failed: {error}"),
+		}
+		tokio::time::sleep(Duration::from_secs(6)).await;
+	}
+	log::info!("Sent {batches} batches of 20 XCMs; waiting for delivery");
+
+	let stream = out_channel().data_stream();
+	let mut delivered = false;
+	for _ in 0..60 {
+		let frontiers: Vec<(StreamId, MmrFrontier)> =
+			call_at(&sender, Some(best_hash(&sender).await?), "SpecMsgApi_outbound_frontiers", &[])
+				.await?;
+		let sent = frontiers.into_iter().find_map(|(s, f)| (s == stream).then_some(f));
+		let consumed = channel_map::<InChannelId, InChannelState>(&receiver, "InChannels")
+			.await?
+			.remove(&in_channel())
+			.map(|state| state.frontier);
+		if sent.is_some() && sent == consumed && queued(&receiver).await? == 0 {
+			delivered = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_secs(5)).await;
+	}
+
+	// Per bundle: how many of its blocks consumed from the other chain.
+	let summary = |name: &str, blocks: &[BundleBlock]| {
+		let bundles = bundles(blocks);
+		let per_bundle: Vec<usize> = bundles
+			.iter()
+			.map(|b| b.iter().filter(|block| block.consumed).count())
+			.collect();
+		let multi = bundles.iter().filter(|b| b.len() > 1).count();
+		log::info!(
+			"{name}: {} finalized blocks in {} bundles, {multi} with several blocks; bundles where \
+			 1, 2+ blocks consumed: {}, {}",
+			blocks.len(),
+			bundles.len(),
+			per_bundle.iter().filter(|n| **n == 1).count(),
+			per_bundle.iter().filter(|n| **n > 1).count(),
+		);
+		(multi, per_bundle)
+	};
+	let (multi, consuming) =
+		summary(&format!("{RECEIVER}, consuming {SENDER}'s channel"), &consuming.lock().unwrap());
+	let (_, reading) =
+		summary(&format!("{SENDER}, reading {RECEIVER}'s register"), &reading.lock().unwrap());
+	if multi == 0 || !consuming.iter().any(|n| *n > 1) {
+		return Err(anyhow!("no {RECEIVER} bundle consumed in more than one of its blocks"));
+	}
+	if !reading.iter().any(|n| *n > 0) {
+		return Err(anyhow!("{SENDER} read no register of {RECEIVER}"));
+	}
+	if let Some(reads) = reading.iter().copied().find(|n| *n > 1) {
+		return Err(anyhow!("a {SENDER} bundle read {RECEIVER}'s register {reads} times"));
+	}
+	if !delivered {
+		return Err(anyhow!("{RECEIVER} did not consume and settle {SENDER}'s stream"));
+	}
+	log::info!("{RECEIVER} consumed and settled all of {SENDER}'s stream");
 	Ok(())
 }
 
