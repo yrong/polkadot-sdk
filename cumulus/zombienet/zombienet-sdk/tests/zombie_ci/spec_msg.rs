@@ -926,8 +926,9 @@ struct Sample {
 	processed_block: u32,
 }
 
-/// Relay block number of each included parachain head, by head hash.
-type Inclusions = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], u32>>>;
+/// The relay block number of each included candidate, by parachain and the number of the
+/// candidate's head, which is the last block of its bundle.
+type Inclusions = std::sync::Arc<std::sync::Mutex<BTreeMap<(u32, u32), u32>>>;
 
 /// Record every `ParaInclusion::CandidateIncluded` on the relay chain's finalized blocks.
 fn track_inclusions(relay: OnlineClient<PolkadotConfig>) -> Inclusions {
@@ -944,9 +945,15 @@ fn track_inclusions(relay: OnlineClient<PolkadotConfig>) -> Inclusions {
 					continue;
 				}
 				let Ok(fields) = event.field_values() else { continue };
-				if let Some(head) = fields.at(1) {
-					let hash = sp_crypto_hashing::blake2_256(&flatten(head));
-					map.lock().unwrap().insert(hash, block.number());
+				let para = fields.at(0).and_then(|r| r.at("descriptor")).and_then(|d| {
+					d.at("para_id").and_then(|id| id.at(0).or(Some(id))).and_then(|v| v.as_u128())
+				});
+				// A head is the encoded header: the parent hash, then the compact block number.
+				let number = fields.at(1).map(flatten).and_then(|head| {
+					codec::Compact::<u32>::decode(&mut head.get(32..)?).ok().map(|n| n.0)
+				});
+				if let (Some(para), Some(number)) = (para, number) {
+					map.lock().unwrap().insert((para as u32, number), block.number());
 				}
 			}
 		}
@@ -954,15 +961,22 @@ fn track_inclusions(relay: OnlineClient<PolkadotConfig>) -> Inclusions {
 	inclusions
 }
 
-/// The relay block that included `head`, waiting up to a minute for it to finalize.
-async fn included_at(inclusions: &Inclusions, head: H256) -> Result<u32, anyhow::Error> {
+/// The relay block that included `para`'s block `number`: the first inclusion of a candidate
+/// whose last block is `number` or later. Waits up to a minute for it to finalize.
+async fn included_at(
+	inclusions: &Inclusions,
+	para: u32,
+	number: u32,
+) -> Result<u32, anyhow::Error> {
 	for _ in 0..60 {
-		if let Some(number) = inclusions.lock().unwrap().get(&head.0) {
-			return Ok(*number);
+		if let Some((_, relay)) =
+			inclusions.lock().unwrap().range((para, number)..=(para, u32::MAX)).next()
+		{
+			return Ok(*relay);
 		}
 		tokio::time::sleep(Duration::from_secs(1)).await;
 	}
-	Err(anyhow!("no inclusion of {head:?} seen"))
+	Err(anyhow!("no inclusion of {para} block #{number} seen"))
 }
 
 /// The longest the fork test sends traffic while waiting for both rare events:
@@ -1420,7 +1434,7 @@ async fn deliver(
 				let sample = Sample {
 					relay_blocks: processed_relay.saturating_sub(sent_relay),
 					sent_relay,
-					included_relay: included_at(inclusions, sent_in.hash()).await?,
+					included_relay: included_at(inclusions, SENDER, sent_in.number()).await?,
 					processed_relay,
 					sent_block: sent_in.number(),
 					processed_block: block.number(),
