@@ -191,7 +191,8 @@ async fn send_and_follow(
 		return Err(anyhow!("{SENDER}'s stream state does not rebuild the committed root"));
 	}
 
-	wait_for("the relay chain to hold that root in the sender's provides window", || async {
+	// A bundle provides only its last root, so the relay records that root or a later one.
+	let newest_from_send = || async {
 		let newest: Option<H256> = call_at(
 			relay,
 			None,
@@ -199,12 +200,20 @@ async fn send_and_follow(
 			&ParaId::from(SENDER).encode(),
 		)
 		.await?;
-		Ok(newest == Some(root))
+		match newest {
+			Some(newest) => committed_since(sender, newest, sent.number()).await,
+			None => Ok(None),
+		}
+	};
+	wait_for("the relay chain to hold a root from the send block on", || async {
+		Ok(newest_from_send().await?.is_some())
 	})
 	.await?;
+	let provided_by = newest_from_send().await?.unwrap_or_default();
 	log::info!(
-		"Checkpoint 3/6, relay: at relay block #{}, `newest_included_provides({SENDER})` is that \
-		 root: the sender's candidate was included and its `Provides` recorded",
+		"Checkpoint 3/6, relay: at relay block #{}, `newest_included_provides({SENDER})` is the \
+		 root {SENDER} block #{provided_by} committed, at or after the send: its candidate was \
+		 included and its `Provides` recorded",
 		relay.blocks().at_latest().await?.number(),
 	);
 
@@ -315,7 +324,8 @@ async fn send_batch_and_follow(
 	if processed != ids {
 		return Err(anyhow!("the batch executed out of order"));
 	}
-	if consumed != end || cuts < 2 {
+	// `pallet-xcm` may send a small leaf after the batch, which the last block can consume too.
+	if consumed < end || cuts < 2 {
 		return Err(anyhow!("consumed up to {consumed} of {end} with {cuts} cut blocks"));
 	}
 	log::info!(
@@ -1638,6 +1648,24 @@ fn committed_root(block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>) -
 		},
 		_ => None,
 	})
+}
+
+/// The number of the block on `client`'s best chain, at or after `from`, that committed `root`.
+async fn committed_since(
+	client: &OnlineClient<PolkadotConfig>,
+	root: H256,
+	from: u32,
+) -> Result<Option<u32>, anyhow::Error> {
+	let mut block = client.blocks().at(best_hash(client).await?).await?;
+	loop {
+		if block.number() < from {
+			return Ok(None);
+		}
+		if committed_root(&block) == Some(root) {
+			return Ok(Some(block.number()));
+		}
+		block = client.blocks().at(block.header().parent_hash).await?;
+	}
 }
 
 /// The stream roots a block's `StreamsRoot` commits: each stream's stored frontier, which is the
