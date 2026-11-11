@@ -728,7 +728,10 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxMsgLen = ConstU32<102400>;
 	type MaxMessagesPerBlock = ConstU32<256>;
 	type MaxInFlight = ConstU32<128>;
-	type MaxSendsPerBlock = ConstU32<1024>;
+	// With every send on its own stream, each costs about 0.72 ms and 6.9 KB of proof (measured at
+	// the worst tree depth): this keeps a block within a third of the PoV, which three bundled
+	// blocks share, and within its ref time.
+	type MaxSendsPerBlock = ConstU32<512>;
 	type MaxTouchedStreams = ConstU32<14>;
 	type MaxBundleStreams = ConstU32<3000>;
 	// Below `MaxInFlight`: a backlog is consumed over several blocks, each cut short of the item
