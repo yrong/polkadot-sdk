@@ -296,8 +296,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 
 const RELAY_PARENT_OFFSET: u32 = 1;
 
-/// Blocks per relay chain block, as Asset Hub Westend builds: with one core, the collator puts all
-/// of them in one PoV.
+/// Blocks per relay block; the collator bundles them into one PoV.
 const BLOCK_PROCESSING_VELOCITY: u32 = 3;
 
 // Unit = the base number of indivisible units for balances
@@ -692,9 +691,7 @@ parameter_types! {
 	pub const SpecMsgSupportedVersions: core::ops::RangeInclusive<u8> = 1..=1;
 }
 
-/// Weight of one spec-msg delivery-queue footprint query: a `MessageQueue::BookStateFor` read. Its
-/// proof size is what the benchmarks give an unbounded map's entry: 2475 bytes of trie nodes, the
-/// `Twox64Concat` key and the value.
+/// Account for the unbounded queue map's key, value, and trie proof.
 pub struct SpecMsgFootprintQueryWeight;
 impl frame_support::traits::Get<Weight> for SpecMsgFootprintQueryWeight {
 	fn get() -> Weight {
@@ -708,7 +705,7 @@ impl frame_support::traits::Get<Weight> for SpecMsgFootprintQueryWeight {
 	}
 }
 
-/// Weight of enqueueing a spec-msg payload: the same message-queue work as an HRMP message.
+/// Reuse the HRMP weight for the same message-queue work.
 pub struct SpecMsgEnqueueWeight;
 impl sp_runtime::traits::Convert<u32, Weight> for SpecMsgEnqueueWeight {
 	fn convert(len: u32) -> Weight {
@@ -721,21 +718,14 @@ impl sp_runtime::traits::Convert<u32, Weight> for SpecMsgEnqueueWeight {
 
 impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type SelfParaId = ParachainInfo;
-	// The protocol's single-message bound (`MAX_SPECULATIVE_MESSAGE_LEN`), which is also the usual
-	// HRMP `max_message_size`. The message queue's `MaxMessageLen` must hold it, which
-	// `integrity_test` checks. The `Data` leaf's framing takes 5 bytes of it: see
-	// `an_xcm_one_framing_short_of_the_bound_is_the_largest_that_fits`.
 	type MaxMsgLen = ConstU32<102400>;
 	type MaxMessagesPerBlock = ConstU32<256>;
 	type MaxInFlight = ConstU32<128>;
-	// With every send on its own stream, each costs about 0.72 ms and 6.9 KB of proof (measured at
-	// the worst tree depth): this keeps a block within a third of the PoV, which three bundled
-	// blocks share, and within its ref time.
+	// Keep sends within each block's share of the bundled PoV.
 	type MaxSendsPerBlock = ConstU32<512>;
 	type MaxTouchedStreams = ConstU32<14>;
 	type MaxBundleStreams = ConstU32<3000>;
-	// Below `MaxInFlight`: a backlog is consumed over several blocks, each cut short of the item
-	// the node planned, which the e2e test relies on.
+	// Stay below `MaxInFlight` to exercise partial consumption across blocks.
 	type MaxInboundMessagesPerItem = ConstU32<8>;
 	type MaxHelloPassPerBlock = ConstU32<8>;
 	type SupportedVersions = SpecMsgSupportedVersions;
@@ -745,14 +735,11 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 		TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>,
 		SpecMsgFootprintQueryWeight,
 	>;
-	// Execute the XCM channel's payloads in the channel's own queue, which XCM sees as the
-	// sibling.
 	type DataHandler = cumulus_pallet_spec_messaging::EnqueueToXcmQueue<
 		TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>,
 		SpecMsgEnqueueWeight,
 	>;
 	type WeightInfo = cumulus_pallet_spec_messaging::weights::SubstrateWeight<Runtime>;
-	// Channel lifecycle is governance-driven on the test chain.
 	type OpenChannelOrigin = EnsureRoot<AccountId>;
 	type AcceptChannelOrigin = EnsureRoot<AccountId>;
 	type ChannelManagementOrigin = EnsureRoot<AccountId>;
