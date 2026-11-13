@@ -1932,7 +1932,9 @@ dependencies = [
  "assert_matches",
  "asset-test-utils",
  "cumulus-pallet-parachain-system",
+ "cumulus-pallet-spec-messaging",
  "cumulus-pallet-xcmp-queue",
+ "cumulus-primitives-core",
  "emulated-integration-tests-common",
  "frame-support",
  "frame-system",
@@ -16283,12 +16285,14 @@ name = "penpal-emulated-chain"
 version = "0.0.0"
 dependencies = [
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "emulated-integration-tests-common",
  "frame-support",
  "parachains-common",
  "penpal-runtime",
  "sp-core 28.0.0",
  "sp-keyring",
+ "sp-runtime 31.0.1",
  "staging-xcm",
 ]
 
@@ -16300,10 +16304,12 @@ dependencies = [
  "cumulus-pallet-aura-ext",
  "cumulus-pallet-parachain-system",
  "cumulus-pallet-session-benchmarking",
+ "cumulus-pallet-spec-messaging",
  "cumulus-pallet-xcm",
  "cumulus-pallet-xcmp-queue",
  "cumulus-primitives-aura",
  "cumulus-primitives-core",
+ "cumulus-primitives-spec-messaging",
  "cumulus-primitives-utility",
  "frame-benchmarking",
  "frame-executive",

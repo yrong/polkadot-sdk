@@ -23,6 +23,7 @@ mod reserve_transfer;
 mod send;
 mod set_asset_claimer;
 mod set_xcm_versions;
+mod spec_msg;
 mod swap;
 mod teleport;
 mod transact;

@@ -157,6 +157,9 @@ pub trait AdditionalInherentCode {
 	fn on_new_block() -> DispatchResult {
 		Ok(())
 	}
+
+	/// Runs after the block's `on_finalize`, while its state still holds what the block wrote.
+	fn on_finalize_block() {}
 }
 
 impl AdditionalInherentCode for () {}
@@ -825,6 +828,7 @@ macro_rules! decl_test_parachains {
 
 						// Process `on_finalize` for all pallets except `System`.
 						$runtime::AllPalletsWithoutSystem::on_finalize(block_number);
+						<<Self as $crate::Parachain>::AdditionalInherentCode as $crate::AdditionalInherentCode>::on_finalize_block();
 					});
 
 					Self::set_last_head();
