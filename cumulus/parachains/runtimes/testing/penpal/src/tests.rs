@@ -14,9 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Speculative Messaging wiring of penpal: the router's place in `XcmRouter` (HRMP wins while
-//! it exists, spec-msg only over an open channel), the `SPMS` digest it causes, the message
-//! queue's room for consumed payloads, junk and overweight XCM on a channel, and a send flood.
+//! Penpal runtime tests for speculative messaging.
 
 use crate::{xcm_config::XcmRouter, PolkadotXcm, Runtime, RuntimeOrigin, SpecMessaging};
 use codec::DecodeAll;
@@ -47,7 +45,6 @@ fn new_test_ext() -> sp_io::TestExternalities {
 		.expect("system genesis builds; qed")
 		.into();
 	ext.execute_with(|| {
-		// A block in progress, as sends need.
 		frame_system::Pallet::<Runtime>::initialize(&1, &Default::default(), &Default::default());
 		// Both transports wrap the XCM for the destination, which needs a default version.
 		assert_ok!(PolkadotXcm::force_default_xcm_version(
@@ -66,8 +63,7 @@ fn xcm() -> Xcm<()> {
 	Xcm(vec![ClearOrigin])
 }
 
-/// The outbound spec-msg XCM channel to [`SIBLING`] as an accept/`Hello`/`Opened` round trip
-/// leaves it: open, with nothing in flight.
+/// Seed the state after a completed opening handshake.
 fn open_spec_msg_channel() {
 	let max_message_size = 102400;
 	OutChannels::<Runtime>::insert(
@@ -89,8 +85,6 @@ fn open_spec_msg_channel() {
 	);
 }
 
-/// An HRMP egress channel to [`SIBLING`] with room, as `ParachainSystem` stores it from relay
-/// state.
 fn open_hrmp_channel() {
 	RelevantMessagingState::<Runtime>::put(MessagingStateSnapshot {
 		dmq_mqc_head: Default::default(),
@@ -116,7 +110,6 @@ fn open_hrmp_channel() {
 #[test]
 fn hrmp_wins_while_a_channel_exists() {
 	new_test_ext().execute_with(|| {
-		// Even with an open spec-msg channel, sibling XCM keeps going through `XcmpQueue`.
 		open_hrmp_channel();
 		open_spec_msg_channel();
 		assert_ok!(send_xcm::<XcmRouter>(sibling(), xcm()));
@@ -127,13 +120,10 @@ fn hrmp_wins_while_a_channel_exists() {
 #[test]
 fn without_hrmp_xcm_goes_over_spec_msg_only_on_an_open_channel() {
 	new_test_ext().execute_with(|| {
-		// No HRMP and no spec-msg channel: the router falls through, and `XcmpQueue` fails the
-		// send rather than spec-msg taking it.
 		assert!(send_xcm::<XcmRouter>(sibling(), xcm()).is_err());
 		assert!(OutboundMessages::<Runtime>::iter().next().is_none());
 
-		// With the channel open, the XCM lands on it as a `Data` leaf holding the
-		// `VersionedXcm`. (`WithUniqueTopic` appends a topic, so decode rather than compare.)
+		// `WithUniqueTopic` appends a topic, so decode rather than compare.
 		open_spec_msg_channel();
 		assert_ok!(send_xcm::<XcmRouter>(sibling(), xcm()));
 		let sent = OutboundMessages::<Runtime>::get(xcm_channel(SIBLING.into()).data_stream());
@@ -143,7 +133,6 @@ fn without_hrmp_xcm_goes_over_spec_msg_only_on_an_open_channel() {
 		};
 		assert!(VersionedXcm::<()>::decode_all(&mut &data[..]).is_ok());
 
-		// The block commits the stream: the root and the `SPMS` digest.
 		let root = SpecMessaging::commit_streams_root().expect("a stream was touched; qed");
 		assert_eq!(SpecMessaging::current_streams_root(), Some(root));
 		assert!(frame_system::Pallet::<Runtime>::digest()
@@ -156,7 +145,6 @@ fn without_hrmp_xcm_goes_over_spec_msg_only_on_an_open_channel() {
 #[test]
 fn a_closing_hrmp_channel_diverts_new_xcm_while_it_drains() {
 	new_test_ext().execute_with(|| {
-		// HRMP still open, but flagged for the cutover: new XCM goes over spec-msg.
 		open_hrmp_channel();
 		open_spec_msg_channel();
 		assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), SIBLING.into()));
@@ -168,7 +156,6 @@ fn a_closing_hrmp_channel_diverts_new_xcm_while_it_drains() {
 
 #[test]
 fn consumed_payloads_fit_the_message_queue() {
-	// `EnqueueToXcmQueue` needs room for every payload the pallet can consume.
 	assert!(
 		pallet_message_queue::MaxMessageLenOf::<Runtime>::get() >=
 			<Runtime as cumulus_pallet_spec_messaging::Config>::MaxMsgLen::get(),
@@ -209,14 +196,12 @@ fn a_full_delivery_queue_stops_consuming_its_channel() {
 fn an_xcm_one_framing_short_of_the_bound_is_the_largest_that_fits() {
 	new_test_ext().execute_with(|| {
 		open_spec_msg_channel();
-		// The `Data` leaf adds a variant byte and a 4-byte compact length to the XCM, and the leaf
-		// may not pass the protocol's 102,400-byte bound: an XCM at the HRMP maximum does not fit.
+		// Channel framing counts toward the protocol's message bound.
 		assert_ok!(SpecMessaging::can_send(xcm_channel(SIBLING.into()), 102_395));
 		assert!(SpecMessaging::can_send(xcm_channel(SIBLING.into()), 102_396).is_err());
 	});
 }
 
-/// Hand `payloads` to the pallet's data handler as the XCM channel from [`SIBLING`] consumes them.
 fn consume(payloads: &[Vec<u8>]) {
 	use cumulus_pallet_spec_messaging::OnSpecMsgData;
 	let stream = cumulus_primitives_spec_messaging::StreamId::Channel {
@@ -269,7 +254,6 @@ fn junk_and_overweight_xcm_do_not_hold_up_the_channel() {
 			crate::MessageQueueServiceWeight::get(),
 		);
 
-		// Each is settled in order, and the queue moves past the junk and the overweight one.
 		let index = |id: sp_core::H256| {
 			payloads.iter().position(|p| sp_io::hashing::blake2_256(p) == id.0).unwrap()
 		};
@@ -286,7 +270,6 @@ fn junk_and_overweight_xcm_do_not_hold_up_the_channel() {
 	});
 }
 
-/// End the block as its hooks do and start the next, past initialization.
 fn next_block() {
 	use frame_support::traits::Hooks;
 	let number = frame_system::Pallet::<Runtime>::block_number();
@@ -300,7 +283,6 @@ fn next_block() {
 	frame_system::Pallet::<Runtime>::note_finished_initialize();
 }
 
-/// The topics of this block's sends on the XCM channel to [`SIBLING`], in order.
 fn sent_topics() -> Vec<u8> {
 	let stream = xcm_channel(SIBLING.into()).data_stream();
 	OutboundMessages::<Runtime>::get(stream)
@@ -328,8 +310,6 @@ fn a_send_flood_stops_at_the_in_flight_window_in_order_and_raises_the_fee() {
 		let window: u32 = <Runtime as cumulus_pallet_spec_messaging::Config>::MaxInFlight::get();
 		let topic = |n: u8| Xcm::<()>(vec![ClearOrigin, SetTopic([n; 32])]);
 		let mut sent = Vec::new();
-		// 200 sends, as a batch keeps trying them: a block that has no room ends, the window
-		// that is full refuses for good.
 		for n in 0..200u8 {
 			match send_xcm::<XcmRouter>(sibling(), topic(n)) {
 				Ok(_) => {},

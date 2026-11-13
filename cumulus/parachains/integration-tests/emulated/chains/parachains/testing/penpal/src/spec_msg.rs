@@ -13,10 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Speculative Messaging between emulated penpal chains. Each block's sends are copied into an
-//! archive the test thread shares, and each block consumes what its channels and registers have
-//! there, through the pallet's own `create_inherent`. Like the emulator's HRMP, delivery is
-//! trusted: no lifts, `Requires` or relay matching.
+//! Trusted delivery between emulated Penpal chains, without proof or relay dependency checks.
 
 use cumulus_primitives_spec_messaging::{
 	leaf_hash, LossyRead, MessagingInherentData, MmrFrontier, StreamId, INHERENT_IDENTIFIER,
@@ -33,19 +30,15 @@ use sp_runtime::traits::Dispatchable;
 use std::{cell::RefCell, collections::BTreeMap};
 
 thread_local! {
-	/// Every leaf each chain sent, by sending chain and stream, in order.
 	static ARCHIVE: RefCell<BTreeMap<(u32, StreamId), Vec<Vec<u8>>>> = RefCell::new(BTreeMap::new());
 }
 
-/// The frontier over `leaves`.
 fn frontier(leaves: &[Vec<u8>]) -> MmrFrontier {
 	let mut frontier = MmrFrontier::new();
 	leaves.iter().for_each(|leaf| frontier.append(leaf_hash(leaf)));
 	frontier
 }
 
-/// What this chain can consume now: its channels' leaves past the stored frontier, and its
-/// outbound channels' newest register past the cursor.
 fn inherent_data() -> MessagingInherentData {
 	let us = ParachainInfo::parachain_id();
 	let consumed = SpecMessaging::consumed_streams();
@@ -81,7 +74,6 @@ fn inherent_data() -> MessagingInherentData {
 	data
 }
 
-/// Carries speculative messages between the emulated penpal chains.
 pub struct SpecMsgTransport;
 
 impl AdditionalInherentCode for SpecMsgTransport {
@@ -98,7 +90,7 @@ impl AdditionalInherentCode for SpecMsgTransport {
 		RuntimeCall::SpecMessaging(call)
 			.dispatch(RuntimeOrigin::none())
 			.map_err(|e| e.error)?;
-		// Execute what was enqueued now, as the emulator does for HRMP.
+		// Match the emulator's HRMP queue servicing.
 		let _ = MessageQueue::service_queues(Weight::MAX);
 		Ok(())
 	}
