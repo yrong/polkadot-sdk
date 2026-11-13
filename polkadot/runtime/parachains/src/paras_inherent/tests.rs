@@ -148,6 +148,128 @@ mod enter {
 		}
 	}
 
+	fn blocked_selection_scenario() -> ParachainsInherentData<HeaderFor<Test>> {
+		let mut data = make_inherent_data(TestConfig {
+			dispute_statements: BTreeMap::new(),
+			dispute_sessions: vec![],
+			backed_and_concluding: BTreeMap::from([(0, 1)]),
+			num_validators_per_core: 1,
+			code_upgrade: None,
+			elastic_paras: BTreeMap::new(),
+			unavailable_cores: vec![],
+			descriptor_version: CandidateDescriptorVersionConfig::V2,
+			approved_peer_signal: None,
+			candidate_modifier: None,
+		})
+		.data;
+		data.backed_candidates.clear();
+		let mut receipt = TestCandidateBuilder { para_id: 0.into(), ..Default::default() }.build();
+		receipt.commitments.upward_messages = vec![
+			polkadot_primitives::UMP_SEPARATOR,
+			UMPSignal::Requires(
+				polkadot_primitives::RequiresSet::try_from_iter([(
+					99.into(),
+					polkadot_primitives::StreamsRoot(polkadot_primitives::Hash::repeat_byte(99)),
+				)])
+				.expect("one requirement; qed"),
+			)
+			.encode(),
+		]
+		.try_into()
+		.expect("two signals fit; qed");
+		let pending = inclusion::CandidatePendingAvailability::new(
+			CoreIndex(0),
+			receipt.hash(),
+			receipt.descriptor,
+			receipt.commitments,
+			bitvec::bitvec![u8, bitvec::order::Lsb0; 1; 1],
+			bitvec::bitvec![u8, bitvec::order::Lsb0; 0; 1],
+			0,
+			frame_system::Pallet::<Test>::block_number(),
+			polkadot_primitives::GroupIndex(0),
+		);
+		inclusion::PendingAvailability::<Test>::insert(
+			ParaId::from(0),
+			alloc::collections::VecDeque::from([pending]),
+		);
+		data
+	}
+
+	#[test]
+	fn blocked_selection_is_charged_on_every_pass_without_bitfields() {
+		new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+			let mut data = blocked_selection_scenario();
+			data.bitfields.clear();
+			let selection = Weight::from_parts(100_000, 0);
+			let without_selection = paras_inherent_total_weight::<Test>(
+				&data.backed_candidates,
+				&data.bitfields,
+				&data.disputes,
+			);
+			crate::mock::SelectionWeight::set(selection);
+			assert_eq!(
+				paras_inherent_total_weight::<Test>(
+					&data.backed_candidates,
+					&data.bitfields,
+					&data.disputes,
+				)
+				.ref_time(),
+				without_selection.ref_time() + selection.ref_time()
+			);
+			for _ in 0..2 {
+				let (processed, post) = Pallet::<Test>::process_inherent_data(data.clone())
+					.expect("valid parent and empty input; qed");
+				assert_eq!(post.actual_weight.map(|w| w.ref_time()), Some(selection.ref_time()));
+				assert!(processed.bitfields.is_empty());
+				assert_eq!(inclusion::Pallet::<Test>::get_occupied_cores().count(), 1);
+			}
+			crate::mock::SelectionWeight::set(Weight::zero());
+		});
+	}
+
+	#[test]
+	fn selection_scan_is_charged_when_disputes_freeze_processing() {
+		new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+			let data = blocked_selection_scenario();
+			let selection = Weight::from_parts(100_000, 0);
+			crate::mock::SelectionWeight::set(selection);
+			crate::disputes::Frozen::<Test>::set(Some(1));
+			let (processed, post) = Pallet::<Test>::process_inherent_data(data)
+				.expect("valid parent and frozen chain; qed");
+			assert_eq!(post.actual_weight.map(|w| w.ref_time()), Some(selection.ref_time()));
+			assert!(processed.bitfields.is_empty());
+			assert_eq!(inclusion::Pallet::<Test>::get_occupied_cores().count(), 1);
+			crate::mock::SelectionWeight::set(Weight::zero());
+		});
+	}
+
+	#[test]
+	fn selection_reserves_the_budget_before_bitfield_filtering() {
+		for reserve in [false, true] {
+			new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+				let data = blocked_selection_scenario();
+				assert_eq!(data.bitfields.len(), 1);
+				let selection = if reserve {
+					BlockWeights::get().max_block.set_proof_size(0)
+				} else {
+					Weight::zero()
+				};
+				crate::mock::SelectionWeight::set(selection);
+				let (processed, post) = Pallet::<Test>::process_inherent_data(data)
+					.expect("valid parent and bitfields; qed");
+				assert_eq!(processed.bitfields.len(), usize::from(!reserve));
+				if reserve {
+					assert_eq!(
+						post.actual_weight.map(|w| w.ref_time()),
+						Some(selection.ref_time())
+					);
+				}
+				assert_eq!(inclusion::Pallet::<Test>::get_occupied_cores().count(), 1);
+				crate::mock::SelectionWeight::set(Weight::zero());
+			});
+		}
+	}
+
 	/// Create a dummy collator id suitable to be used in a V1 candidate descriptor.
 	fn junk_collator() -> CollatorId {
 		CollatorId::from_slice(&mut (0..32).into_iter().collect::<Vec<_>>().as_slice())
@@ -2443,7 +2565,7 @@ mod enter {
 
 			let data = scenario.data.clone();
 			assert_eq!(data.backed_candidates.len(), 2);
-			// Nothing is filtered: para 1's `Requires` matched.
+			// Dependency membership no longer filters candidates at backing.
 			assert_ok!(Pallet::<Test>::enter(frame_system::RawOrigin::None.into(), data));
 
 			// The root went through the real enactment path.
@@ -2481,10 +2603,9 @@ mod enter {
 			.collect()
 	}
 
-	/// A receiver cannot settle against a root that is only backed, even with the sender's
-	/// candidate in the same block: roots enter the window on enactment, not on backing.
+	/// Matching waits for enactment; a missing root does not prevent backing.
 	#[test]
-	fn requires_cannot_match_a_root_that_is_only_backed() {
+	fn requires_on_a_pending_root_does_not_prevent_backing() {
 		new_test_ext(default_config()).execute_with(|| {
 			let mut backed_and_concluding = BTreeMap::new();
 			backed_and_concluding.insert(0, 1);
@@ -2511,14 +2632,13 @@ mod enter {
 			});
 			assert_eq!(scenario.data.backed_candidates.len(), 2);
 
-			assert_eq!(kept_paras(scenario), vec![ParaId::from(0)]);
+			assert_eq!(kept_paras(scenario), vec![ParaId::from(0), ParaId::from(1)]);
 			// The sender's candidate is now pending availability, so its root is not settled.
 			assert_eq!(inclusion::Pallet::<Test>::newest_provides(ParaId::from(0)), None);
 		});
 	}
 
-	/// The sanitize gate keeps a candidate whose signals fail to parse, so a malformed `Requires`
-	/// must be dropped by the signal check first. Both forms here name roots no window holds.
+	/// Signal validation rejects malformed requirements independently of root membership.
 	#[test]
 	fn a_malformed_requires_is_dropped_before_the_window_check() {
 		new_test_ext(default_config()).execute_with(|| {
@@ -2573,10 +2693,9 @@ mod enter {
 		});
 	}
 
-	/// A candidate whose `Requires` misses is dropped with its descendants, so a later block of
-	/// the same para cannot be enacted on top of the dropped one. Its ancestors stay.
+	/// Unmatched dependencies leave the backed chain intact until enactment selection.
 	#[test]
-	fn an_unmet_requires_drops_the_candidate_and_its_descendants() {
+	fn an_unmet_requires_does_not_filter_backed_descendants() {
 		new_test_ext(default_config()).execute_with(|| {
 			let mut backed_and_concluding = BTreeMap::new();
 			backed_and_concluding.insert(0, 1);
@@ -2605,7 +2724,10 @@ mod enter {
 			});
 			assert_eq!(scenario.data.backed_candidates.len(), 4);
 
-			assert_eq!(kept_paras(scenario), vec![ParaId::from(0), ParaId::from(1)]);
+			assert_eq!(
+				kept_paras(scenario),
+				vec![ParaId::from(0), ParaId::from(1), ParaId::from(1), ParaId::from(1)]
+			);
 		});
 	}
 
@@ -5407,77 +5529,5 @@ mod sanitizers {
 				assert_eq!(candidate_receipt_with_backing_validator_indices.len(), untouched.len());
 			});
 		}
-	}
-}
-
-#[cfg(test)]
-mod speculative_admission_gate {
-	//! Candidate-level tests for the `check_speculative_messaging` sanitize gate, which matches a
-	//! candidate's `Requires` against the relay-side provides windows.
-	use super::{check_speculative_messaging, default_config};
-	use crate::{
-		inclusion::tests::TestCandidateBuilder,
-		mock::{new_test_ext, Test},
-	};
-	use codec::Encode;
-	use polkadot_primitives::{
-		BackedCandidate, CoreIndex, Id as ParaId, RequiresSet, StreamsRoot, UMPSignal,
-	};
-
-	fn sr(b: u8) -> StreamsRoot {
-		StreamsRoot(polkadot_primitives::Hash::repeat_byte(b))
-	}
-
-	fn requires(source: u32, root: u8) -> RequiresSet {
-		RequiresSet::try_from_iter([(ParaId::from(source), sr(root))]).unwrap()
-	}
-
-	/// A V2 candidate (which auto-carries a `SelectCore` signal), optionally also carrying
-	/// `Provides` / `Requires` speculative signals.
-	fn candidate(
-		para: u32,
-		provides: Option<StreamsRoot>,
-		requires: Option<RequiresSet>,
-	) -> BackedCandidate {
-		let mut builder = TestCandidateBuilder::default();
-		builder.para_id = ParaId::from(para);
-		builder.core_index = Some(CoreIndex(0));
-		let mut ccr = builder.build();
-		if let Some(r) = requires {
-			ccr.commitments.upward_messages.force_push(UMPSignal::Requires(r).encode());
-		}
-		if let Some(p) = provides {
-			ccr.commitments.upward_messages.force_push(UMPSignal::Provides(p).encode());
-		}
-		BackedCandidate::new(ccr.into(), Default::default(), Default::default(), CoreIndex(0))
-	}
-
-	#[test]
-	fn matches_requires_against_window() {
-		new_test_ext(default_config()).execute_with(|| {
-			let source = 1000;
-			crate::inclusion::Pallet::<Test>::record_provides(ParaId::from(source), sr(0xA));
-
-			// `Requires` present in the source's window → kept.
-			assert!(check_speculative_messaging::<Test>(&candidate(
-				2000,
-				None,
-				Some(requires(source, 0xA)),
-			)));
-			// `Requires` with the wrong root → not in window → dropped.
-			assert!(!check_speculative_messaging::<Test>(&candidate(
-				2000,
-				None,
-				Some(requires(source, 0xC)),
-			)));
-			// `Requires` for an unknown source → dropped.
-			assert!(!check_speculative_messaging::<Test>(&candidate(
-				2000,
-				None,
-				Some(requires(9999, 0xA)),
-			)));
-			// No `Requires` (only `Provides`) → nothing to match → kept.
-			assert!(check_speculative_messaging::<Test>(&candidate(2000, Some(sr(0xB)), None)));
-		});
 	}
 }

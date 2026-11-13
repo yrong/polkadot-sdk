@@ -833,6 +833,10 @@ impl SendXcm for DummyXcmSender {
 	}
 }
 
+parameter_types! {
+	pub static SelectionWeight: Weight = Weight::zero();
+}
+
 pub struct InclusionWeightInfo;
 
 impl crate::inclusion::WeightInfo for InclusionWeightInfo {
@@ -841,6 +845,9 @@ impl crate::inclusion::WeightInfo for InclusionWeightInfo {
 	}
 	fn requires_satisfied(_r: u32) -> Weight {
 		Weight::zero()
+	}
+	fn enactment_selection(_c: u32, _r: u32, _b: u32) -> Weight {
+		SelectionWeight::get()
 	}
 }
 
