@@ -575,8 +575,9 @@ impl<T: Config> Pallet<T> {
 		let mut weight = Weight::zero();
 
 		let mut eligible = BTreeMap::new();
-		let mut pending_paraids = Vec::new();
-		for (paraid, mut candidates) in PendingAvailability::<T>::iter() {
+		let pending_paraids: Vec<_> = PendingAvailability::<T>::iter_keys().collect();
+		for &paraid in &pending_paraids {
+			let Some(mut candidates) = PendingAvailability::<T>::get(paraid) else { continue };
 			for candidate in candidates.iter_mut() {
 				if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
 					for validator_index in validator_indices.iter() {
@@ -600,7 +601,6 @@ impl<T: Config> Pallet<T> {
 					requires: signals.requires().cloned(),
 				});
 			}
-			pending_paraids.push(paraid);
 			eligible.insert(paraid, chain);
 			PendingAvailability::<T>::insert(paraid, candidates);
 		}
