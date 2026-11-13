@@ -244,6 +244,48 @@ mod enter {
 	}
 
 	#[test]
+	fn backing_reserves_the_added_pending_selection_cost() {
+		new_test_ext(MockGenesisConfig::default()).execute_with(|| {
+			use crate::mock::{
+				SelectionByteWeight, SelectionCandidateWeight, SelectionRequirementWeight,
+			};
+			let mut receipt =
+				TestCandidateBuilder { para_id: 1.into(), ..Default::default() }.build();
+			receipt.commitments.upward_messages = vec![
+				polkadot_primitives::UMP_SEPARATOR,
+				UMPSignal::Requires(
+					polkadot_primitives::RequiresSet::try_from_iter([(
+						9.into(),
+						polkadot_primitives::StreamsRoot(Default::default()),
+					)])
+					.expect("one requirement; qed"),
+				)
+				.encode(),
+			]
+			.try_into()
+			.expect("two signals fit; qed");
+			let candidate = BackedCandidate::new(receipt, vec![], Default::default(), CoreIndex(0));
+			let budget = backed_candidate_weight::<Test>(&candidate).set_proof_size(u64::MAX);
+			for (c, e, b) in [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+				SelectionCandidateWeight::set(c);
+				SelectionRequirementWeight::set(e);
+				SelectionByteWeight::set(b);
+				let mut candidates = vec![candidate.clone()];
+				apply_weight_limit::<Test>(
+					&mut candidates,
+					&mut vec![],
+					budget,
+					&mut rand_chacha::ChaChaRng::from_seed([0; 32]),
+				);
+				assert_eq!(candidates.len(), usize::from(c + e + b == 0));
+			}
+			SelectionCandidateWeight::set(0);
+			SelectionRequirementWeight::set(0);
+			SelectionByteWeight::set(0);
+		});
+	}
+
+	#[test]
 	fn selection_reserves_the_budget_before_bitfield_filtering() {
 		for reserve in [false, true] {
 			new_test_ext(MockGenesisConfig::default()).execute_with(|| {

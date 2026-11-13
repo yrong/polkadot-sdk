@@ -196,7 +196,8 @@ pub fn backed_candidate_weight<T: frame_system::Config + Config>(
 				candidate.validity_votes().len() as u32,
 			)
 		}
-		.saturating_sub(<<T as Config>::WeightInfo as WeightInfo>::enter_empty()),
+		.saturating_sub(<<T as Config>::WeightInfo as WeightInfo>::enter_empty())
+		.saturating_add(inclusion::Pallet::<T>::backed_selection_weight(candidate)),
 		candidate,
 	)
 }
