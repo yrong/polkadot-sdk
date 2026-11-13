@@ -21,15 +21,12 @@ use westend_system_emulated_network::penpal_emulated_chain::{
 	penpal_runtime, PARA_ID_A, PARA_ID_B,
 };
 
-/// Whether `from`'s XCM channel to `to` has an open session, read on `from`.
 fn xcm_channel_open(to: u32) -> bool {
 	OutChannels::<penpal_runtime::Runtime>::get(xcm_channel(to.into()))
 		.is_some_and(|state| state.open.is_some_and(|session| session.opened))
 }
 
-/// Open the spec-msg XCM channel PenpalA -> PenpalB and flag PenpalA's HRMP to PenpalB as
-/// closing, so new XCM to PenpalB goes over spec-msg. The open takes a register round trip each
-/// way, so the chains build blocks until PenpalA reads `Opened`.
+/// Wait for the opening handshake before diverting new XCM from HRMP.
 fn open_xcm_channel_a_to_b() {
 	let root = || penpal_runtime::RuntimeOrigin::root();
 	PenpalB::execute_with(|| {
@@ -87,12 +84,10 @@ fn xcm_goes_from_penpal_a_to_penpal_b_over_spec_msg() {
 	});
 }
 
-/// PenpalA's sovereign account on PenpalB.
 fn sovereign_of_a_on_b() -> AccountId {
 	PenpalB::sovereign_account_id_of(Location::new(1, [Parachain(PARA_ID_A)]))
 }
 
-/// Send `xcm` from PenpalA to PenpalB as root.
 fn send_a_to_b(xcm: Xcm<()>) {
 	PenpalA::execute_with(|| {
 		let dest = VersionedLocation::from(Location::new(1, [Parachain(PARA_ID_B)]));
@@ -104,13 +99,11 @@ fn send_a_to_b(xcm: Xcm<()>) {
 	});
 }
 
-/// PenpalB's events since its last block, read in one block: the emulator clears them after
-/// each.
+/// Read events before the emulator clears them at the end of the block.
 fn events_on_b() -> Vec<penpal_runtime::RuntimeEvent> {
 	PenpalB::execute_with(|| PenpalB::events())
 }
 
-/// The XCMs `events` show PenpalB's message queue settled: origin transport and success.
 fn settled(events: &[penpal_runtime::RuntimeEvent]) -> Vec<(&'static str, bool)> {
 	events
 		.iter()
@@ -130,8 +123,6 @@ fn settled(events: &[penpal_runtime::RuntimeEvent]) -> Vec<(&'static str, bool)>
 		.collect()
 }
 
-/// Pay for a `System::remark_with_event` on PenpalB from PenpalA's sovereign account there, and
-/// return to it what the execution did not use.
 fn paid_remark() -> Xcm<()> {
 	let fees: Asset = (Location::here(), penpal_runtime::UNIT).into();
 	let remark = penpal_runtime::RuntimeCall::System(frame_system::Call::remark_with_event {
@@ -153,8 +144,6 @@ fn paid_remark() -> Xcm<()> {
 	])
 }
 
-/// A paid `Transact` from PenpalA executes on PenpalB as its sovereign account, at the same cost
-/// over HRMP and over spec-msg.
 #[test]
 fn a_paid_transact_is_the_same_over_hrmp_and_spec_msg() {
 	let sovereign = sovereign_of_a_on_b();
@@ -189,15 +178,12 @@ fn a_paid_transact_is_the_same_over_hrmp_and_spec_msg() {
 	assert!(runs[0] > 0);
 }
 
-/// Assets an XCM trapped over HRMP are claimed over spec-msg: PenpalB sees the same origin
-/// location for both transports, so the claim matches the trap.
 #[test]
 fn assets_trapped_over_hrmp_are_claimed_over_spec_msg() {
 	let sovereign = sovereign_of_a_on_b();
 	let sibling_a = Location::new(1, [Parachain(PARA_ID_A)]);
 	PenpalB::fund_accounts(vec![(sovereign.clone(), 10 * penpal_runtime::UNIT)]);
 
-	// Over HRMP: pay, then fail, so what the execution did not use is trapped.
 	let fees: Asset = (Location::here(), penpal_runtime::UNIT).into();
 	send_a_to_b(Xcm(vec![
 		WithdrawAsset(fees.clone().into()),
@@ -221,7 +207,6 @@ fn assets_trapped_over_hrmp_are_claimed_over_spec_msg() {
 	let assets: Assets = trapped.1.try_into().expect("a current version");
 	let claimed: Asset = assets.inner()[0].clone();
 
-	// Over spec-msg: claim them and pay with them.
 	open_xcm_channel_a_to_b();
 	let before = PenpalB::execute_with(|| {
 		<penpal_runtime::Balances as frame_support::traits::fungible::Inspect<_>>::balance(
@@ -248,8 +233,7 @@ fn assets_trapped_over_hrmp_are_claimed_over_spec_msg() {
 	assert!(after > before, "the claim deposited nothing back");
 }
 
-/// What a dry run of PenpalA's send to PenpalB forwards there, without the unique `SetTopic` each
-/// send gets, and the delivery fee PenpalA quotes for it in its native asset.
+/// Remove the per-send topic so forwarded XCM can be compared across transports.
 fn dry_run_send_a_to_b() -> (Vec<Xcm<()>>, u128) {
 	use xcm_runtime_apis::{
 		dry_run::runtime_decl_for_dry_run_api::DryRunApiV2,
@@ -288,8 +272,6 @@ fn dry_run_send_a_to_b() -> (Vec<Xcm<()>>, u128) {
 	})
 }
 
-/// A dry run of PenpalA's send forwards the same XCM to PenpalB, and the same delivery fee is
-/// quoted, before and after the cutover to spec-msg.
 #[test]
 fn a_dry_run_forwards_the_same_xcm_and_fee_over_hrmp_and_spec_msg() {
 	let over_hrmp = dry_run_send_a_to_b();
@@ -300,9 +282,6 @@ fn a_dry_run_forwards_the_same_xcm_and_fee_over_hrmp_and_spec_msg() {
 	assert!(over_hrmp.1 > 0);
 }
 
-/// PenpalB's native asset, held on PenpalA as a foreign asset, goes back to PenpalB with
-/// `transfer_assets` (PenpalB is the reserve): the beneficiary receives the same amount over HRMP
-/// and over spec-msg.
 #[test]
 fn a_reserve_transfer_back_home_is_the_same_over_hrmp_and_spec_msg() {
 	let b_native = Location::new(1, [Parachain(PARA_ID_B)]);
@@ -351,7 +330,6 @@ fn a_reserve_transfer_back_home_is_the_same_over_hrmp_and_spec_msg() {
 	assert!(received[0] > 0 && received[0] < amount);
 }
 
-/// The messages waiting in PenpalB's queues, by origin transport.
 fn queued_on_b() -> Vec<(&'static str, u64)> {
 	PenpalB::execute_with(|| {
 		use frame_support::traits::QueueFootprintQuery;
@@ -373,8 +351,6 @@ fn queued_on_b() -> Vec<(&'static str, u64)> {
 	})
 }
 
-/// Suspending XCM execution on PenpalB holds an XCM from PenpalA in its queue until it resumes,
-/// over HRMP and over spec-msg.
 #[test]
 fn suspended_xcm_execution_holds_hrmp_and_spec_msg_alike() {
 	let root = || penpal_runtime::RuntimeOrigin::root();
@@ -407,8 +383,6 @@ fn suspended_xcm_execution_holds_hrmp_and_spec_msg_alike() {
 	}
 }
 
-/// PenpalA's version subscription reaches PenpalB over HRMP and over spec-msg alike: PenpalB starts
-/// notifying, and PenpalA learns its version from the reply, which comes back over HRMP.
 #[test]
 fn a_version_subscription_is_the_same_over_hrmp_and_spec_msg() {
 	let root = || penpal_runtime::RuntimeOrigin::root();
