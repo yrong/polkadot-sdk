@@ -43,13 +43,15 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 use pallet_message_queue::OnQueueChanged;
+#[cfg(any(test, feature = "runtime-benchmarks"))]
+use polkadot_primitives::RequiresSet;
 use polkadot_primitives::{
 	effective_minimum_backing_votes, skip_ump_signals, supermajority_threshold, well_known_keys,
 	BackedCandidate, CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
 	CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex, HeadData,
-	Id as ParaId, RequiresSet, SignedAvailabilityBitfields, SigningContext, StreamsRoot,
-	UpwardMessage, ValidatorId, ValidatorIndex, ValidityAttestation,
+	Id as ParaId, SignedAvailabilityBitfields, SigningContext, StreamsRoot, UpwardMessage,
+	ValidatorId, ValidatorIndex, ValidityAttestation,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{traits::One, DispatchError, SaturatedConversion, Saturating};
@@ -64,6 +66,8 @@ mod benchmarking;
 
 pub mod migration;
 
+mod enactment;
+
 pub trait WeightInfo {
 	/// Weight for `enact_candidate` extrinsic given the number of sent messages
 	/// (ump, hrmp), whether there is a new code for a runtime upgrade, and whether the candidate
@@ -74,6 +78,11 @@ pub trait WeightInfo {
 	fn enact_candidate(u: u32, h: u32, c: u32, p: u32) -> Weight;
 	/// Weight of matching a `Requires` set of `r` entries against the provides windows.
 	fn requires_satisfied(r: u32) -> Weight;
+	/// Selection for `c` candidates, at most `r` requirements each, and `b` encoded bytes.
+	/// Replace the provisional composition with benchmarked weights.
+	fn enactment_selection(c: u32, r: u32, _b: u32) -> Weight {
+		Self::requires_satisfied(r).saturating_mul(c.into())
+	}
 }
 
 pub struct TestWeightInfo;
@@ -565,50 +574,45 @@ impl<T: Config> Pallet<T> {
 		let mut freed_cores = vec![];
 		let mut weight = Weight::zero();
 
-		let pending_paraids: Vec<_> = PendingAvailability::<T>::iter_keys().collect();
-		for paraid in pending_paraids {
-			PendingAvailability::<T>::mutate(paraid, |candidates| {
-				if let Some(candidates) = candidates {
-					let mut last_enacted_index: Option<usize> = None;
-
-					for (candidate_index, candidate) in candidates.iter_mut().enumerate() {
-						if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
-							for validator_index in validator_indices.iter() {
-								// defensive check - this is constructed by loading the
-								// availability bitfield record, which is always `Some` if
-								// the core is occupied - that's why we're here.
-								if let Some(mut bit) =
-									candidate.availability_votes.get_mut(validator_index.0 as usize)
-								{
-									*bit = true;
-								}
-							}
-						}
-
-						// We check for the candidate's availability even if we didn't get any new
-						// bitfields for its core, as it may have already been available at a
-						// previous block but wasn't enacted due to its predecessors not being
-						// available.
-						if candidate.availability_votes.count_ones() >= threshold {
-							// We can only enact a candidate if we've enacted all of its
-							// predecessors already.
-							let can_enact = if candidate_index == 0 {
-								last_enacted_index == None
-							} else {
-								let prev_candidate_index = usize::try_from(candidate_index - 1)
-									.expect("Previous `if` would have caught a 0 candidate index.");
-								matches!(last_enacted_index, Some(old_index) if old_index == prev_candidate_index)
-							};
-
-							if can_enact {
-								last_enacted_index = Some(candidate_index);
-							}
+		let mut eligible = BTreeMap::new();
+		let mut pending_paraids = Vec::new();
+		for (paraid, mut candidates) in PendingAvailability::<T>::iter() {
+			for candidate in candidates.iter_mut() {
+				if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
+					for validator_index in validator_indices.iter() {
+						// defensive check - this is constructed by loading the
+						// availability bitfield record, which is always `Some` if
+						// the core is occupied - that's why we're here.
+						if let Some(mut bit) =
+							candidate.availability_votes.get_mut(validator_index.0 as usize)
+						{
+							*bit = true;
 						}
 					}
-
-					// Trim the pending availability candidates storage and enact candidates of this
-					// para now.
-					if let Some(last_enacted_index) = last_enacted_index {
+				}
+			}
+			let mut chain = Vec::new();
+			for candidate in &candidates {
+				let Ok(signals) = candidate.commitments.ump_signals() else { break };
+				chain.push(enactment::Candidate {
+					available: candidate.availability_votes.count_ones() >= threshold,
+					provides: signals.provides().copied(),
+					requires: signals.requires().cloned(),
+				});
+			}
+			pending_paraids.push(paraid);
+			eligible.insert(paraid, chain);
+			PendingAvailability::<T>::insert(paraid, candidates);
+		}
+		let selected = enactment::select(&eligible, Self::provides_contains);
+		for paraid in pending_paraids {
+			let chain = &eligible[&paraid];
+			let count = (0..chain.len()).take_while(|i| selected.contains(&(paraid, *i))).count();
+			PendingAvailability::<T>::mutate(paraid, |candidates| {
+				if let Some(candidates) = candidates {
+					if let Some(last_enacted_index) = count.checked_sub(1) {
+						// Trim the pending availability candidates storage and enact candidates of
+						// this para now.
 						let evicted_candidates = candidates.drain(0..=last_enacted_index);
 						for candidate in evicted_candidates {
 							freed_cores.push((candidate.core, candidate.hash));
@@ -967,6 +971,29 @@ impl<T: Config> Pallet<T> {
 		);
 	}
 
+	/// Reserve for every pending candidate, including passes with no new bitfields.
+	pub(crate) fn pending_selection_weight() -> Weight {
+		let mut candidates = 0u32;
+		let mut max_entries = 0u32;
+		let mut bytes = 0u32;
+		for candidate in PendingAvailability::<T>::iter_values().flatten() {
+			candidates = candidates.saturating_add(1);
+			bytes = bytes.saturating_add(candidate.encoded_size().try_into().unwrap_or(u32::MAX));
+			let entries = candidate
+				.commitments
+				.ump_signals()
+				.ok()
+				.and_then(|s| s.requires().map(|r| r.len() as u32))
+				.unwrap_or(0);
+			max_entries = max_entries.max(entries);
+		}
+		if candidates == 0 {
+			return Weight::zero();
+		}
+		<T as Config>::WeightInfo::enactment_selection(candidates, max_entries.max(2), bytes)
+			.set_proof_size(0)
+	}
+
 	/// Whether `root` is present in `source`'s provides window.
 	fn provides_contains(source: ParaId, root: &StreamsRoot) -> bool {
 		// Scan newest-first: a `requires` almost always references a recent commitment, which sits
@@ -982,6 +1009,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
 	/// first miss.
+	#[cfg(any(test, feature = "runtime-benchmarks"))]
 	pub(crate) fn requires_satisfied(requires: &RequiresSet) -> Result<(), (ParaId, StreamsRoot)> {
 		// One `RecentProvides` read per required source.
 		for (source, expected) in requires.iter() {

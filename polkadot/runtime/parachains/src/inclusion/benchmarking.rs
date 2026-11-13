@@ -171,6 +171,95 @@ mod benchmarks {
 		}
 	}
 
+	/// Full-window reads followed by removal propagation through a cycle.
+	#[benchmark]
+	fn enactment_selection(
+		c: Linear<1, 1000>,
+		r: Linear<2, { MAX_COMMITMENT_ENTRIES }>,
+		b: Linear<0, { polkadot_primitives::MAX_CODE_SIZE }>,
+	) {
+		let validators = generate_validator_pairs::<T>(500)
+			.into_iter()
+			.map(|(_, validator)| validator)
+			.collect::<Vec<_>>();
+		for i in 0..c {
+			let mut requirements = vec![(((i + 1) % c).into(), root(((i + 1) % c) as u64))];
+			for j in 1..r {
+				let source = ParaId::from(10000 + i * MAX_COMMITMENT_ENTRIES + j);
+				let required =
+					root(u64::from(i) * u64::from(MAX_COMMITMENT_ENTRIES) + u64::from(j));
+				if i != 0 || j != r - 1 {
+					let window: BoundedVec<_, ConstU32<MAX_PROVIDES_WINDOW_SIZE>> =
+						core::iter::once(required)
+							.chain((1..MAX_PROVIDES_WINDOW_SIZE).map(|n| root(u64::MAX - n as u64)))
+							.collect::<Vec<_>>()
+							.try_into()
+							.expect("exact window bound; qed");
+					RecentProvides::<T>::insert(source, window);
+				}
+				requirements.push((source, required));
+			}
+			let para = ParaId::from(i);
+			let descriptor = CandidateDescriptor::<T::Hash>::new(
+				para,
+				Default::default(),
+				CoreIndex(i),
+				1,
+				Default::default(),
+				Default::default(),
+				Default::default(),
+				Default::default(),
+				ValidationCode(vec![]).hash(),
+			);
+			let mut commitments = CandidateCommitments {
+				upward_messages: Default::default(),
+				horizontal_messages: Default::default(),
+				new_validation_code: None,
+				head_data: HeadData(vec![]),
+				processed_downward_messages: 0,
+				hrmp_watermark: 0,
+			};
+			commitments.upward_messages.force_push(UMP_SEPARATOR);
+			commitments
+				.upward_messages
+				.force_push(UMPSignal::Provides(root(i as u64)).encode());
+			commitments.upward_messages.force_push(
+				UMPSignal::Requires(
+					RequiresSet::try_from_iter(requirements).expect("sorted and bounded; qed"),
+				)
+				.encode(),
+			);
+			// Vary total payload bytes independently of candidate and requirement counts.
+			if i == 0 {
+				commitments.new_validation_code = Some(ValidationCode(vec![0; b as usize]));
+			}
+			PendingAvailability::<T>::insert(
+				para,
+				VecDeque::from([CandidatePendingAvailability::new(
+					CoreIndex(i),
+					Default::default(),
+					descriptor,
+					commitments,
+					bitvec![u8, Lsb0; 1; validators.len()],
+					bitvec![u8, Lsb0; 0; validators.len()],
+					0u32.into(),
+					1u32.into(),
+					GroupIndex(0),
+				)]),
+			);
+		}
+		#[block]
+		{
+			// Declaration and reservation each scan storage before the live selection pass.
+			core::hint::black_box(Pallet::<T>::pending_selection_weight());
+			core::hint::black_box(Pallet::<T>::pending_selection_weight());
+			let (_, freed) =
+				Pallet::<T>::update_pending_availability_and_get_freed_cores(&validators, vec![]);
+			assert!(freed.is_empty());
+		}
+		assert_eq!(Pallet::<T>::get_occupied_cores().count(), c as usize);
+	}
+
 	/// `r` sources, each a full window whose oldest entry is the required root: every match
 	/// decodes a whole window and scans all of it.
 	#[benchmark]
@@ -190,6 +279,29 @@ mod benchmarks {
 		#[block]
 		{
 			assert!(Pallet::<T>::requires_satisfied(&requires).is_ok());
+		}
+	}
+
+	#[test]
+	fn selection_storage_path_smoke() {
+		use frame_benchmarking::{BenchmarkParameter, BenchmarkingSetup};
+		for (c, r, b) in [
+			(1, 2, 0),
+			(3, 4, 1024),
+			(2, MAX_COMMITMENT_ENTRIES, polkadot_primitives::MAX_CODE_SIZE),
+		] {
+			crate::mock::new_test_ext(Default::default()).execute_with(|| {
+				<enactment_selection as BenchmarkingSetup<crate::mock::Test>>::test_instance(
+					&enactment_selection,
+					&[
+						(BenchmarkParameter::c, c),
+						(BenchmarkParameter::r, r),
+						(BenchmarkParameter::b, b),
+					],
+					&|| {},
+				)
+				.expect("selection benchmark verifies; qed");
+			});
 		}
 	}
 
