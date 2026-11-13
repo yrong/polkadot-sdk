@@ -372,6 +372,9 @@ impl<T: Config> Pallet<T> {
 		};
 		log::debug!(target: LOG_TARGET, "Used max block weight: {}", max_block_weight);
 
+		let selection_weight = inclusion::Pallet::<T>::pending_selection_weight();
+		let input_weight_budget = max_block_weight.saturating_sub(selection_weight);
+
 		let entropy = compute_entropy::<T>(parent_hash);
 		let mut rng = rand_chacha::ChaChaRng::from_seed(entropy.into());
 
@@ -392,7 +395,7 @@ impl<T: Config> Pallet<T> {
 			limit_and_sanitize_disputes::<T, _>(
 				disputes,
 				dispute_statement_set_valid,
-				max_block_weight,
+				input_weight_budget,
 			);
 
 		let mut all_weight_after = {
@@ -401,7 +404,7 @@ impl<T: Config> Pallet<T> {
 			let non_disputes_weight = apply_weight_limit::<T>(
 				&mut backed_candidates,
 				&mut bitfields,
-				max_block_weight.saturating_sub(checked_disputes_sets_consumed_weight),
+				input_weight_budget.saturating_sub(checked_disputes_sets_consumed_weight),
 				&mut rng,
 			);
 
@@ -419,11 +422,14 @@ impl<T: Config> Pallet<T> {
 			log::debug!(target: LOG_TARGET, "Size after filter: {}, candidates + bitfields: {}, disputes: {}", all_weight_after.proof_size(), non_disputes_weight.proof_size(), checked_disputes_sets_consumed_weight.proof_size());
 			log::debug!(target: LOG_TARGET, "Time weight after filter: {}, candidates + bitfields: {}, disputes: {}", all_weight_after.ref_time(), non_disputes_weight.ref_time(), checked_disputes_sets_consumed_weight.ref_time());
 
-			if all_weight_after.any_gt(max_block_weight) {
+			if all_weight_after.any_gt(input_weight_budget) {
 				log::warn!(target: LOG_TARGET, "Post weight limiting weight is still too large, time: {}, size: {}", all_weight_after.ref_time(), all_weight_after.proof_size());
 			}
 			all_weight_after
 		};
+
+		// Charge the snapshot even if disputes remove pending candidates or freeze processing.
+		all_weight_after.saturating_accrue(selection_weight);
 
 		// Note that `process_checked_multi_dispute_data` will iterate and import each
 		// dispute; so the input here must be reasonably bounded,
@@ -456,7 +462,10 @@ impl<T: Config> Pallet<T> {
 			};
 
 			// The relay chain we are currently on is invalid. Proceed no further on parachains.
-			return Ok((processed, Some(checked_disputes_sets_consumed_weight).into()));
+			return Ok((
+				processed,
+				Some(checked_disputes_sets_consumed_weight.saturating_add(selection_weight)).into(),
+			));
 		}
 
 		// Contains the disputes that are concluded in the current session only,

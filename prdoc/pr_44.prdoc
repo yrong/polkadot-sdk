@@ -1,0 +1,17 @@
+title: Track speculative messaging commitments and match dependencies at enactment
+doc:
+- audience: Runtime Dev
+  description: |-
+    Retain recent messaging commitments per parachain and expose the latest included
+    root through the runtime API, excluding offboarding senders. Match dependencies
+    at enactment against stored roots and candidates selected to enact together,
+    including same-block dependencies and cycles.
+
+    Unmatched candidates and their successors remain pending until they can enact
+    or existing cleanup removes them. Account for recurring dependency selection
+    and reserve its added cost before accepting new pending candidates.
+crates:
+- name: polkadot-runtime-parachains
+  bump: major
+- name: polkadot-primitives
+  bump: major

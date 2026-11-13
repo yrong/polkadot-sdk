@@ -3209,3 +3209,488 @@ fn check_validation_outputs_for_runtime_api_rejects_oversized_new_validation_cod
 		assert!(!ParaInclusion::check_validation_outputs_for_runtime_api(chain_a, 1, commitments,));
 	});
 }
+
+#[cfg(test)]
+mod speculative_provides_window {
+	//! Isolation tests for the relay-side speculative-messaging provides window: window
+	//! advance/trim and requires matching by root.
+	use super::*;
+	use polkadot_primitives::{RequiresSet, StreamsRoot};
+
+	fn sr(b: u8) -> StreamsRoot {
+		StreamsRoot(Hash::repeat_byte(b))
+	}
+
+	fn requires(entries: &[(u32, u8)]) -> RequiresSet {
+		RequiresSet::try_from_iter(
+			entries.iter().map(|(src, root)| (ParaId::from(*src), sr(*root))),
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn record_provides_trims_to_window_and_keeps_newest() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let source = ParaId::from(1000);
+			let total = MAX_PROVIDES_WINDOW_SIZE + 3;
+			for i in 0..total {
+				ParaInclusion::record_provides(source, sr(i as u8));
+			}
+			// The window holds exactly `MAX_PROVIDES_WINDOW_SIZE` entries.
+			assert_eq!(
+				RecentProvides::<Test>::get(source).len(),
+				MAX_PROVIDES_WINDOW_SIZE as usize
+			);
+			// The 3 oldest roots were dropped; roots from index 3 onward are retained.
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 0)])).is_err());
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 2)])).is_err());
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 3)])).is_ok());
+			assert!(
+				ParaInclusion::requires_satisfied(&requires(&[(1000, (total - 1) as u8)])).is_ok()
+			);
+		});
+	}
+
+	#[test]
+	fn requires_satisfied_needs_all_sources_and_exact_roots() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let (a, b) = (ParaId::from(1), ParaId::from(2));
+			ParaInclusion::record_provides(a, sr(0xA));
+			ParaInclusion::record_provides(b, sr(0xB));
+			// Both sources present with the right roots → satisfied.
+			assert!(ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (2, 0xB)])).is_ok());
+			// Wrong root for a present source → Err names that (source, root).
+			assert_eq!(
+				ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (2, 0xC)])),
+				Err((ParaId::from(2), sr(0xC))),
+			);
+			// Unknown source → Err names it.
+			assert_eq!(
+				ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (3, 0xB)])),
+				Err((ParaId::from(3), sr(0xB))),
+			);
+			// No empty case: a `RequiresSet` is non-empty by construction. A candidate that
+			// requires nothing carries no `Requires` signal, so `paras_inherent` never calls this.
+		});
+	}
+
+	#[test]
+	fn newest_included_provides_is_the_window_head() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			use crate::runtime_api_impl::vstaging::newest_included_provides;
+			let source = ParaId::from(1000);
+			// Never provided.
+			assert_eq!(newest_included_provides::<Test>(source), None);
+
+			// The newest entry wins, including after the window trims.
+			for i in 0..MAX_PROVIDES_WINDOW_SIZE + 3 {
+				ParaInclusion::record_provides(source, sr(i as u8));
+				assert_eq!(newest_included_provides::<Test>(source), Some(sr(i as u8)));
+			}
+			// Other sources are independent.
+			assert_eq!(newest_included_provides::<Test>(ParaId::from(1001)), None);
+		});
+	}
+
+	#[test]
+	fn newest_included_provides_is_none_while_offboarding() {
+		new_test_ext(genesis_config(vec![(ParaId::from(1000), ParaKind::Parachain)])).execute_with(
+			|| {
+				use crate::runtime_api_impl::vstaging::newest_included_provides;
+				let source = ParaId::from(1000);
+				ParaInclusion::record_provides(source, sr(0xA));
+				assert_eq!(newest_included_provides::<Test>(source), Some(sr(0xA)));
+
+				paras::Pallet::<Test>::schedule_para_cleanup(source).unwrap();
+				assert_eq!(newest_included_provides::<Test>(source), None);
+			},
+		);
+	}
+
+	#[test]
+	fn offboarding_clears_provides_window() {
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			let (staying, leaving) = (ParaId::from(1), ParaId::from(2));
+			ParaInclusion::record_provides(staying, sr(0xA));
+			ParaInclusion::record_provides(leaving, sr(0xB));
+			assert!(!RecentProvides::<Test>::get(leaving).is_empty());
+
+			// A session change that offboards `leaving` drops its window; `staying` is untouched.
+			let notification = crate::initializer::SessionChangeNotification::default();
+			ParaInclusion::initializer_on_new_session(&notification, &[leaving]);
+
+			assert!(RecentProvides::<Test>::get(leaving).is_empty());
+			assert!(!RecentProvides::<Test>::get(staying).is_empty());
+		});
+	}
+
+	/// Seeded random pushes and offboardings across a few senders, checked after every
+	/// step against a plain model: window length, newest root and membership of a random root.
+	#[test]
+	fn window_matches_a_model_under_random_operations() {
+		use std::collections::{BTreeMap, VecDeque};
+
+		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
+			// Few distinct roots, so repeated roots and the eviction of a repeated one both occur.
+			let root = |n: u64| StreamsRoot(Hash::from_low_u64_be(n));
+			let distinct_roots = 3 * MAX_PROVIDES_WINDOW_SIZE as u64;
+			let sources: Vec<ParaId> = (1..=3u32).map(ParaId::from).collect();
+			let mut model: BTreeMap<ParaId, VecDeque<StreamsRoot>> = BTreeMap::new();
+			// xorshift64, so a failure replays from the same seed.
+			let mut state = 0x2545_f491_4f6c_dd1d_u64;
+			let mut next = |bound: u64| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				state % bound
+			};
+
+			for _ in 0..20_000 {
+				let source = sources[next(sources.len() as u64) as usize];
+				match next(1000) {
+					0 | 1 => {
+						let notification = crate::initializer::SessionChangeNotification::default();
+						ParaInclusion::initializer_on_new_session(&notification, &[source]);
+						model.remove(&source);
+					},
+					_ => {
+						let pushed = root(next(distinct_roots));
+						ParaInclusion::record_provides(source, pushed);
+						let window = model.entry(source).or_default();
+						window.push_back(pushed);
+						if window.len() > MAX_PROVIDES_WINDOW_SIZE as usize {
+							window.pop_front();
+						}
+					},
+				}
+
+				for source in &sources {
+					let window = model.get(source).cloned().unwrap_or_default();
+					assert_eq!(RecentProvides::<Test>::get(source).len(), window.len());
+					assert_eq!(ParaInclusion::newest_provides(*source), window.back().copied());
+					let probe = root(next(distinct_roots));
+					let set = RequiresSet::try_from_iter([(*source, probe)]).unwrap();
+					assert_eq!(
+						ParaInclusion::requires_satisfied(&set).is_ok(),
+						window.contains(&probe)
+					);
+				}
+			}
+		});
+	}
+}
+
+mod enactment_dependencies {
+	use super::*;
+
+	fn root(n: u8) -> StreamsRoot {
+		StreamsRoot(Hash::repeat_byte(n))
+	}
+
+	fn pending(
+		para: u32,
+		core: u32,
+		provides: Option<u8>,
+		requires: &[(u32, u8)],
+	) -> CandidatePendingAvailability<Hash, BlockNumber> {
+		let mut receipt =
+			TestCandidateBuilder { para_id: para.into(), ..Default::default() }.build();
+		receipt.commitments.upward_messages = Default::default();
+		if provides.is_some() || !requires.is_empty() {
+			receipt.commitments.upward_messages.force_push(UMP_SEPARATOR);
+		}
+		if let Some(r) = provides {
+			receipt
+				.commitments
+				.upward_messages
+				.force_push(UMPSignal::Provides(root(r)).encode());
+		}
+		if !requires.is_empty() {
+			let requires =
+				RequiresSet::try_from_iter(requires.iter().map(|&(p, r)| (p.into(), root(r))))
+					.unwrap();
+			receipt
+				.commitments
+				.upward_messages
+				.force_push(UMPSignal::Requires(requires).encode());
+		}
+		CandidatePendingAvailability {
+			core: CoreIndex(core),
+			hash: receipt.hash(),
+			descriptor: receipt.descriptor,
+			commitments: receipt.commitments,
+			availability_votes: bitvec::bitvec![u8, BitOrderLsb0; 1; 1],
+			backers: bitvec::bitvec![u8, BitOrderLsb0; 0; 1],
+			relay_parent_number: 0,
+			backed_in_number: 1,
+			backing_group: GroupIndex(0),
+		}
+	}
+
+	fn enact() -> Vec<(CoreIndex, CandidateHash)> {
+		ParaInclusion::update_pending_availability_and_get_freed_cores(
+			&[Sr25519Keyring::Alice.public().into()],
+			vec![],
+		)
+		.1
+	}
+
+	#[test]
+	fn pending_weight_counts_total_requirements_payload_and_empty_queues() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			use crate::mock::{
+				SelectionByteWeight, SelectionCandidateWeight, SelectionRequirementWeight,
+				SelectionWeight,
+			};
+			SelectionWeight::set(Weight::from_parts(7, 0));
+			SelectionCandidateWeight::set(11);
+			SelectionRequirementWeight::set(101);
+			SelectionByteWeight::set(1);
+			assert_eq!(ParaInclusion::pending_selection_weight(), Weight::zero());
+			PendingAvailability::<Test>::insert(
+				ParaId::from(2),
+				VecDeque::<CandidatePendingAvailability<Hash, BlockNumber>>::new(),
+			);
+			assert_eq!(ParaInclusion::pending_selection_weight(), Weight::from_parts(7 + 11, 0));
+			PendingAvailability::<Test>::remove(ParaId::from(2));
+			let a = pending(1, 0, None, &[(8, 8), (9, 9)]);
+			let mut b = pending(1, 1, None, &[(9, 9)]);
+			b.commitments.new_validation_code = Some(ValidationCode(vec![0; 4096]));
+			let bytes = (a.encoded_size() + b.encoded_size()) as u64;
+			PendingAvailability::<Test>::insert(ParaId::from(1), VecDeque::from([a, b]));
+			assert_eq!(
+				ParaInclusion::pending_selection_weight(),
+				Weight::from_parts(7 + 2 * 11 + 3 * 101 + bytes, 0)
+			);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(2),
+				VecDeque::<CandidatePendingAvailability<Hash, BlockNumber>>::new(),
+			);
+			assert_eq!(
+				ParaInclusion::pending_selection_weight(),
+				Weight::from_parts(7 + 3 * 11 + 3 * 101 + bytes, 0)
+			);
+			SelectionWeight::set(Weight::zero());
+			SelectionCandidateWeight::set(0);
+			SelectionRequirementWeight::set(0);
+			SelectionByteWeight::set(0);
+		});
+	}
+
+	#[test]
+	fn backing_reservation_covers_the_pending_encoding() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			use crate::mock::{
+				SelectionByteWeight, SelectionCandidateWeight, SelectionRequirementWeight,
+			};
+			SelectionCandidateWeight::set(11);
+			SelectionRequirementWeight::set(101);
+			SelectionByteWeight::set(1);
+			shared::ActiveValidatorKeys::<Test>::put(vec![ValidatorId::from(
+				Sr25519Keyring::Alice.public(),
+			)]);
+			let pending = pending(1, 0, Some(1), &[(8, 8), (9, 9)]);
+			let bytes = pending.encoded_size() as u64;
+			let backed = BackedCandidate::new(
+				CommittedCandidateReceipt {
+					descriptor: pending.descriptor,
+					commitments: pending.commitments,
+				},
+				vec![],
+				Default::default(),
+				CoreIndex(0),
+			);
+			assert_eq!(
+				ParaInclusion::backed_selection_weight(&backed),
+				Weight::from_parts(11 + 2 * 101 + bytes, 0)
+			);
+			SelectionCandidateWeight::set(0);
+			SelectionRequirementWeight::set(0);
+			SelectionByteWeight::set(0);
+		});
+	}
+
+	#[test]
+	fn cleanup_allows_the_same_head_with_refreshed_requirements() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			let old = pending(1, 0, Some(1), &[(9, 9)]);
+			let head = old.commitments.head_data.clone();
+			let old_hash = old.hash;
+			PendingAvailability::<Test>::insert(ParaId::from(1), VecDeque::from([old]));
+			assert!(enact().is_empty());
+			configuration::ActiveConfig::<Test>::mutate(|c| {
+				c.scheduler_params.group_rotation_frequency = 10;
+				c.scheduler_params.paras_availability_period = 4;
+			});
+			System::set_block_number(11);
+			assert_eq!(ParaInclusion::free_timedout().len(), 1);
+			ParaInclusion::record_provides(9.into(), root(10));
+			let refreshed = pending(1, 0, Some(1), &[(9, 10)]);
+			assert_eq!(refreshed.commitments.head_data, head);
+			assert_ne!(refreshed.hash, old_hash);
+			let hash = refreshed.hash;
+			PendingAvailability::<Test>::insert(ParaId::from(1), VecDeque::from([refreshed]));
+			assert_eq!(enact(), vec![(CoreIndex(0), hash)]);
+			assert_eq!(ParaInclusion::newest_provides(1.into()), Some(root(1)));
+		});
+	}
+
+	#[test]
+	fn votes_accumulate_behind_a_missing_dependency() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			let mut successor = pending(1, 1, Some(2), &[]);
+			successor.availability_votes.set(0, false);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([pending(1, 0, Some(1), &[(9, 9)]), successor]),
+			);
+			let keystore: KeystorePtr = Arc::new(LocalKeystore::in_memory());
+			keystore
+				.sr25519_generate_new(PARACHAIN_KEY_TYPE_ID, Some("//Alice"))
+				.expect("valid test seed; qed");
+			let bitfield = sign_bitfield(
+				&keystore,
+				&Sr25519Keyring::Alice,
+				ValidatorIndex(0),
+				AvailabilityBitfield(bitvec::bitvec![u8, BitOrderLsb0; 0, 1]),
+				&SigningContext { session_index: 0, parent_hash: Hash::default() },
+			);
+			let (_, freed) = ParaInclusion::update_pending_availability_and_get_freed_cores(
+				&[Sr25519Keyring::Alice.public().into()],
+				vec![bitfield],
+			);
+			assert!(freed.is_empty());
+			assert!(
+				PendingAvailability::<Test>::get(ParaId::from(1)).unwrap()[1].availability_votes[0]
+			);
+			ParaInclusion::record_provides(9.into(), root(9));
+			assert_eq!(enact().len(), 2);
+		});
+	}
+
+	#[test]
+	fn disputed_provider_cannot_release_its_transitive_dependents() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			let provider = pending(1, 0, Some(1), &[]);
+			let hash = provider.hash;
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([provider, pending(1, 1, Some(2), &[])]),
+			);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(2),
+				VecDeque::from([pending(2, 2, Some(3), &[(1, 2)])]),
+			);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(3),
+				VecDeque::from([pending(3, 3, None, &[(2, 3)])]),
+			);
+			assert_eq!(ParaInclusion::free_disputed(&BTreeSet::from([hash])).len(), 2);
+			assert!(enact().is_empty());
+			assert_eq!(ParaInclusion::get_occupied_cores().count(), 2);
+			assert!(ParaInclusion::newest_provides(2.into()).is_none());
+		});
+	}
+
+	#[test]
+	fn available_cycle_enacts_without_new_bitfields() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([pending(1, 0, Some(1), &[(2, 2)])]),
+			);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(2),
+				VecDeque::from([pending(2, 1, Some(2), &[(1, 1)])]),
+			);
+			assert_eq!(enact().len(), 2);
+			assert_eq!(ParaInclusion::newest_provides(1.into()), Some(root(1)));
+			assert_eq!(ParaInclusion::newest_provides(2.into()), Some(root(2)));
+			assert_eq!(ParaInclusion::get_occupied_cores().count(), 0);
+		});
+	}
+
+	#[test]
+	fn missing_provider_holds_the_chain_until_a_later_pass() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([pending(1, 0, Some(1), &[(9, 9)]), pending(1, 1, Some(2), &[])]),
+			);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(2),
+				VecDeque::from([pending(2, 2, None, &[(1, 2)])]),
+			);
+			assert!(enact().is_empty());
+			assert_eq!(ParaInclusion::get_occupied_cores().count(), 3);
+			assert!(
+				PendingAvailability::<Test>::get(ParaId::from(1)).unwrap()[1].availability_votes[0]
+			);
+			ParaInclusion::record_provides(9.into(), root(9));
+			assert_eq!(enact().len(), 3);
+		});
+	}
+
+	#[test]
+	fn an_expired_stored_root_cannot_enact_and_timeout_cleans_descendants() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			ParaInclusion::record_provides(9.into(), root(9));
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([pending(1, 0, None, &[(9, 9)]), pending(1, 1, None, &[])]),
+			);
+			RecentProvides::<Test>::remove(ParaId::from(9));
+			assert!(enact().is_empty());
+			configuration::ActiveConfig::<Test>::mutate(|c| {
+				c.scheduler_params.group_rotation_frequency = 10;
+				c.scheduler_params.paras_availability_period = 4;
+			});
+			System::set_block_number(11);
+			assert_eq!(ParaInclusion::free_timedout().len(), 2);
+			assert_eq!(ParaInclusion::get_occupied_cores().count(), 0);
+		});
+	}
+
+	#[test]
+	fn selection_uses_the_window_before_provider_enactment_can_evict_a_root() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			ParaInclusion::record_provides(1.into(), root(1));
+			for _ in 1..MAX_PROVIDES_WINDOW_SIZE {
+				ParaInclusion::record_provides(1.into(), root(3));
+			}
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([pending(1, 0, Some(2), &[])]),
+			);
+			PendingAvailability::<Test>::insert(
+				ParaId::from(2),
+				VecDeque::from([pending(2, 1, None, &[(1, 1)])]),
+			);
+			assert_eq!(enact().len(), 2);
+			assert!(!ParaInclusion::provides_contains(1.into(), &root(1)));
+		});
+	}
+
+	#[test]
+	fn session_change_removes_available_candidates_waiting_for_roots() {
+		new_test_ext(genesis_config(vec![])).execute_with(|| {
+			PendingAvailability::<Test>::insert(
+				ParaId::from(1),
+				VecDeque::from([pending(1, 0, None, &[(9, 9)])]),
+			);
+			assert!(enact().is_empty());
+			ParaInclusion::initializer_on_new_session(
+				&SessionChangeNotification {
+					validators: vec![],
+					queued: vec![],
+					prev_config: default_config(),
+					new_config: default_config(),
+					random_seed: [0; 32],
+					session_index: 1,
+				},
+				&[],
+			);
+			assert_eq!(ParaInclusion::get_occupied_cores().count(), 0);
+		});
+	}
+}

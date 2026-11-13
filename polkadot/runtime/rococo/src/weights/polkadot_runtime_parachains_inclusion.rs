@@ -102,7 +102,8 @@ impl<T: frame_system::Config> polkadot_runtime_parachains::inclusion::WeightInfo
 	/// The range of component `u` is `[0, 2]`.
 	/// The range of component `h` is `[0, 2]`.
 	/// The range of component `c` is `[0, 1]`.
-	fn enact_candidate(u: u32, h: u32, c: u32, ) -> Weight {
+	/// The range of component `p` is `[0, 1]`.
+	fn enact_candidate(u: u32, h: u32, c: u32, p: u32, ) -> Weight {
 		// Proof Size summary in bytes:
 		//  Measured:  `330 + c * (16114 ±0) + h * (92 ±0) + u * (32955 ±0)`
 		//  Estimated: `36283 + c * (16122 ±370) + h * (7594 ±341) + u * (20798 ±341)`
@@ -126,5 +127,75 @@ impl<T: frame_system::Config> polkadot_runtime_parachains::inclusion::WeightInfo
 			.saturating_add(Weight::from_parts(0, 16122).saturating_mul(c.into()))
 			.saturating_add(Weight::from_parts(0, 7594).saturating_mul(h.into()))
 			.saturating_add(Weight::from_parts(0, 20798).saturating_mul(u.into()))
+			.saturating_add(Self::record_provides().saturating_mul(p.into()))
+	}
+	/// Storage: `ParaInclusion::RecentProvides` (r:1 w:1)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	fn record_provides() -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `4141`
+		//  Estimated: `7606`
+		// Minimum execution time: 22_560_000 picoseconds.
+		Weight::from_parts(27_050_000, 0)
+			.saturating_add(Weight::from_parts(0, 7606))
+			.saturating_add(T::DbWeight::get().reads(1))
+			.saturating_add(T::DbWeight::get().writes(1))
+	}
+	// Selection measurements: Westend Wasm, 2026-11-13, 10 steps, 2 repeats.
+	/// Storage: `ParaInclusion::V1` (r:1002 w:1001)
+	/// Proof: `ParaInclusion::V1` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParaInclusion::RecentProvides` (r:2 w:0)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `c` is `[0, 1000]`.
+	fn enactment_selection(c: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `695 + c * (576 ±0)`
+		//  Estimated: `6629 + c * (3052 ±0)`
+		// Minimum execution time: 70_529_000 picoseconds.
+		Weight::from_parts(70_529_000, 0)
+			.saturating_add(Weight::from_parts(0, 6629))
+			// Standard Error: 343_498
+			.saturating_add(Weight::from_parts(40_237_439, 0).saturating_mul(c.into()))
+			.saturating_add(T::DbWeight::get().reads(4))
+			.saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(c.into())))
+			.saturating_add(T::DbWeight::get().writes(1))
+			.saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(c.into())))
+			.saturating_add(Weight::from_parts(0, 3052).saturating_mul(c.into()))
+	}
+	/// Storage: `ParaInclusion::V1` (r:1009 w:1008)
+	/// Proof: `ParaInclusion::V1` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParaInclusion::RecentProvides` (r:257009 w:0)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `e` is `[0, 256000]`.
+	fn enactment_selection_requirements(e: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `12773 + e * (4154 ±0)`
+		//  Estimated: `14246 + e * (6640 ±0)`
+		// Minimum execution time: 68_748_000 picoseconds.
+		Weight::from_parts(68_748_000, 0)
+			.saturating_add(Weight::from_parts(0, 14246))
+			// Standard Error: 94_720
+			.saturating_add(Weight::from_parts(12_826_087, 0).saturating_mul(e.into()))
+			.saturating_add(T::DbWeight::get().reads(3))
+			.saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(e.into())))
+			.saturating_add(Weight::from_parts(0, 6640).saturating_mul(e.into()))
+	}
+	/// Storage: `ParaInclusion::V1` (r:2 w:1)
+	/// Proof: `ParaInclusion::V1` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParaInclusion::RecentProvides` (r:2 w:0)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `b` is `[0, 5242880]`.
+	fn enactment_selection_payload(b: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `647 + b * (1 ±0)`
+		//  Estimated: `6585 + b * (1 ±0)`
+		// Minimum execution time: 69_619_000 picoseconds.
+		Weight::from_parts(69_619_000, 0)
+			.saturating_add(Weight::from_parts(0, 6585))
+			// Standard Error: 214
+			.saturating_add(Weight::from_parts(4_444, 0).saturating_mul(b.into()))
+			.saturating_add(T::DbWeight::get().reads(4))
+			.saturating_add(T::DbWeight::get().writes(1))
+			.saturating_add(Weight::from_parts(0, 1).saturating_mul(b.into()))
 	}
 }
