@@ -43,7 +43,7 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 use pallet_message_queue::OnQueueChanged;
-#[cfg(any(test, feature = "runtime-benchmarks"))]
+#[cfg(test)]
 use polkadot_primitives::RequiresSet;
 use polkadot_primitives::{
 	effective_minimum_backing_votes, skip_ump_signals, supermajority_threshold, well_known_keys,
@@ -76,13 +76,14 @@ pub trait WeightInfo {
 	/// NOTE: due to a shortcoming of the current benchmarking framework,
 	/// we use `u32` for the code upgrade and `Provides` flags, even though they are `bool`s.
 	fn enact_candidate(u: u32, h: u32, c: u32, p: u32) -> Weight;
-	/// Weight of matching a `Requires` set of `r` entries against the provides windows.
-	fn requires_satisfied(r: u32) -> Weight;
-	/// Selection for `c` candidates, at most `r` requirements each, and `b` encoded bytes.
-	/// Replace the provisional composition with benchmarked weights.
-	fn enactment_selection(c: u32, r: u32, _b: u32) -> Weight {
-		Self::requires_satisfied(r).saturating_mul(c.into())
-	}
+	/// Append a root to a full provides window.
+	fn record_provides() -> Weight;
+	/// Pending queue scans, vote updates, and candidate selection.
+	fn enactment_selection(c: u32) -> Weight;
+	/// Matching and propagation for `e` total requirements.
+	fn enactment_selection_requirements(e: u32) -> Weight;
+	/// Cost of reading and rewriting `b` encoded pending bytes.
+	fn enactment_selection_payload(b: u32) -> Weight;
 }
 
 pub struct TestWeightInfo;
@@ -90,7 +91,16 @@ impl WeightInfo for TestWeightInfo {
 	fn enact_candidate(_u: u32, _h: u32, _c: u32, _p: u32) -> Weight {
 		Weight::zero()
 	}
-	fn requires_satisfied(_r: u32) -> Weight {
+	fn record_provides() -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection(_c: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_requirements(_e: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_payload(_b: u32) -> Weight {
 		Weight::zero()
 	}
 }
@@ -99,7 +109,16 @@ impl WeightInfo for () {
 	fn enact_candidate(_u: u32, _h: u32, _c: u32, _p: u32) -> Weight {
 		Weight::zero()
 	}
-	fn requires_satisfied(_r: u32) -> Weight {
+	fn record_provides() -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection(_c: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_requirements(_e: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_payload(_b: u32) -> Weight {
 		Weight::zero()
 	}
 }
@@ -974,23 +993,73 @@ impl<T: Config> Pallet<T> {
 	/// Reserve for every pending candidate, including passes with no new bitfields.
 	pub(crate) fn pending_selection_weight() -> Weight {
 		let mut candidates = 0u32;
-		let mut max_entries = 0u32;
-		let mut bytes = 0u32;
-		for candidate in PendingAvailability::<T>::iter_values().flatten() {
-			candidates = candidates.saturating_add(1);
-			bytes = bytes.saturating_add(candidate.encoded_size().try_into().unwrap_or(u32::MAX));
-			let entries = candidate
-				.commitments
-				.ump_signals()
-				.ok()
-				.and_then(|s| s.requires().map(|r| r.len() as u32))
-				.unwrap_or(0);
-			max_entries = max_entries.max(entries);
+		let mut entries = 0u32;
+		let payload_base = <T as Config>::WeightInfo::enactment_selection_payload(0);
+		let mut payload_weight = Weight::zero();
+		for queue in PendingAvailability::<T>::iter_values() {
+			candidates =
+				candidates.saturating_add(queue.len().max(1).try_into().unwrap_or(u32::MAX));
+			for candidate in queue {
+				let bytes = candidate.encoded_size().try_into().unwrap_or(u32::MAX);
+				payload_weight.saturating_accrue(
+					<T as Config>::WeightInfo::enactment_selection_payload(bytes)
+						.saturating_sub(payload_base),
+				);
+				let count = candidate
+					.commitments
+					.ump_signals()
+					.ok()
+					.and_then(|s| s.requires().map(|r| r.len() as u32))
+					.unwrap_or(0);
+				entries = entries.saturating_add(count);
+			}
 		}
 		if candidates == 0 {
 			return Weight::zero();
 		}
-		<T as Config>::WeightInfo::enactment_selection(candidates, max_entries.max(2), bytes)
+		<T as Config>::WeightInfo::enactment_selection(candidates)
+			.saturating_add(
+				<T as Config>::WeightInfo::enactment_selection_requirements(entries)
+					.saturating_sub(<T as Config>::WeightInfo::enactment_selection_requirements(0)),
+			)
+			.saturating_add(payload_weight)
+			.set_proof_size(0)
+	}
+
+	/// Reserve the next pass's added work before admitting a new pending candidate.
+	pub(crate) fn backed_selection_weight(candidate: &BackedCandidate<T::Hash>) -> Weight {
+		let validators = shared::ActiveValidatorKeys::<T>::decode_len().unwrap_or(0);
+		let votes = BitVec::<u8, BitOrderLsb0>::repeat(false, validators);
+		let bytes = (
+			CoreIndex(0),
+			CandidateHash::default(),
+			candidate.descriptor(),
+			&candidate.candidate().commitments,
+			&votes,
+			&votes,
+			GroupIndex(0),
+		)
+			.encoded_size()
+			.saturating_add(2 * <BlockNumberFor<T> as codec::MaxEncodedLen>::max_encoded_len());
+		let entries = candidate
+			.candidate()
+			.commitments
+			.ump_signals()
+			.ok()
+			.and_then(|s| s.requires().map(|r| r.len() as u32))
+			.unwrap_or(0);
+		<T as Config>::WeightInfo::enactment_selection(1)
+			.saturating_sub(<T as Config>::WeightInfo::enactment_selection(0))
+			.saturating_add(
+				<T as Config>::WeightInfo::enactment_selection_requirements(entries)
+					.saturating_sub(<T as Config>::WeightInfo::enactment_selection_requirements(0)),
+			)
+			.saturating_add(
+				<T as Config>::WeightInfo::enactment_selection_payload(
+					bytes.try_into().unwrap_or(u32::MAX),
+				)
+				.saturating_sub(<T as Config>::WeightInfo::enactment_selection_payload(0)),
+			)
 			.set_proof_size(0)
 	}
 
@@ -1009,7 +1078,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
 	/// first miss.
-	#[cfg(any(test, feature = "runtime-benchmarks"))]
+	#[cfg(test)]
 	pub(crate) fn requires_satisfied(requires: &RequiresSet) -> Result<(), (ParaId, StreamsRoot)> {
 		// One `RecentProvides` read per required source.
 		for (source, expected) in requires.iter() {
