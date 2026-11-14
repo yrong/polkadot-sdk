@@ -1996,19 +1996,33 @@ fn build_network_config(
 	sender_node: (&str, u16),
 	relay_forks: bool,
 ) -> Result<NetworkConfig, anyhow::Error> {
+	build_network_config_with_fault(sender_node, relay_forks, None)
+}
+
+fn build_network_config_with_fault(
+	sender_node: (&str, u16),
+	relay_forks: bool,
+	gate: Option<&std::path::Path>,
+) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
-	let collator_args = |peer: &str| -> Vec<zombienet_sdk::Arg> {
-		vec![
+	let collator_args = |peer: &str, receiver_side: bool| -> Vec<zombienet_sdk::Arg> {
+		let mut args = vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
-			  runtime::spec-msg=debug,runtime::parachain-system=debug")
+			  runtime::spec-msg=debug,runtime::parachain-system=debug,\
+			 aura::cumulus=debug,aura::resubmittable_segment=debug")
 				.into(),
 			("--force-authoring").into(),
 			("--authoring", "slot-based").into(),
 			("--enable-spec-msg").into(),
 			("--spec-msg-peer", peer).into(),
-		]
+		];
+		let optimistic = if gate.is_some() { receiver_side } else { flag("SPEC_MSG_OPTIMISTIC") };
+		if optimistic {
+			args.push("--spec-msg-optimistic".into());
+		}
+		args
 	};
 
 	// Distinct `protocolId`s: chains sharing one negotiate the legacy block-announce name, fail its
@@ -2019,25 +2033,62 @@ fn build_network_config(
 	// - penpal 2001: dave, collator, fetching from charlie
 	NetworkConfigBuilder::new()
 		.with_relaychain(|r| {
-			let r = r.with_chain("rococo-local");
-			let r = if relay_forks {
-				r.with_genesis_overrides(serde_json::json!({
-					"babe": { "epochConfig": {
-						"c": [99, 100],
-						"allowed_slots": "PrimaryAndSecondaryVRFSlots",
-					} },
-				}))
-			} else {
-				r
-			};
+			let mut genesis = serde_json::json!({
+				"configuration": { "config": {
+					"node_features": { "bits": 8, "data": [0b00011011] }
+				} }
+			});
+			if gate.is_some() {
+				genesis["configuration"]["config"]["scheduler_params"]["num_cores"] =
+					serde_json::json!(2);
+			}
+			if relay_forks {
+				genesis["babe"] = serde_json::json!({ "epochConfig": {
+					"c": [99, 100],
+					"allowed_slots": "PrimaryAndSecondaryVRFSlots",
+				} });
+			}
+			let chain = if gate.is_some() { "rococo-dev" } else { "rococo-local" };
+			let r = r
+				.with_chain(chain)
+				.with_genesis_overrides(genesis)
+				.with_override_session_0(gate.is_some());
 			r.with_default_command("polkadot")
 				.with_default_image(images.polkadot.as_str())
 				.with_default_args(vec![
 					("-lparachain=debug,runtime::inclusion=debug,runtime::inclusion-inherent=debug")
 						.into(),
 				])
-				.with_validator(|node| node.with_name("alice").with_rpc_port(RELAY_RPC_PORT))
-				.with_validator(|node| node.with_name("bob"))
+				.with_validator(|node| {
+					let node = node.with_name("alice").with_rpc_port(RELAY_RPC_PORT);
+					if let Some(gate) = gate {
+						node.with_command("malus")
+							.with_subcommand("withhold-availability")
+							.with_args(vec![
+								"--experimental-collator-protocol".into(),
+								("--withhold-para", "2000").into(),
+								("--availability-gate", gate.to_string_lossy().as_ref()).into(),
+								"-lparachain=debug,MALUS=info".into(),
+							])
+					} else {
+						node
+					}
+				})
+				.with_validator(|node| {
+					let node = node.with_name("bob");
+					if let Some(gate) = gate {
+						node.with_command("malus")
+							.with_subcommand("withhold-availability")
+							.with_args(vec![
+								"--experimental-collator-protocol".into(),
+								("--withhold-para", "2000").into(),
+								("--availability-gate", gate.to_string_lossy().as_ref()).into(),
+								"-lparachain=debug,MALUS=info".into(),
+							])
+					} else {
+						node
+					}
+				})
 		})
 		.with_parachain(|p| {
 			p.with_id(SENDER)
@@ -2047,7 +2098,7 @@ fn build_network_config(
 				.with_raw_spec_override(
 					serde_json::json!({ "protocolId": format!("penpal-{SENDER}") }),
 				)
-				.with_default_args(collator_args(&to_receiver))
+				.with_default_args(collator_args(&to_receiver, false))
 				.with_collator(|n| {
 					n.with_name(SENDER_COLLATOR)
 						.with_p2p_port(SENDER_P2P_PORT)
@@ -2062,7 +2113,7 @@ fn build_network_config(
 				.with_raw_spec_override(
 					serde_json::json!({ "protocolId": format!("penpal-{RECEIVER}") }),
 				)
-				.with_default_args(collator_args(&to_sender))
+				.with_default_args(collator_args(&to_sender, true))
 				.with_collator(|n| {
 					n.with_name(RECEIVER_COLLATOR)
 						.with_p2p_port(RECEIVER_P2P_PORT)
@@ -2078,4 +2129,424 @@ fn build_network_config(
 			let errs = e.into_iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
 			anyhow!("config errs: {errs}")
 		})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
+	use polkadot_primitives::{
+		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2,
+		CommittedCandidateReceiptV2, CoreState, HeadData, NodeFeatures, StreamsRoot,
+	};
+	const TEST_TIMEOUT: Duration = Duration::from_secs(600);
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	if std::env::var("ZOMBIE_PROVIDER").as_deref() != Ok("native") {
+		return Err(anyhow!("the availability gate requires ZOMBIE_PROVIDER=native"));
+	}
+	let control = tempfile::tempdir()?;
+	let gate = control.path().join("withhold");
+	let network = initialize_network(build_network_config_with_fault(
+		(SENDER_COLLATOR, SENDER_P2P_PORT),
+		false,
+		Some(&gate),
+	)?)
+	.await?;
+	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+	let sender: OnlineClient<PolkadotConfig> =
+		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+	let receiver: OnlineClient<PolkadotConfig> =
+		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+
+	let run = async {
+		let ready_at = best_hash(&relay).await?;
+		let cores: Vec<CoreState> =
+			call_at(&relay, Some(ready_at), "ParachainHost_availability_cores", &[]).await?;
+		let claims: BTreeMap<polkadot_primitives::CoreIndex, std::collections::VecDeque<ParaId>> =
+			call_at(&relay, Some(ready_at), "ParachainHost_claim_queue", &[]).await?;
+		if cores.len() != 2 ||
+			[SENDER, RECEIVER]
+				.into_iter()
+				.any(|para| !claims.values().flatten().any(|id| *id == para.into()))
+		{
+			return Err(anyhow!("recovery fixture has no assigned core for both paras at {ready_at:?}: cores={}, claims={claims:?}", cores.len()));
+		}
+		log::info!("Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {ready_at:?}: two cores initialized, claims={claims:?}");
+		wait_for("both V3 chains to finalize their first block", || {
+			advanced(&sender, &receiver, (1, 1))
+		})
+		.await?;
+		let relay_at = best_hash(&relay).await?;
+		let configuration = relay
+			.runtime_api()
+			.at(relay_at)
+			.call(subxt::dynamic::runtime_api_call("BabeApi", "configuration", Vec::<Value>::new()))
+			.await?
+			.to_value()?;
+		let scalar = |name| {
+			configuration
+				.at(name)
+				.and_then(|v| v.as_u128())
+				.ok_or_else(|| anyhow!("Babe configuration lacks {name}"))
+		};
+		let epoch_length = scalar("epoch_length")?;
+		let slot_duration = scalar("slot_duration")?;
+		if epoch_length.saturating_mul(slot_duration) < TEST_TIMEOUT.as_millis() {
+			return Err(anyhow!("relay epoch is shorter than the recovery test deadline"));
+		}
+		let session: u32 =
+			call_at(&relay, Some(relay_at), "ParachainHost_session_index_for_child", &[]).await?;
+		log::info!("Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {relay_at:?}: epoch_length={epoch_length}, slot_duration={slot_duration}, session={session}");
+		let features: NodeFeatures =
+			call_at(&relay, Some(relay_at), "ParachainHost_node_features", &[]).await?;
+		if !FeatureIndex::CandidateReceiptV3.is_set(&features) {
+			return Err(anyhow!("relay {relay_at:?} does not enable V3 receipts"));
+		}
+		for (client, para, port) in
+			[(&sender, SENDER, SENDER_RPC_PORT), (&receiver, RECEIVER, RECEIVER_RPC_PORT)]
+		{
+			let at = best_hash(client).await?;
+			let enabled: bool =
+				call_at(client, Some(at), "SchedulingV3EnabledApi_scheduling_v3_enabled", &[])
+					.await?;
+			if !enabled {
+				return Err(anyhow!("parachain {at:?} does not enable V3 scheduling"));
+			}
+			log::info!("Parachain {para} ws://127.0.0.1:{port} at {at:?}: V3 scheduling enabled; relay features verified at {relay_at:?}");
+		}
+		if hrmp_channel_open(&relay, SENDER, RECEIVER).await? {
+			return Err(anyhow!("the recovery test requires no HRMP channel"));
+		}
+		open_spec_msg_channel(&sender, &receiver).await?;
+		let mut delivered_blocks = receiver.blocks().subscribe_finalized().await?;
+		let mut blocks = relay.blocks().subscribe_best().await?;
+		wait_for(
+			"the sender's first provided root to finalize before arming the fault",
+			|| async {
+				let root: Option<StreamsRoot> = call_at(
+					&relay,
+					None,
+					"ParachainHost_newest_included_provides",
+					&ParaId::from(SENDER).encode(),
+				)
+				.await?;
+				Ok(root.is_some())
+			},
+		)
+		.await?;
+		let baseline: Option<StreamsRoot> = call_at(
+			&relay,
+			None,
+			"ParachainHost_newest_included_provides",
+			&ParaId::from(SENDER).encode(),
+		)
+		.await?;
+		let baseline =
+			baseline.ok_or_else(|| anyhow!("sender has no included root after the handshake"))?;
+		std::fs::write(&gate, baseline.0.as_bytes())?;
+		log::info!("Withholding sender candidates beyond included {baseline:?}");
+		let sent = sender.blocks().at(sudo_in_block(&sender, send_xcm_to(RECEIVER)).await?).await?;
+		let message_id = event_field(&sent, "PolkadotXcm", "Sent", "message_id")
+			.await?
+			.map(|id| flatten(&id))
+			.filter(|id| id.len() == 32)
+			.ok_or_else(|| anyhow!("send block has no XCM message id"))?;
+		let stream = StreamId::Channel { recipient: RECEIVER.into(), domain: 0, num: 0 };
+		let end = committed_stream_roots(&sent)
+			.await?
+			.get(&stream)
+			.ok_or_else(|| anyhow!("send block has no outbound frontier"))?
+			.leaf_count();
+		log::info!(
+			"Faulted send: sender #{} {:?}, channel endpoint {end}",
+			sent.number(),
+			sent.hash()
+		);
+		let mut original: Option<(CandidateHash, CandidateHash, HeadData, StreamsRoot)> = None;
+		let mut provider_timed_out = false;
+		let mut dependent_timed_out = false;
+		let mut dependent_available = false;
+		let mut timeout_blocks = BTreeMap::new();
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			let current_session: u32 =
+				call_at(&relay, Some(block.hash()), "ParachainHost_session_index_for_child", &[])
+					.await?;
+			if current_session != session {
+				return Err(anyhow!("session cleanup occurred before the timeout assertions"));
+			}
+			let providers: Vec<CommittedCandidateReceiptV2> = call_at(
+				&relay,
+				Some(block.hash()),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?;
+			let dependents: Vec<CommittedCandidateReceiptV2> = call_at(
+				&relay,
+				Some(block.hash()),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(RECEIVER).encode(),
+			)
+			.await?;
+			if original.is_none() {
+				for candidate in &dependents {
+					let signals =
+						candidate.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+					let Some(required) = signals.requires().and_then(|r| r.get(SENDER.into()))
+					else {
+						continue;
+					};
+					let Some(provider) = providers.iter().find(|p| {
+						p.commitments
+							.ump_signals()
+							.ok()
+							.is_some_and(|s| s.provides() == Some(required))
+					}) else {
+						continue;
+					};
+					let head = &candidate.commitments.head_data;
+					let hash = H256::from(sp_crypto_hashing::blake2_256(&head.0));
+					let mut bundle_block = receiver.blocks().at(hash).await?;
+					let index = bundle_index(&bundle_block)
+						.ok_or_else(|| anyhow!("V3 block has no bundle index"))?;
+					let mut consumed = false;
+					for offset in 0..=index {
+						let record: ConsumptionRecord = call_at(
+							&receiver,
+							Some(bundle_block.hash()),
+							"SpecMsgApi_consumption_record",
+							&[],
+						)
+						.await?;
+						consumed |= record.entries.get(&SENDER.into()).is_some_and(|streams| {
+							streams.iter().any(|(s, interval)| {
+								*s == stream && interval.end.leaf_count() >= end
+							})
+						});
+						if consumed || offset == index {
+							break;
+						}
+						bundle_block =
+							receiver.blocks().at(bundle_block.header().parent_hash).await?;
+					}
+					if !consumed {
+						continue;
+					}
+					if candidate.descriptor.version() != CandidateDescriptorVersion::V3 ||
+						provider.descriptor.version() != CandidateDescriptorVersion::V3
+					{
+						return Err(anyhow!("recovery experiment did not take the V3 path"));
+					}
+					log::info!(
+						"Relay #{} {:?}: receiver {hash:?} backed against pending {required:?}",
+						block.number(),
+						block.hash()
+					);
+					original = Some((provider.hash(), candidate.hash(), head.clone(), *required));
+					break;
+				}
+			}
+			let Some((provider, dependent, head, _)) = &original else { continue };
+			let cores: Vec<CoreState> =
+				call_at(&relay, Some(block.hash()), "ParachainHost_availability_cores", &[])
+					.await?;
+			let available_now = cores.iter().any(|core| {
+				matches!(core, CoreState::Occupied(core)
+				if core.candidate_hash == *dependent && core.availability.count_ones() >=
+				polkadot_primitives::supermajority_threshold(core.availability.len()))
+			});
+			if available_now && !dependent_available {
+				log::info!(
+					"Dependent {dependent:?} has an availability quorum at relay #{} {:?}",
+					block.number(),
+					block.hash()
+				);
+			}
+			dependent_available |= available_now;
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "ParaInclusion" {
+					continue;
+				}
+				if !matches!(event.variant_name(), "CandidateIncluded" | "CandidateTimedOut") {
+					continue;
+				}
+				let (receipt, event_head) =
+					<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+				if event.variant_name() == "CandidateIncluded" &&
+					(receipt.hash() == *provider || event_head == *head)
+				{
+					return Err(anyhow!(
+						"faulted provider or its dependent enacted before timeout"
+					));
+				}
+				if event.variant_name() == "CandidateTimedOut" {
+					if receipt.hash() == *provider || receipt.hash() == *dependent {
+						timeout_blocks.insert(block.number(), block.hash());
+						log::info!(
+							"Timed out {:?} at relay #{} {:?}",
+							receipt.hash(),
+							block.number(),
+							block.hash()
+						);
+					}
+					provider_timed_out |= receipt.hash() == *provider;
+					dependent_timed_out |= receipt.hash() == *dependent;
+				}
+			}
+			if provider_timed_out && dependent_timed_out {
+				break;
+			}
+		}
+		let (_, _, original_head, old_required) =
+			original.ok_or_else(|| anyhow!("no optimistic consuming candidate observed"))?;
+		if !provider_timed_out || !dependent_timed_out || !dependent_available {
+			return Err(anyhow!("missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"));
+		}
+		let collator = network.get_node(RECEIVER_COLLATOR)?;
+		collator.pause().await?;
+		std::fs::remove_file(&gate)?;
+		wait_for("sender history to be included after releasing availability", || async {
+			let included: Option<StreamsRoot> = call_at(
+				&relay,
+				None,
+				"ParachainHost_newest_included_provides",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?;
+			Ok(included.is_some() && finalized_number(&sender).await? >= sent.number())
+		})
+		.await?;
+		sudo_in_block(&sender, send_xcm_to(RECEIVER)).await?;
+		wait_for("a newer included sender root for retargeting", || async {
+			let included: Option<StreamsRoot> = call_at(
+				&relay,
+				None,
+				"ParachainHost_newest_included_provides",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?;
+			Ok(included.is_some_and(|root| root != old_required))
+		})
+		.await?;
+		blocks = relay.blocks().subscribe_best().await?;
+		collator.resume().await?;
+		let mut retargeted = std::collections::BTreeSet::new();
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			let pending: Vec<CommittedCandidateReceiptV2> = call_at(
+				&relay,
+				Some(block.hash()),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(RECEIVER).encode(),
+			)
+			.await?;
+			for candidate in pending.iter().filter(|c| c.commitments.head_data == original_head) {
+				let signals = candidate.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+				let Some(required) = signals.requires().and_then(|r| r.get(SENDER.into())) else {
+					continue;
+				};
+				let included: Option<StreamsRoot> = call_at(
+					&relay,
+					Some(block.hash()),
+					"ParachainHost_newest_included_provides",
+					&ParaId::from(SENDER).encode(),
+				)
+				.await?;
+				if *required != old_required && included == Some(*required) {
+					retargeted.insert(candidate.hash());
+					log::info!("Receiver's unchanged head retargeted from {old_required:?} to included {required:?} at relay {:?}", block.hash());
+				}
+			}
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "ParaInclusion" ||
+					event.variant_name() != "CandidateIncluded"
+				{
+					continue;
+				}
+				let (receipt, head) =
+					<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+				if receipt.descriptor.para_id() == RECEIVER.into() && head == original_head {
+					if !retargeted.contains(&receipt.hash()) {
+						return Err(anyhow!(
+							"receiver enacted without observing included-root retargeting"
+						));
+					}
+					let options =
+						LogLineCountOptions::new(|n| n > 0, Duration::from_secs(10), false);
+					if !collator
+						.wait_log_line_count_with_timeout(
+							"Submitting segment for core.*resubmitted.*[1-9]",
+							false,
+							options,
+						)
+						.await?
+						.success()
+					{
+						return Err(anyhow!("no production V3 resubmission log"));
+					}
+					log::info!(
+						"V3 timeout recovery passed at relay #{} {:?}",
+						block.number(),
+						block.hash()
+					);
+					while let Some(delivered) = delivered_blocks.next().await {
+						let delivered = delivered?;
+						for event in delivered.events().await?.iter() {
+							let event = event?;
+							if event.pallet_name() != "MessageQueue" ||
+								event.variant_name() != "Processed"
+							{
+								continue;
+							}
+							let values = event.field_values()?;
+							if values.at("id").map(flatten).as_ref() != Some(&message_id) {
+								continue;
+							}
+							let fields = format!("{values:?}");
+							if !fields.contains("SpecMsg") || !fields.contains("Bool(true)") {
+								return Err(anyhow!(
+									"recovered XCM did not execute over spec-msg: {fields}"
+								));
+							}
+							log::info!(
+								"Recovered XCM executed in finalized receiver block #{} {:?}",
+								delivered.number(),
+								delivered.hash()
+							);
+							for (height, expected) in &timeout_blocks {
+								let query = subxt::dynamic::storage(
+									"System",
+									"BlockHash",
+									vec![Value::u128((*height).into())],
+								);
+								let actual = relay
+									.storage()
+									.at_latest()
+									.await?
+									.fetch(&query)
+									.await?
+									.ok_or_else(|| anyhow!("timeout block hash missing"))?
+									.as_type::<H256>()?;
+								if actual != *expected {
+									return Err(anyhow!(
+										"timeout observation was on an abandoned relay fork"
+									));
+								}
+							}
+							return Ok::<_, anyhow::Error>(());
+						}
+					}
+					return Err(anyhow!("receiver finality subscription ended before delivery"));
+				}
+			}
+		}
+		Err(anyhow!("relay subscription ended before recovery"))
+	};
+	let result = tokio::time::timeout(TEST_TIMEOUT, run).await;
+	network.destroy().await?;
+	result.map_err(|_| anyhow!("V3 timeout recovery exceeded 600 seconds"))?
 }
