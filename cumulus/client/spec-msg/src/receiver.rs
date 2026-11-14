@@ -350,8 +350,9 @@ where
 		self.state.lock().sources.entry(source).or_default().push_roots(roots);
 	}
 
-	/// The relay chain did not answer: keep the included root, which only a reorg takes back, but
-	/// stop new consumption under pending roots, whose providers may have been dropped since.
+	/// Until the relay chain answers for the newest head: keep the included root, which only a
+	/// reorg takes back, but stop new consumption under pending roots, whose providers may have
+	/// been dropped since.
 	pub(crate) fn drop_pending_roots(&self, source: ParaId) {
 		if let Some(pool) = self.state.lock().sources.get_mut(&source) {
 			pool.eligible.pending.clear();

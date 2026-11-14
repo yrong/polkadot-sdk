@@ -286,6 +286,8 @@ pub(crate) async fn drive<H, T, S>(
 				slots.newest = Some(head);
 				latest.clear();
 				for source in view.sources.keys().copied() {
+					// A provider may have left with this head: no pending root until it answers.
+					receiver.drop_pending_roots(source);
 					snapshots.push(async move { (source, head, chains.roots(head, source).await) });
 				}
 			},
@@ -590,6 +592,9 @@ mod tests {
 		roots: Mutex<BTreeMap<(PHash, ParaId), SourceRoots>>,
 		/// While set, the relay chain gives no answer.
 		failing: AtomicBool,
+		/// While set, relay reads wait until released.
+		hold: AtomicBool,
+		held: Mutex<Vec<oneshot::Sender<()>>>,
 	}
 
 	#[async_trait::async_trait]
@@ -599,6 +604,11 @@ mod tests {
 		}
 
 		async fn roots(&self, head: PHash, source: ParaId) -> Result<Option<SourceRoots>, ()> {
+			if self.hold.load(Ordering::SeqCst) {
+				let (release, released) = oneshot::channel();
+				self.held.lock().push(release);
+				let _ = released.await;
+			}
 			if self.failing.load(Ordering::SeqCst) {
 				return Err(());
 			}
@@ -642,6 +652,8 @@ mod tests {
 				view: ChainView::new(consumed, 16),
 				roots: Mutex::new(BTreeMap::new()),
 				failing: AtomicBool::new(false),
+				hold: AtomicBool::new(false),
+				held: Mutex::new(Vec::new()),
 			});
 			let peers = Arc::new(Peers(sources.iter().map(|id| (*id, Source::new())).collect()));
 			let receiver = Arc::new(Receiver::new(US.into(), Budget::default(), peers.clone()));
@@ -767,6 +779,30 @@ mod tests {
 		h.relay_block(4, &[]);
 		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
 		assert!(consumed(&data).iter().all(|&count| count <= 2));
+	}
+
+	#[test]
+	fn a_new_head_suspends_pending_roots_until_its_snapshot_answers() {
+		let mut h = Harness::new();
+		let root = h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
+		let next = h.source(live()).author(vec![(channel(US), payloads(2, 2))]);
+		let snapshot = [(live(), SourceRoots { included: Some(root), pending: vec![next] })];
+		h.relay_block_snapshots(1, &snapshot);
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert_eq!(consumed(&data), vec![4]);
+
+		// While the new head's read waits, only the included root is eligible.
+		h.chains.hold.store(true, Ordering::SeqCst);
+		h.relay_block_snapshots(2, &snapshot);
+		assert!(!h.chains.held.lock().is_empty());
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert!(consumed(&data).iter().all(|&count| count <= 2), "consumed past {root:?}");
+
+		h.chains.hold.store(false, Ordering::SeqCst);
+		h.chains.held.lock().clear();
+		h.pool.run_until_stalled();
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert_eq!(consumed(&data), vec![4]);
 	}
 
 	#[test]
