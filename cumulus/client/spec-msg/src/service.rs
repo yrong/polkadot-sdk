@@ -38,13 +38,17 @@ use cumulus_relay_chain_interface::{PHash, RelayChainInterface};
 use futures::{select, stream::FuturesUnordered, Stream, StreamExt};
 use sc_client_api::BlockchainEvents;
 use sp_api::{ApiExt, ProvideRuntimeApi};
-use sp_blockchain::HeaderBackend;
+use sp_blockchain::{Backend as _, HeaderBackend};
 use sp_runtime::{
 	traits::{Block as BlockT, Header as HeaderT},
 	SaturatedConversion,
 };
 use std::{
-	collections::BTreeMap, fmt::Debug, hash::Hash as StdHash, marker::PhantomData, sync::Arc,
+	collections::{BTreeMap, HashSet},
+	fmt::Debug,
+	hash::Hash as StdHash,
+	marker::PhantomData,
+	sync::Arc,
 };
 
 /// The consumption view at `at`, or `None` if its runtime has no `SpecMsgApi`.
@@ -134,8 +138,9 @@ pub(crate) struct Imported<H> {
 
 /// Keep `receiver` fed until a notification stream ends. Enable `optimistic` only on a relay
 /// deployment with enactment matching.
-pub async fn run_receiver<Block, C, T>(
+pub async fn run_receiver<Block, C, B, T>(
 	client: Arc<C>,
+	backend: Arc<B>,
 	relay: Arc<dyn RelayChainInterface>,
 	receiver: Arc<Receiver<Block::Hash, T>>,
 	optimistic: bool,
@@ -143,6 +148,7 @@ pub async fn run_receiver<Block, C, T>(
 	Block: BlockT,
 	C: ProvideRuntimeApi<Block> + BlockchainEvents<Block> + HeaderBackend<Block> + Send + Sync,
 	C::Api: SpecMsgApi<Block>,
+	B: sc_client_api::Backend<Block>,
 	T: Transport + ?Sized,
 {
 	let heads = match relay.new_best_notification_stream().await {
@@ -182,8 +188,65 @@ pub async fn run_receiver<Block, C, T>(
 			((*finalized.header.number()).saturated_into(), view)
 		}
 	});
+	// After a restart, the blocks already imported above finality hold consumption a
+	// resubmission must lift again; resubmission can pick any fork, so every leaf is replayed.
+	let info = client.info();
+	let leaves = backend.blockchain().leaves().unwrap_or_else(|e| {
+		log::warn!(target: LOG_TARGET, "Leaves unknown, replaying the best chain only: {e}");
+		vec![info.best_hash]
+	});
+	let replay = unfinalized_imports(
+		leaves,
+		info.finalized_number.saturated_into(),
+		|hash| {
+			let header = client.header(hash).ok().flatten()?;
+			Some((
+				*header.parent_hash(),
+				(*header.number()).saturated_into(),
+				extends_bundle(&header),
+			))
+		},
+		|hash| consumption_record(&*client, hash),
+	);
+	let imports = futures::stream::iter(replay).chain(imports);
 	let chains = ClientChains { client, relay, optimistic, _block: PhantomData };
 	drive(&chains, &receiver, heads, imports, finality).await
+}
+
+/// The blocks from each of `leaves` down to the finalized number `finalized`, parents first.
+/// `header` gives a block's parent, number and whether it extends its bundle; a block whose
+/// header is unknown ends that walk, and one whose record fails is skipped, as a live import is.
+fn unfinalized_imports<H: Copy + Eq + StdHash + Debug>(
+	leaves: impl IntoIterator<Item = H>,
+	finalized: u64,
+	mut header: impl FnMut(H) -> Option<(H, u64, bool)>,
+	mut record: impl FnMut(H) -> Result<ConsumptionRecord, String>,
+) -> Vec<Imported<H>> {
+	let mut seen = HashSet::new();
+	let mut imports = Vec::new();
+	for leaf in leaves {
+		let mut hash = leaf;
+		while seen.insert(hash) {
+			let Some((parent, number, extends_bundle)) = header(hash) else {
+				log::warn!(target: LOG_TARGET, "Header of unfinalized {hash:?} unknown: replay stops");
+				break;
+			};
+			if number <= finalized {
+				break;
+			}
+			match record(hash) {
+				Ok(record) => {
+					imports.push(Imported { hash, parent, number, extends_bundle, record })
+				},
+				Err(e) => {
+					log::warn!(target: LOG_TARGET, "consumption_record at {hash:?} failed: {e}")
+				},
+			}
+			hash = parent;
+		}
+	}
+	imports.sort_by_key(|block| block.number);
+	imports
 }
 
 /// The receiver loop over `heads` (relay best blocks), `imports` and `finality` (the finalized
@@ -404,6 +467,42 @@ mod tests {
 	use parking_lot::{Mutex, RwLock};
 	use sc_network::PeerId;
 	use std::sync::atomic::{AtomicBool, Ordering};
+
+	#[test]
+	fn startup_replays_every_unfinalized_fork_parents_first() {
+		// Finalized #1; best chain 2-3-4 and a fork 23 on 2. Hash is `number` on the best chain.
+		let parent = |hash: u64| match hash {
+			23 => 2,
+			hash => hash - 1,
+		};
+		let number = |hash: u64| if hash == 23 { 3 } else { hash };
+		let header = |hash: u64| Some((parent(hash), number(hash), hash == 4));
+		let imports =
+			unfinalized_imports([4u64, 23], 1, header, |_| Ok(ConsumptionRecord::default()));
+		let hashes: Vec<_> = imports.iter().map(|block| block.hash).collect();
+		assert_eq!(hashes, vec![2, 3, 23, 4]);
+		assert!(imports.iter().all(|block| block.number > 1));
+		assert!(imports.iter().find(|block| block.hash == 4).unwrap().extends_bundle);
+
+		// A failed record skips its block only; an unknown header ends that walk.
+		let skipped = unfinalized_imports([4u64], 1, header, |hash| {
+			if hash == 3 {
+				Err("record failed".into())
+			} else {
+				Ok(ConsumptionRecord::default())
+			}
+		});
+		assert_eq!(skipped.iter().map(|block| block.hash).collect::<Vec<_>>(), vec![2, 4]);
+		let cut = unfinalized_imports(
+			[4u64],
+			1,
+			|hash| (hash != 3).then(|| header(hash)).flatten(),
+			|_| Ok(ConsumptionRecord::default()),
+		);
+		assert_eq!(cut.iter().map(|block| block.hash).collect::<Vec<_>>(), vec![4]);
+		assert!(unfinalized_imports([1u64], 1, header, |_| panic!("finalized is not replayed"))
+			.is_empty());
+	}
 
 	const US: u32 = 2000;
 

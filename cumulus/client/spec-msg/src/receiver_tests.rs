@@ -1336,3 +1336,25 @@ fn importing_a_live_endpoint_reopens_recovery_binding_work() {
 	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
 	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
 }
+
+#[test]
+fn replaying_unfinalized_consumption_restores_recovery_after_restart() {
+	let sender = Sender::new();
+	let root = sender.author(vec![(channel(US), payloads(1, 4))]);
+	let before = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	block_on(before.on_root(source(), root, &chain.wants()));
+	let record = chain.block(&before);
+	let restarted = receiver(&sender, Budget::default());
+	assert!(restarted.assemble_for_recovery(&[record.clone()]).is_err());
+	block_on(restarted.on_block(
+		chain.number,
+		chain.number - 1,
+		chain.number,
+		false,
+		record.clone(),
+	));
+	block_on(restarted.on_root(source(), root, &chain.wants()));
+	let lifts = restarted.assemble_for_recovery(&[record.clone()]).unwrap();
+	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&root));
+}
