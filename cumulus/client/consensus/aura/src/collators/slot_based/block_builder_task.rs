@@ -184,13 +184,10 @@ struct BuildingPrerequisites<Block: BlockT> {
 	relay_parent_offset: u32,
 	/// The relay parent and the descendants linking it to the scheduling parent.
 	relay_parent_data: RelayParentData,
-	/// The parent to build on. Settled by the parent search in the first phase, against the para
-	/// best head's parameters, and kept as-is when the second phase re-derives the context.
+	/// The parent selected under its own runtime's scheduling parameters.
 	best_parent_header: Block::Header,
+	resubmittable_headers: Vec<Block::Header>,
 	/// The included header at the execution context, i.e. at `relay_parent_data`'s relay parent.
-	/// Follows whichever phase settled that context: the second one whenever the build parent's
-	/// `v3_enabled` or `relay_parent_offset` disagree with the para best head's, since the first
-	/// phase then took it at a scheduling parent we no longer build against.
 	included_header_at_execution: Block::Header,
 }
 
@@ -282,12 +279,13 @@ struct SlotContext<Block: BlockT, Pub> {
 	relay_parent_data: RelayParentData,
 	included_header_at_execution: Block::Header,
 	initial_parent_header: Block::Header,
+	resubmittable_headers: Vec<Block::Header>,
 	para_slot_duration: SlotDuration,
 	para_slot: SlotInfo,
 	max_pov_size: u32,
 	allowed_pov_size: usize,
 	relay_slot: Slot,
-	slot_claim: SlotClaim<Pub>,
+	slot_claim: Option<SlotClaim<Pub>>,
 }
 
 impl<Block: BlockT, Pub> SlotContext<Block, Pub> {
@@ -419,121 +417,77 @@ where
 		}
 	}
 
-	/// Derive the [`BuildingPrerequisites`] for the current slot. `None` means the slot is skipped.
-	///
-	/// The relay chain context follows the [`SchedulingParams`] of the runtime that executes the
-	/// block, which is only known once the parent is settled. So the first phase derives the
-	/// context from the para best head in order to run the parent search, and the second
-	/// re-derives it from the chosen parent whenever the two disagree, keeping the parent the
-	/// first phase settled on.
+	/// Repeat parent search until its scheduling context matches the selected parent's runtime.
 	async fn building_prerequisites(&mut self, slot: Slot) -> Option<BuildingPrerequisites<Block>> {
-		let best_hash = self.para_client.info().best_hash;
-		let best_params = SchedulingParams::at(&*self.para_client, best_hash);
+		let mut params =
+			SchedulingParams::at(&*self.para_client, self.para_client.info().best_hash);
+		let mut visited = Vec::new();
+		loop {
+			if visited.contains(&params) {
+				tracing::warn!(target: LOG_TARGET, "Parent search oscillated across scheduling contexts.");
+				return None;
+			}
+			visited.push(params);
+			let (scheduling_parent_header, v3_enabled, relay_parent_data) = derive_relay_context(
+				&self.relay_client,
+				&mut self.relay_chain_data_cache,
+				&mut self.scheduling_info,
+				params,
+				slot,
+			)
+			.await?;
 
-		let (scheduling_parent_header, v3_enabled, relay_parent_data) = derive_relay_context(
-			&self.relay_client,
-			&mut self.relay_chain_data_cache,
-			&mut self.scheduling_info,
-			best_params,
-			slot,
-		)
-		.await?;
-
-		let search_params = ParentSearchParams::new(
-			v3_enabled,
-			scheduling_parent_header.hash(),
-			relay_parent_data.relay_parent().hash(),
-		);
-		let parent_search_result = crate::collators::find_parent(
-			&self.relay_client,
-			&*self.para_backend,
-			self.para_id,
-			search_params,
-			|parent| {
-				// We never want to build on any "middle block" that isn't the last block in
-				// a core.
-				// When the digest item doesn't exist, we are running in compatibility
-				// mode and all parents are valid.
-				CumulusDigestItem::is_last_block_in_core(parent.digest()).unwrap_or(true)
-			},
-		)
-		.await?;
-
-		let build_parent_hash = parent_search_result.best_parent_header.hash();
-		let build_params = SchedulingParams::at(&*self.para_client, build_parent_hash);
-		let build_parent_agrees = build_parent_hash == best_hash || build_params == best_params;
-
-		let (scheduling_parent_header, v3_enabled, relay_parent_offset, relay_parent_data) =
-			if build_parent_agrees {
-				(
-					scheduling_parent_header,
-					v3_enabled,
-					best_params.relay_parent_offset,
-					relay_parent_data,
-				)
-			} else {
-				tracing::info!(
-					target: LOG_TARGET,
-					best = ?best_hash,
-					?build_parent_hash,
-					"Build parent's runtime disagrees with the para best's, re-deriving the relay \
-					chain context from the build parent.",
-				);
-
-				let (scheduling_parent_header, v3_enabled, relay_parent_data) =
-					derive_relay_context(
-						&self.relay_client,
-						&mut self.relay_chain_data_cache,
-						&mut self.scheduling_info,
-						build_params,
-						slot,
-					)
-					.await?;
-
-				(
-					scheduling_parent_header,
-					v3_enabled,
-					build_params.relay_parent_offset,
-					relay_parent_data,
-				)
-			};
-
-		let best_parent_header = parent_search_result.best_parent_header;
-
-		// Building on a parent that already sits on our relay parent would put two blocks on the
-		// same one, so the prerequisites are not met for this slot.
-		if is_built_on_relay_parent(relay_parent_data.relay_parent(), &best_parent_header) {
-			tracing::debug!(
-				target: LOG_TARGET,
-				relay_parent = ?relay_parent_data.relay_parent().hash(),
-				relay_parent_num = %relay_parent_data.relay_parent().number(),
-				parent = ?best_parent_header.hash(),
-				"Relay parent did not advance past the parent block's, skipping slot."
+			let search_params = ParentSearchParams::new(
+				v3_enabled,
+				scheduling_parent_header.hash(),
+				relay_parent_data.relay_parent().hash(),
 			);
-			return None;
+			let parent_search_result = crate::collators::find_parent(
+				&self.relay_client,
+				&*self.para_backend,
+				self.para_id,
+				search_params,
+				|parent| {
+					// We never want to build on any "middle block" that isn't the last block in
+					// a core.
+					// When the digest item doesn't exist, we are running in compatibility
+					// mode and all parents are valid.
+					CumulusDigestItem::is_last_block_in_core(parent.digest()).unwrap_or(true)
+				},
+			)
+			.await?;
+
+			let parent_params = SchedulingParams::at(
+				&*self.para_client,
+				parent_search_result.best_parent_header.hash(),
+			);
+			if parent_params != params {
+				params = parent_params;
+				continue;
+			}
+			let best_parent_header = parent_search_result.best_parent_header;
+			if is_built_on_relay_parent(relay_parent_data.relay_parent(), &best_parent_header) {
+				return None;
+			}
+			let included_header_at_execution = if !v3_enabled {
+				parent_search_result.included_at_scheduling
+			} else {
+				self.included_header_at_execution(relay_parent_data.relay_parent().hash())
+					.await?
+			};
+			return Some(BuildingPrerequisites {
+				scheduling_parent_header,
+				v3_enabled,
+				relay_parent_offset: params.relay_parent_offset,
+				relay_parent_data,
+				best_parent_header,
+				resubmittable_headers: parent_search_result.resubmittable_segment,
+				included_header_at_execution,
+			});
 		}
-
-		// The parent search's snapshot of the included head only holds while its own context
-		// survives, and only for V2, whose scheduling parent is the relay parent the block
-		// executes against. Otherwise take it at the settled relay parent.
-		let included_header_at_execution = if build_parent_agrees && !v3_enabled {
-			parent_search_result.included_at_scheduling
-		} else {
-			self.included_header_at_execution(relay_parent_data.relay_parent().hash())
-				.await?
-		};
-
-		Some(BuildingPrerequisites {
-			scheduling_parent_header,
-			v3_enabled,
-			relay_parent_offset,
-			relay_parent_data,
-			best_parent_header,
-			included_header_at_execution,
-		})
 	}
 
-	/// Resolve everything needed to author in the current slot, up to a successful slot claim.
+	/// Resolve the current slot for authoring or recovery.
 	/// Returns `None` when this slot should be skipped.
 	async fn prepare_slot(&mut self, slot: Slot) -> Option<SlotContext<Block, P::Public>> {
 		let BuildingPrerequisites {
@@ -542,6 +496,7 @@ where
 			relay_parent_offset,
 			relay_parent_data,
 			best_parent_header,
+			resubmittable_headers,
 			included_header_at_execution,
 		} = self.building_prerequisites(slot).await?;
 
@@ -587,15 +542,15 @@ where
 
 		self.update_backing_connections(para_slot.slot, initial_parent_hash).await;
 
-		let Some(slot_claim) = crate::collators::claim_slot::<_, _, P>(
+		let slot_claim = crate::collators::claim_slot::<_, _, P>(
 			para_slot.slot,
 			para_slot.timestamp,
 			initial_parent_hash,
 			&*self.para_client,
 			&self.keystore,
 		)
-		.await
-		else {
+		.await;
+		if slot_claim.is_none() && resubmittable_headers.is_empty() {
 			tracing::debug!(
 				target: LOG_TARGET,
 				?unincluded_segment_len_at_execution,
@@ -608,7 +563,7 @@ where
 				"Not eligible to claim slot."
 			);
 			return None;
-		};
+		}
 
 		tracing::debug!(
 			target: LOG_TARGET,
@@ -620,7 +575,7 @@ where
 			included_num_at_execution = %included_header_at_execution.number(),
 			initial_parent = ?initial_parent_hash,
 			slot = ?para_slot.slot,
-			"Claiming slot."
+			"Prepared authoring and recovery context."
 		);
 
 		Some(SlotContext {
@@ -630,6 +585,7 @@ where
 			relay_parent_data,
 			included_header_at_execution,
 			initial_parent_header,
+			resubmittable_headers,
 			para_slot_duration,
 			para_slot,
 			max_pov_size,
@@ -718,6 +674,63 @@ where
 			number_of_blocks,
 		}))
 	}
+}
+
+async fn recovery_scheduling_proof<Block, P, Client>(
+	client: &Client,
+	parent: Block::Hash,
+	internal: &RelayHeader,
+	descendants: Vec<RelayHeader>,
+	core: &CoreInfo,
+	peer: PeerId,
+	keystore: &KeystorePtr,
+	relay_slot_duration: Duration,
+) -> Option<cumulus_primitives_core::SchedulingProof>
+where
+	Block: BlockT,
+	P: Pair,
+	P::Public: AppPublic + Member + Codec,
+	P::Signature: TryFrom<Vec<u8>> + Member + Codec,
+	Client: ProvideRuntimeApi<Block>,
+	Client::Api: AuraApi<Block, P::Public>,
+{
+	let duration = crate::slot_duration_at(client, parent).ok()?;
+	let slot = adjust_para_to_relay_parent_slot(internal, relay_slot_duration, duration)?;
+	let authorities = onchain_runtime_api(client).authorities(parent).ok()?;
+	sign_recovery_scheduling_proof::<P>(
+		internal,
+		descendants,
+		core,
+		peer,
+		keystore,
+		slot.slot,
+		&authorities,
+	)
+	.await
+}
+
+async fn sign_recovery_scheduling_proof<P>(
+	internal: &RelayHeader,
+	descendants: Vec<RelayHeader>,
+	core: &CoreInfo,
+	peer: PeerId,
+	keystore: &KeystorePtr,
+	slot: Slot,
+	authorities: &[P::Public],
+) -> Option<cumulus_primitives_core::SchedulingProof>
+where
+	P: Pair,
+	P::Public: AppPublic,
+{
+	let author =
+		sc_consensus_aura::standalone::claim_slot::<P>(slot, authorities, keystore).await?;
+	SchedulingProofBuilder::<P>::new(internal.clone())
+		.descendants(descendants)
+		.for_core(core)
+		.crediting_peer(peer)
+		.keystore(keystore)
+		.build_with_signed_payload(&author)
+		.ok()
 }
 
 /// Run block-builder.
@@ -854,6 +867,24 @@ where
 					Err(()) => break,
 				};
 
+			let mut resubmittable = if cx.v3_enabled && !cx.resubmittable_headers.is_empty() {
+				let store = cumulus_client_resubmission_store::ResubmissionStore::new(
+					env.para_backend.clone(),
+				);
+				let parts = super::resubmittable_segment::ResubmittableSegment::<Block>::new(
+					cx.resubmittable_headers.clone(),
+				)
+				.hydrate(&*env.para_backend, &code_hash_provider, &store);
+				if parts.is_empty() {
+					continue;
+				}
+				parts
+			} else {
+				Vec::new()
+			};
+			let recovery_only = cx.slot_claim.is_none() ||
+				resubmittable.len() >= polkadot_node_primitives::MAX_SEGMENT_LEN as usize;
+			resubmittable.truncate(polkadot_node_primitives::MAX_SEGMENT_LEN as usize);
 			let mut pov_parent_header = cx.initial_parent_header.clone();
 
 			for blocks_per_core in blocks_per_cores {
@@ -870,6 +901,49 @@ where
 
 				// Time the core build so we can pace after submitting (send early, then sleep).
 				let core_start = Instant::now();
+				let mut recovery = Vec::new();
+				let mut prefix_only = recovery_only;
+				for parts in core::mem::take(&mut resubmittable) {
+					let Some(descendants) = v3_descendants.clone() else {
+						prefix_only = true;
+						break;
+					};
+					let Some(proof) = recovery_scheduling_proof::<Block, P, _>(
+						&*env.para_client,
+						parts.parent_header.hash(),
+						cx.relay_parent(),
+						descendants,
+						&core_info,
+						collator_peer_id,
+						&env.keystore,
+						env.relay_chain_slot_duration,
+					)
+					.await
+					else {
+						prefix_only = true;
+						break;
+					};
+					recovery.push((parts, proof));
+				}
+				let scheduling_proof = v3_descendants.clone().map(|descendants| {
+					SchedulingProofBuilder::<P>::new(cx.relay_parent().clone())
+						.descendants(descendants)
+						.build()
+				});
+				if prefix_only {
+					let mut builder = CollatorMessageBuilder::new(this_core_index, recovery);
+					if let Some(proof) = scheduling_proof {
+						builder = builder.with_scheduling_proof(proof);
+					}
+					if let Some(message) = builder.build() {
+						if collator_sender.unbounded_send(message).is_err() {
+							return;
+						}
+					}
+					break;
+				}
+				let Some(slot_claim) = cx.slot_claim.as_ref() else { break };
+
 				let parts = match build_collation_parts_for_core(BuildCollationParams {
 					pov_parent_header: pov_parent_header.clone(),
 					relay_parent_header: cx.relay_parent(),
@@ -877,7 +951,7 @@ where
 					para_id,
 					relay_client: &env.relay_client,
 					code_hash_provider: &code_hash_provider,
-					slot_claim: &cx.slot_claim,
+					slot_claim,
 					collator: &mut collator,
 					allowed_pov_size: cx.allowed_pov_size,
 					core_info: core_info.clone(),
@@ -899,7 +973,21 @@ where
 				{
 					Ok(Some(parts)) => parts,
 					// Let's wait for the next slot
-					Ok(None) => break,
+					Ok(None) => {
+						if let Some(proof) = scheduling_proof {
+							if let Some(message) =
+								CollatorMessageBuilder::new(this_core_index, recovery)
+									.with_scheduling_proof(proof)
+									.build()
+							{
+								if collator_sender.unbounded_send(message).is_err() {
+									tracing::error!(target: LOG_TARGET, "Unable to send recovery segment to the collation task.");
+									return;
+								}
+							}
+						}
+						break;
+					},
 					Err(()) => return,
 				};
 
@@ -915,24 +1003,10 @@ where
 				};
 				pov_parent_header = tip_header.clone();
 
-				let mut builder = CollatorMessageBuilder::new(this_core_index).with_bundle(parts);
-				if let Some(descendants) = v3_descendants {
-					// Initial submission: `internal_scheduling_parent == relay_parent`, unsigned.
-					let scheduling_proof =
-						SchedulingProofBuilder::<P>::new(cx.relay_parent().clone())
-							.descendants(descendants)
-							.build();
-
-					tracing::debug!(
-						target: LOG_TARGET,
-						core_index = ?this_core_index,
-						relay_parent = ?cx.relay_parent().hash(),
-						scheduling_parent = ?scheduling_proof.scheduling_parent(),
-						header_chain_len = scheduling_proof.header_chain.len(),
-						"Submitting V3 segment with scheduling proof",
-					);
-
-					builder = builder.with_scheduling_proof(scheduling_proof);
+				let mut builder =
+					CollatorMessageBuilder::new(this_core_index, recovery).with_bundle(parts);
+				if let Some(proof) = scheduling_proof {
+					builder = builder.with_scheduling_proof(proof);
 				}
 
 				match builder.build() {
@@ -1932,5 +2006,81 @@ mod relay_parent_advance_tests {
 		let relay = relay_parent(64, RelayHash::repeat_byte(1));
 
 		assert!(!is_built_on_relay_parent(&relay, &para_header_with_digest(Digest::default())));
+	}
+}
+
+#[cfg(test)]
+mod recovery_authority_tests {
+	use super::*;
+	use sp_consensus_aura::sr25519::AuthorityPair;
+	use sp_core::Pair;
+	use sp_keyring::Sr25519Keyring;
+	use sp_keystore::{testing::MemoryKeystore, Keystore};
+	#[tokio::test]
+	async fn recovery_signs_against_each_bundles_parent_authorities() {
+		let keys: KeystorePtr = MemoryKeystore::new().into();
+		for name in ["//Alice", "//Bob"] {
+			keys.sr25519_generate_new(sp_application_crypto::key_types::AURA, Some(name))
+				.expect("test key; qed");
+		}
+		let header = super::super::tests::relay_header_with_slot(10, Default::default(), 7);
+		let core = CoreInfo {
+			selector: cumulus_primitives_core::CoreSelector(0),
+			claim_queue_offset: cumulus_primitives_core::ClaimQueueOffset(0),
+			number_of_cores: 1u16.into(),
+		};
+		let peer = PeerId::random();
+		for (expected, other) in [
+			(Sr25519Keyring::Alice, Sr25519Keyring::Bob),
+			(Sr25519Keyring::Bob, Sr25519Keyring::Alice),
+		] {
+			let proof = sign_recovery_scheduling_proof::<AuthorityPair>(
+				&header,
+				vec![],
+				&core,
+				peer,
+				&keys,
+				Slot::from(7),
+				&[expected.public().into()],
+			)
+			.await
+			.expect("parent's author key is held; qed");
+			let signed = proof.signed_scheduling_info.expect("recovery is signed; qed");
+			let signature: sp_consensus_aura::sr25519::AuthoritySignature =
+				sp_core::sr25519::Signature::from_raw(signed.signature).into();
+			assert!(AuthorityPair::verify(
+				&signature,
+				signed.payload.encode(),
+				&expected.public().into()
+			));
+			assert!(!AuthorityPair::verify(
+				&signature,
+				signed.payload.encode(),
+				&other.public().into()
+			));
+		}
+	}
+	#[tokio::test]
+	async fn missing_old_author_key_does_not_use_the_new_author() {
+		let keys: KeystorePtr = MemoryKeystore::new().into();
+		keys.sr25519_generate_new(sp_application_crypto::key_types::AURA, Some("//Bob"))
+			.expect("test key; qed");
+		let header = super::super::tests::relay_header_with_slot(10, Default::default(), 7);
+		let core = CoreInfo {
+			selector: cumulus_primitives_core::CoreSelector(0),
+			claim_queue_offset: cumulus_primitives_core::ClaimQueueOffset(0),
+			number_of_cores: 1u16.into(),
+		};
+		assert!(sign_recovery_scheduling_proof::<AuthorityPair>(
+			&header,
+			vec![],
+			&core,
+			PeerId::random(),
+			&keys,
+			Slot::from(7),
+			&[Sr25519Keyring::Alice.public().into()]
+		)
+		.await
+		.is_none());
 	}
 }

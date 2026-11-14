@@ -395,7 +395,7 @@ impl RelayChainInterface for TestRelayClient {
 	}
 
 	async fn session_index_for_child(&self, _: RelayHash) -> RelayChainResult<SessionIndex> {
-		unimplemented!("Not needed for test")
+		Ok(1)
 	}
 
 	async fn import_notification_stream(

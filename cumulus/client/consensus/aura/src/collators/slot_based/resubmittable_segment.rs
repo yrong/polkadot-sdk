@@ -17,9 +17,6 @@
 
 //! A [`ResubmittableSegment`] of V3 parablock headers, hydrated into [`CollationParts`] from
 //! local state only.
-//!
-//! Dead until the collation task wires it in; the allow comes off then.
-#![allow(dead_code)]
 
 use super::message::CollationParts;
 use codec::Encode;
@@ -34,8 +31,7 @@ use std::sync::Arc;
 
 const LOG_TARGET: &str = "aura::resubmittable_segment";
 
-/// Why a bundle could not be hydrated. Recoverable: [`ResubmittableSegment::hydrate`] skips the
-/// bundle.
+/// Why a bundle could not be hydrated.
 #[derive(Debug, thiserror::Error)]
 enum HydrateError {
 	#[error("no stored storage-proof entry (entry was pruned or never written)")]
@@ -103,8 +99,7 @@ impl<Block: BlockT> ResubmittableSegment<Block> {
 		Ok(bundles)
 	}
 
-	/// Hydrate into [`CollationParts`], one per original bundle. Bundles that fail to hydrate are
-	/// skipped.
+	/// Hydrate complete segments only; a missing predecessor invalidates its descendants.
 	pub(super) fn hydrate<B, CHP>(
 		self,
 		para_backend: &B,
@@ -140,13 +135,10 @@ impl<Block: BlockT> ResubmittableSegment<Block> {
 					);
 					parts.push(bundle_parts)
 				},
-				Err(err) => tracing::warn!(
-					target: LOG_TARGET,
-					?block_number,
-					?block_hash,
-					%err,
-					"Skipping resubmittable bundle.",
-				),
+				Err(err) => {
+					tracing::warn!(target: LOG_TARGET, ?block_number, ?block_hash, %err, "Unable to hydrate resubmittable segment.");
+					return Vec::new();
+				},
 			}
 		}
 
@@ -317,5 +309,55 @@ mod tests {
 			header_with(4, Some(1), false),
 		];
 		assert_eq!(grouped_numbers(headers), vec![vec![1, 2], vec![3, 4]]);
+	}
+	#[test]
+	fn missing_predecessor_proof_discards_the_segment() {
+		use cumulus_client_resubmission_store::prepare_resubmission_aux_data;
+		use sc_client_api::backend::{AuxStore, NewBlockState};
+		let backend = Arc::new(sc_client_api::in_mem::Backend::<TestBlock>::new());
+		let parent = header(0, None);
+		let mut first = header(1, None);
+		first.set_parent_hash(parent.hash());
+		let mut second = header(2, None);
+		second.set_parent_hash(first.hash());
+		for h in [&parent, &first, &second] {
+			backend
+				.blockchain()
+				.insert(h.hash(), h.clone(), None, Some(vec![]), NewBlockState::Normal, false)
+				.expect("test block inserts; qed");
+		}
+		let entries: Vec<_> = prepare_resubmission_aux_data::<TestBlock>(
+			second.hash(),
+			Arc::new(StorageProof::empty()),
+			polkadot_primitives::Header::new(
+				1,
+				Default::default(),
+				Default::default(),
+				Default::default(),
+				Default::default(),
+			),
+			1,
+			1024,
+		)
+		.collect();
+		AuxStore::insert_aux(
+			&*backend,
+			&entries.iter().map(|(k, v)| (&k[..], &v[..])).collect::<Vec<_>>(),
+			&[],
+		)
+		.expect("aux writes succeed; qed");
+		let store = ResubmissionStore::new(backend.clone());
+		let provider = |_| {
+			Some(polkadot_primitives::ValidationCodeHash::from(polkadot_primitives::Hash::zero()))
+		};
+		assert_eq!(
+			ResubmittableSegment::new(vec![second.clone()])
+				.hydrate(&*backend, &provider, &store)
+				.len(),
+			1
+		);
+		assert!(ResubmittableSegment::new(vec![first, second])
+			.hydrate(&*backend, &provider, &store)
+			.is_empty());
 	}
 }

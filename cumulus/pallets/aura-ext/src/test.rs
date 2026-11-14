@@ -673,6 +673,28 @@ mod scheduling_verifier_tests {
 	}
 
 	#[test]
+	fn authority_rotation_requires_a_signature_for_each_parent_context() {
+		TestSlotDuration::set_slot_duration(PARA_SLOT_DURATION_MS);
+		let payload = make_payload();
+		let old = SignedSchedulingInfo {
+			signature: Sr25519Keyring::Alice.sign(&payload.encode()).0,
+			payload: payload.clone(),
+		};
+		let new = SignedSchedulingInfo {
+			signature: Sr25519Keyring::Bob.sign(&payload.encode()).0,
+			payload,
+		};
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			set_authorities::<Test>(vec![Sr25519Keyring::Alice.public().into()]);
+			assert!(AuraSchedulingVerifier::<Test>::verify(&old, Slot::from(7)));
+			assert!(!AuraSchedulingVerifier::<Test>::verify(&new, Slot::from(7)));
+			set_authorities::<Test>(vec![Sr25519Keyring::Bob.public().into()]);
+			assert!(!AuraSchedulingVerifier::<Test>::verify(&old, Slot::from(7)));
+			assert!(AuraSchedulingVerifier::<Test>::verify(&new, Slot::from(7)));
+		});
+	}
+
+	#[test]
 	fn tampered_payload_is_rejected() {
 		// Sign one payload, verify against a different one — verification must fail.
 		TestSlotDuration::set_slot_duration(PARA_SLOT_DURATION_MS);

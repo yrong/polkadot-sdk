@@ -34,9 +34,8 @@ pub(super) enum CollatorMessage<Block: BlockT> {
 		/// Shared by the whole segment; V3/V4-only, so always present.
 		scheduling_proof: SchedulingProof,
 		core_index: CoreIndex,
-		/// This core's resubmittable-block headers, oldest first. Empty for now.
-		// TODO: hydrate these into parts, submitted ahead of `bundle`.
-		resubmittable_headers: Vec<Block::Header>,
+		/// Old bundles to submit before new work, oldest first.
+		resubmittable: Vec<(CollationParts<Block>, SchedulingProof)>,
 		/// The freshly-built bundle for this core, if any.
 		bundle: Option<CollationParts<Block>>,
 	},
@@ -64,11 +63,15 @@ pub(super) struct CollatorMessageBuilder<Block: BlockT> {
 	core_index: CoreIndex,
 	bundle: Option<CollationParts<Block>>,
 	scheduling_proof: Option<SchedulingProof>,
+	resubmittable: Vec<(CollationParts<Block>, SchedulingProof)>,
 }
 
 impl<Block: BlockT> CollatorMessageBuilder<Block> {
-	pub(super) fn new(core_index: CoreIndex) -> Self {
-		Self { core_index, bundle: None, scheduling_proof: None }
+	pub(super) fn new(
+		core_index: CoreIndex,
+		resubmittable: Vec<(CollationParts<Block>, SchedulingProof)>,
+	) -> Self {
+		Self { core_index, bundle: None, scheduling_proof: None, resubmittable }
 	}
 
 	/// Attach the freshly-built bundle.
@@ -85,18 +88,25 @@ impl<Block: BlockT> CollatorMessageBuilder<Block> {
 
 	/// Build the message. `None` when there is nothing to submit for the core.
 	pub(super) fn build(self) -> Option<CollatorMessage<Block>> {
+		if self.resubmittable.len() + usize::from(self.bundle.is_some()) >
+			polkadot_node_primitives::MAX_SEGMENT_LEN as usize
+		{
+			return None;
+		}
 		match self.scheduling_proof {
 			Some(scheduling_proof) => {
-				let bundle = self.bundle?;
+				if self.bundle.is_none() && self.resubmittable.is_empty() {
+					return None;
+				}
 
 				Some(CollatorMessage::Segment {
 					scheduling_proof,
 					core_index: self.core_index,
-					// Empty for now.
-					resubmittable_headers: Vec::new(),
-					bundle: Some(bundle),
+					resubmittable: self.resubmittable,
+					bundle: self.bundle,
 				})
 			},
+			None if !self.resubmittable.is_empty() => None,
 			None => self
 				.bundle
 				.map(|parts| CollatorMessage::Collation { core_index: self.core_index, parts }),
@@ -109,5 +119,131 @@ impl<Block: BlockT> CollationParts<Block> {
 	/// the empty bundle, which the builder never produces.
 	pub(super) fn tip_header(&self) -> Option<&Block::Header> {
 		self.blocks.last().map(|block| block.header())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cumulus_test_client::runtime::Block as TestBlock;
+	use sp_runtime::traits::Header;
+	fn header() -> <TestBlock as BlockT>::Header {
+		Header::new(
+			1,
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+		)
+	}
+
+	fn parts() -> CollationParts<TestBlock> {
+		CollationParts {
+			relay_parent: Default::default(),
+			parent_header: header(),
+			blocks: vec![TestBlock::new(header(), vec![])],
+			proof: StorageProof::empty(),
+			validation_code_hash: ValidationCodeHash::from(RelayHash::zero()),
+			validation_data: PersistedValidationData {
+				parent_head: Default::default(),
+				relay_parent_number: 0,
+				relay_parent_storage_root: Default::default(),
+				max_pov_size: 1024,
+			},
+		}
+	}
+
+	fn proof() -> SchedulingProof {
+		SchedulingProof {
+			header_chain: Vec::new(),
+			internal_scheduling_parent_header: Header::new(
+				1,
+				Default::default(),
+				Default::default(),
+				Default::default(),
+				Default::default(),
+			),
+			signed_scheduling_info: None,
+		}
+	}
+
+	#[test]
+	fn old_bundles_can_form_a_segment_without_a_new_bundle() {
+		let headers = vec![(parts(), proof()), (parts(), proof())];
+		let message = CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), headers.clone())
+			.with_scheduling_proof(proof())
+			.build();
+		let Some(CollatorMessage::Segment { core_index, resubmittable, bundle, .. }) = message
+		else {
+			panic!("expected a resubmission segment");
+		};
+		assert_eq!(core_index, CoreIndex(1));
+		assert_eq!(resubmittable.len(), headers.len());
+		assert_eq!(resubmittable[0].0.blocks, headers[0].0.blocks);
+		assert!(bundle.is_none());
+	}
+
+	#[test]
+	fn empty_segment_is_not_submitted() {
+		assert!(CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), Vec::new())
+			.with_scheduling_proof(proof())
+			.build()
+			.is_none());
+	}
+
+	#[test]
+	fn old_bundles_do_not_enable_v3_without_a_scheduling_proof() {
+		assert!(CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), vec![(parts(), proof())])
+			.build()
+			.is_none());
+	}
+	#[test]
+	fn old_and_new_bundles_are_kept_separate() {
+		let old = parts();
+		let mut new = parts();
+		let new_header = Header::new(
+			2,
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+		);
+		new.blocks = vec![TestBlock::new(new_header, vec![])];
+		let message =
+			CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), vec![(old.clone(), proof())])
+				.with_bundle(new.clone())
+				.with_scheduling_proof(proof())
+				.build();
+		let Some(CollatorMessage::Segment { resubmittable, bundle: Some(bundle), .. }) = message
+		else {
+			panic!("expected old and new bundles");
+		};
+		assert_eq!(resubmittable.len(), 1);
+		assert_eq!(resubmittable[0].0.blocks, old.blocks);
+		assert_eq!(bundle.blocks, new.blocks);
+	}
+
+	#[test]
+	fn a_full_recovery_segment_does_not_fit_a_fresh_bundle() {
+		let old = vec![(parts(), proof()); polkadot_node_primitives::MAX_SEGMENT_LEN as usize];
+		assert!(CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), old.clone())
+			.with_scheduling_proof(proof())
+			.build()
+			.is_some());
+		assert!(CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), old)
+			.with_bundle(parts())
+			.with_scheduling_proof(proof())
+			.build()
+			.is_none());
+	}
+
+	#[test]
+	fn fresh_v2_bundle_still_builds_without_a_scheduling_proof() {
+		assert!(matches!(
+			CollatorMessageBuilder::<TestBlock>::new(CoreIndex(1), vec![])
+				.with_bundle(parts())
+				.build(),
+			Some(CollatorMessage::Collation { .. })
+		));
 	}
 }

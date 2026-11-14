@@ -721,7 +721,7 @@ fn consuming_block(
 	client: &Client,
 	parent_head: Header,
 	source: ParaId,
-) -> (TestBlockData, LiftsBySource, StreamsRoot) {
+) -> (TestBlockData, LiftsBySource, StreamsRoot, MmrFrontier) {
 	let channel = InChannelId { sender: source, domain: 0, num: 0 };
 	let stream =
 		StreamId::Channel { recipient: test_runtime::PARACHAIN_ID.into(), domain: 0, num: 0 };
@@ -753,7 +753,7 @@ fn consuming_block(
 	);
 	let block =
 		build_block_with_witness(client, vec![inherent], parent_head, Default::default(), vec![]);
-	(block, lifts, committed)
+	(block, lifts, committed, frontier)
 }
 
 fn with_lifts(block: ParachainBlockData<Block>, lifts: LiftsBySource) -> ParachainBlockData<Block> {
@@ -768,7 +768,7 @@ fn validate_block_synthesizes_requires_from_the_lifts() {
 	let (client, genesis_head) = create_test_client();
 	let source = ParaId::from(2000);
 	let parent_head = accept_channels(&client, genesis_head, &[source]);
-	let (TestBlockData { block, validation_data }, lifts, committed) =
+	let (TestBlockData { block, validation_data }, lifts, committed, _) =
 		consuming_block(&client, parent_head.clone(), source);
 	// Consuming publishes the ack register at block end, so the block also provides its root.
 	let provides = cumulus_primitives_core::bundle_provides(
@@ -841,7 +841,7 @@ fn validate_block_rejects_a_lift_for_another_source() {
 		let (TestBlockData { block, validation_data }, ..) =
 			consuming_block(&client, parent_head.clone(), source);
 		// A lift that verifies on its own, but for a source the block did not consume.
-		let (_, other_lifts, _) = consuming_block(&client, parent_head.clone(), other_source);
+		let (_, other_lifts, _, _) = consuming_block(&client, parent_head.clone(), other_source);
 
 		call_validate_block(
 			parent_head,
@@ -1567,4 +1567,62 @@ fn validate_block_with_ump_capacity_constraint_and_4_blocks_per_pov() {
 	// the relay dispatch queue remaining count (3) is exhausted.
 	let ump_count = result.upward_messages.iter().take_while(|m| **m != UMP_SEPARATOR).count();
 	assert_eq!(ump_count, 3);
+}
+
+#[test]
+fn refreshed_lifts_retarget_the_same_sealed_block() {
+	use cumulus_primitives_spec_messaging::streams_root::streams_root;
+	let (client, genesis_head) = create_test_client();
+	let source = ParaId::from(2000);
+	let parent_head = accept_channels(&client, genesis_head, &[source]);
+	let (TestBlockData { block, validation_data }, old_lifts, old_root, frontier) =
+		consuming_block(&client, parent_head.clone(), source);
+	let stream =
+		StreamId::Channel { recipient: test_runtime::PARACHAIN_ID.into(), domain: 0, num: 0 };
+	let entries = BTreeMap::from([
+		(stream, frontier.root().0),
+		(StreamId::Broadcast { domain: 0, subdomain: 0, num: 0 }, Hash::repeat_byte(9)),
+	]);
+	let new_root = streams_root(&entries).expect("two distinct streams; qed");
+	let (_, tree_proof) = gen_stream_proof(&entries, stream).expect("stream is present; qed");
+	let new_lifts = LiftsBySource::try_from(BTreeMap::from([(
+		source,
+		vec![RequiresLift {
+			advances: vec![],
+			extension: MmrExtensionProof::identity(&frontier),
+			tree_proof,
+		}],
+	)]))
+	.expect("one source is bounded; qed");
+	let sealed = block.blocks().encode();
+	let old_pov = with_lifts(block.clone(), old_lifts);
+	let new_pov = with_lifts(block, new_lifts);
+	assert_eq!(old_pov.blocks().encode(), sealed);
+	assert_eq!(new_pov.blocks().encode(), sealed);
+	let wasm = WASM_BINARY.expect("test Wasm is built; qed");
+	let old_result = call_validate_block_validation_result(
+		wasm,
+		parent_head.clone(),
+		old_pov,
+		validation_data.relay_parent_storage_root,
+	)
+	.expect("original lifts validate; qed");
+	let new_result = call_validate_block_validation_result(
+		wasm,
+		parent_head,
+		new_pov,
+		validation_data.relay_parent_storage_root,
+	)
+	.expect("refreshed lifts validate; qed");
+	assert_ne!(old_root, new_root);
+	assert_eq!(old_result.head_data, new_result.head_data);
+	let expected = |root| {
+		UMPSignal::Requires(RequiresSet::try_from_iter([(source, root)]).expect("one source; qed"))
+			.encode()
+	};
+	let mut old_messages = old_result.upward_messages;
+	let mut new_messages = new_result.upward_messages;
+	assert_eq!(old_messages.pop(), Some(expected(old_root)));
+	assert_eq!(new_messages.pop(), Some(expected(new_root)));
+	assert_eq!(old_messages, new_messages);
 }
