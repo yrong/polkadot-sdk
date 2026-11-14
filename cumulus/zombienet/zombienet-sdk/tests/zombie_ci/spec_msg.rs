@@ -2219,7 +2219,7 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 			return Err(anyhow!("the recovery test requires no HRMP channel"));
 		}
 		open_spec_msg_channel(&sender, &receiver).await?;
-		let mut delivered_blocks = receiver.blocks().subscribe_finalized().await?;
+		let mut next_delivery_block = finalized_number(&receiver).await? + 1;
 		let mut blocks = relay.blocks().subscribe_best().await?;
 		wait_for(
 			"the sender's first provided root to finalize before arming the fault",
@@ -2433,6 +2433,9 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 		.await?;
 		blocks = relay.blocks().subscribe_best().await?;
 		collator.resume().await?;
+		let receiver =
+			OnlineClient::<PolkadotConfig>::from_url(format!("ws://127.0.0.1:{RECEIVER_RPC_PORT}"))
+				.await?;
 		let mut retargeted = std::collections::BTreeSet::new();
 		while let Some(block) = blocks.next().await {
 			let block = block?;
@@ -2493,8 +2496,30 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 						block.number(),
 						block.hash()
 					);
-					while let Some(delivered) = delivered_blocks.next().await {
-						let delivered = delivered?;
+					loop {
+						let finalized = receiver.blocks().at_latest().await?;
+						if next_delivery_block > finalized.number() {
+							tokio::time::sleep(Duration::from_secs(1)).await;
+							continue;
+						}
+						let query = subxt::dynamic::storage(
+							"System",
+							"BlockHash",
+							vec![Value::u128(next_delivery_block.into())],
+						);
+						let hash = if next_delivery_block == finalized.number() {
+							finalized.hash()
+						} else {
+							receiver
+								.storage()
+								.at(finalized.hash())
+								.fetch(&query)
+								.await?
+								.ok_or_else(|| anyhow!("finalized receiver block hash missing"))?
+								.as_type::<H256>()?
+						};
+						let delivered = receiver.blocks().at(hash).await?;
+						next_delivery_block += 1;
 						for event in delivered.events().await?.iter() {
 							let event = event?;
 							if event.pallet_name() != "MessageQueue" ||
@@ -2540,7 +2565,6 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 							return Ok::<_, anyhow::Error>(());
 						}
 					}
-					return Err(anyhow!("receiver finality subscription ended before delivery"));
 				}
 			}
 		}
