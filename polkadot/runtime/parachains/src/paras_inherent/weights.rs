@@ -19,7 +19,7 @@
 //! the relay chain, but we do care about the size of the block, by putting the tx in the
 //! proof_size we can use the already existing weight limiting code to limit the used size as well.
 
-use crate::{configuration, inclusion};
+use crate::{configuration, inclusion, scheduler};
 use codec::{Encode, WrapperTypeEncode};
 use polkadot_primitives::{
 	CheckedMultiDisputeStatementSet, MultiDisputeStatementSet, UncheckedSignedAvailabilityBitfield,
@@ -97,7 +97,8 @@ pub fn paras_inherent_total_weight<T: Config>(
 	let weight = backed_candidates_weight::<T>(backed_candidates)
 		.saturating_add(signed_bitfields_weight::<T>(bitfields))
 		.saturating_add(multi_dispute_statement_sets_weight::<T>(disputes))
-		.saturating_add(enact_candidates_max_weight::<T>(bitfields));
+		.saturating_add(enact_candidates_max_weight::<T>(bitfields))
+		.saturating_add(inclusion::Pallet::<T>::pending_selection_weight());
 	// Relay chain blocks pre-dispatch weight can be set to any high enough value
 	// but the proof size is irrelevant for the relay chain either way.
 	weight.set_proof_size(u64::MAX)
@@ -169,8 +170,9 @@ pub fn enact_candidates_max_weight<T: Config>(
 	let config = configuration::ActiveConfig::<T>::get();
 	let max_ump_msgs = config.max_upward_message_num_per_candidate;
 	let max_hrmp_msgs = config.hrmp_max_message_num_per_candidate;
-	// No bitfields - no enacted candidates
-	let bitfield_size = bitfields.first().map(|b| b.unchecked_payload().0.len()).unwrap_or(0);
+	// Available candidates can have waited for a dependency in an earlier block.
+	let bitfield_size = scheduler::Pallet::<T>::num_availability_cores()
+		.max(bitfields.first().map(|b| b.unchecked_payload().0.len()).unwrap_or(0));
 	set_proof_size_to_tx_size(
 		<<T as inclusion::Config>::WeightInfo as inclusion::WeightInfo>::enact_candidate(
 			max_ump_msgs,
@@ -195,24 +197,9 @@ pub fn backed_candidate_weight<T: frame_system::Config + Config>(
 			)
 		}
 		.saturating_sub(<<T as Config>::WeightInfo as WeightInfo>::enter_empty())
-		.saturating_add(requires_weight::<T>(candidate)),
+		.saturating_add(inclusion::Pallet::<T>::backed_selection_weight(candidate)),
 		candidate,
 	)
-}
-
-/// The `Requires` check for `candidate`, by its actual number of entries; none without `Requires`.
-fn requires_weight<T: Config>(candidate: &BackedCandidate<T::Hash>) -> Weight {
-	let entries = candidate
-		.candidate()
-		.commitments
-		.ump_signals()
-		.ok()
-		.and_then(|signals| signals.requires().map(|requires| requires.len() as u32))
-		.unwrap_or(0);
-	if entries == 0 {
-		return Weight::zero();
-	}
-	<<T as inclusion::Config>::WeightInfo as inclusion::WeightInfo>::requires_satisfied(entries)
 }
 
 pub fn backed_candidates_weight<T: frame_system::Config + Config>(
