@@ -867,22 +867,24 @@ where
 					Err(()) => break,
 				};
 
-			let mut resubmittable = if cx.v3_enabled && !cx.resubmittable_headers.is_empty() {
-				let store = cumulus_client_resubmission_store::ResubmissionStore::new(
-					env.para_backend.clone(),
-				);
-				let parts = super::resubmittable_segment::ResubmittableSegment::<Block>::new(
-					cx.resubmittable_headers.clone(),
-				)
-				.hydrate(&*env.para_backend, &code_hash_provider, &store);
-				if parts.is_empty() {
-					continue;
-				}
-				parts
-			} else {
-				Vec::new()
-			};
-			let recovery_only = cx.slot_claim.is_none() ||
+			let (mut resubmittable, complete) =
+				if cx.v3_enabled && !cx.resubmittable_headers.is_empty() {
+					let store = cumulus_client_resubmission_store::ResubmissionStore::new(
+						env.para_backend.clone(),
+					);
+					let (parts, complete) = super::resubmittable_segment::ResubmittableSegment::<
+						Block,
+					>::new(cx.resubmittable_headers.clone())
+					.hydrate(&*env.para_backend, &code_hash_provider, &store);
+					if parts.is_empty() {
+						continue;
+					}
+					(parts, complete)
+				} else {
+					(Vec::new(), true)
+				};
+			let recovery_only = !complete ||
+				cx.slot_claim.is_none() ||
 				resubmittable.len() >= polkadot_node_primitives::MAX_SEGMENT_LEN as usize;
 			resubmittable.truncate(polkadot_node_primitives::MAX_SEGMENT_LEN as usize);
 			let mut pov_parent_header = cx.initial_parent_header.clone();

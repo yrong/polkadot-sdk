@@ -99,13 +99,13 @@ impl<Block: BlockT> ResubmittableSegment<Block> {
 		Ok(bundles)
 	}
 
-	/// Hydrate complete segments only; a missing predecessor invalidates its descendants.
+	/// Hydrate the available prefix, reporting whether every bundle was recovered.
 	pub(super) fn hydrate<B, CHP>(
 		self,
 		para_backend: &B,
 		code_hash_provider: &CHP,
 		store: &ResubmissionStore<Block, B>,
-	) -> Vec<CollationParts<Block>>
+	) -> (Vec<CollationParts<Block>>, bool)
 	where
 		B: Backend<Block>,
 		CHP: ValidationCodeHashProvider<Block::Hash>,
@@ -115,11 +115,12 @@ impl<Block: BlockT> ResubmittableSegment<Block> {
 			Ok(bundles) => bundles,
 			Err(err) => {
 				tracing::warn!(target: LOG_TARGET, %err, "Malformed resubmittable segment; skipping.");
-				return Vec::new();
+				return (Vec::new(), false);
 			},
 		};
 		let num_bundles = bundles.len();
 		let mut parts = Vec::with_capacity(num_bundles);
+		let mut complete = true;
 		for bundle in bundles {
 			let block_number = *bundle[0].number();
 			let block_hash = bundle[0].hash();
@@ -137,7 +138,8 @@ impl<Block: BlockT> ResubmittableSegment<Block> {
 				},
 				Err(err) => {
 					tracing::warn!(target: LOG_TARGET, ?block_number, ?block_hash, %err, "Unable to hydrate resubmittable segment.");
-					return Vec::new();
+					complete = false;
+					break;
 				},
 			}
 		}
@@ -151,7 +153,7 @@ impl<Block: BlockT> ResubmittableSegment<Block> {
 			"Hydrated resubmittable headers.",
 		);
 
-		parts
+		(parts, complete)
 	}
 }
 
@@ -353,11 +355,23 @@ mod tests {
 		assert_eq!(
 			ResubmittableSegment::new(vec![second.clone()])
 				.hydrate(&*backend, &provider, &store)
+				.0
 				.len(),
 			1
 		);
+		let mut third = header(3, None);
+		third.set_parent_hash(second.hash());
+		backend
+			.blockchain()
+			.insert(third.hash(), third.clone(), None, Some(vec![]), NewBlockState::Normal, false)
+			.expect("test block inserts; qed");
+		let (prefix, complete) = ResubmittableSegment::new(vec![second.clone(), third])
+			.hydrate(&*backend, &provider, &store);
+		assert_eq!(prefix.len(), 1);
+		assert!(!complete);
 		assert!(ResubmittableSegment::new(vec![first, second])
 			.hydrate(&*backend, &provider, &store)
+			.0
 			.is_empty());
 	}
 }
