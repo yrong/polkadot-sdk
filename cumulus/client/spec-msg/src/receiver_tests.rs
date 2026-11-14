@@ -1371,6 +1371,8 @@ fn consumption_past_included_settles_without_repeating_binding_requests() {
 	let record = chain.block(&receiver);
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	receiver.on_finalized(0, &chain.view());
+	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
 	let requests = sender.log.lock().len();
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert_eq!(sender.log.lock().len(), requests);
@@ -1381,4 +1383,61 @@ fn consumption_past_included_settles_without_repeating_binding_requests() {
 	);
 	block_on(receiver.on_root(source(), pending, &chain.wants()));
 	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
+}
+
+#[test]
+fn an_included_head_probe_does_not_bind_another_forks_endpoint() {
+	struct Forks {
+		included: StreamsRoot,
+		a: Arc<Sender>,
+		b: Arc<Sender>,
+	}
+	#[async_trait::async_trait]
+	impl Transport for Forks {
+		fn peers(&self, source: ParaId) -> Vec<PeerId> {
+			self.b.peers(source)
+		}
+		async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+			let decoded = MessagesRequest::decode(&mut &request[..]).unwrap();
+			let sender = if decoded.under == self.included { &self.a } else { &self.b };
+			sender.request(peer, request).await
+		}
+	}
+	let a = Sender::new();
+	let included_payloads = payloads(1, 3);
+	let included = a.author(vec![(channel(US), included_payloads.clone())]);
+	let sender = Sender::new();
+	let other = payloads(2, 4);
+	let pending = sender.author(vec![(channel(US), other.clone())]);
+	let receiver = Receiver::<u64, _>::new(
+		US.into(),
+		Budget { max_payloads: 2, ..Budget::default() },
+		Arc::new(Forks { included, a: a.clone(), b: sender }),
+	);
+	let chain = Chain::default();
+	let roots = crate::SourceRoots { included: Some(included), pending: vec![pending] };
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	let record = ConsumptionRecord {
+		entries: BTreeMap::from([(
+			source(),
+			vec![(
+				channel(US),
+				Interval { start: MmrFrontier::new().root(), end: frontier_at(&other, 4) },
+			)],
+		)]),
+	};
+	block_on(receiver.on_block(1, 0, 1, false, record));
+	block_on(receiver.on_roots(source(), roots, &chain.wants()));
+	assert!(a
+		.requests(channel(US))
+		.iter()
+		.any(|request| request.start.is_none() && request.max_bytes == 0));
+	assert_eq!(receiver.verified_stream_len(source(), channel(US), included), Some(3));
+	let pending_data = block_on(receiver.inherent_data(&chain.view(), &[]));
+	let planned = pending_data.channels.get(&in_id(0)).unwrap();
+	assert_eq!(planned.len(), 2);
+	assert_ne!(frontier_at(planned, 2), frontier_at(&included_payloads, 2));
+	receiver.drop_pending_roots(source());
+	let data = block_on(receiver.inherent_data(&chain.view(), &[]));
+	assert!(data.channels.is_empty());
 }

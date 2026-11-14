@@ -437,7 +437,7 @@ where
 	C::Api: SpecMsgApi<Block>,
 	T: Transport + ?Sized + 'static,
 {
-	Arc::new(move |blocks: &[Block], _resubmitting: bool| {
+	Arc::new(move |blocks: &[Block]| {
 		let records = blocks
 			.iter()
 			.map(|block| consumption_record(&*client, block.header().hash()))
@@ -778,7 +778,7 @@ mod tests {
 		h.chains.failing.store(true, Ordering::SeqCst);
 		h.relay_block(4, &[]);
 		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
-		assert!(consumed(&data).iter().all(|&count| count <= 2));
+		assert!(consumed(&data).is_empty());
 	}
 
 	#[test]
@@ -796,7 +796,7 @@ mod tests {
 		h.relay_block_snapshots(2, &snapshot);
 		assert!(!h.chains.held.lock().is_empty());
 		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
-		assert!(consumed(&data).iter().all(|&count| count <= 2), "consumed past {root:?}");
+		assert!(consumed(&data).is_empty());
 
 		h.chains.hold.store(false, Ordering::SeqCst);
 		h.chains.held.lock().clear();
@@ -827,14 +827,14 @@ mod tests {
 		let included_only = [(live(), SourceRoots::included(root))];
 		h.relay_block_snapshots(3, &included_only);
 		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
-		assert!(consumed(&data).iter().all(|&count| count <= 2), "consumed past {root:?}");
+		assert!(consumed(&data).is_empty());
 
 		// The stalled round ending does not make them eligible again.
 		h.source(live()).hold.store(false, Ordering::SeqCst);
 		h.source(live()).release();
 		h.pool.run_until_stalled();
 		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
-		assert!(consumed(&data).iter().all(|&count| count <= 2), "consumed past {root:?}");
+		assert_eq!(consumed(&data), vec![2]);
 	}
 
 	#[test]

@@ -276,6 +276,22 @@ where
 		}
 	}
 
+	#[cfg(test)]
+	pub(crate) fn verified_stream_len(
+		&self,
+		source: ParaId,
+		stream: StreamId,
+		root: StreamsRoot,
+	) -> Option<u64> {
+		self.state
+			.lock()
+			.sources
+			.get(&source)?
+			.stream_len
+			.get(&(stream, root.0))
+			.copied()
+	}
+
 	/// Whether the record of block `hash` is noted and not final yet.
 	#[cfg(test)]
 	pub(crate) fn is_live(&self, hash: &H) -> bool {
@@ -341,7 +357,7 @@ where
 
 	/// `roots` are `source`'s eligible roots at the current relay head: fetch under the newest
 	/// eligible root what `wants` names, and bind the live endpoints to it (and to the included
-	/// root when distinct, so a recovery resubmission can lift to the included root).
+	/// root when distinct, to prefer included dependencies whenever they cover the bundle).
 	pub async fn on_roots(&self, source: ParaId, roots: SourceRoots, wants: &SourceWants) {
 		self.update_roots(source, roots.clone());
 		self.fetch_roots(source, roots, wants).await;
@@ -484,15 +500,12 @@ where
 					let request =
 						MessagesRequest { stream, under: target_root, start: None, max_bytes: 0 };
 					if let Ok(response) = fetch(&self.transport, source, &request, None).await {
-						self.state.lock().sources.entry(source).or_default().insert_binding(
-							stream,
-							response.frontier.leaf_count(),
-							target_root,
-							Binding {
-								extension: response.extension,
-								tree_proof: response.tree_proof,
-							},
-						);
+						let mut state = self.state.lock();
+						let pool = state.sources.entry(source).or_default();
+						if pool.roots.contains(&target_root) {
+							pool.stream_len
+								.insert((stream, target_root.0), response.extension.leaf_count);
+						}
 					}
 				}
 				if target_root == root {
@@ -649,10 +662,7 @@ where
 		let endpoint_bound =
 			|source: ParaId, stream: &StreamId, end: &MmrFrontier, root: &StreamsRoot| {
 				let state = self.state.lock();
-				state.sources.get(&source).is_some_and(|pool| {
-					pool.binding(stream, end.leaf_count(), root).is_some() ||
-						lifts_to(pool, stream, end, root)
-				})
+				state.sources.get(&source).is_some_and(|pool| lifts_to(pool, stream, end, root))
 			};
 		let endpoint_lifts =
 			|source: ParaId, stream: &StreamId, end: &MmrFrontier, root: &StreamsRoot| {

@@ -78,6 +78,8 @@ pub struct SourcePool {
 	pub(crate) heads: BTreeMap<StreamId, HeadRead>,
 	/// Bindings by `(stream, leaf count)` and root hash.
 	pub(crate) bindings: BTreeMap<(StreamId, u64), BTreeMap<Hash, Binding>>,
+	/// Each root's verified leaf count per stream, from a binding or head proof under it.
+	pub(crate) stream_len: BTreeMap<(StreamId, Hash), u64>,
 	/// Advances by `(stream, from leaf count, to leaf count)` and the stream root they reach, the
 	/// start of the read they lead to: two forks' reads can share the leaf counts.
 	pub(crate) advances: BTreeMap<(StreamId, u64, u64, Hash), MmrExtensionProof>,
@@ -137,6 +139,7 @@ impl SourcePool {
 			.max(usize::from(self.eligible.included.is_some()) + self.eligible.pending.len());
 		while self.roots.len() > max_kept {
 			if let Some(old) = self.roots.pop_front() {
+				self.stream_len.retain(|(_, root), _| *root != old.0);
 				for by_root in self.bindings.values_mut() {
 					by_root.remove(&old.0);
 				}
@@ -220,16 +223,16 @@ impl SourcePool {
 		root: StreamsRoot,
 		binding: Binding,
 	) {
+		if self.roots.contains(&root) {
+			self.stream_len.insert((stream, root.0), binding.extension.leaf_count);
+		}
 		self.bindings.entry((stream, count)).or_default().insert(root.0, binding);
 	}
 
 	/// Whether a verified binding under `root` shows `stream` holds fewer than `count` leaves
 	/// there, so the endpoint cannot lift to `root`.
 	pub fn predates(&self, stream: &StreamId, count: u64, root: &StreamsRoot) -> bool {
-		self.bindings.iter().any(|((stored_stream, _), roots)| {
-			stored_stream == stream &&
-				roots.get(&root.0).is_some_and(|binding| binding.extension.leaf_count < count)
-		})
+		self.stream_len.get(&(*stream, root.0)).is_some_and(|length| *length < count)
 	}
 
 	/// The binding of `stream` at `count` under `root`.
