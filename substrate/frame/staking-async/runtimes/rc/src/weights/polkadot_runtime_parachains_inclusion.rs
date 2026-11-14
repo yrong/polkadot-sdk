@@ -135,26 +135,75 @@ impl<T: frame_system::Config> polkadot_runtime_parachains::inclusion::WeightInfo
 			.saturating_add(Weight::from_parts(0, 25419).saturating_mul(c.into()))
 			.saturating_add(Weight::from_parts(0, 29985).saturating_mul(h.into()))
 			.saturating_add(Weight::from_parts(0, 82828).saturating_mul(u.into()))
-			// Placeholder until `/cmd bench`: one full-window `RecentProvides` read and write, at
-			// `requires_satisfied`'s per-window cost.
-			.saturating_add(Weight::from_parts(7_792_478, 0).saturating_mul(p.into()))
-			.saturating_add(T::DbWeight::get().reads_writes(1, 1).saturating_mul(p.into()))
-			.saturating_add(Weight::from_parts(0, 6593).saturating_mul(p.into()))
+			.saturating_add(Self::record_provides().saturating_mul(p.into()))
 	}
-	// Copied from Westend's local measurement (10 steps, 1 repeat); regenerate with `/cmd bench`.
-	/// Storage: `ParaInclusion::RecentProvides` (r:256 w:0)
+	/// Storage: `ParaInclusion::RecentProvides` (r:1 w:1)
 	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
-	/// The range of component `r` is `[1, 256]`.
-	fn requires_satisfied(r: u32, ) -> Weight {
+	fn record_provides() -> Weight {
 		// Proof Size summary in bytes:
-		//  Measured:  `37 + r * (4117 ±0)`
-		//  Estimated: `1027 + r * (6593 ±0)`
-		// Minimum execution time: 9_000_000 picoseconds.
-		Weight::from_parts(9_000_000, 0)
-			.saturating_add(Weight::from_parts(0, 1027))
-			// Standard Error: 19_313
-			.saturating_add(Weight::from_parts(7_792_478, 0).saturating_mul(r.into()))
-			.saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(r.into())))
-			.saturating_add(Weight::from_parts(0, 6593).saturating_mul(r.into()))
+		//  Measured:  `4141`
+		//  Estimated: `7606`
+		// Minimum execution time: 22_560_000 picoseconds.
+		Weight::from_parts(27_050_000, 0)
+			.saturating_add(Weight::from_parts(0, 7606))
+			.saturating_add(T::DbWeight::get().reads(1))
+			.saturating_add(T::DbWeight::get().writes(1))
+	}
+	// Selection measurements: Westend Wasm, 2026-11-13, 10 steps, 2 repeats.
+	/// Storage: `ParaInclusion::V1` (r:1002 w:1001)
+	/// Proof: `ParaInclusion::V1` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParaInclusion::RecentProvides` (r:2 w:0)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `c` is `[0, 1000]`.
+	fn enactment_selection(c: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `695 + c * (576 ±0)`
+		//  Estimated: `6629 + c * (3052 ±0)`
+		// Minimum execution time: 70_529_000 picoseconds.
+		Weight::from_parts(70_529_000, 0)
+			.saturating_add(Weight::from_parts(0, 6629))
+			// Standard Error: 343_498
+			.saturating_add(Weight::from_parts(40_237_439, 0).saturating_mul(c.into()))
+			.saturating_add(T::DbWeight::get().reads(4))
+			.saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(c.into())))
+			.saturating_add(T::DbWeight::get().writes(1))
+			.saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(c.into())))
+			.saturating_add(Weight::from_parts(0, 3052).saturating_mul(c.into()))
+	}
+	/// Storage: `ParaInclusion::V1` (r:1009 w:1008)
+	/// Proof: `ParaInclusion::V1` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParaInclusion::RecentProvides` (r:257009 w:0)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `e` is `[0, 256000]`.
+	fn enactment_selection_requirements(e: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `12773 + e * (4154 ±0)`
+		//  Estimated: `14246 + e * (6640 ±0)`
+		// Minimum execution time: 68_748_000 picoseconds.
+		Weight::from_parts(68_748_000, 0)
+			.saturating_add(Weight::from_parts(0, 14246))
+			// Standard Error: 94_720
+			.saturating_add(Weight::from_parts(12_826_087, 0).saturating_mul(e.into()))
+			.saturating_add(T::DbWeight::get().reads(3))
+			.saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(e.into())))
+			.saturating_add(Weight::from_parts(0, 6640).saturating_mul(e.into()))
+	}
+	/// Storage: `ParaInclusion::V1` (r:2 w:1)
+	/// Proof: `ParaInclusion::V1` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `ParaInclusion::RecentProvides` (r:2 w:0)
+	/// Proof: `ParaInclusion::RecentProvides` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `b` is `[0, 5242880]`.
+	fn enactment_selection_payload(b: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `647 + b * (1 ±0)`
+		//  Estimated: `6585 + b * (1 ±0)`
+		// Minimum execution time: 69_619_000 picoseconds.
+		Weight::from_parts(69_619_000, 0)
+			.saturating_add(Weight::from_parts(0, 6585))
+			// Standard Error: 214
+			.saturating_add(Weight::from_parts(4_444, 0).saturating_mul(b.into()))
+			.saturating_add(T::DbWeight::get().reads(4))
+			.saturating_add(T::DbWeight::get().writes(1))
+			.saturating_add(Weight::from_parts(0, 1).saturating_mul(b.into()))
 	}
 }

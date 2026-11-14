@@ -43,13 +43,15 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 use pallet_message_queue::OnQueueChanged;
+#[cfg(test)]
+use polkadot_primitives::RequiresSet;
 use polkadot_primitives::{
 	effective_minimum_backing_votes, skip_ump_signals, supermajority_threshold, well_known_keys,
 	BackedCandidate, CandidateCommitments, CandidateDescriptorV2 as CandidateDescriptor,
 	CandidateHash, CandidateReceiptV2 as CandidateReceipt,
 	CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, GroupIndex, HeadData,
-	Id as ParaId, RequiresSet, SignedAvailabilityBitfields, SigningContext, StreamsRoot,
-	UpwardMessage, ValidatorId, ValidatorIndex, ValidityAttestation,
+	Id as ParaId, SignedAvailabilityBitfields, SigningContext, StreamsRoot, UpwardMessage,
+	ValidatorId, ValidatorIndex, ValidityAttestation,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{traits::One, DispatchError, SaturatedConversion, Saturating};
@@ -64,6 +66,8 @@ mod benchmarking;
 
 pub mod migration;
 
+mod enactment;
+
 pub trait WeightInfo {
 	/// Weight for `enact_candidate` extrinsic given the number of sent messages
 	/// (ump, hrmp), whether there is a new code for a runtime upgrade, and whether the candidate
@@ -72,8 +76,14 @@ pub trait WeightInfo {
 	/// NOTE: due to a shortcoming of the current benchmarking framework,
 	/// we use `u32` for the code upgrade and `Provides` flags, even though they are `bool`s.
 	fn enact_candidate(u: u32, h: u32, c: u32, p: u32) -> Weight;
-	/// Weight of matching a `Requires` set of `r` entries against the provides windows.
-	fn requires_satisfied(r: u32) -> Weight;
+	/// Append a root to a full provides window.
+	fn record_provides() -> Weight;
+	/// Pending queue scans, vote updates, and candidate selection.
+	fn enactment_selection(c: u32) -> Weight;
+	/// Matching and propagation for `e` total requirements.
+	fn enactment_selection_requirements(e: u32) -> Weight;
+	/// Cost of reading and rewriting `b` encoded pending bytes.
+	fn enactment_selection_payload(b: u32) -> Weight;
 }
 
 pub struct TestWeightInfo;
@@ -81,7 +91,16 @@ impl WeightInfo for TestWeightInfo {
 	fn enact_candidate(_u: u32, _h: u32, _c: u32, _p: u32) -> Weight {
 		Weight::zero()
 	}
-	fn requires_satisfied(_r: u32) -> Weight {
+	fn record_provides() -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection(_c: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_requirements(_e: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_payload(_b: u32) -> Weight {
 		Weight::zero()
 	}
 }
@@ -90,7 +109,16 @@ impl WeightInfo for () {
 	fn enact_candidate(_u: u32, _h: u32, _c: u32, _p: u32) -> Weight {
 		Weight::zero()
 	}
-	fn requires_satisfied(_r: u32) -> Weight {
+	fn record_provides() -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection(_c: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_requirements(_e: u32) -> Weight {
+		Weight::zero()
+	}
+	fn enactment_selection_payload(_b: u32) -> Weight {
 		Weight::zero()
 	}
 }
@@ -565,50 +593,45 @@ impl<T: Config> Pallet<T> {
 		let mut freed_cores = vec![];
 		let mut weight = Weight::zero();
 
+		let mut eligible = BTreeMap::new();
 		let pending_paraids: Vec<_> = PendingAvailability::<T>::iter_keys().collect();
-		for paraid in pending_paraids {
-			PendingAvailability::<T>::mutate(paraid, |candidates| {
-				if let Some(candidates) = candidates {
-					let mut last_enacted_index: Option<usize> = None;
-
-					for (candidate_index, candidate) in candidates.iter_mut().enumerate() {
-						if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
-							for validator_index in validator_indices.iter() {
-								// defensive check - this is constructed by loading the
-								// availability bitfield record, which is always `Some` if
-								// the core is occupied - that's why we're here.
-								if let Some(mut bit) =
-									candidate.availability_votes.get_mut(validator_index.0 as usize)
-								{
-									*bit = true;
-								}
-							}
-						}
-
-						// We check for the candidate's availability even if we didn't get any new
-						// bitfields for its core, as it may have already been available at a
-						// previous block but wasn't enacted due to its predecessors not being
-						// available.
-						if candidate.availability_votes.count_ones() >= threshold {
-							// We can only enact a candidate if we've enacted all of its
-							// predecessors already.
-							let can_enact = if candidate_index == 0 {
-								last_enacted_index == None
-							} else {
-								let prev_candidate_index = usize::try_from(candidate_index - 1)
-									.expect("Previous `if` would have caught a 0 candidate index.");
-								matches!(last_enacted_index, Some(old_index) if old_index == prev_candidate_index)
-							};
-
-							if can_enact {
-								last_enacted_index = Some(candidate_index);
-							}
+		for &paraid in &pending_paraids {
+			let Some(mut candidates) = PendingAvailability::<T>::get(paraid) else { continue };
+			for candidate in candidates.iter_mut() {
+				if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
+					for validator_index in validator_indices.iter() {
+						// defensive check - this is constructed by loading the
+						// availability bitfield record, which is always `Some` if
+						// the core is occupied - that's why we're here.
+						if let Some(mut bit) =
+							candidate.availability_votes.get_mut(validator_index.0 as usize)
+						{
+							*bit = true;
 						}
 					}
-
-					// Trim the pending availability candidates storage and enact candidates of this
-					// para now.
-					if let Some(last_enacted_index) = last_enacted_index {
+				}
+			}
+			let mut chain = Vec::new();
+			for candidate in &candidates {
+				let Ok(signals) = candidate.commitments.ump_signals() else { break };
+				chain.push(enactment::Candidate {
+					available: candidate.availability_votes.count_ones() >= threshold,
+					provides: signals.provides().copied(),
+					requires: signals.requires().cloned(),
+				});
+			}
+			eligible.insert(paraid, chain);
+			PendingAvailability::<T>::insert(paraid, candidates);
+		}
+		let selected = enactment::select(&eligible, Self::provides_contains);
+		for paraid in pending_paraids {
+			let chain = &eligible[&paraid];
+			let count = (0..chain.len()).take_while(|i| selected.contains(&(paraid, *i))).count();
+			PendingAvailability::<T>::mutate(paraid, |candidates| {
+				if let Some(candidates) = candidates {
+					if let Some(last_enacted_index) = count.checked_sub(1) {
+						// Trim the pending availability candidates storage and enact candidates of
+						// this para now.
 						let evicted_candidates = candidates.drain(0..=last_enacted_index);
 						for candidate in evicted_candidates {
 							freed_cores.push((candidate.core, candidate.hash));
@@ -967,6 +990,79 @@ impl<T: Config> Pallet<T> {
 		);
 	}
 
+	/// Reserve for every pending candidate, including passes with no new bitfields.
+	pub(crate) fn pending_selection_weight() -> Weight {
+		let mut candidates = 0u32;
+		let mut entries = 0u32;
+		let payload_base = <T as Config>::WeightInfo::enactment_selection_payload(0);
+		let mut payload_weight = Weight::zero();
+		for queue in PendingAvailability::<T>::iter_values() {
+			candidates =
+				candidates.saturating_add(queue.len().max(1).try_into().unwrap_or(u32::MAX));
+			for candidate in queue {
+				let bytes = candidate.encoded_size().try_into().unwrap_or(u32::MAX);
+				payload_weight.saturating_accrue(
+					<T as Config>::WeightInfo::enactment_selection_payload(bytes)
+						.saturating_sub(payload_base),
+				);
+				let count = candidate
+					.commitments
+					.ump_signals()
+					.ok()
+					.and_then(|s| s.requires().map(|r| r.len() as u32))
+					.unwrap_or(0);
+				entries = entries.saturating_add(count);
+			}
+		}
+		if candidates == 0 {
+			return Weight::zero();
+		}
+		<T as Config>::WeightInfo::enactment_selection(candidates)
+			.saturating_add(
+				<T as Config>::WeightInfo::enactment_selection_requirements(entries)
+					.saturating_sub(<T as Config>::WeightInfo::enactment_selection_requirements(0)),
+			)
+			.saturating_add(payload_weight)
+			.set_proof_size(0)
+	}
+
+	/// Reserve the next pass's added work before admitting a new pending candidate.
+	pub(crate) fn backed_selection_weight(candidate: &BackedCandidate<T::Hash>) -> Weight {
+		let validators = shared::ActiveValidatorKeys::<T>::decode_len().unwrap_or(0);
+		let votes = BitVec::<u8, BitOrderLsb0>::repeat(false, validators);
+		let bytes = (
+			CoreIndex(0),
+			CandidateHash::default(),
+			candidate.descriptor(),
+			&candidate.candidate().commitments,
+			&votes,
+			&votes,
+			GroupIndex(0),
+		)
+			.encoded_size()
+			.saturating_add(2 * <BlockNumberFor<T> as codec::MaxEncodedLen>::max_encoded_len());
+		let entries = candidate
+			.candidate()
+			.commitments
+			.ump_signals()
+			.ok()
+			.and_then(|s| s.requires().map(|r| r.len() as u32))
+			.unwrap_or(0);
+		<T as Config>::WeightInfo::enactment_selection(1)
+			.saturating_sub(<T as Config>::WeightInfo::enactment_selection(0))
+			.saturating_add(
+				<T as Config>::WeightInfo::enactment_selection_requirements(entries)
+					.saturating_sub(<T as Config>::WeightInfo::enactment_selection_requirements(0)),
+			)
+			.saturating_add(
+				<T as Config>::WeightInfo::enactment_selection_payload(
+					bytes.try_into().unwrap_or(u32::MAX),
+				)
+				.saturating_sub(<T as Config>::WeightInfo::enactment_selection_payload(0)),
+			)
+			.set_proof_size(0)
+	}
+
 	/// Whether `root` is present in `source`'s provides window.
 	fn provides_contains(source: ParaId, root: &StreamsRoot) -> bool {
 		// Scan newest-first: a `requires` almost always references a recent commitment, which sits
@@ -982,6 +1078,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
 	/// first miss.
+	#[cfg(test)]
 	pub(crate) fn requires_satisfied(requires: &RequiresSet) -> Result<(), (ParaId, StreamsRoot)> {
 		// One `RecentProvides` read per required source.
 		for (source, expected) in requires.iter() {
