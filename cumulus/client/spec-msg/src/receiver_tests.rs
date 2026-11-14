@@ -69,6 +69,7 @@ struct Sender {
 	archive: RwLock<TestArchive>,
 	/// Every request fails, as over a dropped connection.
 	down: RwLock<bool>,
+	down_under: RwLock<Option<StreamsRoot>>,
 	/// How long each request takes.
 	delay: RwLock<std::time::Duration>,
 	model: RwLock<Model>,
@@ -87,6 +88,7 @@ impl Sender {
 		Arc::new(Self {
 			archive: RwLock::new(Archive::open(Arc::new(MemoryStore::default()))),
 			down: RwLock::new(false),
+			down_under: RwLock::new(None),
 			delay: RwLock::new(Default::default()),
 			model: RwLock::new(Model::default()),
 			number: RwLock::new(0),
@@ -137,9 +139,11 @@ impl Transport for Sender {
 		if *self.down.read() {
 			return Err("connection closed".into());
 		}
-		self.log
-			.lock()
-			.push((peer, MessagesRequest::decode(&mut &request[..]).unwrap()));
+		let decoded = MessagesRequest::decode(&mut &request[..]).unwrap();
+		if self.down_under.read().as_ref() == Some(&decoded.under) {
+			return Err("connection closed".into());
+		}
+		self.log.lock().push((peer, decoded));
 		protocol::answer(&self.archive.read(), &request).ok_or_else(|| "refused".into())
 	}
 }
@@ -865,9 +869,11 @@ fn a_round_before_block_one_is_imported(
 	block_on(receiver.on_root(source(), root2, &wants));
 	chain.number += 1;
 	block_on(receiver.on_block(1, 0, 1, false, first.clone()));
-	// The next relay block has the same root: settled, so block 1 is not bound under it.
-	block_on(receiver.on_root(source(), root2, &chain.wants()));
-	assert!(receiver.is_settled(&source(), &root2, &chain.wants()));
+	assert!(!receiver.is_roots_settled(
+		&source(),
+		&crate::SourceRoots::included(root2),
+		&chain.wants()
+	));
 	(first, root1, root2)
 }
 
@@ -1165,4 +1171,156 @@ fn a_backlog_is_consumed_without_waiting_while_the_source_hangs() {
 	let waited = started.elapsed();
 	assert_eq!(chain.frontier.leaf_count(), 2, "the held backlog is consumed");
 	assert!(waited < crate::receiver::INHERENT_FETCH_TIMEOUT, "waited {waited:?}");
+}
+
+#[test]
+fn included_root_is_preferred_over_pending_when_it_covers_the_bundle() {
+	let sender = Sender::new();
+	let r0 = sender.author(vec![(channel(US), payloads(1, 3))]);
+	let r1 = sender.author(vec![(channel(US), payloads(2, 3))]);
+	// Budget caps consumption to 2 payloads per block, which is within r0's 3 leaves.
+	let receiver = receiver(&sender, Budget { max_payloads: 2, ..Budget::default() });
+	let mut chain = Chain::default();
+
+	// Only a snapshot with r0 included and r1 pending has been seen, so payloads were fetched
+	// under r1 (6 leaves).
+	block_on(receiver.on_roots(
+		source(),
+		crate::SourceRoots { included: Some(r0), pending: vec![r1] },
+		&chain.wants(),
+	));
+	let record = chain.block(&receiver);
+	assert_eq!(chain.frontier.leaf_count(), 2);
+	// Authoring fetched the missing binding at leaf_count 2 under r0 within INHERENT_FETCH_TIMEOUT,
+	// so assembly selects the included root r0 rather than the pending root r1.
+	assert_eq!(requires(&receiver, &[record.clone()]), Some(r0));
+	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
+}
+
+#[test]
+fn oldest_covering_pending_root_is_chosen_when_bundle_consumes_past_included() {
+	let sender = Sender::new();
+	let r0 = sender.author(vec![(channel(US), payloads(1, 2))]);
+	let r1 = sender.author(vec![(channel(US), payloads(2, 3))]);
+	let r2 = sender.author(vec![(channel(US), payloads(3, 3))]);
+	// Budget of 4 payloads consumes past r0 (2 leaves) and within r1 (5 leaves).
+	let receiver = receiver(&sender, Budget { max_payloads: 4, ..Budget::default() });
+	let mut chain = Chain::default();
+
+	block_on(receiver.on_roots(
+		source(),
+		crate::SourceRoots { included: Some(r0), pending: vec![r1, r2] },
+		&chain.wants(),
+	));
+	let record = chain.block(&receiver);
+	assert_eq!(chain.frontier.leaf_count(), 4);
+	// r0 does not cover 4 leaves; r1 is the oldest pending root that covers 4 leaves.
+	assert_eq!(requires(&receiver, &[record.clone()]), Some(r1));
+	// Recovery assembly requires an included root: until r1 is included, it refuses.
+	assert!(receiver.assemble_for_recovery(&[record.clone()]).is_err());
+
+	// Once r1 becomes included, recovery assembly succeeds and lifts to r1.
+	block_on(receiver.on_roots(
+		source(),
+		crate::SourceRoots { included: Some(r1), pending: vec![r2] },
+		&chain.wants(),
+	));
+	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let set = build_requires(&[record], &lifts).unwrap().unwrap();
+	assert_eq!(set.get(source()), Some(&r1));
+}
+
+#[test]
+fn multi_block_bundle_switches_from_included_to_pending_on_later_block() {
+	let sender = Sender::new();
+	let r0 = sender.author(vec![(channel(US), payloads(1, 2))]);
+	let r1 = sender.author(vec![(channel(US), payloads(2, 2))]);
+	let receiver = receiver(&sender, Budget { max_payloads: 2, ..Budget::default() });
+	let mut chain = Chain::default();
+
+	block_on(receiver.on_roots(
+		source(),
+		crate::SourceRoots { included: Some(r0), pending: vec![r1] },
+		&chain.wants(),
+	));
+	// Block 1 consumes 2 leaves, covered by r0.
+	let first = chain.block(&receiver);
+	assert_eq!(requires(&receiver, &[first.clone()]), Some(r0));
+
+	// Block 2 in the same bundle consumes 2 more leaves (up to 4), which only r1 covers.
+	let data = block_on(receiver.inherent_data(&chain.view(), &[first.clone()]));
+	let second = chain.import(&receiver, &data);
+	assert_eq!(chain.frontier.leaf_count(), 4);
+	assert_eq!(requires(&receiver, &[first, second]), Some(r1));
+}
+
+#[test]
+fn discarded_pending_roots_do_not_feed_new_consumption() {
+	let sender = Sender::new();
+	let included = sender.author(vec![(channel(US), payloads(1, 2))]);
+	let pending = sender.author(vec![(channel(US), payloads(2, 2))]);
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	block_on(receiver.on_roots(
+		source(),
+		crate::SourceRoots { included: Some(included), pending: vec![pending] },
+		&chain.wants(),
+	));
+	let data = block_on(receiver.inherent_data(&chain.view(), &[]));
+	let record = chain.enact(&data);
+	assert_eq!(chain.frontier.leaf_count(), 4);
+
+	*sender.down.write() = true;
+	block_on(receiver.on_root(source(), included, &Chain::default().wants()));
+	let data = block_on(receiver.inherent_data(&Chain::default().view(), &[]));
+	assert!(data.channels.is_empty());
+	assert_eq!(requires(&receiver, &[record.clone()]), Some(pending));
+	assert!(receiver.assemble_for_recovery(&[record]).is_err());
+}
+
+#[test]
+fn failed_included_bindings_retry_without_a_snapshot_change() {
+	let sender = Sender::new();
+	let included = sender.author(vec![(channel(US), payloads(1, 3))]);
+	let pending = sender.author(vec![(channel(US), payloads(2, 3))]);
+	let receiver = receiver(&sender, Budget { max_payloads: 2, ..Budget::default() });
+	let mut chain = Chain::default();
+	block_on(receiver.on_roots(
+		source(),
+		crate::SourceRoots { included: None, pending: vec![pending] },
+		&chain.wants(),
+	));
+	let record = chain.block(&receiver);
+	let roots = crate::SourceRoots { included: Some(included), pending: vec![pending] };
+	*sender.down_under.write() = Some(included);
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	assert!(receiver.assemble_for_recovery(&[record.clone()]).is_err());
+
+	*sender.down_under.write() = None;
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&included));
+}
+
+#[test]
+fn importing_a_live_endpoint_reopens_recovery_binding_work() {
+	let sender = Sender::new();
+	let included = sender.author(vec![(channel(US), payloads(1, 3))]);
+	let pending = sender.author(vec![(channel(US), payloads(2, 3))]);
+	let receiver = receiver(&sender, Budget { max_payloads: 2, ..Budget::default() });
+	let mut chain = Chain::default();
+	let roots = crate::SourceRoots { included: Some(included), pending: vec![pending] };
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+
+	*sender.down_under.write() = Some(included);
+	let record = chain.block(&receiver);
+	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	assert!(receiver.assemble_for_recovery(&[record.clone()]).is_err());
+	*sender.down_under.write() = None;
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
 }

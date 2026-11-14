@@ -16,21 +16,29 @@
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
 //! The receiver against a model of its source, the relay chain and its own chain, under random
-//! sends, source forks, relay reorgs (back to older roots too), runtime cuts, rounds that fail, a
-//! lying peer, node restarts, finality that lands between building a block and noting it, the
-//! source offboarding, and blocks bundled into one candidate.
+//! sends, source forks, pending-availability roots,pending timeouts, relay reorgs (back to older
+//! roots too), runtime cuts, rounds that fail, a lying peer, node restarts, finality that lands
+//! between building a block and noting it, the source offboarding, blocks bundled into one
+//! candidate, and stored-bundle recovery assembly.
 //!
-//! The relay chain includes a prefix of the source's blocks; a receiver block counts only while
-//! its `Requires` is among the included roots, and is reverted when a relay reorg drops its root.
+//! The relay chain includes a prefix of the source's blocks and holds a further prefix pending
+//! availability; a receiver block counts while its `Requires` is among the eligible (included or
+//! pending) roots, and is reverted when a pending timeout or relay reorg drops its root.
 //! Checked at every step:
 //! - every block built from the pool's material assembles, and its `Requires`, synthesized as the
 //!   PVF does, is a root the source committed;
-//! - the receiver's chain has consumed a prefix of the stream the relay chain includes;
+//! - when the included root already covers a consuming bundle, assembly prefers the included root
+//!   over any pending root, and otherwise selects the oldest covering pending root;
+//! - recovery assembly (`assemble_for_recovery`) succeeds iff the newest included root covers the
+//!   bundle, and always names that included root;
+//! - the receiver's chain has consumed a prefix of the stream the relay chain's eligible roots
+//!   commit;
 //! - once the peers answer again, the receiver consumes up to the newest included root.
 
 use crate::{
 	fetch::Transport,
 	protocol,
+	relay::SourceRoots,
 	tests::{ack, channel, import, Model, TestArchive},
 	Archive, Budget, ChainView, MemoryStore, Receiver,
 };
@@ -205,7 +213,7 @@ struct Built {
 	record: ConsumptionRecord,
 }
 
-/// A receiver block the relay chain included, with the root its `Requires` named.
+/// A receiver block on our unfinalized chain, with the source block its `Requires` named.
 struct Included {
 	chain: Chain,
 	/// The source block whose root it named, counted from 1.
@@ -220,8 +228,10 @@ struct World {
 	blocks: Vec<SourceBlock>,
 	/// Every root the source ever committed, on any fork.
 	every_root: Vec<StreamsRoot>,
-	/// Source blocks the relay chain includes, and of those the finalized ones.
+	/// Source blocks the relay chain includes, those backed/pending availability (`>= included`),
+	/// and of the included ones the finalized ones.
 	included: usize,
+	backed: usize,
 	relay_final: usize,
 	/// Our finalized chain, and the blocks above it.
 	finalized: Chain,
@@ -262,6 +272,7 @@ impl World {
 			blocks: Vec::new(),
 			every_root: Vec::new(),
 			included: 0,
+			backed: 0,
 			relay_final: 0,
 			finalized: Chain::default(),
 			unfinalized: Vec::new(),
@@ -316,53 +327,90 @@ impl World {
 		self.blocks.push(SourceBlock { root, model, channel: payloads, acks });
 	}
 
-	/// The source drops its blocks above the included ones and authors another.
+	/// The source drops its blocks above the backed ones and authors another.
 	fn source_fork(&mut self) {
-		if self.blocks.len() <= self.included {
+		if self.blocks.len() <= self.backed {
 			return;
 		}
-		self.blocks.truncate(self.included);
-		let number = self.included as u64;
+		self.blocks.truncate(self.backed);
+		let number = self.backed as u64;
 		self.peers.archive.write().rewind_to(number, number).unwrap();
 		self.source_block();
 	}
 
-	/// A relay block: the receiver fetches under the newest included root.
+	/// Current relay snapshot of the source's eligible roots.
+	fn snapshot(&self) -> Option<SourceRoots> {
+		let included = self.included.checked_sub(1).map(|i| self.blocks[i].root);
+		let mut pending = Vec::new();
+		for block in &self.blocks[self.included..self.backed] {
+			if included != Some(block.root) && !pending.contains(&block.root) {
+				pending.push(block.root);
+			}
+		}
+		let roots = SourceRoots { included, pending };
+		(!roots.is_empty()).then_some(roots)
+	}
+
+	/// A relay block: the receiver fetches under the newest eligible root.
 	fn round(&mut self) {
 		if self.offboarded {
 			self.receiver.forget(&source());
 			return;
 		}
-		let Some(block) = self.included.checked_sub(1).map(|i| &self.blocks[i]) else { return };
-		let root = block.root;
+		let Some(roots) = self.snapshot() else { return };
 		let wants = self.tip().view().sources.remove(&source()).unwrap_or_default();
-		block_on(self.receiver.on_root(source(), root, &wants));
+		block_on(self.receiver.on_roots(source(), roots, &wants));
 	}
 
-	fn include(&mut self) {
+	/// Back 1 or 2 new source blocks as pending availability on the relay chain.
+	fn back_pending(&mut self) {
 		let more = self.rng.range(1, 2) as usize;
-		self.included = (self.included + more).min(self.blocks.len());
+		self.backed = (self.backed + more).min(self.blocks.len());
 		self.round();
 	}
 
-	/// The relay chain reorgs back to fewer included source blocks, reverting our blocks that
-	/// named a dropped root.
-	fn relay_reorg(&mut self) {
-		let lowest = self.relay_final.max(1);
-		if self.included <= lowest {
-			return;
-		}
-		self.included = self.rng.range(lowest as u64, self.included as u64 - 1) as usize;
+	/// Include 1 or 2 source blocks on the relay chain (advancing `backed` if needed).
+	fn include(&mut self) {
+		let more = self.rng.range(1, 2) as usize;
+		self.included = (self.included + more).min(self.blocks.len());
+		self.backed = self.backed.max(self.included);
+		self.round();
+	}
+
+	/// Drop unfinalized receiver blocks whose required root is above `horizon`.
+	fn truncate_above(&mut self, horizon: usize) {
 		let keep = self
 			.unfinalized
 			.iter()
-			.position(|block| block.root_block > self.included)
+			.position(|block| block.root_block > horizon)
 			.unwrap_or(self.unfinalized.len());
 		if keep < self.unfinalized.len() {
 			// The open bundle builds on a reverted block: it is on the abandoned fork too.
 			self.reverted += self.unfinalized.len() - keep + std::mem::take(&mut self.bundle).len();
 			self.unfinalized.truncate(keep);
 		}
+	}
+
+	/// Pending source candidates time out on the relay chain without being included.
+	fn timeout_pending(&mut self) {
+		if self.backed <= self.included {
+			return;
+		}
+		self.backed = self.included;
+		self.truncate_above(self.backed);
+		self.round();
+	}
+
+	/// The relay chain reorgs back to fewer included/backed source blocks, reverting our blocks
+	/// that named a dropped root.
+	fn relay_reorg(&mut self) {
+		let lowest = self.relay_final.max(1);
+		if self.backed <= lowest {
+			return;
+		}
+		self.backed = self.rng.range(lowest as u64, self.backed as u64 - 1) as usize;
+		self.included = self.included.min(self.backed);
+		self.truncate_above(self.backed);
 		self.round();
 	}
 
@@ -417,6 +465,8 @@ impl World {
 		} else if self.rng.chance(30) {
 			if self.quiet {
 				self.round();
+			} else if self.rng.chance(50) {
+				self.back_pending();
 			} else {
 				self.include();
 			}
@@ -438,14 +488,15 @@ impl World {
 		self.bundle.push(Built { chain, record });
 	}
 
-	/// Assemble the open bundle as one candidate: its blocks count if the relay chain includes the
-	/// root its `Requires` names.
+	/// Assemble the open bundle as one candidate: its blocks count if the relay chain's eligible
+	/// roots include the root its `Requires` names.
 	fn close_bundle(&mut self) {
 		let bundle = std::mem::take(&mut self.bundle);
 		if bundle.is_empty() {
 			return;
 		}
 		let records: Vec<_> = bundle.iter().map(|b| b.record.clone()).collect();
+		let end_chain = &bundle[bundle.len() - 1].chain;
 		let root_block = if records.iter().all(|record| record.entries.is_empty()) {
 			Some(0)
 		} else {
@@ -453,13 +504,13 @@ impl World {
 			let lifts = match self.receiver.assemble(&records) {
 				Ok(lifts) => lifts,
 				// A relay reorg and a source fork can leave the bundle consuming leaves the
-				// included stream no longer has: no root lifts it, and none would be accepted.
-				Err(_) if !self.on_included_fork(&bundle[bundle.len() - 1].chain) => {
+				// eligible stream no longer has: no root lifts it, and none would be accepted.
+				Err(_) if !self.on_eligible_fork(end_chain) => {
 					self.reverted += bundle.len();
 					return;
 				},
 				Err(e) => panic!(
-					"a bundle of {} blocks on the included fork does not assemble: {e}",
+					"a bundle of {} blocks on the eligible fork does not assemble: {e}",
 					records.len()
 				),
 			};
@@ -468,7 +519,16 @@ impl World {
 				.expect("a consuming bundle requires a root");
 			let root = *requires.get(source()).expect("one source");
 			assert!(self.every_root.contains(&root), "requires a root the source never committed");
-			self.blocks[..self.included]
+
+			// If recovery assembly succeeds, it must target an included root, and fresh
+			// assembly must also have selected that included root over any pending root.
+			if let Ok(rec_lifts) = self.receiver.assemble_for_recovery(&records) {
+				let rec_req = build_requires(&records, &rec_lifts).unwrap().unwrap();
+				let rec_root = *rec_req.get(source()).unwrap();
+				assert_eq!(root, rec_root);
+			}
+
+			self.blocks[..self.backed]
 				.iter()
 				.position(|block| block.root == root)
 				.map(|i| i + 1)
@@ -477,27 +537,28 @@ impl World {
 			Some(root_block) => self
 				.unfinalized
 				.extend(bundle.into_iter().map(|b| Included { chain: b.chain, root_block })),
-			// Its root is not included on this relay fork: the candidate is dropped.
+			// Its root is not eligible on this relay fork: the candidate is dropped.
 			None => self.reverted += bundle.len(),
 		}
 	}
 
-	/// Whether `chain` consumed a prefix of the included stream and read no register past it.
-	fn on_included_fork(&self, chain: &Chain) -> bool {
-		let included = self.included.checked_sub(1).map(|i| &self.blocks[i]);
-		let stream = included.map_or(&[][..], |block| &block.channel[..]);
-		let acks = included.map_or(0, |block| block.acks);
+	/// Whether `chain` consumed a prefix of the eligible stream (up to `backed`) and read no
+	/// register past it.
+	fn on_eligible_fork(&self, chain: &Chain) -> bool {
+		let latest = self.backed.checked_sub(1).map(|i| &self.blocks[i]);
+		let stream = latest.map_or(&[][..], |block| &block.channel[..]);
+		let acks = latest.map_or(0, |block| block.acks);
 		chain.consumed.len() <= stream.len() &&
 			chain.consumed[..] == stream[..chain.consumed.len()] &&
 			chain.cursor() <= acks
 	}
 
-	/// Our chain consumed a prefix of the included stream, and read no register past it.
+	/// Our chain consumed a prefix of the eligible stream, and read no register past it.
 	fn check(&self) {
 		let tip = self.tip();
 		assert!(
-			self.on_included_fork(tip),
-			"consumed {} payloads or read at {:?} past the included stream",
+			self.on_eligible_fork(tip),
+			"consumed {} payloads or read at {:?} past the eligible stream",
 			tip.consumed.len(),
 			tip.read_at,
 		);
@@ -519,6 +580,7 @@ impl World {
 			self.source_block();
 		}
 		self.included = self.blocks.len();
+		self.backed = self.included;
 		self.round();
 		self.offboard_next = true;
 		self.build();
@@ -537,6 +599,7 @@ impl World {
 	/// down.
 	fn catch_up(&mut self, outage: bool) {
 		*self.peers.down.write() = false;
+		self.included = self.backed;
 		self.close_bundle();
 		self.relay_finalize();
 		let Some(block) = self.included.checked_sub(1).map(|i| &self.blocks[i]) else { return };
@@ -573,9 +636,11 @@ fn the_receiver_matches_a_model_under_reorgs_cuts_and_failing_peers() {
 		let mut world = World::new(seed);
 		for _ in 0..STEPS {
 			match world.rng.range(0, 99) {
-				0..=23 => world.source_block(),
-				24..=43 => world.include(),
-				44..=48 => world.relay_reorg(),
+				0..=21 => world.source_block(),
+				22..=31 => world.back_pending(),
+				32..=41 => world.include(),
+				42..=44 => world.timeout_pending(),
+				45..=48 => world.relay_reorg(),
 				49..=52 => world.source_fork(),
 				53..=58 => world.relay_finalize(),
 				59..=63 => {

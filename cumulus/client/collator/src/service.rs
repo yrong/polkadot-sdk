@@ -53,7 +53,7 @@ pub struct SpecMsgInputs {
 /// one with [`CollatorService::with_spec_msg_assembler`]; without one, a collation carries no
 /// records and no lifts, which is correct for blocks that consumed nothing.
 pub type SpecMsgAssembler<Block> =
-	Arc<dyn Fn(&[Block]) -> Result<SpecMsgInputs, String> + Send + Sync>;
+	Arc<dyn Fn(&[Block], bool) -> Result<SpecMsgInputs, String> + Send + Sync>;
 
 /// The candidate's UMP signal tail, byte-identical to `validate_block`'s from the same records and
 /// lifts, so a rejected candidate is never submitted. `provides` comes from the blocks' digests
@@ -360,7 +360,7 @@ where
 		// The speculative-messaging inputs for these blocks. A collation `validate_block` would
 		// reject is not worth submitting, so a failure skips it.
 		let spec_msg_inputs = match &self.spec_msg_assembler {
-			Some(assemble) => match assemble(&blocks) {
+			Some(assemble) => match assemble(&blocks, signed_scheduling_info.is_some()) {
 				Ok(inputs) => inputs,
 				Err(error) => {
 					tracing::error!(

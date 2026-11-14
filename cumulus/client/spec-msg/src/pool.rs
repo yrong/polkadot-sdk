@@ -19,6 +19,7 @@
 //! material from a leaf count to a root) and advances between read contexts. All of it verified,
 //! and all of it fetchable again.
 
+use crate::relay::SourceRoots;
 use cumulus_primitives_spec_messaging::{
 	MmrExtensionProof, MmrFrontier, StreamId, StreamProof, StreamsRoot,
 };
@@ -28,8 +29,8 @@ use std::{
 	ops::Bound,
 };
 
-/// Source roots kept per source, newest last. Lifts target the newest root the material covers,
-/// so older roots only matter while their material is all a bundle has.
+/// Source roots kept per source, newest last. Lifts target the preferred eligible root the
+/// material covers, while older roots stay for unfinalized blocks already built.
 pub const ROOTS_KEPT: usize = 8;
 
 /// Lift material: extends a stream's frontier at some leaf count to its entry under a root.
@@ -64,6 +65,9 @@ impl HeadRead {
 pub struct SourcePool {
 	/// Roots material was fetched under, newest last.
 	pub(crate) roots: VecDeque<StreamsRoot>,
+	/// The source's currently eligible roots on the relay chain: its newest included root and its
+	/// ordered pending-availability roots.
+	pub(crate) eligible: SourceRoots,
 	/// Every fetch under the newest root succeeded. Until then, each relay block fetches under it
 	/// again: a request can fail for reasons that pass, such as a dropped connection.
 	pub(crate) settled: bool,
@@ -92,6 +96,7 @@ impl SourcePool {
 	pub fn forget(&mut self) {
 		self.heads.clear();
 		self.reach.clear();
+		self.eligible = SourceRoots::default();
 		self.settled = false;
 		self.forgotten = true;
 	}
@@ -101,16 +106,33 @@ impl SourcePool {
 		self.roots.back().copied()
 	}
 
-	/// Note `root` as the newest. Bindings under roots that fall out are dropped.
+	/// Note `root` as the newest included root (with no pending roots).
 	pub fn push_root(&mut self, root: StreamsRoot) {
-		self.forgotten = false;
-		if self.newest_root() == Some(root) {
+		self.push_roots(SourceRoots::included(root));
+	}
+
+	/// Update the source's eligible roots from the relay chain and record every root in `roots`
+	/// with the newest last. Bindings under roots that fall out of `ROOTS_KEPT` and are not
+	/// currently eligible are dropped.
+	pub fn push_roots(&mut self, eligible: SourceRoots) {
+		let Some(newest) = eligible.newest() else {
+			self.forget();
 			return;
+		};
+		self.forgotten = false;
+		let newest_changed = self.newest_root() != Some(newest);
+		let included_changed = self.eligible.included != eligible.included;
+		self.eligible = eligible.clone();
+		for root in eligible.included.into_iter().chain(eligible.pending) {
+			self.roots.retain(|r| *r != root);
+			self.roots.push_back(root);
 		}
-		self.roots.retain(|r| *r != root);
-		self.roots.push_back(root);
-		self.settled = false;
-		while self.roots.len() > ROOTS_KEPT {
+		if newest_changed || included_changed {
+			self.settled = false;
+		}
+		let max_kept = ROOTS_KEPT
+			.max(usize::from(self.eligible.included.is_some()) + self.eligible.pending.len());
+		while self.roots.len() > max_kept {
 			if let Some(old) = self.roots.pop_front() {
 				for by_root in self.bindings.values_mut() {
 					by_root.remove(&old.0);
@@ -118,6 +140,31 @@ impl SourcePool {
 			}
 		}
 		self.bindings.retain(|_, by_root| !by_root.is_empty());
+	}
+
+	/// Eligible roots, preferring included state and then the oldest pending root.
+	pub fn target_roots(&self) -> Vec<StreamsRoot> {
+		let mut out = Vec::new();
+		if let Some(included) = self.eligible.included {
+			out.push(included);
+		}
+		for root in &self.eligible.pending {
+			if !out.contains(root) {
+				out.push(*root);
+			}
+		}
+		out
+	}
+
+	/// Retained roots can still assemble blocks built before the snapshot changed.
+	pub fn assembly_roots(&self) -> Vec<StreamsRoot> {
+		let mut roots = self.target_roots();
+		for root in self.roots.iter().rev() {
+			if !roots.contains(root) {
+				roots.push(*root);
+			}
+		}
+		roots
 	}
 
 	/// Store `payloads` of `stream` from position `start`.

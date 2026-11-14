@@ -17,9 +17,9 @@
 
 //! The receiver's ties to the own chain and the relay chain.
 //!
-//! - [`run_receiver`]: per relay best block, pass each source's newest included root to
-//!   [`Receiver::on_root`] until it settles, one round per source at a time; note own blocks; prune
-//!   on finality. The loop never waits on the network.
+//! - [`run_receiver`]: per relay best block, pass each source's eligible roots to
+//!   [`Receiver::on_roots`] until it settles, one round per source at a time; note own blocks;
+//!   prune on finality. The loop never waits on the network.
 //! - [`inherent_data`] and [`assembler`]: the inherent provider and the collator's
 //!   [`SpecMsgAssembler`].
 //!
@@ -28,12 +28,12 @@
 use crate::{
 	fetch::Transport,
 	receiver::{ChainView, Receiver, SourceWants},
-	relay::{answered_newest_included_provides, relay_has_api},
+	relay::{receiver_roots, SourceRoots},
 	LOG_TARGET,
 };
 use cumulus_client_collator::service::{SpecMsgAssembler, SpecMsgInputs};
 use cumulus_primitives_core::{CumulusDigestItem, ParaId, SpecMsgApi};
-use cumulus_primitives_spec_messaging::{ConsumptionRecord, MessagingInherentData, StreamsRoot};
+use cumulus_primitives_spec_messaging::{ConsumptionRecord, MessagingInherentData};
 use cumulus_relay_chain_interface::{PHash, RelayChainInterface};
 use futures::{select, stream::FuturesUnordered, Stream, StreamExt};
 use sc_client_api::BlockchainEvents;
@@ -92,16 +92,17 @@ pub(crate) trait Chains: Send + Sync {
 	/// The consumption view at the own chain's best block; `None` without `SpecMsgApi`.
 	fn view(&self) -> Option<ChainView>;
 
-	/// `source`'s newest included root as of relay block `head`. `Ok(None)` is the relay runtime
+	/// `source`'s eligible roots as of relay block `head`. `Ok(None)` is the relay runtime
 	/// answering that it has none; `Err` when it did not answer, e.g. the call failed or the
 	/// runtime lacks the API.
-	async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()>;
+	async fn roots(&self, head: PHash, source: ParaId) -> Result<Option<SourceRoots>, ()>;
 }
 
 /// [`Chains`] read from the node's client and relay chain interface.
 struct ClientChains<Block, C> {
 	client: Arc<C>,
 	relay: Arc<dyn RelayChainInterface>,
+	optimistic: bool,
 	_block: PhantomData<fn() -> Block>,
 }
 
@@ -116,11 +117,8 @@ where
 		chain_view(&*self.client, self.client.info().best_hash)
 	}
 
-	async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()> {
-		if !relay_has_api(&*self.relay, head).await {
-			return Err(());
-		}
-		answered_newest_included_provides(&*self.relay, head, source).await
+	async fn roots(&self, head: PHash, source: ParaId) -> Result<Option<SourceRoots>, ()> {
+		receiver_roots(&*self.relay, head, source, self.optimistic).await
 	}
 }
 
@@ -134,11 +132,13 @@ pub(crate) struct Imported<H> {
 	pub(crate) record: ConsumptionRecord,
 }
 
-/// Keep `receiver` fed from `client` and `relay` until a notification stream ends.
+/// Keep `receiver` fed until a notification stream ends. Enable `optimistic` only on a relay
+/// deployment with enactment matching.
 pub async fn run_receiver<Block, C, T>(
 	client: Arc<C>,
 	relay: Arc<dyn RelayChainInterface>,
 	receiver: Arc<Receiver<Block::Hash, T>>,
+	optimistic: bool,
 ) where
 	Block: BlockT,
 	C: ProvideRuntimeApi<Block> + BlockchainEvents<Block> + HeaderBackend<Block> + Send + Sync,
@@ -182,7 +182,7 @@ pub async fn run_receiver<Block, C, T>(
 			((*finalized.header.number()).saturated_into(), view)
 		}
 	});
-	let chains = ClientChains { client, relay, _block: PhantomData };
+	let chains = ClientChains { client, relay, optimistic, _block: PhantomData };
 	drive(&chains, &receiver, heads, imports, finality).await
 }
 
@@ -210,8 +210,8 @@ pub(crate) async fn drive<H, T, S>(
 	let mut rounds = FuturesUnordered::new();
 	let mut gap_fetches = FuturesUnordered::new();
 	let round = |source: ParaId, head: PHash, wants: SourceWants| async move {
-		match chains.root(head, source).await {
-			Ok(Some(root)) => receiver.on_root(source, root, &wants).await,
+		match chains.roots(head, source).await {
+			Ok(Some(roots)) => receiver.on_roots(source, roots, &wants).await,
 			Ok(None) => receiver.forget(&source),
 			Err(()) => {},
 		}
@@ -357,7 +357,8 @@ fn extends_bundle<H: HeaderT>(header: &H) -> bool {
 }
 
 /// The collator's assembler: each block's consumption record, and the lifts for them from the
-/// receiver's pool. An error skips the collation; the next attempt assembles again.
+/// receiver's pool. When `resubmitting` is true, requires an included root for every source in the
+/// bundle. An error skips the collation; the next attempt assembles again.
 pub fn assembler<Block, C, T>(
 	client: Arc<C>,
 	receiver: Arc<Receiver<Block::Hash, T>>,
@@ -368,12 +369,16 @@ where
 	C::Api: SpecMsgApi<Block>,
 	T: Transport + ?Sized + 'static,
 {
-	Arc::new(move |blocks: &[Block]| {
+	Arc::new(move |blocks: &[Block], resubmitting: bool| {
 		let records = blocks
 			.iter()
 			.map(|block| consumption_record(&*client, block.header().hash()))
 			.collect::<Result<Vec<_>, _>>()?;
-		let lifts = receiver.assemble(&records)?;
+		let lifts = if resubmitting {
+			receiver.assemble_for_recovery(&records)?
+		} else {
+			receiver.assemble(&records)?
+		};
 		Ok(SpecMsgInputs { records, lifts })
 	})
 }
@@ -389,7 +394,7 @@ mod tests {
 	use codec::{Decode, Encode};
 	use cumulus_primitives_spec_messaging::{
 		ConsumedStreams, InChannelId, Interval, MessagePosition, MessagesRequest, MmrFrontier,
-		OutChannelId, Register, RegisterStatus, StreamId,
+		OutChannelId, Register, RegisterStatus, StreamId, StreamsRoot,
 	};
 	use futures::{
 		channel::{mpsc, oneshot},
@@ -484,7 +489,7 @@ mod tests {
 	/// channel to it, and the sources' roots per relay head.
 	struct TestChains {
 		view: ChainView,
-		roots: Mutex<BTreeMap<(PHash, ParaId), StreamsRoot>>,
+		roots: Mutex<BTreeMap<(PHash, ParaId), SourceRoots>>,
 		/// While set, the relay chain gives no answer.
 		failing: AtomicBool,
 	}
@@ -495,11 +500,11 @@ mod tests {
 			Some(self.view.clone())
 		}
 
-		async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()> {
+		async fn roots(&self, head: PHash, source: ParaId) -> Result<Option<SourceRoots>, ()> {
 			if self.failing.load(Ordering::SeqCst) {
 				return Err(());
 			}
-			Ok(self.roots.lock().get(&(head, source)).copied())
+			Ok(self.roots.lock().get(&(head, source)).cloned())
 		}
 	}
 
@@ -568,7 +573,19 @@ mod tests {
 		/// until nothing can progress.
 		fn relay_block(&mut self, n: u8, roots: &[(ParaId, StreamsRoot)]) {
 			for (source, root) in roots {
-				self.chains.roots.lock().insert((head(n), *source), *root);
+				self.chains
+					.roots
+					.lock()
+					.insert((head(n), *source), SourceRoots::included(*root));
+			}
+			self.heads.unbounded_send(head(n)).unwrap();
+			self.pool.run_until_stalled();
+		}
+
+		/// Relay block `n` becomes best, with full `SourceRoots` snapshots per source.
+		fn relay_block_snapshots(&mut self, n: u8, roots: &[(ParaId, SourceRoots)]) {
+			for (source, snapshot) in roots {
+				self.chains.roots.lock().insert((head(n), *source), snapshot.clone());
 			}
 			self.heads.unbounded_send(head(n)).unwrap();
 			self.pool.run_until_stalled();
@@ -650,6 +667,35 @@ mod tests {
 		let unders = h.source(stalled()).unders();
 		assert!(!unders.contains(&roots[1]), "{unders:?}");
 		assert_eq!(unders.last(), Some(&roots[2]));
+	}
+
+	#[test]
+	fn pending_root_fetches_optimistically_and_transitions_on_inclusion_or_timeout() {
+		let mut h = Harness::new();
+		let r0 = h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
+		let r1 = h.source(live()).author(vec![(channel(US), payloads(2, 2))]);
+
+		// Relay block 1 has r0 included and r1 pending availability: the receiver fetches under r1.
+		h.relay_block_snapshots(
+			1,
+			&[(live(), SourceRoots { included: Some(r0), pending: vec![r1] })],
+		);
+		assert!(h.receiver.is_settled(&live(), &r1, h.wants(live())));
+		assert_eq!(h.receiver.newest_root(&live()), Some(r1));
+
+		// Relay block 2 includes r1: settled under r1 without needing a new root.
+		h.relay_block_snapshots(
+			2,
+			&[(live(), SourceRoots { included: Some(r1), pending: Vec::new() })],
+		);
+		assert!(h.receiver.is_settled(&live(), &r1, h.wants(live())));
+
+		// Relay block 3 reorgs / times out back to r0 only: the newest root reverts to r0.
+		h.relay_block_snapshots(
+			3,
+			&[(live(), SourceRoots { included: Some(r0), pending: Vec::new() })],
+		);
+		assert_eq!(h.receiver.newest_root(&live()), Some(r0));
 	}
 
 	#[test]
