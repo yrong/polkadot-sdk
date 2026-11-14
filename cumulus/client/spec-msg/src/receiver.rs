@@ -319,7 +319,8 @@ where
 		let Some(newest) = roots.newest() else { return false };
 		let state = self.state.lock();
 		let Some(pool) = state.sources.get(source) else { return false };
-		pool.eligible == *roots &&
+		pool.eligibility_known &&
+			pool.eligible == *roots &&
 			pool.newest_root() == Some(newest) &&
 			pool.settled &&
 			state.live_endpoints(source).iter().all(|((stream, _), end)| {
@@ -341,6 +342,28 @@ where
 	/// eligible root what `wants` names, and bind the live endpoints to it (and to the included
 	/// root when distinct, so a recovery resubmission can lift to the included root).
 	pub async fn on_roots(&self, source: ParaId, roots: SourceRoots, wants: &SourceWants) {
+		self.update_roots(source, roots.clone());
+		self.fetch_roots(source, roots, wants).await;
+	}
+
+	pub(crate) fn update_roots(&self, source: ParaId, roots: SourceRoots) {
+		self.state.lock().sources.entry(source).or_default().push_roots(roots);
+	}
+
+	/// The relay chain did not answer: keep the included root, which only a reorg takes back, but
+	/// stop new consumption under pending roots, whose providers may have been dropped since.
+	pub(crate) fn drop_pending_roots(&self, source: ParaId) {
+		if let Some(pool) = self.state.lock().sources.get_mut(&source) {
+			pool.eligible.pending.clear();
+		}
+	}
+
+	pub(crate) async fn fetch_roots(
+		&self,
+		source: ParaId,
+		roots: SourceRoots,
+		wants: &SourceWants,
+	) {
 		let Some(root) = roots.newest() else {
 			self.forget(&source);
 			return;
@@ -349,7 +372,6 @@ where
 			return;
 		}
 		self.transport.next_round(source);
-		self.state.lock().sources.entry(source).or_default().push_roots(roots.clone());
 		log::debug!(target: LOG_TARGET, "New root {root:?} of {source:?}: fetching");
 		let started = std::time::Instant::now();
 		let mut settled = true;
@@ -463,7 +485,7 @@ where
 		let mut state = self.state.lock();
 		if let Some(pool) = state.sources.get_mut(&source) {
 			// A newer root may have arrived meanwhile; it settles on its own.
-			if pool.newest_root() == Some(root) {
+			if pool.eligible == roots {
 				pool.settled = settled;
 			}
 		}

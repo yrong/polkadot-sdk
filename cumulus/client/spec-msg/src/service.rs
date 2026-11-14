@@ -272,23 +272,21 @@ pub(crate) async fn drive<H, T, S>(
 	let mut slots = RoundSlots::default();
 	let mut rounds = FuturesUnordered::new();
 	let mut gap_fetches = FuturesUnordered::new();
-	let round = |source: ParaId, head: PHash, wants: SourceWants| async move {
-		match chains.roots(head, source).await {
-			Ok(Some(roots)) => receiver.on_roots(source, roots, &wants).await,
-			Ok(None) => receiver.forget(&source),
-			Err(()) => {},
-		}
+	let mut snapshots = FuturesUnordered::new();
+	let mut latest = BTreeMap::new();
+	let round = |source: ParaId, roots: SourceRoots, wants: SourceWants| async move {
+		receiver.fetch_roots(source, roots, &wants).await;
 		source
 	};
 	loop {
 		select! {
 			head = heads.next() => {
 				let Some(head) = head else { return };
-				let mut view = chains.view().unwrap_or_default();
-				for source in slots.on_head(head, view.sources.keys().copied()) {
-					if let Some(wants) = view.sources.remove(&source) {
-						rounds.push(round(source, head, wants));
-					}
+				let view = chains.view().unwrap_or_default();
+				slots.newest = Some(head);
+				latest.clear();
+				for source in view.sources.keys().copied() {
+					snapshots.push(async move { (source, head, chains.roots(head, source).await) });
 				}
 			},
 			import = imports.next() => {
@@ -304,12 +302,31 @@ pub(crate) async fn drive<H, T, S>(
 				let Some((number, view)) = finalized else { return };
 				receiver.on_finalized(number, &view);
 			},
+			snapshot = snapshots.select_next_some() => {
+				let (source, head, result) = snapshot;
+				if slots.newest != Some(head) { continue }
+				match result {
+					Ok(Some(roots)) => {
+						receiver.update_roots(source, roots.clone());
+						latest.insert(source, roots.clone());
+						if !slots.running.contains_key(&source) {
+							if let Some(wants) = chains.view().and_then(|mut view| view.sources.remove(&source)) {
+								slots.start(source, head);
+								rounds.push(round(source, roots, wants));
+							}
+						}
+					},
+					Ok(None) => receiver.forget(&source),
+					Err(()) => receiver.drop_pending_roots(source),
+				}
+			},
 			source = rounds.select_next_some() => {
 				let Some(head) = slots.on_done(source) else { continue };
-				let wants = chains.view().and_then(|mut view| view.sources.remove(&source));
-				if let Some(wants) = wants {
-					slots.start(source, head);
-					rounds.push(round(source, head, wants));
+				if let Some(roots) = latest.get(&source).cloned() {
+					if let Some(wants) = chains.view().and_then(|mut view| view.sources.remove(&source)) {
+						slots.start(source, head);
+						rounds.push(round(source, roots, wants));
+					}
 				}
 			},
 			() = gap_fetches.select_next_some() => {},
@@ -327,20 +344,6 @@ struct RoundSlots {
 }
 
 impl RoundSlots {
-	/// Relay block `head` is the newest. Of `sources`, those to start a round for on it: the
-	/// others have one running.
-	fn on_head(&mut self, head: PHash, sources: impl IntoIterator<Item = ParaId>) -> Vec<ParaId> {
-		self.newest = Some(head);
-		let mut started = Vec::new();
-		for source in sources {
-			if !self.running.contains_key(&source) {
-				self.running.insert(source, head);
-				started.push(source);
-			}
-		}
-		started
-	}
-
 	/// `source`'s round ended. The newest relay block, if newer than the one the round ran on:
 	/// `source` needs another round, on it.
 	fn on_done(&mut self, source: ParaId) -> Option<PHash> {
@@ -420,7 +423,7 @@ fn extends_bundle<H: HeaderT>(header: &H) -> bool {
 }
 
 /// The collator's assembler: each block's consumption record, and the lifts for them from the
-/// receiver's pool. When `resubmitting` is true, only the source's current eligible roots qualify.
+/// receiver's pool. Only the source's current eligible roots qualify.
 /// An error skips the collation; the next attempt assembles again.
 pub fn assembler<Block, C, T>(
 	client: Arc<C>,
@@ -432,16 +435,12 @@ where
 	C::Api: SpecMsgApi<Block>,
 	T: Transport + ?Sized + 'static,
 {
-	Arc::new(move |blocks: &[Block], resubmitting: bool| {
+	Arc::new(move |blocks: &[Block], _resubmitting: bool| {
 		let records = blocks
 			.iter()
 			.map(|block| consumption_record(&*client, block.header().hash()))
 			.collect::<Result<Vec<_>, _>>()?;
-		let lifts = if resubmitting {
-			receiver.assemble_for_recovery(&records)?
-		} else {
-			receiver.assemble(&records)?
-		};
+		let lifts = receiver.assemble_for_recovery(&records)?;
 		Ok(SpecMsgInputs { records, lifts })
 	})
 }
@@ -738,15 +737,68 @@ mod tests {
 		assert!(!h.receiver.is_settled(&live(), &root, h.wants(live())));
 	}
 
+	/// The payload counts of `data`'s channel items.
+	fn consumed(data: &MessagingInherentData) -> Vec<usize> {
+		data.channels.values().map(Vec::len).collect()
+	}
+
 	#[test]
-	fn a_relay_chain_that_does_not_answer_leaves_the_source_alone() {
+	fn a_failed_relay_read_keeps_the_included_root_only() {
 		let mut h = Harness::new();
 		let root = h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
 		h.relay_block(1, &[(live(), root)]);
 
+		// Included-only consumption goes on while the relay chain does not answer.
 		h.chains.failing.store(true, Ordering::SeqCst);
 		h.relay_block(2, &[]);
-		assert!(h.receiver.is_settled(&live(), &root, h.wants(live())));
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert_eq!(consumed(&data), vec![2]);
+
+		// A pending root stops being eligible until the relay chain answers again.
+		h.chains.failing.store(false, Ordering::SeqCst);
+		let next = h.source(live()).author(vec![(channel(US), payloads(2, 2))]);
+		h.relay_block_snapshots(
+			3,
+			&[(live(), SourceRoots { included: Some(root), pending: vec![next] })],
+		);
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert_eq!(consumed(&data), vec![4]);
+		h.chains.failing.store(true, Ordering::SeqCst);
+		h.relay_block(4, &[]);
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert!(consumed(&data).iter().all(|&count| count <= 2));
+	}
+
+	#[test]
+	fn a_stalled_fetch_cannot_keep_a_removed_provider_eligible() {
+		let mut h = Harness::new();
+		let root = h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
+		let next = h.source(live()).author(vec![(channel(US), payloads(2, 2))]);
+		h.relay_block_snapshots(
+			1,
+			&[(live(), SourceRoots { included: Some(root), pending: vec![next] })],
+		);
+		// The pool holds four payloads; a round under a newer pending root then stalls.
+		let newer = h.source(live()).author(vec![(channel(US), payloads(3, 2))]);
+		h.source(live()).hold.store(true, Ordering::SeqCst);
+		h.relay_block_snapshots(
+			2,
+			&[(live(), SourceRoots { included: Some(root), pending: vec![next, newer] })],
+		);
+		assert!(!h.source(live()).held.lock().is_empty());
+
+		// Both providers leave the relay view while that round is still waiting.
+		let included_only = [(live(), SourceRoots::included(root))];
+		h.relay_block_snapshots(3, &included_only);
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert!(consumed(&data).iter().all(|&count| count <= 2), "consumed past {root:?}");
+
+		// The stalled round ending does not make them eligible again.
+		h.source(live()).hold.store(false, Ordering::SeqCst);
+		h.source(live()).release();
+		h.pool.run_until_stalled();
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		assert!(consumed(&data).iter().all(|&count| count <= 2), "consumed past {root:?}");
 	}
 
 	#[test]

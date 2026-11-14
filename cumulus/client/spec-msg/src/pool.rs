@@ -68,6 +68,7 @@ pub struct SourcePool {
 	/// The source's currently eligible roots on the relay chain: its newest included root and its
 	/// ordered pending-availability roots.
 	pub(crate) eligible: SourceRoots,
+	pub(crate) eligibility_known: bool,
 	/// Every fetch under the newest root succeeded. Until then, each relay block fetches under it
 	/// again: a request can fail for reasons that pass, such as a dropped connection.
 	pub(crate) settled: bool,
@@ -97,6 +98,7 @@ impl SourcePool {
 		self.heads.clear();
 		self.reach.clear();
 		self.eligible = SourceRoots::default();
+		self.eligibility_known = false;
 		self.settled = false;
 		self.forgotten = true;
 	}
@@ -120,6 +122,7 @@ impl SourcePool {
 			return;
 		};
 		self.forgotten = false;
+		self.eligibility_known = true;
 		let newest_changed = self.newest_root() != Some(newest);
 		let included_changed = self.eligible.included != eligible.included;
 		self.eligible = eligible.clone();
@@ -144,6 +147,9 @@ impl SourcePool {
 
 	/// Eligible roots, preferring included state and then the oldest pending root.
 	pub fn target_roots(&self) -> Vec<StreamsRoot> {
+		if !self.eligibility_known {
+			return Vec::new();
+		}
 		let mut out = Vec::new();
 		if let Some(included) = self.eligible.included {
 			out.push(included);
