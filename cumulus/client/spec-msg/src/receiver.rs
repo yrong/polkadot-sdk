@@ -324,9 +324,10 @@ where
 			pool.newest_root() == Some(newest) &&
 			pool.settled &&
 			state.live_endpoints(source).iter().all(|((stream, _), end)| {
-				std::iter::once(newest)
-					.chain(roots.included)
-					.all(|root| lifts_to(pool, stream, end, &root))
+				std::iter::once(newest).chain(roots.included).all(|root| {
+					lifts_to(pool, stream, end, &root) ||
+						(root != newest && pool.predates(stream, end.leaf_count(), &root))
+				})
 			}) && wants.channels.iter().all(|(id, stored)| {
 			covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
 		})
@@ -469,7 +470,8 @@ where
 					.into_iter()
 					.filter(|((stream, count), endpoint)| {
 						pool.is_none_or(|pool| {
-							pool.binding(stream, *count, &target_root).is_none() &&
+							!pool.predates(stream, *count, &target_root) &&
+								pool.binding(stream, *count, &target_root).is_none() &&
 								!lifts_to(pool, stream, endpoint, &target_root)
 						})
 					})
@@ -477,6 +479,22 @@ where
 			};
 			for ((stream, _), endpoint) in unbound {
 				let bound = self.fetch_binding(source, stream, &endpoint, target_root).await;
+				if !bound && target_root != root {
+					// A refusal alone cannot prove that an included root is too old.
+					let request =
+						MessagesRequest { stream, under: target_root, start: None, max_bytes: 0 };
+					if let Ok(response) = fetch(&self.transport, source, &request, None).await {
+						self.state.lock().sources.entry(source).or_default().insert_binding(
+							stream,
+							response.frontier.leaf_count(),
+							target_root,
+							Binding {
+								extension: response.extension,
+								tree_proof: response.tree_proof,
+							},
+						);
+					}
+				}
 				if target_root == root {
 					settled &= bound;
 				}

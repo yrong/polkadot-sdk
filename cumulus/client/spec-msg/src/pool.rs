@@ -223,6 +223,15 @@ impl SourcePool {
 		self.bindings.entry((stream, count)).or_default().insert(root.0, binding);
 	}
 
+	/// Whether a verified binding under `root` shows `stream` holds fewer than `count` leaves
+	/// there, so the endpoint cannot lift to `root`.
+	pub fn predates(&self, stream: &StreamId, count: u64, root: &StreamsRoot) -> bool {
+		self.bindings.iter().any(|((stored_stream, _), roots)| {
+			stored_stream == stream &&
+				roots.get(&root.0).is_some_and(|binding| binding.extension.leaf_count < count)
+		})
+	}
+
 	/// The binding of `stream` at `count` under `root`.
 	pub fn binding(&self, stream: &StreamId, count: u64, root: &StreamsRoot) -> Option<&Binding> {
 		self.bindings.get(&(*stream, count)).and_then(|by_root| by_root.get(&root.0))

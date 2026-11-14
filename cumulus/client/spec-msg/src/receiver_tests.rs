@@ -1358,3 +1358,27 @@ fn replaying_unfinalized_consumption_restores_recovery_after_restart() {
 	let lifts = restarted.assemble_for_recovery(&[record.clone()]).unwrap();
 	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&root));
 }
+
+#[test]
+fn consumption_past_included_settles_without_repeating_binding_requests() {
+	let sender = Sender::new();
+	let included = sender.author(vec![(channel(US), payloads(1, 2))]);
+	let pending = sender.author(vec![(channel(US), payloads(2, 2))]);
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let roots = crate::SourceRoots { included: Some(included), pending: vec![pending] };
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	let record = chain.block(&receiver);
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	let requests = sender.log.lock().len();
+	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
+	assert_eq!(sender.log.lock().len(), requests);
+	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	assert_eq!(
+		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
+		Some(&pending)
+	);
+	block_on(receiver.on_root(source(), pending, &chain.wants()));
+	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
+}
