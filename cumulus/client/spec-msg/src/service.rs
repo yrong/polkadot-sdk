@@ -357,8 +357,8 @@ fn extends_bundle<H: HeaderT>(header: &H) -> bool {
 }
 
 /// The collator's assembler: each block's consumption record, and the lifts for them from the
-/// receiver's pool. When `resubmitting` is true, requires an included root for every source in the
-/// bundle. An error skips the collation; the next attempt assembles again.
+/// receiver's pool. When `resubmitting` is true, only the source's current eligible roots qualify.
+/// An error skips the collation; the next attempt assembles again.
 pub fn assembler<Block, C, T>(
 	client: Arc<C>,
 	receiver: Arc<Receiver<Block::Hash, T>>,

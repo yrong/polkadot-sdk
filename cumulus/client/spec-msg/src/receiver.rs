@@ -990,10 +990,8 @@ where
 		self.assemble_inner(records, false)
 	}
 
-	/// The lifts for a resubmitted (recovery) candidate whose blocks have `records`, in bundle
-	/// order. Every source touched by the bundle must lift to its newest **included** root; if no
-	/// included root covers the bundle yet, returns `Err` so the collator waits for a covering
-	/// included root.
+	/// Like [`Self::assemble`], but only from the current eligible roots: a resubmission never
+	/// targets a root the relay chain dropped.
 	pub fn assemble_for_recovery(
 		&self,
 		records: &[ConsumptionRecord],
@@ -1004,7 +1002,7 @@ where
 	fn assemble_inner(
 		&self,
 		records: &[ConsumptionRecord],
-		recovery_only: bool,
+		resubmission: bool,
 	) -> Result<LiftsBySource, String> {
 		let mut merged: BTreeMap<ParaId, SourceStreams> = BTreeMap::new();
 		for record in records {
@@ -1022,11 +1020,7 @@ where
 				.sources
 				.get(source)
 				.ok_or_else(|| format!("nothing fetched from {source:?}"))?;
-			let candidates = if recovery_only {
-				pool.eligible.included.into_iter().collect::<Vec<_>>()
-			} else {
-				pool.assembly_roots()
-			};
+			let candidates = if resubmission { pool.target_roots() } else { pool.assembly_roots() };
 			let found = candidates.iter().find_map(|root| {
 				let source_lifts = streams
 					.iter()
@@ -1034,13 +1028,8 @@ where
 					.collect::<Option<Vec<_>>>()?;
 				(build_requires_entry(streams, &source_lifts) == Ok(*root)).then_some(source_lifts)
 			});
-			let source_lifts = found.ok_or_else(|| {
-				if recovery_only {
-					format!("no lift material for {source:?} under an included root")
-				} else {
-					format!("no lift material for {source:?} under any root")
-				}
-			})?;
+			let source_lifts = found
+				.ok_or_else(|| format!("no lift material for {source:?} under an eligible root"))?;
 			lifts.insert(*source, source_lifts);
 		}
 		LiftsBySource::try_from(lifts).map_err(|e| format!("{e:?}"))

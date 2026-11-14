@@ -1216,8 +1216,12 @@ fn oldest_covering_pending_root_is_chosen_when_bundle_consumes_past_included() {
 	assert_eq!(chain.frontier.leaf_count(), 4);
 	// r0 does not cover 4 leaves; r1 is the oldest pending root that covers 4 leaves.
 	assert_eq!(requires(&receiver, &[record.clone()]), Some(r1));
-	// Recovery assembly requires an included root: until r1 is included, it refuses.
-	assert!(receiver.assemble_for_recovery(&[record.clone()]).is_err());
+	// An in-flight resend can retain its eligible pending provider.
+	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	assert_eq!(
+		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
+		Some(&r1)
+	);
 
 	// Once r1 becomes included, recovery assembly succeeds and lifts to r1.
 	block_on(receiver.on_roots(
@@ -1295,7 +1299,11 @@ fn failed_included_bindings_retry_without_a_snapshot_change() {
 	*sender.down_under.write() = Some(included);
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	assert!(receiver.assemble_for_recovery(&[record.clone()]).is_err());
+	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	assert_eq!(
+		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
+		Some(&pending)
+	);
 
 	*sender.down_under.write() = None;
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
@@ -1318,7 +1326,11 @@ fn importing_a_live_endpoint_reopens_recovery_binding_work() {
 	*sender.down_under.write() = Some(included);
 	let record = chain.block(&receiver);
 	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	assert!(receiver.assemble_for_recovery(&[record.clone()]).is_err());
+	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	assert_eq!(
+		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
+		Some(&pending)
+	);
 	*sender.down_under.write() = None;
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));

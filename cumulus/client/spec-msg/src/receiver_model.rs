@@ -29,8 +29,7 @@
 //!   PVF does, is a root the source committed;
 //! - when the included root already covers a consuming bundle, assembly prefers the included root
 //!   over any pending root, and otherwise selects the oldest covering pending root;
-//! - recovery assembly (`assemble_for_recovery`) succeeds iff the newest included root covers the
-//!   bundle, and always names that included root;
+//! - recovery assembly (`assemble_for_recovery`) selects the same eligible root as fresh assembly;
 //! - the receiver's chain has consumed a prefix of the stream the relay chain's eligible roots
 //!   commit;
 //! - once the peers answer again, the receiver consumes up to the newest included root.
@@ -520,8 +519,7 @@ impl World {
 			let root = *requires.get(source()).expect("one source");
 			assert!(self.every_root.contains(&root), "requires a root the source never committed");
 
-			// If recovery assembly succeeds, it must target an included root, and fresh
-			// assembly must also have selected that included root over any pending root.
+			// Both assembly paths prefer the same eligible root when one covers the bundle.
 			if let Ok(rec_lifts) = self.receiver.assemble_for_recovery(&records) {
 				let rec_req = build_requires(&records, &rec_lifts).unwrap().unwrap();
 				let rec_root = *rec_req.get(source()).unwrap();
