@@ -2007,7 +2007,7 @@ fn build_network_config_with_fault(
 	relay_forks: bool,
 	gate: Option<&std::path::Path>,
 ) -> Result<NetworkConfig, anyhow::Error> {
-	build_recovery_network_config(sender_node, relay_forks, gate, false)
+	build_recovery_network_config(sender_node, relay_forks, gate, false, false)
 }
 
 fn build_recovery_network_config(
@@ -2015,6 +2015,7 @@ fn build_recovery_network_config(
 	relay_forks: bool,
 	gate: Option<&std::path::Path>,
 	catch_up: bool,
+	two_way: bool,
 ) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
@@ -2035,7 +2036,8 @@ fn build_recovery_network_config(
 		if catch_up && receiver_side {
 			args.push(("--spec-msg-peer", to_replacement.as_str()).into());
 		}
-		let optimistic = if gate.is_some() { receiver_side } else { flag("SPEC_MSG_OPTIMISTIC") };
+		let optimistic =
+			if gate.is_some() { receiver_side || two_way } else { flag("SPEC_MSG_OPTIMISTIC") };
 		if optimistic {
 			args.push("--spec-msg-optimistic".into());
 		}
@@ -2184,16 +2186,22 @@ fn build_recovery_network_config(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
-	run_v3_timeout_recovery(false).await
+	run_v3_timeout_recovery(false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
 async fn spec_msg_v3_catch_up_recovery() -> Result<(), anyhow::Error> {
-	run_v3_timeout_recovery(true).await
+	run_v3_timeout_recovery(true, false).await
 }
 
-async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
+async fn spec_msg_v3_two_way_recovery() -> Result<(), anyhow::Error> {
+	run_v3_timeout_recovery(true, true).await
+}
+
+async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), anyhow::Error> {
 	use polkadot_primitives::{
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2,
 		CommittedCandidateReceiptV2, CoreState, HeadData, NodeFeatures, StreamsRoot,
@@ -2212,6 +2220,7 @@ async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 		false,
 		Some(&gate),
 		catch_up,
+		two_way,
 	)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
@@ -2323,6 +2332,16 @@ async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 		.await?;
 		let baseline =
 			baseline.ok_or_else(|| anyhow!("sender has no included root after the handshake"))?;
+		let ack_stream = StreamId::Ack { recipient: SENDER.into(), domain: 0, num: 0 };
+		let ack_before_fault = if two_way {
+			let head = receiver.blocks().at(best_hash(&receiver).await?).await?;
+			committed_stream_roots(&head)
+				.await?
+				.get(&ack_stream)
+				.map_or(0, |f| f.leaf_count())
+		} else {
+			0
+		};
 		std::fs::write(&gate, baseline.0.as_bytes())?;
 		log::info!("Withholding sender candidates beyond included {baseline:?}");
 		let sent = sender.blocks().at(sudo_in_block(&sender, send_xcm_to(RECEIVER)).await?).await?;
@@ -2347,6 +2366,8 @@ async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 		let mut provider_timed_out = false;
 		let mut dependent_timed_out = false;
 		let mut dependent_available = false;
+		let mut return_dependency = false;
+		let mut return_head = None;
 		let mut timeout_blocks = BTreeMap::new();
 		while let Some(block) = blocks.next().await {
 			let block = block?;
@@ -2429,6 +2450,53 @@ async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 					break;
 				}
 			}
+			if two_way && !return_dependency && original.is_some() {
+				for pending in &dependents {
+					let signals =
+						pending.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+					let Some(required) = signals.provides() else { continue };
+					let hash =
+						H256::from(sp_crypto_hashing::blake2_256(&pending.commitments.head_data.0));
+					let receiver_block = receiver.blocks().at(hash).await?;
+					let roots = committed_stream_roots(&receiver_block).await?;
+					let entries = roots.iter().map(|(stream, f)| (*stream, f.root().0)).collect();
+					if streams_root(&entries).map(|r| r.0 .0) != Some(required.0 .0) {
+						return Err(anyhow!(
+							"receiver stream state does not rebuild its pending Provides"
+						));
+					}
+					let ack = roots
+						.get(&ack_stream)
+						.ok_or_else(|| anyhow!("pending receiver has no credit register"))?;
+					if ack.leaf_count() > ack_before_fault {
+						let mut authored = sender.blocks().at(best_hash(&sender).await?).await?;
+						while authored.number() > sent.number() {
+							let record: ConsumptionRecord = call_at(
+								&sender,
+								Some(authored.hash()),
+								"SpecMsgApi_consumption_record",
+								&[],
+							)
+							.await?;
+							return_dependency =
+								record.entries.get(&RECEIVER.into()).is_some_and(|streams| {
+									streams.iter().any(|(stream, interval)| {
+										*stream == ack_stream && interval.end == *ack
+									})
+								});
+							if return_dependency {
+								return_head = Some((authored.number(), authored.hash()));
+								log::info!("Two-way dependency at relay #{} {:?}: sender #{} {:?} read credit frontier {} under pending receiver {required:?}, on the stalled receiver chain", block.number(), block.hash(), authored.number(), authored.hash(), ack.leaf_count());
+								break;
+							}
+							authored = sender.blocks().at(authored.header().parent_hash).await?;
+						}
+					}
+					if return_dependency {
+						break;
+					}
+				}
+			}
 			let Some((provider, dependent, head, _)) = &original else { continue };
 			let cores: Vec<CoreState> =
 				call_at(&relay, Some(block.hash()), "ParachainHost_availability_cores", &[])
@@ -2486,8 +2554,13 @@ async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 		if !provider_timed_out || !dependent_timed_out || !dependent_available {
 			return Err(anyhow!("missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"));
 		}
+		if two_way && !return_dependency {
+			return Err(anyhow!(
+				"no authored sender block read the new credit frontier under the pending receiver root"
+			));
+		}
 		if catch_up {
-			return recover_after_catch_up(
+			recover_after_catch_up(
 				&network,
 				&relay,
 				&receiver,
@@ -2496,7 +2569,33 @@ async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 				message_id,
 				next_delivery_block,
 			)
-			.await;
+			.await?;
+			if let Some((number, expected)) = return_head {
+				let replacement: OnlineClient<PolkadotConfig> =
+					network.get_node(REPLACEMENT_COLLATOR)?.wait_client().await?;
+				let query = subxt::dynamic::storage(
+					"System",
+					"BlockHash",
+					vec![Value::u128(number.into())],
+				);
+				let actual = replacement
+					.storage()
+					.at_latest()
+					.await?
+					.fetch(&query)
+					.await?
+					.ok_or_else(|| {
+						anyhow!("return dependency block missing from finalized history")
+					})?
+					.as_type::<H256>()?;
+				if actual != expected {
+					return Err(anyhow!("recovery did not preserve the sender block that read the pending receiver register"));
+				}
+				log::info!(
+					"Two-way recovery preserved sender #{number} {expected:?} in finalized history"
+				);
+			}
+			return Ok(());
 		}
 		let collator = network.get_node(RECEIVER_COLLATOR)?;
 		collator.pause().await?;
