@@ -1,0 +1,37 @@
+title: 'spec-msg: PVF support on the enactment stack'
+doc:
+- audience: Runtime Dev
+  description: Emit messaging commitments and derive bundle dependencies during PVF validation.
+crates:
+- name: cumulus-client-collator
+  bump: major
+- name: cumulus-pallet-aura-ext
+  bump: none
+- name: cumulus-pallet-parachain-system
+  bump: major
+- name: cumulus-pallet-xcmp-queue
+  bump: none
+- name: asset-hub-rococo-runtime
+  bump: none
+- name: asset-hub-westend-runtime
+  bump: none
+- name: bridge-hub-rococo-runtime
+  bump: none
+- name: bridge-hub-westend-runtime
+  bump: none
+- name: collectives-westend-runtime
+  bump: none
+- name: coretime-westend-runtime
+  bump: none
+- name: glutton-westend-runtime
+  bump: none
+- name: people-westend-runtime
+  bump: none
+- name: penpal-runtime
+  bump: none
+- name: yet-another-parachain-runtime
+  bump: none
+- name: cumulus-primitives-core
+  bump: major
+- name: cumulus-primitives-spec-messaging
+  bump: minor
