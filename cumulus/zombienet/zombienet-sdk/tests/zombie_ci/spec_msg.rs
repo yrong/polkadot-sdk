@@ -2237,6 +2237,16 @@ async fn spec_msg_v3_relay_reorg_recovery() -> Result<(), anyhow::Error> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_included_only_delivery() -> Result<(), anyhow::Error> {
+	run_v3_delivery(RootPolicy::IncludedOnly, false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_optimistic_early_consumption() -> Result<(), anyhow::Error> {
+	run_v3_delivery(RootPolicy::BothOptimistic, true).await
+}
+
+async fn run_v3_delivery(policy: RootPolicy, prove_early: bool) -> Result<(), anyhow::Error> {
 	use polkadot_primitives::{
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateReceiptV2, HeadData,
 		NodeFeatures,
@@ -2251,7 +2261,7 @@ async fn spec_msg_v3_included_only_delivery() -> Result<(), anyhow::Error> {
 		false,
 		Some(&gate),
 		false,
-		RootPolicy::IncludedOnly,
+		policy,
 	)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
@@ -2260,67 +2270,292 @@ async fn spec_msg_v3_included_only_delivery() -> Result<(), anyhow::Error> {
 	let receiver: OnlineClient<PolkadotConfig> =
 		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
 	let run = async {
-		wait_for("both inclusion-only V3 chains to finalize", || {
-			advanced(&sender, &receiver, (1, 1))
-		})
-		.await?;
+		wait_for("both V3 delivery chains to finalize", || advanced(&sender, &receiver, (1, 1)))
+			.await?;
 		let features: NodeFeatures =
 			call_at(&relay, None, "ParachainHost_node_features", &[]).await?;
 		if !FeatureIndex::CandidateReceiptV3.is_set(&features) {
-			return Err(anyhow!("baseline relay does not enable V3 receipts"));
+			return Err(anyhow!("delivery relay does not enable V3 receipts"));
 		}
 		for client in [&sender, &receiver] {
 			let enabled: bool =
 				call_at(client, None, "SchedulingV3EnabledApi_scheduling_v3_enabled", &[]).await?;
 			if !enabled {
-				return Err(anyhow!("baseline parachain does not enable V3 scheduling"));
+				return Err(anyhow!("delivery parachain does not enable V3 scheduling"));
 			}
 		}
 		if hrmp_channel_open(&relay, SENDER, RECEIVER).await? {
-			return Err(anyhow!("baseline requires no HRMP channel"));
+			return Err(anyhow!("delivery requires no HRMP channel"));
 		}
 		open_spec_msg_channel(&sender, &receiver).await?;
 		let mut blocks = relay.blocks().subscribe_finalized().await?;
-		send_and_follow(&relay, &sender, &receiver).await?;
-		let mut seen = std::collections::BTreeSet::new();
-		while let Some(block) = blocks.next().await {
-			let block = block?;
-			for event in block.events().await?.iter() {
-				let event = event?;
-				if event.pallet_name() != "ParaInclusion" ||
-					event.variant_name() != "CandidateIncluded"
-				{
-					continue;
+		if prove_early {
+			prove_early_consumption(&relay, &sender, &receiver, &mut blocks).await?;
+		} else {
+			send_and_follow(&relay, &sender, &receiver).await?;
+			let mut seen = std::collections::BTreeSet::new();
+			while let Some(block) = blocks.next().await {
+				let block = block?;
+				for event in block.events().await?.iter() {
+					let event = event?;
+					if event.pallet_name() != "ParaInclusion" ||
+						event.variant_name() != "CandidateIncluded"
+					{
+						continue;
+					}
+					let (receipt, _) =
+						<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+					let para = receipt.descriptor.para_id();
+					if para != SENDER.into() && para != RECEIVER.into() {
+						continue;
+					}
+					if receipt.descriptor.version() != CandidateDescriptorVersion::V3 {
+						return Err(anyhow!("included-only baseline submitted a non-V3 receipt"));
+					}
+					seen.insert(para);
 				}
-				let (receipt, _) =
-					<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
-				let para = receipt.descriptor.para_id();
-				if para != SENDER.into() && para != RECEIVER.into() {
-					continue;
+				if seen.len() == 2 {
+					break;
 				}
-				if receipt.descriptor.version() != CandidateDescriptorVersion::V3 {
-					return Err(anyhow!("included-only baseline submitted a non-V3 receipt"));
-				}
-				seen.insert(para);
 			}
-			if seen.len() == 2 {
-				break;
+			if seen.len() != 2 {
+				return Err(anyhow!(
+					"baseline did not observe finalized V3 receipts for both paras"
+				));
 			}
-		}
-		if seen.len() != 2 {
-			return Err(anyhow!("baseline did not observe finalized V3 receipts for both paras"));
 		}
 		let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
-		wait_for("both inclusion-only V3 chains to keep progressing", || {
+		wait_for("both V3 delivery chains to keep progressing", || {
 			advanced(&sender, &receiver, (now.0 + 1, now.1 + 1))
 		})
 		.await?;
-		log::info!("Included-only delivery passed with finalized V3 receipts for both parachains");
+		log::info!("V3 delivery passed, early_consumption={prove_early}");
 		Ok::<_, anyhow::Error>(())
 	};
 	let result = tokio::time::timeout(Duration::from_secs(600), run).await;
 	network.destroy().await?;
-	result.map_err(|_| anyhow!("included-only V3 delivery exceeded 600 seconds"))?
+	result.map_err(|_| anyhow!("V3 delivery exceeded 600 seconds"))?
+}
+
+async fn sender_bundle_contains_packet(
+	sender: &OnlineClient<PolkadotConfig>,
+	head: &polkadot_primitives::HeadData,
+	packet: &[u8],
+) -> Result<bool, anyhow::Error> {
+	let mut block = sender.blocks().at(H256::from(sp_crypto_hashing::blake2_256(&head.0))).await?;
+	let index = bundle_index(&block).ok_or_else(|| anyhow!("sender has no bundle index"))?;
+	for offset in 0..=index {
+		let outbound: Vec<(StreamId, Vec<Vec<u8>>)> =
+			call_at(sender, Some(block.hash()), "SpecMsgApi_outbound_messages", &[]).await?;
+		if outbound.iter().any(|(stream, payloads)| {
+			*stream == out_channel().data_stream() && payloads.iter().any(|p| p == packet)
+		}) {
+			return Ok(true);
+		}
+		if offset != index {
+			block = sender.blocks().at(block.header().parent_hash).await?;
+		}
+	}
+	Ok(false)
+}
+
+async fn prove_early_consumption(
+	relay: &OnlineClient<PolkadotConfig>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+	blocks: &mut StreamOfResults<Block<PolkadotConfig, OnlineClient<PolkadotConfig>>>,
+) -> Result<(), anyhow::Error> {
+	use cumulus_primitives_spec_messaging::{ChannelMessage, MessagingInherentData};
+	use polkadot_primitives::{
+		CandidateDescriptorVersion, CandidateReceiptV2, CommittedCandidateReceiptV2, HeadData,
+	};
+	let before_send = receiver.blocks().at(best_hash(receiver).await?).await?.number();
+	let deliveries = receiver.blocks().subscribe_finalized().await?;
+	let mut imports = receiver.blocks().subscribe_all().await?;
+	let id = H256::from([0x45; 32]);
+	let (sent_hash, ids) =
+		submit_sudo(sender, send_xcm_with_topic(RECEIVER, Some(id.0)), false).await?;
+	if ids != vec![id.0.to_vec()] {
+		return Err(anyhow!("normal-traffic send did not retain its XCM topic"));
+	}
+	let sent = sender.blocks().at(sent_hash).await?;
+	let committed = committed_stream_roots(&sent).await?;
+	let root = committed_root(&sent).ok_or_else(|| anyhow!("send block has no committed root"))?;
+	let entries = committed
+		.iter()
+		.map(|(stream, frontier)| (*stream, frontier.root().0))
+		.collect();
+	if streams_root(&entries).map(|r| r.0 .0) != Some(root.0) {
+		return Err(anyhow!("send block's stream state does not rebuild its committed root"));
+	}
+	let stream = out_channel().data_stream();
+	let target = committed.get(&stream).ok_or_else(|| anyhow!("send has no channel frontier"))?;
+	let outbound: Vec<(StreamId, Vec<Vec<u8>>)> =
+		call_at(sender, Some(sent_hash), "SpecMsgApi_outbound_messages", &[]).await?;
+	let mut packets = outbound
+		.into_iter()
+		.filter(|(s, _)| *s == stream)
+		.flat_map(|(_, messages)| messages)
+		.filter(|payload| {
+			matches!(ChannelMessage::decode_all(&mut &payload[..]), Ok(ChannelMessage::Data(_)))
+		});
+	let packet = packets
+		.next()
+		.ok_or_else(|| anyhow!("send block has no outbound data packet"))?;
+	if packets.next().is_some() {
+		return Err(anyhow!("normal-traffic probe expects one outbound data packet"));
+	}
+	log::info!(
+		"Normal-traffic send {id:?}: sender #{} {:?}, channel endpoint {}",
+		sent.number(),
+		sent.hash(),
+		target.leaf_count()
+	);
+	let observe = async {
+		while let Some(block) = imports.next().await {
+			let block = block?;
+			if block.number() <= before_send {
+				continue;
+			}
+			let mut consumed = false;
+			for extrinsic in block.extrinsics().await?.iter() {
+				if extrinsic.pallet_name()? != "SpecMessaging" ||
+					extrinsic.variant_name()? != "enact_messages"
+				{
+					continue;
+				}
+				let data = MessagingInherentData::decode_all(&mut &extrinsic.field_bytes()[..])?;
+				consumed |= data
+					.channels
+					.get(&in_channel())
+					.is_some_and(|payloads| payloads.contains(&packet));
+			}
+			if consumed {
+				return Ok((block.number(), block.hash()));
+			}
+		}
+		Err(anyhow!("no consuming block was imported"))
+	};
+	let (number, hash) = tokio::time::timeout(Duration::from_secs(60), observe)
+		.await
+		.map_err(|_| anyhow!("normal-traffic packet was not observed within 60 seconds"))??;
+	let checkpoint = best_hash(relay).await?;
+	let providers: Vec<CommittedCandidateReceiptV2> = call_at(
+		relay,
+		Some(checkpoint),
+		"ParachainHost_candidates_pending_availability",
+		&ParaId::from(SENDER).encode(),
+	)
+	.await?;
+	let mut provider = None;
+	for candidate in &providers {
+		let signals = candidate.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+		let Some(provided) = signals.provides() else { continue };
+		if sender_bundle_contains_packet(sender, &candidate.commitments.head_data, &packet).await? {
+			provider = Some((candidate.hash(), *provided));
+			break;
+		}
+	}
+	let (provider, provided) = provider
+		.ok_or_else(|| anyhow!("consumed frontier has no backed provider at the checkpoint"))?;
+	log::info!(
+		"Observed early receiver #{number} {hash:?}; relay checkpoint {checkpoint:?}, \
+		 pending provider {provider:?}, root {provided:?}"
+	);
+	let remark = Value::unnamed_variant(
+		"System",
+		[Value::named_variant("remark", [("remark", Value::from_bytes(hash.as_bytes()))])],
+	);
+	let anchor = relay.blocks().at(sudo(relay, remark).await?).await?;
+	log::info!(
+		"Receiver header {hash:?} anchored in finalized relay #{} {:?}",
+		anchor.number(),
+		anchor.hash()
+	);
+	let mut sender_included = None;
+	let mut receiver_included = false;
+	while let Some(block) = blocks.next().await {
+		let block = block?;
+		for event in block.events().await?.iter() {
+			let event = event?;
+			if event.pallet_name() != "ParaInclusion" || event.variant_name() != "CandidateIncluded"
+			{
+				continue;
+			}
+			let (receipt, head) =
+				<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+			let para = receipt.descriptor.para_id();
+			if para != SENDER.into() && para != RECEIVER.into() {
+				continue;
+			}
+			if receipt.descriptor.version() != CandidateDescriptorVersion::V3 {
+				return Err(anyhow!("normal-traffic delivery submitted a non-V3 receipt"));
+			}
+			let head_hash = H256::from(sp_crypto_hashing::blake2_256(&head.0));
+			if para == SENDER.into() && sender_included.is_none() {
+				if sender_bundle_contains_packet(sender, &head, &packet).await? {
+					sender_included = Some((block.number(), block.hash()));
+					log::info!(
+						"Sender message first included at relay #{} {:?}",
+						block.number(),
+						block.hash()
+					);
+				}
+			}
+			if para == RECEIVER.into() && !receiver_included {
+				let mut tip = receiver.blocks().at(head_hash).await?;
+				let index = bundle_index(&tip)
+					.ok_or_else(|| anyhow!("normal-traffic receiver has no bundle index"))?;
+				for offset in 0..=index {
+					if tip.hash() == hash {
+						receiver_included = true;
+						log::info!(
+							"Observed receiver block enacted in receipt {:?} at relay #{} {:?}",
+							receipt.hash(),
+							block.number(),
+							block.hash()
+						);
+						break;
+					}
+					if offset != index {
+						tip = receiver.blocks().at(tip.header().parent_hash).await?;
+					}
+				}
+			}
+		}
+		if let Some((included, _)) = sender_included {
+			// Same-block anchoring proves the header existed before the inclusion block was sealed.
+			if anchor.number() > included {
+				return Err(anyhow!(
+					"receiver header anchored at relay #{}, after sender inclusion #{included}",
+					anchor.number()
+				));
+			}
+			if receiver_included {
+				break;
+			}
+		}
+	}
+	if sender_included.is_none() || !receiver_included {
+		return Err(anyhow!("normal-traffic sender or consuming block did not enact"));
+	}
+	follow_delivery(receiver, deliveries, before_send, id, root, &committed).await?;
+	let query = subxt::dynamic::storage("System", "BlockHash", vec![Value::u128(number.into())]);
+	let actual = receiver
+		.storage()
+		.at_latest()
+		.await?
+		.fetch(&query)
+		.await?
+		.ok_or_else(|| anyhow!("early consuming block is absent from finalized history"))?
+		.as_type::<H256>()?;
+	if actual != hash {
+		return Err(anyhow!("early consuming block did not survive in finalized history"));
+	}
+	log::info!(
+		"Early consumption passed with unchanged-block enactment and finalized XCM delivery"
+	);
+	Ok(())
 }
 
 async fn relay_ancestor(
