@@ -46,6 +46,9 @@ const SENDER: u32 = 2000;
 const RECEIVER: u32 = 2001;
 const SENDER_COLLATOR: &str = "charlie";
 const RECEIVER_COLLATOR: &str = "dave";
+const REPLACEMENT_COLLATOR: &str = "eve";
+const REPLACEMENT_RPC_PORT: u16 = 30_513;
+const REPLACEMENT_P2P_PORT: u16 = 30_503;
 const SENDER_P2P_PORT: u16 = 30_500;
 const RECEIVER_P2P_PORT: u16 = 30_501;
 const RELAY_RPC_PORT: u16 = 30_510;
@@ -2004,9 +2007,21 @@ fn build_network_config_with_fault(
 	relay_forks: bool,
 	gate: Option<&std::path::Path>,
 ) -> Result<NetworkConfig, anyhow::Error> {
+	build_recovery_network_config(sender_node, relay_forks, gate, false)
+}
+
+fn build_recovery_network_config(
+	sender_node: (&str, u16),
+	relay_forks: bool,
+	gate: Option<&std::path::Path>,
+	missing_proof: bool,
+) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
+	let to_replacement = peer_arg(SENDER, REPLACEMENT_COLLATOR, REPLACEMENT_P2P_PORT)?;
+	let outage_wasm =
+		missing_proof.then(|| std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM")).transpose()?;
 	let collator_args = |peer: &str, receiver_side: bool| -> Vec<zombienet_sdk::Arg> {
 		let mut args = vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
@@ -2018,6 +2033,9 @@ fn build_network_config_with_fault(
 			("--enable-spec-msg").into(),
 			("--spec-msg-peer", peer).into(),
 		];
+		if missing_proof && receiver_side {
+			args.push(("--spec-msg-peer", to_replacement.as_str()).into());
+		}
 		let optimistic = if gate.is_some() { receiver_side } else { flag("SPEC_MSG_OPTIMISTIC") };
 		if optimistic {
 			args.push("--spec-msg-optimistic".into());
@@ -2042,6 +2060,16 @@ fn build_network_config_with_fault(
 				genesis["configuration"]["config"]["scheduler_params"]["num_cores"] =
 					serde_json::json!(2);
 			}
+			if missing_proof {
+				genesis["configuration"]["config"]["scheduler_params"]
+					["group_rotation_frequency"] = serde_json::json!(10);
+				genesis["configuration"]["config"]["scheduler_params"]
+					["paras_availability_period"] = serde_json::json!(6);
+				genesis["configuration"]["config"]["minimum_validation_upgrade_delay"] =
+					serde_json::json!(7);
+				genesis["configuration"]["config"]["max_relay_parent_session_age"] =
+					serde_json::json!(0);
+			}
 			if relay_forks {
 				genesis["babe"] = serde_json::json!({ "epochConfig": {
 					"c": [99, 100],
@@ -2053,6 +2081,8 @@ fn build_network_config_with_fault(
 				.with_chain(chain)
 				.with_genesis_overrides(genesis)
 				.with_override_session_0(gate.is_some());
+			let r =
+				if let Some(wasm) = &outage_wasm { r.with_wasm_override(wasm.as_str()) } else { r };
 			r.with_default_command("polkadot")
 				.with_default_image(images.polkadot.as_str())
 				.with_default_args(vec![
@@ -2091,7 +2121,8 @@ fn build_network_config_with_fault(
 				})
 		})
 		.with_parachain(|p| {
-			p.with_id(SENDER)
+			let p = p
+				.with_id(SENDER)
 				.with_default_command("polkadot-parachain")
 				.with_default_image(images.cumulus.as_str())
 				.with_chain(format!("penpal-rococo-{SENDER}").as_str())
@@ -2103,7 +2134,18 @@ fn build_network_config_with_fault(
 					n.with_name(SENDER_COLLATOR)
 						.with_p2p_port(SENDER_P2P_PORT)
 						.with_rpc_port(SENDER_RPC_PORT)
+				});
+			if missing_proof {
+				p.with_collator(|n| {
+					n.with_name(REPLACEMENT_COLLATOR)
+						.with_p2p_port(REPLACEMENT_P2P_PORT)
+						.with_rpc_port(REPLACEMENT_RPC_PORT)
+						// Keep the replacement from authoring before the fault.
+						.with_keystore_key_types(vec!["gran"])
 				})
+			} else {
+				p
+			}
 		})
 		.with_parachain(|p| {
 			p.with_id(RECEIVER)
@@ -2120,9 +2162,13 @@ fn build_network_config_with_fault(
 						.with_rpc_port(RECEIVER_RPC_PORT)
 				})
 		})
-		.with_global_settings(|global_settings| match std::env::var("ZOMBIENET_SDK_BASE_DIR") {
-			Ok(val) => global_settings.with_base_dir(val),
-			_ => global_settings,
+		.with_global_settings(|global_settings| {
+			// The node monitor can mistake the deliberate restart for a crash.
+			let global_settings = global_settings.with_tear_down_on_failure(!missing_proof);
+			match std::env::var("ZOMBIENET_SDK_BASE_DIR") {
+				Ok(val) => global_settings.with_base_dir(val),
+				_ => global_settings,
+			}
 		})
 		.build()
 		.map_err(|e| {
@@ -2134,11 +2180,21 @@ fn build_network_config_with_fault(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
+	run_v3_timeout_recovery(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
+async fn spec_msg_v3_missing_proof_outage() -> Result<(), anyhow::Error> {
+	run_v3_timeout_recovery(true).await
+}
+
+async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Error> {
 	use polkadot_primitives::{
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2,
 		CommittedCandidateReceiptV2, CoreState, HeadData, NodeFeatures, StreamsRoot,
 	};
-	const TEST_TIMEOUT: Duration = Duration::from_secs(600);
+	let test_timeout = Duration::from_secs(if missing_proof { 900 } else { 600 });
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
@@ -2147,10 +2203,11 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 	}
 	let control = tempfile::tempdir()?;
 	let gate = control.path().join("withhold");
-	let network = initialize_network(build_network_config_with_fault(
+	let network = initialize_network(build_recovery_network_config(
 		(SENDER_COLLATOR, SENDER_P2P_PORT),
 		false,
 		Some(&gate),
+		missing_proof,
 	)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
@@ -2192,10 +2249,10 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 		};
 		let epoch_length = scalar("epoch_length")?;
 		let slot_duration = scalar("slot_duration")?;
-		if epoch_length.saturating_mul(slot_duration) < TEST_TIMEOUT.as_millis() {
+		if !missing_proof && epoch_length.saturating_mul(slot_duration) < test_timeout.as_millis() {
 			return Err(anyhow!("relay epoch is shorter than the recovery test deadline"));
 		}
-		let session: u32 =
+		let mut session: u32 =
 			call_at(&relay, Some(relay_at), "ParachainHost_session_index_for_child", &[]).await?;
 		log::info!("Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {relay_at:?}: epoch_length={epoch_length}, slot_duration={slot_duration}, session={session}");
 		let features: NodeFeatures =
@@ -2219,6 +2276,24 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 			return Err(anyhow!("the recovery test requires no HRMP channel"));
 		}
 		open_spec_msg_channel(&sender, &receiver).await?;
+		if missing_proof {
+			// Live imports retain proofs; catching up after an outage exercises sync imports.
+			network.get_node(REPLACEMENT_COLLATOR)?.pause().await?;
+			if !(30..=60).contains(&epoch_length) {
+				return Err(anyhow!(
+					"outage fixture requires a 30–60 slot epoch, got {epoch_length}"
+				));
+			}
+			let before: u32 =
+				call_at(&relay, None, "ParachainHost_session_index_for_child", &[]).await?;
+			wait_for("a new session before arming the outage", || async {
+				let current: u32 =
+					call_at(&relay, None, "ParachainHost_session_index_for_child", &[]).await?;
+				Ok(current != before)
+			})
+			.await?;
+			session = call_at(&relay, None, "ParachainHost_session_index_for_child", &[]).await?;
+		}
 		let mut next_delivery_block = finalized_number(&receiver).await? + 1;
 		let mut blocks = relay.blocks().subscribe_best().await?;
 		wait_for(
@@ -2264,6 +2339,7 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 			sent.hash()
 		);
 		let mut original: Option<(CandidateHash, CandidateHash, HeadData, StreamsRoot)> = None;
+		let mut faulted_provider = None;
 		let mut provider_timed_out = false;
 		let mut dependent_timed_out = false;
 		let mut dependent_available = false;
@@ -2344,6 +2420,7 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 						block.number(),
 						block.hash()
 					);
+					faulted_provider = Some(provider.clone());
 					original = Some((provider.hash(), candidate.hash(), head.clone(), *required));
 					break;
 				}
@@ -2404,6 +2481,18 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 			original.ok_or_else(|| anyhow!("no optimistic consuming candidate observed"))?;
 		if !provider_timed_out || !dependent_timed_out || !dependent_available {
 			return Err(anyhow!("missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"));
+		}
+		if missing_proof {
+			return measure_missing_proof_outage(
+				&network,
+				&relay,
+				&receiver,
+				&gate,
+				faulted_provider.ok_or_else(|| anyhow!("faulted provider missing"))?,
+				message_id,
+				next_delivery_block,
+			)
+			.await;
 		}
 		let collator = network.get_node(RECEIVER_COLLATOR)?;
 		collator.pause().await?;
@@ -2570,7 +2659,257 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 		}
 		Err(anyhow!("relay subscription ended before recovery"))
 	};
-	let result = tokio::time::timeout(TEST_TIMEOUT, run).await;
+	let result = tokio::time::timeout(test_timeout, run).await;
 	network.destroy().await?;
-	result.map_err(|_| anyhow!("V3 timeout recovery exceeded 600 seconds"))?
+	result.map_err(|_| {
+		anyhow!("V3 recovery experiment exceeded {} seconds", test_timeout.as_secs())
+	})?
+}
+
+async fn measure_missing_proof_outage(
+	network: &Network<LocalFileSystem>,
+	relay: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+	gate: &std::path::Path,
+	provider: polkadot_primitives::CommittedCandidateReceiptV2,
+	message_id: Vec<u8>,
+	mut next_delivery: u32,
+) -> Result<(), anyhow::Error> {
+	use polkadot_primitives::vstaging::RelayParentInfo;
+	use subxt::ext::subxt_rpcs::rpc_params;
+
+	let replacement = network.get_node(REPLACEMENT_COLLATOR)?;
+	replacement.restart(None).await?;
+	let sender: OnlineClient<PolkadotConfig> = replacement.wait_client().await?;
+	let replacement_rpc = replacement.rpc().await?;
+	let head = polkadot_primitives::Header::decode(&mut &provider.commitments.head_data.0[..])?;
+	let hash = H256::from(sp_crypto_hashing::blake2_256(&provider.commitments.head_data.0));
+	wait_for("the replacement to hold the faulted bundle header and body", || async {
+		let block: Option<serde_json::Value> =
+			replacement_rpc.request("chain_getBlock", rpc_params![hash]).await?;
+		Ok(block.is_some())
+	})
+	.await?;
+	let execution_parent = provider.descriptor.relay_parent();
+	let parent_session: u32 =
+		call_at(relay, Some(execution_parent), "ParachainHost_session_index_for_child", &[])
+			.await?;
+	let at = best_hash(relay).await?;
+	let query = subxt::dynamic::storage("Configuration", "ActiveConfig", Vec::<Value>::new());
+	let config = relay
+		.storage()
+		.at(at)
+		.fetch(&query)
+		.await?
+		.ok_or_else(|| anyhow!("active relay configuration missing"))?
+		.to_value()?;
+	let age = config
+		.at("max_relay_parent_session_age")
+		.and_then(|v| v.as_u128())
+		.ok_or_else(|| anyhow!("active configuration has no relay-parent session age"))?;
+	let scheduler = config
+		.at("scheduler_params")
+		.ok_or_else(|| anyhow!("scheduler config missing"))?;
+	log::info!("Outage config ws://127.0.0.1:{RELAY_RPC_PORT} at {at:?}, runtime {:?}: max_relay_parent_session_age={age}, scheduler={scheduler}; execution parent={execution_parent:?}, session={parent_session}", relay.runtime_version());
+	let info: Option<RelayParentInfo<H256, u32>> = call_at(
+		relay,
+		Some(at),
+		"ParachainHost_ancestor_relay_parent_info",
+		&(parent_session, execution_parent).encode(),
+	)
+	.await?;
+	if info.is_none() {
+		return Err(anyhow!("execution relay parent expired before the outage began"));
+	}
+	let initial_finalized = finalized_number(&sender).await?;
+	let old_hash = best_hash(&sender).await?;
+	let public = format!("0x{}", hex::encode(dev::eve().public_key().0));
+	let has_key: bool =
+		replacement_rpc.request("author_hasKey", rpc_params![&public, "aura"]).await?;
+	if has_key {
+		return Err(anyhow!("replacement already had its Aura key before the outage"));
+	}
+	let authorities: Vec<[u8; 32]> =
+		call_at(&sender, Some(old_hash), "AuraApi_authorities", &[]).await?;
+	if !authorities.contains(&dev::eve().public_key().0) {
+		return Err(anyhow!("replacement is not an Aura authority"));
+	}
+	let failures_before =
+		replacement.logs().await?.matches("no stored storage-proof entry").count();
+	network.get_node(SENDER_COLLATOR)?.pause().await?;
+	std::fs::remove_file(gate)?;
+	// This public development key is withheld until all faulted blocks came from the other author.
+	let _: () = replacement_rpc
+		.request("author_insertKey", rpc_params!["aura", "//Eve", public])
+		.await?;
+	let stopped = std::time::Instant::now();
+	log::info!("Author stopped at relay {at:?}; replacement holds bundle #{}, {hash:?}, sender finalized #{initial_finalized}", head.number);
+	let result = replacement
+		.wait_log_line_count_with_timeout(
+			"no stored storage-proof entry",
+			false,
+			LogLineCountOptions::new(
+				move |n| n as usize > failures_before,
+				Duration::from_secs(30),
+				false,
+			),
+		)
+		.await?;
+	if !result.success() {
+		return Err(anyhow!("replacement did not demonstrate a missing stored proof"));
+	}
+
+	let mut blocks = relay.blocks().subscribe_best().await?;
+	let mut expired = None;
+	let mut authored = None;
+	let mut sender_finalized = false;
+	let mut delivery = false;
+	while let Some(block) = blocks.next().await {
+		let block = block?;
+		let session: u32 =
+			call_at(relay, Some(block.hash()), "ParachainHost_session_index_for_child", &[])
+				.await?;
+		let info: Option<RelayParentInfo<H256, u32>> = call_at(
+			relay,
+			Some(block.hash()),
+			"ParachainHost_ancestor_relay_parent_info",
+			&(parent_session, execution_parent).encode(),
+		)
+		.await?;
+		let pending: Vec<polkadot_primitives::CommittedCandidateReceiptV2> = call_at(
+			relay,
+			Some(block.hash()),
+			"ParachainHost_candidates_pending_availability",
+			&ParaId::from(SENDER).encode(),
+		)
+		.await?;
+		let finalized = finalized_number(&sender).await?;
+		log::info!("Outage +{}s: relay #{} {:?}, session={session}, relay_parent_present={}, sender_pending={}, sender_finalized={finalized}, receiver_finalized={}", stopped.elapsed().as_secs(), block.number(), block.hash(), info.is_some(), pending.len(), finalized_number(receiver).await?);
+		if info.is_none() && expired.is_none() {
+			if u128::from(session) != u128::from(parent_session) + age + 1 {
+				return Err(anyhow!(
+					"relay-parent expiry differed from the session-boundary expectation"
+				));
+			}
+			expired = Some((block.number(), block.hash()));
+			log::info!(
+				"Execution relay parent expired at +{}s, relay #{} {:?}, session={session}",
+				stopped.elapsed().as_secs(),
+				block.number(),
+				block.hash()
+			);
+		}
+		let current = best_hash(&sender).await?;
+		if current != old_hash && authored.is_none() {
+			use sp_core::{ByteArray, Pair};
+			use sp_runtime::traits::Header as _;
+			let built = sender.blocks().at(current).await?;
+			let mut header =
+				polkadot_primitives::Header::decode(&mut &built.header().encode()[..])?;
+			if let Some(sp_runtime::DigestItem::Seal(engine, signature)) = header.digest_mut().pop()
+			{
+				if engine == *b"aura" &&
+					sp_core::sr25519::Pair::verify(
+						&sp_core::sr25519::Signature::from_slice(&signature)
+							.map_err(|_| anyhow!("invalid Aura seal length"))?,
+						header.hash().as_bytes(),
+						&sp_core::sr25519::Public::from_raw(dev::eve().public_key().0),
+					) {
+					authored = Some((built.number(), current));
+					log::info!("Replacement signed a fresh block at +{}s: {current:?}; relay parent expired={}", stopped.elapsed().as_secs(), expired.is_some());
+				}
+			}
+		}
+		if let Some((height, expected)) = authored {
+			if finalized >= height && !sender_finalized {
+				let query = subxt::dynamic::storage(
+					"System",
+					"BlockHash",
+					vec![Value::u128(height.into())],
+				);
+				let actual = sender
+					.storage()
+					.at_latest()
+					.await?
+					.fetch(&query)
+					.await?
+					.ok_or_else(|| anyhow!("sender finalized hash missing"))?
+					.as_type::<H256>()?;
+				if actual != expected {
+					authored = None;
+				} else {
+					sender_finalized = true;
+					log::info!(
+						"Replacement's fresh block finalized at +{}s: #{height} {expected:?}",
+						stopped.elapsed().as_secs()
+					);
+				}
+			}
+		}
+		let receiver_final = receiver.blocks().at_latest().await?;
+		while next_delivery <= receiver_final.number() {
+			let query = subxt::dynamic::storage(
+				"System",
+				"BlockHash",
+				vec![Value::u128(next_delivery.into())],
+			);
+			let hash = if next_delivery == receiver_final.number() {
+				receiver_final.hash()
+			} else {
+				receiver
+					.storage()
+					.at(receiver_final.hash())
+					.fetch(&query)
+					.await?
+					.ok_or_else(|| anyhow!("receiver finalized hash missing"))?
+					.as_type::<H256>()?
+			};
+			let delivered = receiver.blocks().at(hash).await?;
+			next_delivery += 1;
+			for event in delivered.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
+					continue;
+				}
+				let values = event.field_values()?;
+				if values.at("id").map(flatten).as_ref() != Some(&message_id) {
+					continue;
+				}
+				let fields = format!("{values:?}");
+				if !fields.contains("SpecMsg") || !fields.contains("Bool(true)") {
+					return Err(anyhow!("outage XCM execution failed: {fields}"));
+				}
+				log::info!(
+					"XCM delivered at +{}s: executed in finalized receiver #{} {:?}",
+					stopped.elapsed().as_secs(),
+					delivered.number(),
+					delivered.hash()
+				);
+				delivery = true;
+			}
+		}
+		if delivery && sender_finalized {
+			if let Some((height, expected)) = expired {
+				let query = subxt::dynamic::storage(
+					"System",
+					"BlockHash",
+					vec![Value::u128(height.into())],
+				);
+				let actual = relay
+					.storage()
+					.at_latest()
+					.await?
+					.fetch(&query)
+					.await?
+					.ok_or_else(|| anyhow!("relay expiry hash missing"))?
+					.as_type::<H256>()?;
+				if actual != expected {
+					return Err(anyhow!("expiry observed on an abandoned relay fork"));
+				}
+				log::info!("Outage measurement complete at +{}s", stopped.elapsed().as_secs());
+				return Ok(());
+			}
+		}
+	}
+	Err(anyhow!("relay subscription ended before outage recovery"))
 }
