@@ -367,6 +367,11 @@ pub struct Cli<Config: CliConfig> {
 	#[arg(long)]
 	pub enable_spec_msg: bool,
 
+	/// Consume backed messages before inclusion. Requires a relay deployment with enactment
+	/// matching; API availability alone does not establish support.
+	#[arg(long, requires = "enable_spec_msg")]
+	pub spec_msg_optimistic: bool,
+
 	/// A node to fetch speculative messages from, as `<PARA_ID>=<MULTIADDR>`: a collator of a
 	/// source chain, or with this chain's own id, a peer to backfill the archive from. The address
 	/// must end in `/p2p/<PEER_ID>`. Repeat it for more peers; peers of one chain are tried in
@@ -453,7 +458,8 @@ impl<Config: CliConfig> Cli<Config> {
 			collator_reserved_slots: self.collator_reserved_slots,
 			hop: self.hop.enabled.then(|| self.hop.clone()),
 			spec_msg: self.enable_spec_msg.then(|| {
-				let mut config = SpecMsgConfig::default();
+				let mut config =
+					SpecMsgConfig { optimistic: self.spec_msg_optimistic, ..Default::default() };
 				for (para_id, address) in &self.spec_msg_peer {
 					config.peers.entry((*para_id).into()).or_default().push(address.clone());
 				}
@@ -732,6 +738,24 @@ mod tests {
 		fn copyright_start_year() -> u16 {
 			2025
 		}
+	}
+
+	#[test]
+	fn optimistic_spec_msg_requires_explicit_opt_in() {
+		let command = || Cli::<TestCliConfig>::command().version("0.0.0");
+		let matches = command().get_matches_from(["polkadot-omni-node", "--enable-spec-msg"]);
+		let cli = Cli::<TestCliConfig>::from_arg_matches(&matches).unwrap();
+		assert!(!cli.node_extra_args().spec_msg.unwrap().optimistic);
+		assert!(command()
+			.try_get_matches_from(["polkadot-omni-node", "--spec-msg-optimistic"])
+			.is_err());
+		let matches = command().get_matches_from([
+			"polkadot-omni-node",
+			"--enable-spec-msg",
+			"--spec-msg-optimistic",
+		]);
+		let cli = Cli::<TestCliConfig>::from_arg_matches(&matches).unwrap();
+		assert!(cli.node_extra_args().spec_msg.unwrap().optimistic);
 	}
 
 	#[test]

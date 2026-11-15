@@ -43,6 +43,8 @@ use std::{collections::BTreeMap, sync::Arc};
 /// Speculative messaging configuration.
 #[derive(Clone, Debug, Default)]
 pub struct SpecMsgConfig {
+	/// Allow pending roots on a relay deployment with enactment matching.
+	pub optimistic: bool,
 	/// The collators to fetch each source chain's messages from, in the order to try them.
 	pub peers: BTreeMap<ParaId, Vec<MultiaddrWithPeerId>>,
 }
@@ -121,7 +123,13 @@ where
 	spawner.spawn(
 		"spec-msg-receiver",
 		Some("spec-msg"),
-		run_receiver::<Block, _, _, _>(client, backend, relay_chain_interface, receiver.clone()),
+		run_receiver::<Block, _, _, _>(
+			client,
+			backend,
+			relay_chain_interface,
+			receiver.clone(),
+			config.optimistic,
+		),
 	);
 	Some(receiver)
 }

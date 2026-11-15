@@ -15,17 +15,20 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-//! The receiver, inclusion tier only:
+//! The receiver:
 //!
-//! - [`Receiver::on_root`]: under a source's newest included root, fetch channel data and `Ack`
-//!   heads, and rebind every unfinalized endpoint to it.
-//! - [`Receiver::inherent_data`]: consume within a [`Budget`], only items already liftable.
+//! - [`Receiver::on_roots`] / [`Receiver::on_root`]: under a source's newest eligible root, fetch
+//!   channel data and `Ack` heads, and rebind unfinalized endpoints to the newest root and the
+//!   included root.
+//! - [`Receiver::inherent_data`]: consume within a [`Budget`], preferring the newest included root
+//!   when it covers the bundle and otherwise the oldest covering pending root.
 //! - [`Receiver::on_block`]: note a block's record and fetch the leaves for a read-context gap.
 //! - [`Receiver::assemble`]: one lift per recorded stream, checked with `build_requires_entry`.
 
 use crate::{
 	fetch::{fetch, RequestError, Transport},
 	pool::{Binding, HeadRead, SourcePool},
+	relay::SourceRoots,
 	LOG_TARGET,
 };
 use codec::{DecodeAll, MaxEncodedLen};
@@ -130,7 +133,7 @@ impl ChainView {
 	}
 }
 
-/// Wraps a transport so the peer asked first changes every round: one unresponsive peer then
+/// [`Transport`] wrapper whose peer asked first changes every round: one unresponsive peer then
 /// delays only the rounds it leads.
 struct Rotating<T: ?Sized> {
 	inner: Arc<T>,
@@ -217,7 +220,6 @@ struct Planned {
 	stream: StreamId,
 	item: Item,
 	endpoint: MmrFrontier,
-	root: StreamsRoot,
 }
 
 /// A gap between two reads of a stream, and where its leaves come from.
@@ -282,6 +284,22 @@ where
 		}
 	}
 
+	#[cfg(test)]
+	pub(crate) fn verified_stream_len(
+		&self,
+		source: ParaId,
+		stream: StreamId,
+		root: StreamsRoot,
+	) -> Option<u64> {
+		self.state
+			.lock()
+			.sources
+			.get(&source)?
+			.stream_len
+			.get(&(stream, root.0))
+			.copied()
+	}
+
 	/// Whether the record of block `hash` is noted and not final yet.
 	#[cfg(test)]
 	pub(crate) fn is_live(&self, hash: &H) -> bool {
@@ -315,15 +333,71 @@ where
 			})
 	}
 
-	/// `root` is `source`'s newest included root: fetch under it what `wants` names, and bind the
-	/// live endpoints to it. Under a root already settled this does nothing; under one whose last
-	/// round had a failed fetch, it fetches again.
+	/// Whether `source`'s current `roots` snapshot is settled for `wants`.
+	pub fn is_roots_settled(
+		&self,
+		source: &ParaId,
+		roots: &SourceRoots,
+		wants: &SourceWants,
+	) -> bool {
+		let Some(newest) = roots.newest() else { return false };
+		let state = self.state.lock();
+		let Some(pool) = state.sources.get(source) else { return false };
+		pool.eligibility_known &&
+			pool.eligible == *roots &&
+			pool.newest_root() == Some(newest) &&
+			pool.settled &&
+			state.live_endpoints(source).iter().all(|((stream, _), end)| {
+				std::iter::once(newest).chain(roots.included).all(|root| {
+					lifts_to(pool, stream, end, &root) ||
+						(root != newest && pool.predates(stream, end.leaf_count(), &root))
+				})
+			}) && wants.channels.iter().all(|(id, stored)| {
+			covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
+		})
+	}
+
+	/// `root` is `source`'s newest included root (with no pending roots): fetch under it what
+	/// `wants` names, and bind the live endpoints to it.
 	pub async fn on_root(&self, source: ParaId, root: StreamsRoot, wants: &SourceWants) {
-		if self.is_settled(&source, &root, wants) {
+		self.on_roots(source, SourceRoots::included(root), wants).await
+	}
+
+	/// `roots` are `source`'s eligible roots at the current relay head: fetch under the newest
+	/// eligible root what `wants` names, and bind the live endpoints to it (and to the included
+	/// root when distinct, to prefer included dependencies whenever they cover the bundle).
+	pub async fn on_roots(&self, source: ParaId, roots: SourceRoots, wants: &SourceWants) {
+		self.update_roots(source, roots.clone());
+		self.fetch_roots(source, roots, wants).await;
+	}
+
+	pub(crate) fn update_roots(&self, source: ParaId, roots: SourceRoots) {
+		self.state.lock().sources.entry(source).or_default().push_roots(roots);
+	}
+
+	/// Until the relay chain answers for the newest head: keep the included root, which only a
+	/// reorg takes back, but stop new consumption under pending roots, whose providers may have
+	/// been dropped since.
+	pub(crate) fn drop_pending_roots(&self, source: ParaId) {
+		if let Some(pool) = self.state.lock().sources.get_mut(&source) {
+			pool.eligible.pending.clear();
+		}
+	}
+
+	pub(crate) async fn fetch_roots(
+		&self,
+		source: ParaId,
+		roots: SourceRoots,
+		wants: &SourceWants,
+	) {
+		let Some(root) = roots.newest() else {
+			self.forget(&source);
+			return;
+		};
+		if self.is_roots_settled(&source, &roots, wants) {
 			return;
 		}
 		self.transport.next_round(source);
-		self.state.lock().sources.entry(source).or_default().push_root(root);
 		log::debug!(target: LOG_TARGET, "New root {root:?} of {source:?}: fetching");
 		let started = std::time::Instant::now();
 		let mut settled = true;
@@ -407,25 +481,51 @@ where
 			}
 		}
 
-		let unbound: Vec<_> = {
-			let state = self.state.lock();
-			let pool = state.sources.get(&source);
-			state
-				.live_endpoints(&source)
-				.into_iter()
-				.filter(|((stream, count), _)| {
-					pool.and_then(|pool| pool.binding(stream, *count, &root)).is_none()
-				})
-				.collect()
-		};
-		for ((stream, _), endpoint) in unbound {
-			settled &= self.fetch_binding(source, stream, &endpoint, root).await;
+		let mut bind_roots = vec![root];
+		if let Some(included) = roots.included.filter(|inc| *inc != root) {
+			bind_roots.push(included);
+		}
+		for target_root in bind_roots {
+			let unbound: Vec<_> = {
+				let state = self.state.lock();
+				let pool = state.sources.get(&source);
+				state
+					.live_endpoints(&source)
+					.into_iter()
+					.filter(|((stream, count), endpoint)| {
+						pool.is_none_or(|pool| {
+							!pool.predates(stream, *count, &target_root) &&
+								pool.binding(stream, *count, &target_root).is_none() &&
+								!lifts_to(pool, stream, endpoint, &target_root)
+						})
+					})
+					.collect()
+			};
+			for ((stream, _), endpoint) in unbound {
+				let bound = self.fetch_binding(source, stream, &endpoint, target_root).await;
+				if !bound && target_root != root {
+					// A refusal alone cannot prove that an included root is too old.
+					let request =
+						MessagesRequest { stream, under: target_root, start: None, max_bytes: 0 };
+					if let Ok(response) = fetch(&self.transport, source, &request, None).await {
+						let mut state = self.state.lock();
+						let pool = state.sources.entry(source).or_default();
+						if pool.roots.contains(&target_root) {
+							pool.stream_len
+								.insert((stream, target_root.0), response.extension.leaf_count);
+						}
+					}
+				}
+				if target_root == root {
+					settled &= bound;
+				}
+			}
 		}
 
 		let mut state = self.state.lock();
 		if let Some(pool) = state.sources.get_mut(&source) {
 			// A newer root may have arrived meanwhile; it settles on its own.
-			if pool.newest_root() == Some(root) {
+			if pool.eligible == roots {
 				pool.settled = settled;
 			}
 		}
@@ -438,8 +538,8 @@ where
 	}
 
 	/// Where the next fetch of the channel `stream` starts: the frontier after the payloads the
-	/// pool holds from the cursor, with the payload budget. While the buffer is full the budget is
-	/// zero: the fetch only checks that the root's stream still runs through what the pool holds.
+	/// pool holds from the cursor, with the payload budget. While the buffer is full, `max_bytes`
+	/// is `0`: a proofs-only check that the held payloads still match the newest root.
 	fn channel_start(
 		&self,
 		source: ParaId,
@@ -542,11 +642,10 @@ where
 	/// the blocks before it in its bundle, oldest first.
 	///
 	/// The bundle's candidate needs, per source, one root that every stream's last endpoint in
-	/// the bundle lifts to. A source's items are planned under its newest root, which may be newer
-	/// than the one an earlier block of the bundle used, and that block may have been imported
-	/// after the newer root's round bound the live endpoints. So the earlier endpoints are bound
-	/// under the planned root as well, and a source whose earlier endpoints stay unbound gets no
-	/// item in this block.
+	/// the bundle lifts to. For each source touched by `bundle` or `planned`, the newest included
+	/// root is preferred whenever all endpoints lift to it; otherwise the oldest covering pending
+	/// root is used. Missing bindings under both the source's newest root and its newest included
+	/// root are fetched within `INHERENT_FETCH_TIMEOUT` before choosing.
 	pub async fn inherent_data(
 		&self,
 		view: &ChainView,
@@ -554,35 +653,47 @@ where
 	) -> MessagingInherentData {
 		let bundle = last_endpoints(bundle);
 		let planned = self.plan(view, &bundle);
-		let roots: BTreeMap<ParaId, StreamsRoot> =
-			planned.iter().map(|p| (p.source, p.root)).collect();
-		let earlier: Vec<_> = bundle
-			.into_iter()
-			.filter_map(|((source, stream), end)| Some((source, stream, end, *roots.get(&source)?)))
-			.collect();
-		// A binding at the endpoint, or a later one to rebase from over the pooled payloads: an
-		// item the budget cuts short of what the pool holds needs no fetch.
-		let bound = |p: &Planned| {
+		let mut sources: BTreeSet<ParaId> = planned.iter().map(|p| p.source).collect();
+		sources.extend(bundle.keys().map(|(source, _)| *source));
+
+		let candidate_roots: BTreeMap<ParaId, Vec<StreamsRoot>> = {
 			let state = self.state.lock();
-			state.sources.get(&p.source).is_some_and(|pool| {
-				pool.binding(&p.stream, p.endpoint.leaf_count(), &p.root).is_some() ||
-					lifts_to(pool, &p.stream, &p.endpoint, &p.root)
-			})
+			sources
+				.iter()
+				.filter_map(|source| {
+					let pool = state.sources.get(source)?;
+					Some((*source, pool.target_roots()))
+				})
+				.collect()
 		};
-		let liftable =
-			|(source, stream, end, root): &(ParaId, StreamId, MmrFrontier, StreamsRoot)| {
+
+		let endpoint_lifts =
+			|source: ParaId, stream: &StreamId, end: &MmrFrontier, root: &StreamsRoot| {
 				let state = self.state.lock();
-				state.sources.get(source).is_some_and(|pool| lifts_to(pool, stream, end, root))
+				state.sources.get(&source).is_some_and(|pool| lifts_to(pool, stream, end, root))
 			};
+
 		// Fetch every missing binding at once, under one deadline: authoring waits at most
 		// `INHERENT_FETCH_TIMEOUT`, however many items there are and whatever their peers do.
 		{
-			let missing: Vec<_> = planned
-				.iter()
-				.filter(|p| !bound(p))
-				.map(|p| (p.source, p.stream, p.endpoint.clone(), p.root))
-				.chain(earlier.iter().filter(|e| !liftable(e)).cloned())
-				.collect();
+			let mut missing: Vec<(ParaId, StreamId, MmrFrontier, StreamsRoot)> = Vec::new();
+			for p in &planned {
+				for root in candidate_roots.get(&p.source).into_iter().flatten() {
+					if !endpoint_lifts(p.source, &p.stream, &p.endpoint, root) {
+						missing.push((p.source, p.stream, p.endpoint.clone(), *root));
+					}
+				}
+			}
+			for ((source, stream), end) in &bundle {
+				for root in candidate_roots.get(source).into_iter().flatten() {
+					if !endpoint_lifts(*source, stream, end, root) {
+						let entry = (*source, *stream, end.clone(), *root);
+						if !missing.contains(&entry) {
+							missing.push(entry);
+						}
+					}
+				}
+			}
 			if !missing.is_empty() {
 				let fetches = missing.iter().map(|(source, stream, endpoint, root)| {
 					self.fetch_binding(*source, *stream, endpoint, *root)
@@ -593,39 +704,74 @@ where
 				}
 			}
 		}
-		let stuck: std::collections::BTreeSet<ParaId> = earlier
-			.iter()
-			.filter(|e| !liftable(e))
-			.map(|(source, stream, end, _)| {
-				log::debug!(
-					target: LOG_TARGET,
-					"Not consuming from {source:?}: the bundle's {stream:?} at {} does not lift to \
-					 its newest root",
-					end.leaf_count(),
-				);
-				*source
-			})
-			.collect();
-		let planned = planned.into_iter().filter(|p| !stuck.contains(&p.source));
+
+		// Keep one eligible root per source for all consumed endpoints in the bundle.
 		let mut data = MessagingInherentData::default();
-		for p in planned {
-			if !bound(&p) {
-				log::debug!(
-					target: LOG_TARGET,
-					"Not consuming {:?} of {:?}: no lift material at {}",
-					p.stream,
-					p.source,
-					p.endpoint.leaf_count(),
-				);
+		for source in sources {
+			let source_planned: Vec<_> = planned.iter().filter(|p| p.source == source).collect();
+			if source_planned.is_empty() {
 				continue;
 			}
-			match p.item {
-				Item::Channel(id, payloads) => {
-					data.channels.insert(id, payloads);
-				},
-				Item::Register(id, read) => {
-					data.registers.insert(id, read);
-				},
+			let source_earlier: Vec<_> = bundle
+				.iter()
+				.filter(|((s, _), _)| *s == source)
+				.map(|((_, stream), end)| (*stream, end.clone()))
+				.collect();
+			let target_roots = {
+				let state = self.state.lock();
+				state.sources.get(&source).map(SourcePool::target_roots).unwrap_or_default()
+			};
+			// Find a target root that covers all earlier endpoints in the bundle and all planned
+			// items of this source; if none covers all planned items, pick the first target root
+			// that covers all earlier endpoints and at least one planned item.
+			let chosen = target_roots
+				.iter()
+				.copied()
+				.find(|root| {
+					source_earlier
+						.iter()
+						.all(|(stream, end)| endpoint_lifts(source, stream, end, root)) &&
+						source_planned
+							.iter()
+							.all(|p| endpoint_lifts(source, &p.stream, &p.endpoint, root))
+				})
+				.or_else(|| {
+					target_roots.iter().copied().find(|root| {
+						source_earlier
+							.iter()
+							.all(|(stream, end)| endpoint_lifts(source, stream, end, root)) &&
+							source_planned
+								.iter()
+								.any(|p| endpoint_lifts(source, &p.stream, &p.endpoint, root))
+					})
+				});
+			let Some(chosen) = chosen else {
+				log::debug!(
+					target: LOG_TARGET,
+					"Not consuming from {source:?}: no eligible root covers the bundle",
+				);
+				continue;
+			};
+			for p in source_planned {
+				if !endpoint_lifts(source, &p.stream, &p.endpoint, &chosen) {
+					log::debug!(
+						target: LOG_TARGET,
+						"Not consuming {:?} of {:?}: no lift material at {} under {:?}",
+						p.stream,
+						p.source,
+						p.endpoint.leaf_count(),
+						chosen,
+					);
+					continue;
+				}
+				match &p.item {
+					Item::Channel(id, payloads) => {
+						data.channels.insert(*id, payloads.clone());
+					},
+					Item::Register(id, read) => {
+						data.registers.insert(*id, read.clone());
+					},
+				}
 			}
 		}
 		if !data.is_empty() {
@@ -650,9 +796,10 @@ where
 		let mut planned = Vec::new();
 		let rotation = self.rotation.fetch_add(1, Ordering::Relaxed);
 		let state = self.state.lock();
-		let newest = |source: &ParaId| {
+		let active = |source: &ParaId| {
 			let pool = state.sources.get(source).filter(|pool| !pool.forgotten)?;
-			Some((pool, pool.newest_root()?))
+			pool.newest_root()?;
+			Some(pool)
 		};
 
 		let registers: Vec<_> = view
@@ -671,7 +818,7 @@ where
 			if bundle.contains_key(&(*source, stream)) {
 				continue;
 			}
-			let Some((pool, root)) = newest(source) else { continue };
+			let Some(pool) = active(source) else { continue };
 			let Some(head) = pool.heads.get(&stream) else { continue };
 			// The pallet rejects the block on a head at or below the applied one, and on an
 			// undecodable register.
@@ -696,7 +843,6 @@ where
 					},
 				),
 				endpoint,
-				root,
 			});
 		}
 
@@ -712,7 +858,7 @@ where
 			if streams >= max_streams {
 				break;
 			}
-			let Some((pool, root)) = newest(source) else { continue };
+			let Some(pool) = active(source) else { continue };
 			let stream = id.sender_data_stream(self.us).1;
 			// Up to what the newest root commits.
 			let reach = pool.reach.get(&stream).map_or(usize::MAX, |reach| {
@@ -738,7 +884,6 @@ where
 				stream,
 				item: Item::Channel(*id, taken),
 				endpoint,
-				root,
 			});
 		}
 		planned
@@ -823,7 +968,6 @@ where
 	/// the leaves between them.
 	async fn fetch_skip_proof(&self, gap: Gap) -> Option<MmrExtensionProof> {
 		let Gap { source, stream, from, to_start, to_count, under } = gap;
-		// The next read's own leaf is not part of the gap.
 		let read_position = to_count.checked_sub(1)?;
 		let mut frontier = from.clone();
 		let mut leaves = Vec::new();
@@ -893,18 +1037,36 @@ where
 		channels.chain(registers).collect()
 	}
 
-	/// The lifts for a candidate whose blocks have `records`, in bundle order. Per source, the
-	/// newest root that all its streams' material reaches.
+	/// Check retained proof material independently of submission eligibility.
+	#[cfg(test)]
+	pub(crate) fn retained_lifts(&self, records: &[ConsumptionRecord]) -> LiftsBySource {
+		let merged = merge(records);
+		let state = self.state.lock();
+		let lifts = merged
+			.iter()
+			.map(|(source, streams)| {
+				let pool = &state.sources[source];
+				let lifts = pool
+					.roots
+					.iter()
+					.rev()
+					.find_map(|root| {
+						streams
+							.iter()
+							.map(|(stream, intervals)| lift(pool, stream, intervals, root))
+							.collect::<Option<Vec<_>>>()
+					})
+					.expect("retained material covers the bundle; qed");
+				(*source, lifts)
+			})
+			.collect::<BTreeMap<_, _>>();
+		LiftsBySource::try_from(lifts).expect("test sources are bounded; qed")
+	}
+
+	/// Assemble lifts under one eligible root per source, preferring the included root when it
+	/// covers the bundle and otherwise the oldest covering pending root.
 	pub fn assemble(&self, records: &[ConsumptionRecord]) -> Result<LiftsBySource, String> {
-		let mut merged: BTreeMap<ParaId, SourceStreams> = BTreeMap::new();
-		for record in records {
-			for (source, streams) in &record.entries {
-				let by_stream = merged.entry(*source).or_default();
-				for (stream, interval) in streams {
-					by_stream.entry(*stream).or_default().push(interval.clone());
-				}
-			}
-		}
+		let merged = merge(records);
 		let state = self.state.lock();
 		let mut lifts = BTreeMap::new();
 		for (source, streams) in &merged {
@@ -912,15 +1074,16 @@ where
 				.sources
 				.get(source)
 				.ok_or_else(|| format!("nothing fetched from {source:?}"))?;
-			let found = pool.roots.iter().rev().find_map(|root| {
+			let candidates = pool.target_roots();
+			let found = candidates.iter().find_map(|root| {
 				let source_lifts = streams
 					.iter()
 					.map(|(stream, intervals)| lift(pool, stream, intervals, root))
 					.collect::<Option<Vec<_>>>()?;
 				(build_requires_entry(streams, &source_lifts) == Ok(*root)).then_some(source_lifts)
 			});
-			let source_lifts =
-				found.ok_or_else(|| format!("no lift material for {source:?} under any root"))?;
+			let source_lifts = found
+				.ok_or_else(|| format!("no lift material for {source:?} under an eligible root"))?;
 			lifts.insert(*source, source_lifts);
 		}
 		LiftsBySource::try_from(lifts).map_err(|e| format!("{e:?}"))
@@ -1110,6 +1273,19 @@ pub(crate) fn skip_proof(from: &MmrFrontier, leaves: &[Hash]) -> Option<MmrExten
 			.try_into()
 			.ok()?,
 	})
+}
+
+fn merge(records: &[ConsumptionRecord]) -> BTreeMap<ParaId, SourceStreams> {
+	let mut merged: BTreeMap<ParaId, SourceStreams> = BTreeMap::new();
+	for record in records {
+		for (source, streams) in &record.entries {
+			let by_stream = merged.entry(*source).or_default();
+			for (stream, interval) in streams {
+				by_stream.entry(*stream).or_default().push(interval.clone());
+			}
+		}
+	}
+	merged
 }
 
 /// The lift of one stream's `intervals` to `root`, from the pool's material.
