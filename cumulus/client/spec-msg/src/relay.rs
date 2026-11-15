@@ -31,18 +31,26 @@ pub const NEWEST_INCLUDED_PROVIDES: &str = "ParachainHost_newest_included_provid
 /// The `ParachainHost` version that added [`NEWEST_INCLUDED_PROVIDES`].
 pub const NEWEST_INCLUDED_PROVIDES_VERSION: u32 = 17;
 
-/// `source`'s newest included root as of relay block `at`. `None` also when the relay runtime
-/// predates the API.
+/// `source`'s newest included root as of relay block `at`. `None` also when the call failed or the
+/// relay runtime predates the API.
 pub async fn newest_included_provides(
 	relay: &(impl RelayChainInterface + ?Sized),
 	at: PHash,
 	source: ParaId,
 ) -> Option<StreamsRoot> {
+	answered_newest_included_provides(relay, at, source).await.ok().flatten()
+}
+
+/// Like [`newest_included_provides`], but `Err` when the call failed, so `Ok(None)` is the relay
+/// runtime's own answer that `source` has no root.
+pub(crate) async fn answered_newest_included_provides(
+	relay: &(impl RelayChainInterface + ?Sized),
+	at: PHash,
+	source: ParaId,
+) -> Result<Option<StreamsRoot>, ()> {
 	call_runtime_api::<Option<StreamsRoot>>(relay, NEWEST_INCLUDED_PROVIDES, at, source)
 		.await
 		.map_err(|e| log::debug!(target: LOG_TARGET, "{NEWEST_INCLUDED_PROVIDES} failed: {e}"))
-		.ok()
-		.flatten()
 }
 
 /// Whether relay block `at` has [`NEWEST_INCLUDED_PROVIDES`].
