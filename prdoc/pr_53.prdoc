@@ -1,0 +1,6 @@
+title: 'spec-msg: optimistic V3 recovery and delivery tests'
+doc:
+- audience: Node Dev
+  description: Add focused optimistic messaging integration tests and controlled availability-fault
+    tooling.
+crates: []
