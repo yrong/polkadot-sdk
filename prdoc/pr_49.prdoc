@@ -1,0 +1,10 @@
+title: 'spec-msg: archive and fetch on the enactment stack'
+doc:
+- audience: Node Operator
+  description: Archive and serve outgoing messaging streams with finalized-watermark retention and
+    own-chain backfill.
+crates:
+- name: cumulus-client-spec-msg
+  bump: minor
+- name: penpal-runtime
+  bump: patch
