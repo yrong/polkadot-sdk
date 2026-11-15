@@ -2335,6 +2335,102 @@ async fn relay_ancestor(
 	Ok((block.number() == number).then_some(block.hash()))
 }
 
+async fn relay_has_sender_root(
+	relay: &OnlineClient<PolkadotConfig>,
+	at: H256,
+	root: polkadot_primitives::StreamsRoot,
+) -> Result<bool, anyhow::Error> {
+	let pending: Vec<polkadot_primitives::CommittedCandidateReceiptV2> = call_at(
+		relay,
+		Some(at),
+		"ParachainHost_candidates_pending_availability",
+		&ParaId::from(SENDER).encode(),
+	)
+	.await?;
+	let included: Option<polkadot_primitives::StreamsRoot> = call_at(
+		relay,
+		Some(at),
+		"ParachainHost_newest_included_provides",
+		&ParaId::from(SENDER).encode(),
+	)
+	.await?;
+	Ok(included == Some(root) ||
+		pending.iter().any(|candidate| {
+			candidate
+				.commitments
+				.ump_signals()
+				.ok()
+				.is_some_and(|s| s.provides() == Some(&root))
+		}))
+}
+
+async fn promote_relay_fork(
+	network: &Network<LocalFileSystem>,
+	relay: &OnlineClient<PolkadotConfig>,
+	competing: &OnlineClient<PolkadotConfig>,
+	current: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	root: polkadot_primitives::StreamsRoot,
+) -> Result<Option<(H256, u32, H256)>, anyhow::Error> {
+	let fork = competing.blocks().at(best_hash(competing).await?).await?;
+	if fork.number() != current.number() ||
+		fork.hash() == current.hash() ||
+		best_hash(relay).await? != current.hash() ||
+		relay_has_sender_root(competing, fork.hash(), root).await?
+	{
+		return Ok(None);
+	}
+	let sender = network.get_node(SENDER_COLLATOR)?;
+	let alice = network.get_node("alice")?;
+	// Keep the provider from returning while the competing branch is promoted.
+	sender.pause().await?;
+	if let Err(error) = alice.pause().await {
+		sender.resume().await?;
+		return Err(error);
+	}
+	let mut alice_paused = true;
+	log::info!(
+		"Promoting Bob's relay fork #{} {:?}, which lacks consumed root {root:?}, \
+		 over Alice's {:?}",
+		fork.number(),
+		fork.hash(),
+		current.hash()
+	);
+	let promote = async {
+		let mut blocks = competing.blocks().subscribe_best().await?;
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			if relay_ancestor(competing, block.hash(), fork.number()).await? != Some(fork.hash()) {
+				return Ok(None);
+			}
+			if block.number() < fork.number() + 2 {
+				continue;
+			}
+			if relay_has_sender_root(competing, block.hash(), root).await? {
+				return Ok(None);
+			}
+			alice.resume().await?;
+			alice_paused = false;
+			let mut adopted = relay.blocks().subscribe_best().await?;
+			while let Some(block) = adopted.next().await {
+				let block = block?;
+				if relay_ancestor(relay, block.hash(), fork.number()).await? == Some(fork.hash()) &&
+					!relay_has_sender_root(relay, block.hash(), root).await?
+				{
+					return Ok(Some((fork.hash(), block.number(), block.hash())));
+				}
+			}
+			return Err(anyhow!("relay subscription ended before adopting the promoted fork"));
+		}
+		Err(anyhow!("competing relay subscription ended before fork promotion"))
+	};
+	let result = tokio::time::timeout(Duration::from_secs(45), promote).await;
+	let resumed_alice = if alice_paused { alice.resume().await } else { Ok(()) };
+	let resumed_sender = sender.resume().await;
+	resumed_alice?;
+	resumed_sender?;
+	result.map_err(|_| anyhow!("relay fork promotion exceeded 45 seconds"))?
+}
+
 async fn run_v3_timeout_recovery(
 	catch_up: bool,
 	two_way: bool,
@@ -2372,6 +2468,11 @@ async fn run_v3_timeout_recovery(
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 	let receiver: OnlineClient<PolkadotConfig> =
 		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+	let competing = if reorg {
+		Some(network.get_node("bob")?.wait_client::<PolkadotConfig>().await?)
+	} else {
+		None
+	};
 
 	let run = async {
 		let ready_at = best_hash(&relay).await?;
@@ -2453,6 +2554,11 @@ async fn run_v3_timeout_recovery(
 		}
 		let mut next_delivery_block = finalized_number(&receiver).await? + 1;
 		let mut blocks = relay.blocks().subscribe_best().await?;
+		let mut competing_blocks = if let Some(competing) = &competing {
+			Some(competing.blocks().subscribe_best().await?)
+		} else {
+			None
+		};
 		wait_for(
 			"the sender's first provided root to finalize before arming the fault",
 			|| async {
@@ -2516,7 +2622,6 @@ async fn run_v3_timeout_recovery(
 		let mut original: Option<(CandidateHash, CandidateHash, HeadData, StreamsRoot)> = None;
 		let mut original_at = None;
 		let mut target_removed = false;
-		let mut previous_snapshot = None;
 		let mut faulted_provider = None;
 		let mut provider_timed_out = false;
 		let mut dependent_timed_out = false;
@@ -2524,7 +2629,19 @@ async fn run_v3_timeout_recovery(
 		let mut return_dependency = false;
 		let mut return_head = None;
 		let mut timeout_blocks = BTreeMap::new();
-		while let Some(block) = blocks.next().await {
+		loop {
+			let next = if let Some(competing_blocks) = &mut competing_blocks {
+				tokio::select! {
+					next = blocks.next() => next,
+					next = competing_blocks.next() => match next {
+						Some(Ok(_)) => Some(relay.blocks().at(best_hash(&relay).await?).await),
+						other => other,
+					},
+				}
+			} else {
+				blocks.next().await
+			};
+			let Some(block) = next else { break };
 			let block = block?;
 			let current_session: u32 =
 				call_at(&relay, Some(block.hash()), "ParachainHost_session_index_for_child", &[])
@@ -2546,14 +2663,6 @@ async fn run_v3_timeout_recovery(
 				&ParaId::from(RECEIVER).encode(),
 			)
 			.await?;
-			let mut pending_roots = std::collections::BTreeSet::new();
-			for provider in &providers {
-				let signals = provider.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
-				if let Some(root) = signals.provides() {
-					pending_roots.insert(root.0);
-				}
-			}
-			let previous = previous_snapshot.replace((block.number(), block.hash(), pending_roots));
 			if original.is_none() {
 				for candidate in &dependents {
 					let signals =
@@ -2678,59 +2787,32 @@ async fn run_v3_timeout_recovery(
 				}
 			}
 			let Some((provider, dependent, head, required)) = &original else { continue };
-			if reorg {
-				let included: Option<StreamsRoot> = call_at(
-					&relay,
-					Some(block.hash()),
-					"ParachainHost_newest_included_provides",
-					&ParaId::from(SENDER).encode(),
-				)
-				.await?;
-				let still_pending = providers.iter().any(|c| {
-					c.commitments.ump_signals().ok().is_some_and(|s| s.provides() == Some(required))
+			if let Some(competing) = &competing {
+				let still_pending = providers.iter().any(|candidate| {
+					candidate
+						.commitments
+						.ump_signals()
+						.ok()
+						.is_some_and(|s| s.provides() == Some(required))
 				});
-				let (height, observed) =
-					original_at.ok_or_else(|| anyhow!("consumption observation missing"))?;
-				if !still_pending && included != Some(*required) {
-					let fork_from = match previous {
-						Some((height, hash, roots)) if roots.contains(&required.0) => {
-							relay_ancestor(&relay, block.hash(), height)
-								.await?
-								.filter(|fork| *fork != hash)
-								.map(|fork| (height, hash, fork))
-						},
-						_ => None,
-					};
-					if let Some((fork_height, previous_hash, fork_hash)) = fork_from {
-						let pending: Vec<CommittedCandidateReceiptV2> = call_at(
-							&relay,
-							Some(fork_hash),
-							"ParachainHost_candidates_pending_availability",
-							&ParaId::from(SENDER).encode(),
-						)
-						.await?;
-						let included: Option<StreamsRoot> = call_at(
-							&relay,
-							Some(fork_hash),
-							"ParachainHost_newest_included_provides",
-							&ParaId::from(SENDER).encode(),
-						)
-						.await?;
-						let pending = pending.iter().any(|candidate| {
-							candidate
-								.commitments
-								.ump_signals()
-								.ok()
-								.is_some_and(|signals| signals.provides() == Some(required))
-						});
-						if !pending && included != Some(*required) {
-							target_removed = true;
-							log::info!("Relay reorg removed consumed pending root {required:?}: observed consumption at #{height} {observed:?}, pending at #{fork_height} {previous_hash:?}, absent at same height {fork_hash:?}, new best #{} {:?}; both execution parents were finalized before the reorg", block.number(), block.hash());
-							break;
-						}
+				if still_pending {
+					if let Some((fork, height, best)) =
+						promote_relay_fork(&network, &relay, competing, &block, *required).await?
+					{
+						let (observed_height, observed) = original_at
+							.ok_or_else(|| anyhow!("consumption observation missing"))?;
+						target_removed = true;
+						log::info!(
+							"Controlled relay reorg removed consumed pending root {required:?}: \
+							 observed consumption at #{observed_height} {observed:?}, \
+							 pending at #{} {:?}, absent at same height {fork:?}, \
+							 new best #{height} {best:?}; both execution parents were finalized \
+							 before the reorg",
+							block.number(),
+							block.hash()
+						);
+						break;
 					}
-					log::info!("Pending target {required:?} is absent without a same-height fork-state witness; retaining the sealed receiver head for the next attempt");
-					continue;
 				}
 			}
 			let cores: Vec<CoreState> =
