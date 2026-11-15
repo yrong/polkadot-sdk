@@ -1640,13 +1640,18 @@ fn sibling(para: u32) -> Value {
 /// `PolkadotXcm::send` of `[UnsubscribeVersion]` to sibling `para`. Penpal's barrier admits it
 /// from any origin, and it executes without paying or sending anything back.
 fn send_xcm_to(para: u32) -> Value {
+	send_xcm_with_topic(para, None)
+}
+
+fn send_xcm_with_topic(para: u32, topic: Option<[u8; 32]>) -> Value {
 	let dest = sibling(para);
+	let mut instructions = vec![Value::unnamed_variant("UnsubscribeVersion", [])];
+	if let Some(topic) = topic {
+		instructions.push(Value::unnamed_variant("SetTopic", [Value::from_bytes(topic)]));
+	}
 	let message = Value::unnamed_variant(
 		"V5",
-		[Value::unnamed_composite([Value::unnamed_composite([Value::unnamed_variant(
-			"UnsubscribeVersion",
-			[],
-		)])])],
+		[Value::unnamed_composite([Value::unnamed_composite(instructions)])],
 	);
 	Value::unnamed_variant(
 		"PolkadotXcm",
@@ -1803,7 +1808,10 @@ async fn call_at<T: Decode>(
 		Some(hash) => client.runtime_api().at(hash),
 		None => client.runtime_api().at_latest().await?,
 	};
-	let bytes = api.call_raw(method, Some(args)).await?;
+	let bytes = api
+		.call_raw(method, Some(args))
+		.await
+		.map_err(|e| anyhow!("{method} at {at:?}: {e}"))?;
 	Ok(T::decode(&mut &bytes[..])?)
 }
 
@@ -2007,7 +2015,21 @@ fn build_network_config_with_fault(
 	relay_forks: bool,
 	gate: Option<&std::path::Path>,
 ) -> Result<NetworkConfig, anyhow::Error> {
-	build_recovery_network_config(sender_node, relay_forks, gate, false, false)
+	let policy = if gate.is_some() {
+		RootPolicy::ReceiverOptimistic
+	} else if flag("SPEC_MSG_OPTIMISTIC") {
+		RootPolicy::BothOptimistic
+	} else {
+		RootPolicy::IncludedOnly
+	};
+	build_recovery_network_config(sender_node, relay_forks, gate, false, policy)
+}
+
+#[derive(Clone, Copy)]
+enum RootPolicy {
+	IncludedOnly,
+	ReceiverOptimistic,
+	BothOptimistic,
 }
 
 fn build_recovery_network_config(
@@ -2015,13 +2037,25 @@ fn build_recovery_network_config(
 	relay_forks: bool,
 	gate: Option<&std::path::Path>,
 	catch_up: bool,
-	two_way: bool,
+	policy: RootPolicy,
 ) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
 	let to_replacement = peer_arg(SENDER, REPLACEMENT_COLLATOR, REPLACEMENT_P2P_PORT)?;
 	let outage_wasm = catch_up.then(|| std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM")).transpose()?;
+	let availability_args = |gate: &std::path::Path| -> Vec<zombienet_sdk::Arg> {
+		let mut args = vec![
+			"--experimental-collator-protocol".into(),
+			("--withhold-para", "2000").into(),
+			("--availability-gate", gate.to_string_lossy().as_ref()).into(),
+			"-lparachain=debug,MALUS=info".into(),
+		];
+		if relay_forks {
+			args.push(("--state-pruning", "archive").into());
+		}
+		args
+	};
 	let collator_args = |peer: &str, receiver_side: bool| -> Vec<zombienet_sdk::Arg> {
 		let mut args = vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
@@ -2036,8 +2070,11 @@ fn build_recovery_network_config(
 		if catch_up && receiver_side {
 			args.push(("--spec-msg-peer", to_replacement.as_str()).into());
 		}
-		let optimistic =
-			if gate.is_some() { receiver_side || two_way } else { flag("SPEC_MSG_OPTIMISTIC") };
+		let optimistic = match policy {
+			RootPolicy::IncludedOnly => false,
+			RootPolicy::ReceiverOptimistic => receiver_side,
+			RootPolicy::BothOptimistic => true,
+		};
 		if optimistic {
 			args.push("--spec-msg-optimistic".into());
 		}
@@ -2095,12 +2132,7 @@ fn build_recovery_network_config(
 					if let Some(gate) = gate {
 						node.with_command("malus")
 							.with_subcommand("withhold-availability")
-							.with_args(vec![
-								"--experimental-collator-protocol".into(),
-								("--withhold-para", "2000").into(),
-								("--availability-gate", gate.to_string_lossy().as_ref()).into(),
-								"-lparachain=debug,MALUS=info".into(),
-							])
+							.with_args(availability_args(gate))
 					} else {
 						node
 					}
@@ -2110,12 +2142,7 @@ fn build_recovery_network_config(
 					if let Some(gate) = gate {
 						node.with_command("malus")
 							.with_subcommand("withhold-availability")
-							.with_args(vec![
-								"--experimental-collator-protocol".into(),
-								("--withhold-para", "2000").into(),
-								("--availability-gate", gate.to_string_lossy().as_ref()).into(),
-								"-lparachain=debug,MALUS=info".into(),
-							])
+							.with_args(availability_args(gate))
 					} else {
 						node
 					}
@@ -2186,27 +2213,144 @@ fn build_recovery_network_config(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
-	run_v3_timeout_recovery(false, false).await
+	run_v3_timeout_recovery(false, false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
 async fn spec_msg_v3_catch_up_recovery() -> Result<(), anyhow::Error> {
-	run_v3_timeout_recovery(true, false).await
+	run_v3_timeout_recovery(true, false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
 async fn spec_msg_v3_two_way_recovery() -> Result<(), anyhow::Error> {
-	run_v3_timeout_recovery(true, true).await
+	run_v3_timeout_recovery(true, true, false).await
 }
 
-async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), anyhow::Error> {
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_relay_reorg_recovery() -> Result<(), anyhow::Error> {
+	run_v3_timeout_recovery(false, false, true).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_included_only_delivery() -> Result<(), anyhow::Error> {
+	use polkadot_primitives::{
+		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateReceiptV2, HeadData,
+		NodeFeatures,
+	};
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let control = tempfile::tempdir()?;
+	let gate = control.path().join("unarmed");
+	let network = initialize_network(build_recovery_network_config(
+		(SENDER_COLLATOR, SENDER_P2P_PORT),
+		false,
+		Some(&gate),
+		false,
+		RootPolicy::IncludedOnly,
+	)?)
+	.await?;
+	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+	let sender: OnlineClient<PolkadotConfig> =
+		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+	let receiver: OnlineClient<PolkadotConfig> =
+		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+	let run = async {
+		wait_for("both inclusion-only V3 chains to finalize", || {
+			advanced(&sender, &receiver, (1, 1))
+		})
+		.await?;
+		let features: NodeFeatures =
+			call_at(&relay, None, "ParachainHost_node_features", &[]).await?;
+		if !FeatureIndex::CandidateReceiptV3.is_set(&features) {
+			return Err(anyhow!("baseline relay does not enable V3 receipts"));
+		}
+		for client in [&sender, &receiver] {
+			let enabled: bool =
+				call_at(client, None, "SchedulingV3EnabledApi_scheduling_v3_enabled", &[]).await?;
+			if !enabled {
+				return Err(anyhow!("baseline parachain does not enable V3 scheduling"));
+			}
+		}
+		if hrmp_channel_open(&relay, SENDER, RECEIVER).await? {
+			return Err(anyhow!("baseline requires no HRMP channel"));
+		}
+		open_spec_msg_channel(&sender, &receiver).await?;
+		let mut blocks = relay.blocks().subscribe_finalized().await?;
+		send_and_follow(&relay, &sender, &receiver).await?;
+		let mut seen = std::collections::BTreeSet::new();
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "ParaInclusion" ||
+					event.variant_name() != "CandidateIncluded"
+				{
+					continue;
+				}
+				let (receipt, _) =
+					<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+				let para = receipt.descriptor.para_id();
+				if para != SENDER.into() && para != RECEIVER.into() {
+					continue;
+				}
+				if receipt.descriptor.version() != CandidateDescriptorVersion::V3 {
+					return Err(anyhow!("included-only baseline submitted a non-V3 receipt"));
+				}
+				seen.insert(para);
+			}
+			if seen.len() == 2 {
+				break;
+			}
+		}
+		if seen.len() != 2 {
+			return Err(anyhow!("baseline did not observe finalized V3 receipts for both paras"));
+		}
+		let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
+		wait_for("both inclusion-only V3 chains to keep progressing", || {
+			advanced(&sender, &receiver, (now.0 + 1, now.1 + 1))
+		})
+		.await?;
+		log::info!("Included-only delivery passed with finalized V3 receipts for both parachains");
+		Ok::<_, anyhow::Error>(())
+	};
+	let result = tokio::time::timeout(Duration::from_secs(600), run).await;
+	network.destroy().await?;
+	result.map_err(|_| anyhow!("included-only V3 delivery exceeded 600 seconds"))?
+}
+
+async fn relay_ancestor(
+	relay: &OnlineClient<PolkadotConfig>,
+	at: H256,
+	number: u32,
+) -> Result<Option<H256>, anyhow::Error> {
+	let mut block = relay.blocks().at(at).await?;
+	while block.number() > number {
+		block = relay.blocks().at(block.header().parent_hash).await?;
+	}
+	Ok((block.number() == number).then_some(block.hash()))
+}
+
+async fn run_v3_timeout_recovery(
+	catch_up: bool,
+	two_way: bool,
+	reorg: bool,
+) -> Result<(), anyhow::Error> {
 	use polkadot_primitives::{
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2,
 		CommittedCandidateReceiptV2, CoreState, HeadData, NodeFeatures, StreamsRoot,
 	};
-	let test_timeout = Duration::from_secs(if catch_up { 900 } else { 600 });
+	let test_timeout = Duration::from_secs(if reorg {
+		fork_secs() + 600
+	} else if catch_up {
+		900
+	} else {
+		600
+	});
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
@@ -2217,10 +2361,10 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 	let gate = control.path().join("withhold");
 	let network = initialize_network(build_recovery_network_config(
 		(SENDER_COLLATOR, SENDER_P2P_PORT),
-		false,
+		reorg,
 		Some(&gate),
 		catch_up,
-		two_way,
+		if two_way { RootPolicy::BothOptimistic } else { RootPolicy::ReceiverOptimistic },
 	)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
@@ -2344,12 +2488,20 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 		};
 		std::fs::write(&gate, baseline.0.as_bytes())?;
 		log::info!("Withholding sender candidates beyond included {baseline:?}");
-		let sent = sender.blocks().at(sudo_in_block(&sender, send_xcm_to(RECEIVER)).await?).await?;
+		// Keep the probe's identity when its transaction is re-executed after a fork.
+		let topic = reorg.then_some([0x52; 32]);
+		let sent = sender
+			.blocks()
+			.at(sudo_in_block(&sender, send_xcm_with_topic(RECEIVER, topic)).await?)
+			.await?;
 		let message_id = event_field(&sent, "PolkadotXcm", "Sent", "message_id")
 			.await?
 			.map(|id| flatten(&id))
 			.filter(|id| id.len() == 32)
 			.ok_or_else(|| anyhow!("send block has no XCM message id"))?;
+		if topic.is_some_and(|topic| message_id != topic) {
+			return Err(anyhow!("reorg probe did not retain its explicit XCM topic"));
+		}
 		let stream = StreamId::Channel { recipient: RECEIVER.into(), domain: 0, num: 0 };
 		let end = committed_stream_roots(&sent)
 			.await?
@@ -2362,6 +2514,9 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 			sent.hash()
 		);
 		let mut original: Option<(CandidateHash, CandidateHash, HeadData, StreamsRoot)> = None;
+		let mut original_at = None;
+		let mut target_removed = false;
+		let mut previous_snapshot = None;
 		let mut faulted_provider = None;
 		let mut provider_timed_out = false;
 		let mut dependent_timed_out = false;
@@ -2391,6 +2546,14 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 				&ParaId::from(RECEIVER).encode(),
 			)
 			.await?;
+			let mut pending_roots = std::collections::BTreeSet::new();
+			for provider in &providers {
+				let signals = provider.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+				if let Some(root) = signals.provides() {
+					pending_roots.insert(root.0);
+				}
+			}
+			let previous = previous_snapshot.replace((block.number(), block.hash(), pending_roots));
 			if original.is_none() {
 				for candidate in &dependents {
 					let signals =
@@ -2407,6 +2570,22 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 					}) else {
 						continue;
 					};
+					if reorg {
+						let finalized = relay.blocks().at_latest().await?;
+						let mut common_execution = true;
+						for hash in [
+							provider.descriptor.relay_parent(),
+							candidate.descriptor.relay_parent(),
+						] {
+							let execution = relay.blocks().at(hash).await?;
+							common_execution &=
+								relay_ancestor(&relay, finalized.hash(), execution.number())
+									.await? == Some(hash);
+						}
+						if !common_execution {
+							continue;
+						}
+					}
 					let head = &candidate.commitments.head_data;
 					let hash = H256::from(sp_crypto_hashing::blake2_256(&head.0));
 					let mut bundle_block = receiver.blocks().at(hash).await?;
@@ -2446,6 +2625,7 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 						block.hash()
 					);
 					faulted_provider = Some(provider.clone());
+					original_at = Some((block.number(), block.hash()));
 					original = Some((provider.hash(), candidate.hash(), head.clone(), *required));
 					break;
 				}
@@ -2497,7 +2677,62 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 					}
 				}
 			}
-			let Some((provider, dependent, head, _)) = &original else { continue };
+			let Some((provider, dependent, head, required)) = &original else { continue };
+			if reorg {
+				let included: Option<StreamsRoot> = call_at(
+					&relay,
+					Some(block.hash()),
+					"ParachainHost_newest_included_provides",
+					&ParaId::from(SENDER).encode(),
+				)
+				.await?;
+				let still_pending = providers.iter().any(|c| {
+					c.commitments.ump_signals().ok().is_some_and(|s| s.provides() == Some(required))
+				});
+				let (height, observed) =
+					original_at.ok_or_else(|| anyhow!("consumption observation missing"))?;
+				if !still_pending && included != Some(*required) {
+					let fork_from = match previous {
+						Some((height, hash, roots)) if roots.contains(&required.0) => {
+							relay_ancestor(&relay, block.hash(), height)
+								.await?
+								.filter(|fork| *fork != hash)
+								.map(|fork| (height, hash, fork))
+						},
+						_ => None,
+					};
+					if let Some((fork_height, previous_hash, fork_hash)) = fork_from {
+						let pending: Vec<CommittedCandidateReceiptV2> = call_at(
+							&relay,
+							Some(fork_hash),
+							"ParachainHost_candidates_pending_availability",
+							&ParaId::from(SENDER).encode(),
+						)
+						.await?;
+						let included: Option<StreamsRoot> = call_at(
+							&relay,
+							Some(fork_hash),
+							"ParachainHost_newest_included_provides",
+							&ParaId::from(SENDER).encode(),
+						)
+						.await?;
+						let pending = pending.iter().any(|candidate| {
+							candidate
+								.commitments
+								.ump_signals()
+								.ok()
+								.is_some_and(|signals| signals.provides() == Some(required))
+						});
+						if !pending && included != Some(*required) {
+							target_removed = true;
+							log::info!("Relay reorg removed consumed pending root {required:?}: observed consumption at #{height} {observed:?}, pending at #{fork_height} {previous_hash:?}, absent at same height {fork_hash:?}, new best #{} {:?}; both execution parents were finalized before the reorg", block.number(), block.hash());
+							break;
+						}
+					}
+					log::info!("Pending target {required:?} is absent without a same-height fork-state witness; retaining the sealed receiver head for the next attempt");
+					continue;
+				}
+			}
 			let cores: Vec<CoreState> =
 				call_at(&relay, Some(block.hash()), "ParachainHost_availability_cores", &[])
 					.await?;
@@ -2533,7 +2768,9 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 				}
 				if event.variant_name() == "CandidateTimedOut" {
 					if receipt.hash() == *provider || receipt.hash() == *dependent {
-						timeout_blocks.insert(block.number(), block.hash());
+						if !reorg {
+							timeout_blocks.insert(block.number(), block.hash());
+						}
 						log::info!(
 							"Timed out {:?} at relay #{} {:?}",
 							receipt.hash(),
@@ -2545,13 +2782,16 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 					dependent_timed_out |= receipt.hash() == *dependent;
 				}
 			}
-			if provider_timed_out && dependent_timed_out {
+			if !reorg && provider_timed_out && dependent_timed_out {
 				break;
 			}
 		}
 		let (_, _, original_head, old_required) =
 			original.ok_or_else(|| anyhow!("no optimistic consuming candidate observed"))?;
-		if !provider_timed_out || !dependent_timed_out || !dependent_available {
+		if reorg && !target_removed {
+			return Err(anyhow!("no consumed pending target was removed by a relay reorg"));
+		}
+		if !reorg && (!provider_timed_out || !dependent_timed_out || !dependent_available) {
 			return Err(anyhow!("missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"));
 		}
 		if two_way && !return_dependency {
@@ -2623,7 +2863,11 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 			Ok(included.is_some_and(|root| root != old_required))
 		})
 		.await?;
-		blocks = relay.blocks().subscribe_best().await?;
+		blocks = if reorg {
+			relay.blocks().subscribe_finalized().await?
+		} else {
+			relay.blocks().subscribe_best().await?
+		};
 		collator.resume().await?;
 		let receiver =
 			OnlineClient::<PolkadotConfig>::from_url(format!("ws://127.0.0.1:{RECEIVER_RPC_PORT}"))
@@ -2684,7 +2928,7 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 						return Err(anyhow!("no production V3 resubmission log"));
 					}
 					log::info!(
-						"V3 timeout recovery passed at relay #{} {:?}",
+						"V3 recovery passed at relay #{} {:?}, reorg={reorg}",
 						block.number(),
 						block.hash()
 					);
@@ -2753,6 +2997,12 @@ async fn run_v3_timeout_recovery(catch_up: bool, two_way: bool) -> Result<(), an
 										"timeout observation was on an abandoned relay fork"
 									));
 								}
+							}
+							if reorg {
+								send_and_follow(&relay, &sender, &receiver).await?;
+								log::info!(
+									"Fresh XCM delivery after relay reorg recovery finalized"
+								);
 							}
 							return Ok::<_, anyhow::Error>(());
 						}
