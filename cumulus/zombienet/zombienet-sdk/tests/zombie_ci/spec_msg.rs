@@ -2014,14 +2014,13 @@ fn build_recovery_network_config(
 	sender_node: (&str, u16),
 	relay_forks: bool,
 	gate: Option<&std::path::Path>,
-	missing_proof: bool,
+	catch_up: bool,
 ) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
 	let to_replacement = peer_arg(SENDER, REPLACEMENT_COLLATOR, REPLACEMENT_P2P_PORT)?;
-	let outage_wasm =
-		missing_proof.then(|| std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM")).transpose()?;
+	let outage_wasm = catch_up.then(|| std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM")).transpose()?;
 	let collator_args = |peer: &str, receiver_side: bool| -> Vec<zombienet_sdk::Arg> {
 		let mut args = vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
@@ -2033,7 +2032,7 @@ fn build_recovery_network_config(
 			("--enable-spec-msg").into(),
 			("--spec-msg-peer", peer).into(),
 		];
-		if missing_proof && receiver_side {
+		if catch_up && receiver_side {
 			args.push(("--spec-msg-peer", to_replacement.as_str()).into());
 		}
 		let optimistic = if gate.is_some() { receiver_side } else { flag("SPEC_MSG_OPTIMISTIC") };
@@ -2060,7 +2059,7 @@ fn build_recovery_network_config(
 				genesis["configuration"]["config"]["scheduler_params"]["num_cores"] =
 					serde_json::json!(2);
 			}
-			if missing_proof {
+			if catch_up {
 				genesis["configuration"]["config"]["scheduler_params"]
 					["group_rotation_frequency"] = serde_json::json!(10);
 				genesis["configuration"]["config"]["scheduler_params"]
@@ -2135,7 +2134,7 @@ fn build_recovery_network_config(
 						.with_p2p_port(SENDER_P2P_PORT)
 						.with_rpc_port(SENDER_RPC_PORT)
 				});
-			if missing_proof {
+			if catch_up {
 				p.with_collator(|n| {
 					n.with_name(REPLACEMENT_COLLATOR)
 						.with_p2p_port(REPLACEMENT_P2P_PORT)
@@ -2164,7 +2163,7 @@ fn build_recovery_network_config(
 		})
 		.with_global_settings(|global_settings| {
 			// The node monitor can mistake the deliberate restart for a crash.
-			let global_settings = global_settings.with_tear_down_on_failure(!missing_proof);
+			let global_settings = global_settings.with_tear_down_on_failure(!catch_up);
 			match std::env::var("ZOMBIENET_SDK_BASE_DIR") {
 				Ok(val) => global_settings.with_base_dir(val),
 				_ => global_settings,
@@ -2185,16 +2184,16 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
-async fn spec_msg_v3_missing_proof_outage() -> Result<(), anyhow::Error> {
+async fn spec_msg_v3_catch_up_recovery() -> Result<(), anyhow::Error> {
 	run_v3_timeout_recovery(true).await
 }
 
-async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Error> {
+async fn run_v3_timeout_recovery(catch_up: bool) -> Result<(), anyhow::Error> {
 	use polkadot_primitives::{
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2,
 		CommittedCandidateReceiptV2, CoreState, HeadData, NodeFeatures, StreamsRoot,
 	};
-	let test_timeout = Duration::from_secs(if missing_proof { 900 } else { 600 });
+	let test_timeout = Duration::from_secs(if catch_up { 900 } else { 600 });
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
@@ -2207,7 +2206,7 @@ async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Erro
 		(SENDER_COLLATOR, SENDER_P2P_PORT),
 		false,
 		Some(&gate),
-		missing_proof,
+		catch_up,
 	)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
@@ -2249,7 +2248,7 @@ async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Erro
 		};
 		let epoch_length = scalar("epoch_length")?;
 		let slot_duration = scalar("slot_duration")?;
-		if !missing_proof && epoch_length.saturating_mul(slot_duration) < test_timeout.as_millis() {
+		if !catch_up && epoch_length.saturating_mul(slot_duration) < test_timeout.as_millis() {
 			return Err(anyhow!("relay epoch is shorter than the recovery test deadline"));
 		}
 		let mut session: u32 =
@@ -2276,7 +2275,7 @@ async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Erro
 			return Err(anyhow!("the recovery test requires no HRMP channel"));
 		}
 		open_spec_msg_channel(&sender, &receiver).await?;
-		if missing_proof {
+		if catch_up {
 			// Live imports retain proofs; catching up after an outage exercises sync imports.
 			network.get_node(REPLACEMENT_COLLATOR)?.pause().await?;
 			if !(30..=60).contains(&epoch_length) {
@@ -2482,8 +2481,8 @@ async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Erro
 		if !provider_timed_out || !dependent_timed_out || !dependent_available {
 			return Err(anyhow!("missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"));
 		}
-		if missing_proof {
-			return measure_missing_proof_outage(
+		if catch_up {
+			return recover_after_catch_up(
 				&network,
 				&relay,
 				&receiver,
@@ -2666,7 +2665,7 @@ async fn run_v3_timeout_recovery(missing_proof: bool) -> Result<(), anyhow::Erro
 	})?
 }
 
-async fn measure_missing_proof_outage(
+async fn recover_after_catch_up(
 	network: &Network<LocalFileSystem>,
 	relay: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
@@ -2723,6 +2722,7 @@ async fn measure_missing_proof_outage(
 	}
 	let initial_finalized = finalized_number(&sender).await?;
 	let old_hash = best_hash(&sender).await?;
+	let old_number = sender.blocks().at(old_hash).await?.number();
 	let public = format!("0x{}", hex::encode(dev::eve().public_key().0));
 	let has_key: bool =
 		replacement_rpc.request("author_hasKey", rpc_params![&public, "aura"]).await?;
@@ -2734,8 +2734,6 @@ async fn measure_missing_proof_outage(
 	if !authorities.contains(&dev::eve().public_key().0) {
 		return Err(anyhow!("replacement is not an Aura authority"));
 	}
-	let failures_before =
-		replacement.logs().await?.matches("no stored storage-proof entry").count();
 	network.get_node(SENDER_COLLATOR)?.pause().await?;
 	std::fs::remove_file(gate)?;
 	// This public development key is withheld until all faulted blocks came from the other author.
@@ -2746,21 +2744,16 @@ async fn measure_missing_proof_outage(
 	log::info!("Author stopped at relay {at:?}; replacement holds bundle #{}, {hash:?}, sender finalized #{initial_finalized}", head.number);
 	let result = replacement
 		.wait_log_line_count_with_timeout(
-			"no stored storage-proof entry",
+			"Submitting segment for core.*resubmitted.*[1-9]",
 			false,
-			LogLineCountOptions::new(
-				move |n| n as usize > failures_before,
-				Duration::from_secs(30),
-				false,
-			),
+			LogLineCountOptions::new(|n| n > 0, Duration::from_secs(30), false),
 		)
 		.await?;
 	if !result.success() {
-		return Err(anyhow!("replacement did not demonstrate a missing stored proof"));
+		return Err(anyhow!("replacement did not resubmit the caught-up blocks"));
 	}
 
 	let mut blocks = relay.blocks().subscribe_best().await?;
-	let mut expired = None;
 	let mut authored = None;
 	let mut sender_finalized = false;
 	let mut delivery = false;
@@ -2785,19 +2778,8 @@ async fn measure_missing_proof_outage(
 		.await?;
 		let finalized = finalized_number(&sender).await?;
 		log::info!("Outage +{}s: relay #{} {:?}, session={session}, relay_parent_present={}, sender_pending={}, sender_finalized={finalized}, receiver_finalized={}", stopped.elapsed().as_secs(), block.number(), block.hash(), info.is_some(), pending.len(), finalized_number(receiver).await?);
-		if info.is_none() && expired.is_none() {
-			if u128::from(session) != u128::from(parent_session) + age + 1 {
-				return Err(anyhow!(
-					"relay-parent expiry differed from the session-boundary expectation"
-				));
-			}
-			expired = Some((block.number(), block.hash()));
-			log::info!(
-				"Execution relay parent expired at +{}s, relay #{} {:?}, session={session}",
-				stopped.elapsed().as_secs(),
-				block.number(),
-				block.hash()
-			);
+		if info.is_none() || session != parent_session {
+			return Err(anyhow!("catch-up recovery waited for the relay-parent session to expire"));
 		}
 		let current = best_hash(&sender).await?;
 		if current != old_hash && authored.is_none() {
@@ -2816,7 +2798,10 @@ async fn measure_missing_proof_outage(
 						&sp_core::sr25519::Public::from_raw(dev::eve().public_key().0),
 					) {
 					authored = Some((built.number(), current));
-					log::info!("Replacement signed a fresh block at +{}s: {current:?}; relay parent expired={}", stopped.elapsed().as_secs(), expired.is_some());
+					log::info!(
+						"Replacement signed a fresh block at +{}s: {current:?}",
+						stopped.elapsed().as_secs()
+					);
 				}
 			}
 		}
@@ -2827,14 +2812,18 @@ async fn measure_missing_proof_outage(
 					"BlockHash",
 					vec![Value::u128(height.into())],
 				);
-				let actual = sender
-					.storage()
-					.at_latest()
-					.await?
-					.fetch(&query)
-					.await?
-					.ok_or_else(|| anyhow!("sender finalized hash missing"))?
-					.as_type::<H256>()?;
+				let finalized_block = sender.blocks().at_latest().await?;
+				let actual = if height == finalized_block.number() {
+					finalized_block.hash()
+				} else {
+					sender
+						.storage()
+						.at(finalized_block.hash())
+						.fetch(&query)
+						.await?
+						.ok_or_else(|| anyhow!("sender finalized hash missing"))?
+						.as_type::<H256>()?
+				};
 				if actual != expected {
 					authored = None;
 				} else {
@@ -2889,26 +2878,24 @@ async fn measure_missing_proof_outage(
 			}
 		}
 		if delivery && sender_finalized {
-			if let Some((height, expected)) = expired {
-				let query = subxt::dynamic::storage(
-					"System",
-					"BlockHash",
-					vec![Value::u128(height.into())],
-				);
-				let actual = relay
-					.storage()
-					.at_latest()
-					.await?
-					.fetch(&query)
-					.await?
-					.ok_or_else(|| anyhow!("relay expiry hash missing"))?
-					.as_type::<H256>()?;
-				if actual != expected {
-					return Err(anyhow!("expiry observed on an abandoned relay fork"));
-				}
-				log::info!("Outage measurement complete at +{}s", stopped.elapsed().as_secs());
-				return Ok(());
+			let query = subxt::dynamic::storage(
+				"System",
+				"BlockHash",
+				vec![Value::u128(old_number.into())],
+			);
+			let actual = sender
+				.storage()
+				.at_latest()
+				.await?
+				.fetch(&query)
+				.await?
+				.ok_or_else(|| anyhow!("caught-up block hash missing from finalized history"))?
+				.as_type::<H256>()?;
+			if actual != old_hash {
+				return Err(anyhow!("catch-up recovery replaced the original sender suffix"));
 			}
+			log::info!("Catch-up recovery complete at +{}s", stopped.elapsed().as_secs());
+			return Ok(());
 		}
 	}
 	Err(anyhow!("relay subscription ended before outage recovery"))
