@@ -147,8 +147,8 @@ where
 					.chain(bundle.map(|parts| (parts, scheduling_proof.clone())))
 				{
 					let Some(collation) = self.build_collation(parts, Some(proof)).await else {
-						// Submitting a descendant without its predecessor leaves a segment gap.
-						return None;
+						// Earlier collations can unblock a later dependency.
+						break;
 					};
 					collations.push(collation);
 				}
@@ -166,7 +166,7 @@ where
 					target: LOG_TARGET,
 					?core_index,
 					segment_len = collations.len(),
-					resubmitted = resubmitted,
+					resubmitted = resubmitted.min(collations.len()),
 					"Submitting segment for core.",
 				);
 
@@ -458,17 +458,35 @@ mod tests {
 		);
 	}
 	#[tokio::test]
-	async fn failed_predecessor_prevents_descendant_submission() {
-		let submitter = submitter(Some(1));
-		let message = CollatorMessageBuilder::new(
-			polkadot_primitives::CoreIndex(2),
-			vec![(parts(1), proof()), (parts(2), proof())],
-		)
-		.with_bundle(parts(3))
-		.with_scheduling_proof(proof())
-		.build()
-		.expect("nonempty segment; qed");
-		assert!(submitter.prepare_submission(message).await.is_none());
-		assert_eq!(*submitter.collator_service.seen.lock().expect("test mutex; qed"), vec![1]);
+	async fn failed_collation_preserves_only_its_valid_predecessors() {
+		for failed in 1..=3 {
+			let submitter = submitter(Some(failed));
+			let message = CollatorMessageBuilder::new(
+				polkadot_primitives::CoreIndex(2),
+				vec![(parts(1), proof()), (parts(2), proof())],
+			)
+			.with_bundle(parts(3))
+			.with_scheduling_proof(proof())
+			.build()
+			.expect("nonempty segment; qed");
+			let params = submitter.prepare_submission(message).await;
+			if failed == 1 {
+				assert!(params.is_none());
+			} else {
+				let params = params.expect("valid prefix submits; qed");
+				assert_eq!(
+					params
+						.collations
+						.iter()
+						.map(|c| c.collation.head_data.0.clone())
+						.collect::<Vec<_>>(),
+					(1..failed).map(|n: u32| n.encode()).collect::<Vec<_>>()
+				);
+			}
+			assert_eq!(
+				*submitter.collator_service.seen.lock().expect("test mutex; qed"),
+				(1..=failed).collect::<Vec<_>>()
+			);
+		}
 	}
 }
