@@ -2136,7 +2136,12 @@ fn build_recovery_network_config(
 				});
 			if catch_up {
 				p.with_collator(|n| {
+					let mut args = collator_args(&to_receiver, false);
+					if let Ok(url) = std::env::var("SPEC_MSG_REPLACEMENT_RELAY_RPC_URL") {
+						args.push(("--relay-chain-rpc-url", url.as_str()).into());
+					}
 					n.with_name(REPLACEMENT_COLLATOR)
+						.with_args(args)
 						.with_p2p_port(REPLACEMENT_P2P_PORT)
 						.with_rpc_port(REPLACEMENT_RPC_PORT)
 						// Keep the replacement from authoring before the fault.
