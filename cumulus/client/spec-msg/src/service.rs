@@ -442,7 +442,7 @@ where
 			.iter()
 			.map(|block| consumption_record(&*client, block.header().hash()))
 			.collect::<Result<Vec<_>, _>>()?;
-		let lifts = receiver.assemble_for_recovery(&records)?;
+		let lifts = receiver.assemble(&records)?;
 		Ok(SpecMsgInputs { records, lifts })
 	})
 }

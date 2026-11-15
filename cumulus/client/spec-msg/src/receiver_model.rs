@@ -23,13 +23,12 @@
 //!
 //! The relay chain includes a prefix of the source's blocks and holds a further prefix pending
 //! availability; a receiver block counts while its `Requires` is among the eligible (included or
-//! pending) roots, and is reverted when a pending timeout or relay reorg drops its root.
+//! pending) roots, and is reverted when assembly fails or a timeout or reorg drops its root.
 //! Checked at every step:
-//! - every block built from the pool's material assembles, and its `Requires`, synthesized as the
-//!   PVF does, is a root the source committed;
+//! - every assembled bundle has verified lifts and requires a root the source committed;
 //! - when the included root already covers a consuming bundle, assembly prefers the included root
 //!   over any pending root, and otherwise selects the oldest covering pending root;
-//! - recovery assembly (`assemble_for_recovery`) selects the same eligible root as fresh assembly;
+//! - assembly only targets roots eligible at assembly time;
 //! - the receiver's chain has consumed a prefix of the stream the relay chain's eligible roots
 //!   commit;
 //! - once the peers answer again, the receiver consumes up to the newest included root.
@@ -356,7 +355,10 @@ impl World {
 			self.receiver.forget(&source());
 			return;
 		}
-		let Some(roots) = self.snapshot() else { return };
+		let Some(roots) = self.snapshot() else {
+			self.receiver.forget(&source());
+			return;
+		};
 		let wants = self.tip().view().sources.remove(&source()).unwrap_or_default();
 		block_on(self.receiver.on_roots(source(), roots, &wants));
 	}
@@ -495,23 +497,26 @@ impl World {
 			return;
 		}
 		let records: Vec<_> = bundle.iter().map(|b| b.record.clone()).collect();
-		let end_chain = &bundle[bundle.len() - 1].chain;
 		let root_block = if records.iter().all(|record| record.entries.is_empty()) {
 			Some(0)
 		} else {
 			self.consuming += 1;
 			let lifts = match self.receiver.assemble(&records) {
 				Ok(lifts) => lifts,
-				// A relay reorg and a source fork can leave the bundle consuming leaves the
-				// eligible stream no longer has: no root lifts it, and none would be accepted.
-				Err(_) if !self.on_eligible_fork(end_chain) => {
+				// A dropped root or unavailable binding can prevent collation after execution.
+				Err(error) => {
+					let end_chain = &bundle[bundle.len() - 1].chain;
+					let wants = end_chain.view().sources.remove(&source()).unwrap_or_default();
+					assert!(
+						!self.on_eligible_fork(end_chain) ||
+							!self.snapshot().is_some_and(|roots| {
+								self.receiver.is_roots_settled(&source(), &roots, &wants)
+							}),
+						"a bundle on the eligible fork with settled roots must assemble: {error}",
+					);
 					self.reverted += bundle.len();
 					return;
 				},
-				Err(e) => panic!(
-					"a bundle of {} blocks on the eligible fork does not assemble: {e}",
-					records.len()
-				),
 			};
 			let requires = build_requires(&records, &lifts)
 				.expect("the lifts verify as the PVF checks them")
@@ -519,12 +524,13 @@ impl World {
 			let root = *requires.get(source()).expect("one source");
 			assert!(self.every_root.contains(&root), "requires a root the source never committed");
 
-			// Both assembly paths prefer the same eligible root when one covers the bundle.
-			if let Ok(rec_lifts) = self.receiver.assemble_for_recovery(&records) {
-				let rec_req = build_requires(&records, &rec_lifts).unwrap().unwrap();
-				let rec_root = *rec_req.get(source()).unwrap();
-				assert_eq!(root, rec_root);
-			}
+			assert!(
+				!self.offboarded &&
+					self.snapshot().is_some_and(|roots| {
+						roots.included == Some(root) || roots.pending.contains(&root)
+					}),
+				"assembled under a root that is no longer eligible",
+			);
 
 			self.blocks[..self.backed]
 				.iter()
@@ -570,7 +576,7 @@ impl World {
 	}
 
 	/// The source offboards with a backlog the receiver holds: a block planned just before the
-	/// relay chain answers that it has no root still assembles, and the receiver then builds
+	/// relay chain answers that it has no root is dropped, and the receiver then builds
 	/// blocks that consume nothing from the source.
 	fn offboard(&mut self) {
 		*self.peers.down.write() = false;
@@ -597,8 +603,8 @@ impl World {
 	/// down.
 	fn catch_up(&mut self, outage: bool) {
 		*self.peers.down.write() = false;
-		self.included = self.backed;
 		self.close_bundle();
+		self.included = self.backed;
 		self.relay_finalize();
 		let Some(block) = self.included.checked_sub(1).map(|i| &self.blocks[i]) else { return };
 		let (want, acks) = (block.channel.len(), block.acks);

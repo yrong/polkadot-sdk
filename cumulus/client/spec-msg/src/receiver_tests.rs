@@ -285,6 +285,16 @@ fn requires(
 	set.get(source()).copied()
 }
 
+fn retained_requires(
+	receiver: &Receiver<u64, Sender>,
+	records: &[ConsumptionRecord],
+) -> Option<StreamsRoot> {
+	let lifts = receiver.retained_lifts(records);
+	let set = build_requires(records, &lifts).expect("retained lifts verify")?;
+	assert_eq!(set.len(), 1);
+	set.get(source()).copied()
+}
+
 #[test]
 fn a_block_consumes_what_verified_and_lifts_to_the_newest_root() {
 	let sender = Sender::new();
@@ -787,7 +797,7 @@ fn a_forgotten_source_is_not_consumed_from() {
 }
 
 #[test]
-fn a_block_built_before_its_source_is_forgotten_still_assembles() {
+fn a_block_built_before_its_source_is_forgotten_keeps_its_proofs() {
 	let sender = Sender::new();
 	let receiver = receiver(&sender, Budget::default());
 	let mut chain = Chain::default();
@@ -795,7 +805,8 @@ fn a_block_built_before_its_source_is_forgotten_still_assembles() {
 	block_on(receiver.on_root(source(), root, &chain.wants()));
 	let record = chain.block(&receiver);
 	receiver.forget(&source());
-	assert_eq!(requires(&receiver, &[record]), Some(root));
+	assert!(receiver.assemble(&[record.clone()]).is_err());
+	assert_eq!(retained_requires(&receiver, &[record]), Some(root));
 }
 
 #[test]
@@ -906,7 +917,7 @@ fn a_source_whose_bundle_does_not_lift_to_its_newest_root_waits() {
 	let data = block_on(receiver.inherent_data(&chain.view(), &[first.clone()]));
 	assert!(data.is_empty());
 	let second = chain.import(&receiver, &data);
-	assert_eq!(requires(&receiver, &[first, second]), Some(root1));
+	assert_eq!(retained_requires(&receiver, &[first, second]), Some(root1));
 }
 
 #[test]
@@ -1055,7 +1066,7 @@ fn runtime_cuts_in_every_block_keep_consuming_and_every_bundle_lifts() {
 			}
 			if records.iter().any(|record| !record.entries.is_empty()) {
 				assert!(
-					requires(&receiver, &records).is_some(),
+					retained_requires(&receiver, &records).is_some(),
 					"seed {seed}, bundle {bundle}: the candidate lifts"
 				);
 			}
@@ -1072,7 +1083,7 @@ fn runtime_cuts_in_every_block_keep_consuming_and_every_bundle_lifts() {
 			let before = chain.frontier.leaf_count();
 			let record = chain.block(&receiver);
 			assert!(chain.frontier.leaf_count() > before, "seed {seed}: the channel drains");
-			assert_eq!(requires(&receiver, &[record]), Some(root));
+			assert_eq!(retained_requires(&receiver, &[record]), Some(root));
 		}
 		assert_eq!(chain.frontier, frontier_at(&sent, sent.len()), "seed {seed}");
 	}
@@ -1095,11 +1106,11 @@ fn a_cut_endpoint_keeps_its_lift_material_past_finality() {
 	// A finality notification for an earlier block prunes the pool before the collation is
 	// assembled.
 	receiver.on_finalized(0, &Chain::default().view());
-	assert_eq!(requires(&receiver, &[record]), Some(root1));
+	assert_eq!(retained_requires(&receiver, &[record]), Some(root1));
 }
 
 #[test]
-fn a_register_read_assembles_when_finality_lands_before_its_import() {
+fn a_register_read_keeps_its_proofs_when_finality_lands_before_its_import() {
 	let sender = Sender::new();
 	let root1 =
 		sender.author(vec![(channel(US), payloads(1, 5)), (ack(US), vec![register(0).encode()])]);
@@ -1114,11 +1125,11 @@ fn a_register_read_assembles_when_finality_lands_before_its_import() {
 	let root2 = sender.author(vec![(ack(US), vec![register(1).encode()])]);
 	block_on(receiver.on_root(source(), root2, &wants));
 	receiver.on_finalized(0, &Chain::default().view());
-	assert_eq!(requires(&receiver, &[record]), Some(root1));
+	assert_eq!(retained_requires(&receiver, &[record]), Some(root1));
 }
 
 #[test]
-fn a_channel_item_assembles_when_finality_lands_before_its_import() {
+fn a_channel_item_keeps_its_proofs_when_finality_lands_before_its_import() {
 	let sender = Sender::new();
 	let root1 = sender.author(vec![(channel(US), payloads(1, 5))]);
 	let receiver = receiver(&sender, Budget::default());
@@ -1132,7 +1143,7 @@ fn a_channel_item_assembles_when_finality_lands_before_its_import() {
 	*sender.down.write() = true;
 	block_on(receiver.on_root(source(), root2, &wants));
 	receiver.on_finalized(0, &Chain::default().view());
-	assert_eq!(requires(&receiver, &[record]), Some(root1));
+	assert_eq!(retained_requires(&receiver, &[record]), Some(root1));
 }
 
 #[test]
@@ -1194,7 +1205,7 @@ fn included_root_is_preferred_over_pending_when_it_covers_the_bundle() {
 	// Authoring fetched the missing binding at leaf_count 2 under r0 within INHERENT_FETCH_TIMEOUT,
 	// so assembly selects the included root r0 rather than the pending root r1.
 	assert_eq!(requires(&receiver, &[record.clone()]), Some(r0));
-	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
+	assert!(receiver.assemble(&[record]).is_ok());
 }
 
 #[test]
@@ -1217,7 +1228,7 @@ fn oldest_covering_pending_root_is_chosen_when_bundle_consumes_past_included() {
 	// r0 does not cover 4 leaves; r1 is the oldest pending root that covers 4 leaves.
 	assert_eq!(requires(&receiver, &[record.clone()]), Some(r1));
 	// An in-flight resend can retain its eligible pending provider.
-	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = receiver.assemble(&[record.clone()]).unwrap();
 	assert_eq!(
 		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
 		Some(&r1)
@@ -1229,7 +1240,7 @@ fn oldest_covering_pending_root_is_chosen_when_bundle_consumes_past_included() {
 		crate::SourceRoots { included: Some(r1), pending: vec![r2] },
 		&chain.wants(),
 	));
-	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = receiver.assemble(&[record.clone()]).unwrap();
 	let set = build_requires(&[record], &lifts).unwrap().unwrap();
 	assert_eq!(set.get(source()), Some(&r1));
 }
@@ -1278,8 +1289,7 @@ fn discarded_pending_roots_do_not_feed_new_consumption() {
 	block_on(receiver.on_root(source(), included, &Chain::default().wants()));
 	let data = block_on(receiver.inherent_data(&Chain::default().view(), &[]));
 	assert!(data.channels.is_empty());
-	assert_eq!(requires(&receiver, &[record.clone()]), Some(pending));
-	assert!(receiver.assemble_for_recovery(&[record]).is_err());
+	assert!(receiver.assemble(&[record]).is_err());
 }
 
 #[test]
@@ -1299,7 +1309,7 @@ fn failed_included_bindings_retry_without_a_snapshot_change() {
 	*sender.down_under.write() = Some(included);
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = receiver.assemble(&[record.clone()]).unwrap();
 	assert_eq!(
 		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
 		Some(&pending)
@@ -1308,7 +1318,7 @@ fn failed_included_bindings_retry_without_a_snapshot_change() {
 	*sender.down_under.write() = None;
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = receiver.assemble(&[record.clone()]).unwrap();
 	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&included));
 }
 
@@ -1326,7 +1336,7 @@ fn importing_a_live_endpoint_reopens_recovery_binding_work() {
 	*sender.down_under.write() = Some(included);
 	let record = chain.block(&receiver);
 	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = receiver.assemble(&[record.clone()]).unwrap();
 	assert_eq!(
 		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
 		Some(&pending)
@@ -1334,7 +1344,7 @@ fn importing_a_live_endpoint_reopens_recovery_binding_work() {
 	*sender.down_under.write() = None;
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
+	assert!(receiver.assemble(&[record]).is_ok());
 }
 
 #[test]
@@ -1346,7 +1356,7 @@ fn replaying_unfinalized_consumption_restores_recovery_after_restart() {
 	block_on(before.on_root(source(), root, &chain.wants()));
 	let record = chain.block(&before);
 	let restarted = receiver(&sender, Budget::default());
-	assert!(restarted.assemble_for_recovery(&[record.clone()]).is_err());
+	assert!(restarted.assemble(&[record.clone()]).is_err());
 	block_on(restarted.on_block(
 		chain.number,
 		chain.number - 1,
@@ -1355,7 +1365,7 @@ fn replaying_unfinalized_consumption_restores_recovery_after_restart() {
 		record.clone(),
 	));
 	block_on(restarted.on_root(source(), root, &chain.wants()));
-	let lifts = restarted.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = restarted.assemble(&[record.clone()]).unwrap();
 	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&root));
 }
 
@@ -1376,13 +1386,13 @@ fn consumption_past_included_settles_without_repeating_binding_requests() {
 	let requests = sender.log.lock().len();
 	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
 	assert_eq!(sender.log.lock().len(), requests);
-	let lifts = receiver.assemble_for_recovery(&[record.clone()]).unwrap();
+	let lifts = receiver.assemble(&[record.clone()]).unwrap();
 	assert_eq!(
 		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
 		Some(&pending)
 	);
 	block_on(receiver.on_root(source(), pending, &chain.wants()));
-	assert!(receiver.assemble_for_recovery(&[record]).is_ok());
+	assert!(receiver.assemble(&[record]).is_ok());
 }
 
 #[test]

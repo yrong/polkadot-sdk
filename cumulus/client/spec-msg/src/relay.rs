@@ -35,11 +35,10 @@ pub const NEWEST_INCLUDED_PROVIDES: &str = "ParachainHost_newest_included_provid
 /// The `ParachainHost` version that added [`NEWEST_INCLUDED_PROVIDES`].
 pub const NEWEST_INCLUDED_PROVIDES_VERSION: u32 = 17;
 
-/// The relay storage prefix of `Paras::ParaLifecycles` (`Twox128("Paras") ++
-/// Twox128("ParaLifecycles")`).
+/// The relay storage prefix of `Paras::ParaLifecycles`.
 const PARA_LIFECYCLES_PREFIX: [u8; 32] = [
 	0xcd, 0x71, 0x0b, 0x30, 0xbd, 0x2e, 0xab, 0x03, 0x52, 0xdd, 0xcc, 0x26, 0x41, 0x7a, 0xa1, 0x94,
-	0xdf, 0x16, 0x62, 0x02, 0x26, 0x2b, 0x9c, 0x55, 0x20, 0x21, 0x39, 0x2f, 0x9c, 0xc3, 0x19, 0x45,
+	0x28, 0x1e, 0x0b, 0xfd, 0xe1, 0x7b, 0x36, 0x57, 0x32, 0x08, 0xa0, 0x6c, 0xb5, 0xcf, 0xba, 0x6b,
 ];
 
 /// A source's eligible roots at one relay block: its newest included root and the ordered
@@ -119,12 +118,7 @@ async fn is_live_para(
 		let tag = u8::decode(&mut &raw[..]).map_err(|_| ())?;
 		return Ok(matches!(tag, 1..=4));
 	}
-	// Fallback for test harnesses that populate `Heads` without `ParaLifecycles`.
-	let head = relay
-		.get_storage_by_key(at, &well_known_keys::para_head(source))
-		.await
-		.map_err(|e| log::debug!(target: LOG_TARGET, "Para head lookup failed: {e}"))?;
-	Ok(head.is_some())
+	Ok(false)
 }
 
 /// `source`'s newest included root as of relay block `at`. `None` also when the call failed or
@@ -518,6 +512,14 @@ mod tests {
 		) -> RelayChainResult<Option<RelayParentInfo<PHash, polkadot_primitives::BlockNumber>>> {
 			unimplemented!()
 		}
+	}
+
+	#[test]
+	fn lifecycle_storage_prefix_matches_its_names() {
+		let expected =
+			[sp_crypto_hashing::twox_128(b"Paras"), sp_crypto_hashing::twox_128(b"ParaLifecycles")]
+				.concat();
+		assert_eq!(PARA_LIFECYCLES_PREFIX.as_slice(), expected.as_slice());
 	}
 
 	#[test]

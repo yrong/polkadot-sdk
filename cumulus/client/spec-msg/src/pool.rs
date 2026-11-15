@@ -29,8 +29,8 @@ use std::{
 	ops::Bound,
 };
 
-/// Source roots kept per source, newest last. Lifts target the preferred eligible root the
-/// material covers, while older roots stay for unfinalized blocks already built.
+/// Roots whose proof material is retained per source, newest last. Assembly targets only
+/// eligible roots; older material stays for unfinalized blocks.
 pub const ROOTS_KEPT: usize = 8;
 
 /// Lift material: extends a stream's frontier at some leaf count to its entry under a root.
@@ -163,17 +163,6 @@ impl SourcePool {
 			}
 		}
 		out
-	}
-
-	/// Retained roots can still assemble blocks built before the snapshot changed.
-	pub fn assembly_roots(&self) -> Vec<StreamsRoot> {
-		let mut roots = self.target_roots();
-		for root in self.roots.iter().rev() {
-			if !roots.contains(root) {
-				roots.push(*root);
-			}
-		}
-		roots
 	}
 
 	/// Store `payloads` of `stream` from position `start`.

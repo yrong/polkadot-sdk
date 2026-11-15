@@ -23,8 +23,7 @@
 //! - [`Receiver::inherent_data`]: consume within a [`Budget`], preferring the newest included root
 //!   when it covers the bundle and otherwise the oldest covering pending root.
 //! - [`Receiver::on_block`]: note a block's record and fetch the leaves for a read-context gap.
-//! - [`Receiver::assemble`] / [`Receiver::assemble_for_recovery`]: one lift per recorded stream,
-//!   checked with `build_requires_entry`.
+//! - [`Receiver::assemble`]: one lift per recorded stream, checked with `build_requires_entry`.
 
 use crate::{
 	fetch::{fetch, RequestError, Transport},
@@ -659,11 +658,6 @@ where
 				.collect()
 		};
 
-		let endpoint_bound =
-			|source: ParaId, stream: &StreamId, end: &MmrFrontier, root: &StreamsRoot| {
-				let state = self.state.lock();
-				state.sources.get(&source).is_some_and(|pool| lifts_to(pool, stream, end, root))
-			};
 		let endpoint_lifts =
 			|source: ParaId, stream: &StreamId, end: &MmrFrontier, root: &StreamsRoot| {
 				let state = self.state.lock();
@@ -676,7 +670,7 @@ where
 			let mut missing: Vec<(ParaId, StreamId, MmrFrontier, StreamsRoot)> = Vec::new();
 			for p in &planned {
 				for root in candidate_roots.get(&p.source).into_iter().flatten() {
-					if !endpoint_bound(p.source, &p.stream, &p.endpoint, root) {
+					if !endpoint_lifts(p.source, &p.stream, &p.endpoint, root) {
 						missing.push((p.source, p.stream, p.endpoint.clone(), *root));
 					}
 				}
@@ -730,7 +724,7 @@ where
 						.all(|(stream, end)| endpoint_lifts(source, stream, end, root)) &&
 						source_planned
 							.iter()
-							.all(|p| endpoint_bound(source, &p.stream, &p.endpoint, root))
+							.all(|p| endpoint_lifts(source, &p.stream, &p.endpoint, root))
 				})
 				.or_else(|| {
 					target_roots.iter().copied().find(|root| {
@@ -739,7 +733,7 @@ where
 							.all(|(stream, end)| endpoint_lifts(source, stream, end, root)) &&
 							source_planned
 								.iter()
-								.any(|p| endpoint_bound(source, &p.stream, &p.endpoint, root))
+								.any(|p| endpoint_lifts(source, &p.stream, &p.endpoint, root))
 					})
 				});
 			let Some(chosen) = chosen else {
@@ -750,7 +744,7 @@ where
 				continue;
 			};
 			for p in source_planned {
-				if !endpoint_bound(source, &p.stream, &p.endpoint, &chosen) {
+				if !endpoint_lifts(source, &p.stream, &p.endpoint, &chosen) {
 					log::debug!(
 						target: LOG_TARGET,
 						"Not consuming {:?} of {:?}: no lift material at {} under {:?}",
@@ -1034,36 +1028,36 @@ where
 		channels.chain(registers).collect()
 	}
 
-	/// The lifts for a fresh candidate whose blocks have `records`, in bundle order. Per source,
-	/// selects the newest included root when it covers the bundle, and otherwise the oldest
-	/// covering pending root (falling back to kept roots for blocks built before a transition).
+	/// Check retained proof material independently of submission eligibility.
+	#[cfg(test)]
+	pub(crate) fn retained_lifts(&self, records: &[ConsumptionRecord]) -> LiftsBySource {
+		let merged = merge(records);
+		let state = self.state.lock();
+		let lifts = merged
+			.iter()
+			.map(|(source, streams)| {
+				let pool = &state.sources[source];
+				let lifts = pool
+					.roots
+					.iter()
+					.rev()
+					.find_map(|root| {
+						streams
+							.iter()
+							.map(|(stream, intervals)| lift(pool, stream, intervals, root))
+							.collect::<Option<Vec<_>>>()
+					})
+					.expect("retained material covers the bundle; qed");
+				(*source, lifts)
+			})
+			.collect::<BTreeMap<_, _>>();
+		LiftsBySource::try_from(lifts).expect("test sources are bounded; qed")
+	}
+
+	/// Assemble lifts under one eligible root per source, preferring the included root when it
+	/// covers the bundle and otherwise the oldest covering pending root.
 	pub fn assemble(&self, records: &[ConsumptionRecord]) -> Result<LiftsBySource, String> {
-		self.assemble_inner(records, false)
-	}
-
-	/// Like [`Self::assemble`], but only from the current eligible roots: a resubmission never
-	/// targets a root the relay chain dropped.
-	pub fn assemble_for_recovery(
-		&self,
-		records: &[ConsumptionRecord],
-	) -> Result<LiftsBySource, String> {
-		self.assemble_inner(records, true)
-	}
-
-	fn assemble_inner(
-		&self,
-		records: &[ConsumptionRecord],
-		resubmission: bool,
-	) -> Result<LiftsBySource, String> {
-		let mut merged: BTreeMap<ParaId, SourceStreams> = BTreeMap::new();
-		for record in records {
-			for (source, streams) in &record.entries {
-				let by_stream = merged.entry(*source).or_default();
-				for (stream, interval) in streams {
-					by_stream.entry(*stream).or_default().push(interval.clone());
-				}
-			}
-		}
+		let merged = merge(records);
 		let state = self.state.lock();
 		let mut lifts = BTreeMap::new();
 		for (source, streams) in &merged {
@@ -1071,7 +1065,7 @@ where
 				.sources
 				.get(source)
 				.ok_or_else(|| format!("nothing fetched from {source:?}"))?;
-			let candidates = if resubmission { pool.target_roots() } else { pool.assembly_roots() };
+			let candidates = pool.target_roots();
 			let found = candidates.iter().find_map(|root| {
 				let source_lifts = streams
 					.iter()
@@ -1270,6 +1264,19 @@ pub(crate) fn skip_proof(from: &MmrFrontier, leaves: &[Hash]) -> Option<MmrExten
 			.try_into()
 			.ok()?,
 	})
+}
+
+fn merge(records: &[ConsumptionRecord]) -> BTreeMap<ParaId, SourceStreams> {
+	let mut merged: BTreeMap<ParaId, SourceStreams> = BTreeMap::new();
+	for record in records {
+		for (source, streams) in &record.entries {
+			let by_stream = merged.entry(*source).or_default();
+			for (stream, interval) in streams {
+				by_stream.entry(*stream).or_default().push(interval.clone());
+			}
+		}
+	}
+	merged
 }
 
 /// The lift of one stream's `intervals` to `root`, from the pool's material.
