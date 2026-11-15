@@ -254,14 +254,15 @@ impl<Block: BlockT, BI, Client> SlotBasedBlockImport<Block, BI, Client> {
 		runtime_api.record_proof_with_recorder(recorder.clone());
 		runtime_api.register_extension(ProofSizeExt::new(proof_size_recorder.clone()));
 
-		// Only blocks imported at the tip (built by other collators) are forwarded to the
-		// resubmission backfill task. Sync/gap/warp imports are historical and never part of our
-		// unincluded segment, so recording resubmission data for them would be wasted work (and
-		// would buffer their potentially large storage proofs).
-		let collect_for_resubmission = matches!(
-			params.origin,
-			BlockOrigin::NetworkBroadcast | BlockOrigin::ConsensusBroadcast
-		);
+		// Catch-up can import an unincluded suffix whose original collator is no longer online.
+		let collect_for_resubmission = !params.finalized &&
+			*params.header.number() > self.client.info().finalized_number &&
+			matches!(
+				params.origin,
+				BlockOrigin::NetworkInitialSync |
+					BlockOrigin::NetworkBroadcast |
+					BlockOrigin::ConsensusBroadcast
+			);
 
 		let body = params.body.clone().unwrap_or_default();
 		let resubmission_body = collect_for_resubmission.then(|| body.clone());
@@ -382,5 +383,84 @@ where
 		}
 
 		Ok(result)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cumulus_test_client::{
+		runtime::Block, BuildBlockBuilder, Client, TestClientBuilder, TestClientBuilderExt,
+	};
+	use cumulus_test_relay_sproof_builder::RelayStateSproofBuilder;
+	use futures::FutureExt;
+	use sc_consensus::{BlockImportParams, ForkChoiceStrategy};
+
+	fn block(client: &Client) -> Block {
+		let parent = client.info().best_hash;
+		let mut sproof = RelayStateSproofBuilder::default();
+		sproof.para_id = cumulus_test_client::runtime::PARACHAIN_ID.into();
+		sproof.included_para_head = Some(
+			client
+				.header(parent)
+				.expect("header lookup succeeds; qed")
+				.expect("genesis exists; qed")
+				.encode()
+				.into(),
+		);
+		client
+			.init_block_builder_builder()
+			.with_relay_sproof_builder(sproof)
+			.with_pre_digests(vec![
+				CumulusDigestItem::CoreInfo(CoreInfo {
+					selector: 0.into(),
+					claim_queue_offset: 0.into(),
+					number_of_cores: 1.into(),
+				})
+				.to_digest_item(),
+				CumulusDigestItem::BlockBundleInfo(BlockBundleInfo { index: 0, is_last: true })
+					.to_digest_item(),
+			])
+			.build()
+			.block_builder
+			.build()
+			.expect("test block builds; qed")
+			.block
+	}
+
+	#[tokio::test]
+	async fn catch_up_import_forwards_the_execution_proof() {
+		let client = Arc::new(TestClientBuilder::default().build());
+		let (importer, mut handle) = SlotBasedBlockImport::new(client.clone(), client.clone());
+		let block = block(&client);
+		let (header, body) = block.clone().deconstruct();
+		let mut params = BlockImportParams::new(BlockOrigin::NetworkInitialSync, header);
+		params.body = Some(body);
+		params.fork_choice = Some(ForkChoiceStrategy::LongestChain);
+		importer.import_block(params).await.expect("catch-up import succeeds; qed");
+		let (forwarded, proof) = handle
+			.next()
+			.now_or_never()
+			.expect("unfinalized catch-up block must reach backfill; qed");
+		assert_eq!(forwarded, block);
+		assert!(proof.iter_nodes().next().is_some());
+		assert_eq!(client.info().best_hash, block.header.hash());
+	}
+
+	#[tokio::test]
+	async fn finalized_catch_up_imports_do_not_forward_proofs() {
+		let client = Arc::new(TestClientBuilder::default().build());
+		let (importer, mut handle) = SlotBasedBlockImport::new(client.clone(), client.clone());
+		let block = block(&client);
+		for finalized in [true, false] {
+			let (header, body) = block.clone().deconstruct();
+			let mut params = BlockImportParams::new(BlockOrigin::NetworkInitialSync, header);
+			params.body = Some(body);
+			params.fork_choice = Some(ForkChoiceStrategy::LongestChain);
+			params.finalized = finalized;
+			importer.import_block(params).await.expect("finalized import succeeds; qed");
+			assert!(handle.next().now_or_never().is_none());
+			assert_eq!(client.info().finalized_number, 1);
+		}
 	}
 }
