@@ -19,7 +19,7 @@
 //!
 //! [`resolve_session`] is shared by the build path (block_builder_task) and the resubmission
 //! backfill task. [`run_resubmission_backfill`] is the task that records resubmission entries for
-//! blocks imported at the tip (built by other collators), doing the relay-chain queries off the
+//! unfinalized imported blocks, doing the relay-chain queries off the
 //! block-import path.
 
 use super::SlotBasedBlockImportHandle;
@@ -103,7 +103,7 @@ async fn resolve_relay_parent<R: RelayChainInterface + ?Sized>(
 	}
 }
 
-/// Maintain the resubmission store for blocks imported at the tip.
+/// Maintain the resubmission store for unfinalized imported blocks.
 ///
 /// Receives imported `(block, storage proof)` pairs from the [`SlotBasedBlockImportHandle`] and
 /// records a resubmission entry for each via [`backfill_resubmission_entry`], and prunes entries as
