@@ -3224,8 +3224,6 @@ fn check_validation_outputs_for_runtime_api_rejects_oversized_new_validation_cod
 
 #[cfg(test)]
 mod speculative_provides_window {
-	//! Isolation tests for the relay-side speculative-messaging provides window: window
-	//! advance/trim and requires matching by root.
 	use super::*;
 	use polkadot_primitives::{RequiresSet, StreamsRoot};
 
@@ -3248,12 +3246,10 @@ mod speculative_provides_window {
 			for i in 0..total {
 				ParaInclusion::record_provides(source, sr(i as u8));
 			}
-			// The window holds exactly `MAX_PROVIDES_WINDOW_SIZE` entries.
 			assert_eq!(
 				RecentProvides::<Test>::get(source).len(),
 				MAX_PROVIDES_WINDOW_SIZE as usize
 			);
-			// The 3 oldest roots were dropped; roots from index 3 onward are retained.
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 0)])).is_err());
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 2)])).is_err());
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1000, 3)])).is_ok());
@@ -3269,20 +3265,15 @@ mod speculative_provides_window {
 			let (a, b) = (ParaId::from(1), ParaId::from(2));
 			ParaInclusion::record_provides(a, sr(0xA));
 			ParaInclusion::record_provides(b, sr(0xB));
-			// Both sources present with the right roots → satisfied.
 			assert!(ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (2, 0xB)])).is_ok());
-			// Wrong root for a present source → Err names that (source, root).
 			assert_eq!(
 				ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (2, 0xC)])),
 				Err((ParaId::from(2), sr(0xC))),
 			);
-			// Unknown source → Err names it.
 			assert_eq!(
 				ParaInclusion::requires_satisfied(&requires(&[(1, 0xA), (3, 0xB)])),
 				Err((ParaId::from(3), sr(0xB))),
 			);
-			// No empty case: a `RequiresSet` is non-empty by construction. A candidate that
-			// requires nothing carries no `Requires` signal, so `paras_inherent` never calls this.
 		});
 	}
 
@@ -3291,15 +3282,12 @@ mod speculative_provides_window {
 		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
 			use crate::runtime_api_impl::vstaging::newest_included_provides;
 			let source = ParaId::from(1000);
-			// Never provided.
 			assert_eq!(newest_included_provides::<Test>(source), None);
 
-			// The newest entry wins, including after the window trims.
 			for i in 0..MAX_PROVIDES_WINDOW_SIZE + 3 {
 				ParaInclusion::record_provides(source, sr(i as u8));
 				assert_eq!(newest_included_provides::<Test>(source), Some(sr(i as u8)));
 			}
-			// Other sources are independent.
 			assert_eq!(newest_included_provides::<Test>(ParaId::from(1001)), None);
 		});
 	}
@@ -3327,7 +3315,6 @@ mod speculative_provides_window {
 			ParaInclusion::record_provides(leaving, sr(0xB));
 			assert!(!RecentProvides::<Test>::get(leaving).is_empty());
 
-			// A session change that offboards `leaving` drops its window; `staying` is untouched.
 			let notification = crate::initializer::SessionChangeNotification::default();
 			ParaInclusion::initializer_on_new_session(&notification, &[leaving]);
 
@@ -3336,14 +3323,12 @@ mod speculative_provides_window {
 		});
 	}
 
-	/// Seeded random pushes and offboardings across a few senders, checked after every
-	/// step against a plain model: window length, newest root and membership of a random root.
 	#[test]
 	fn window_matches_a_model_under_random_operations() {
 		use std::collections::{BTreeMap, VecDeque};
 
 		new_test_ext(genesis_config(Vec::new())).execute_with(|| {
-			// Few distinct roots, so repeated roots and the eviction of a repeated one both occur.
+			// Reuse roots to cover duplicate eviction.
 			let root = |n: u64| StreamsRoot(Hash::from_low_u64_be(n));
 			let distinct_roots = 3 * MAX_PROVIDES_WINDOW_SIZE as u64;
 			let sources: Vec<ParaId> = (1..=3u32).map(ParaId::from).collect();
