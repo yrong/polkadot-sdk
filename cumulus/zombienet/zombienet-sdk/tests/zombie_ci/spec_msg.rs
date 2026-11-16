@@ -235,7 +235,7 @@ const MAX_PER_ITEM: u64 = 8;
 async fn send_batch_and_follow(
 	sender: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
-) -> Result<(), anyhow::Error> {
+) -> Result<Vec<H256>, anyhow::Error> {
 	log::info!("Sending {BATCH} XCMs {SENDER} -> {RECEIVER} in one block");
 	let stream = in_channel().sender_data_stream(RECEIVER.into()).1;
 	let mut consumed = channel_map::<InChannelId, InChannelState>(receiver, "InChannels")
@@ -268,6 +268,7 @@ async fn send_batch_and_follow(
 	}
 	log::info!("{SENDER} block #{} sent leaves {}..{end}", sent.number(), end - BATCH);
 
+	let mut consuming_blocks = Vec::new();
 	let mut cuts = 0;
 	let mut processed = Vec::new();
 	let follow = async {
@@ -297,6 +298,7 @@ async fn send_batch_and_follow(
 					"{RECEIVER} block #{} consumed leaves {consumed}..{reached} and is finalized",
 					block.number(),
 				);
+				consuming_blocks.push(block.hash());
 				consumed = reached;
 			}
 			for event in block.events().await?.iter() {
@@ -335,7 +337,7 @@ async fn send_batch_and_follow(
 		"All {BATCH} XCMs executed in order over {} consuming blocks, {cuts} of them cut short",
 		cuts + 1,
 	);
-	Ok(())
+	Ok(consuming_blocks)
 }
 
 /// XCMs the receiver holds when the sender's collator stops: several blocks' worth.
@@ -2237,16 +2239,29 @@ async fn spec_msg_v3_relay_reorg_recovery() -> Result<(), anyhow::Error> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_included_only_delivery() -> Result<(), anyhow::Error> {
-	run_v3_delivery(RootPolicy::IncludedOnly, false).await
+	run_v3_delivery(V3Delivery::IncludedOnly).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_optimistic_early_consumption() -> Result<(), anyhow::Error> {
-	run_v3_delivery(RootPolicy::BothOptimistic, true).await
+	run_v3_delivery(V3Delivery::EarlyConsumption).await
 }
 
-async fn run_v3_delivery(policy: RootPolicy, prove_early: bool) -> Result<(), anyhow::Error> {
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_optimistic_bundle_cut() -> Result<(), anyhow::Error> {
+	run_v3_delivery(V3Delivery::BundleCut).await
+}
+
+#[derive(Clone, Copy, Debug)]
+enum V3Delivery {
+	IncludedOnly,
+	EarlyConsumption,
+	BundleCut,
+}
+
+async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
 	use polkadot_primitives::{
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateReceiptV2, HeadData,
 		NodeFeatures,
@@ -2254,6 +2269,10 @@ async fn run_v3_delivery(policy: RootPolicy, prove_early: bool) -> Result<(), an
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
+	let policy = match check {
+		V3Delivery::IncludedOnly => RootPolicy::IncludedOnly,
+		_ => RootPolicy::BothOptimistic,
+	};
 	let control = tempfile::tempdir()?;
 	let gate = control.path().join("unarmed");
 	let network = initialize_network(build_recovery_network_config(
@@ -2289,8 +2308,10 @@ async fn run_v3_delivery(policy: RootPolicy, prove_early: bool) -> Result<(), an
 		}
 		open_spec_msg_channel(&sender, &receiver).await?;
 		let mut blocks = relay.blocks().subscribe_finalized().await?;
-		if prove_early {
+		if matches!(check, V3Delivery::EarlyConsumption) {
 			prove_early_consumption(&relay, &sender, &receiver, &mut blocks).await?;
+		} else if matches!(check, V3Delivery::BundleCut) {
+			prove_bundle_cut(&relay, &sender, &receiver, &mut blocks).await?;
 		} else {
 			send_and_follow(&relay, &sender, &receiver).await?;
 			let mut seen = std::collections::BTreeSet::new();
@@ -2329,12 +2350,102 @@ async fn run_v3_delivery(policy: RootPolicy, prove_early: bool) -> Result<(), an
 			advanced(&sender, &receiver, (now.0 + 1, now.1 + 1))
 		})
 		.await?;
-		log::info!("V3 delivery passed, early_consumption={prove_early}");
+		log::info!("V3 delivery passed: {check:?}");
 		Ok::<_, anyhow::Error>(())
 	};
 	let result = tokio::time::timeout(Duration::from_secs(600), run).await;
 	network.destroy().await?;
 	result.map_err(|_| anyhow!("V3 delivery exceeded 600 seconds"))?
+}
+
+async fn prove_bundle_cut(
+	relay: &OnlineClient<PolkadotConfig>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+	blocks: &mut StreamOfResults<Block<PolkadotConfig, OnlineClient<PolkadotConfig>>>,
+) -> Result<(), anyhow::Error> {
+	use polkadot_primitives::{
+		CandidateDescriptorVersion, CandidateReceiptV2, CommittedCandidateReceiptV2, HeadData,
+	};
+	let observe = async {
+		let consumed = send_batch_and_follow(sender, receiver).await?;
+		let mut backed = std::collections::BTreeSet::new();
+		while let Some(block) = blocks.next().await {
+			let block = block?;
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "ParaInclusion" ||
+					!matches!(event.variant_name(), "CandidateBacked" | "CandidateIncluded")
+				{
+					continue;
+				}
+				let (receipt, head) =
+					<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+				if receipt.descriptor.para_id() != RECEIVER.into() {
+					continue;
+				}
+				if event.variant_name() == "CandidateIncluded" {
+					if backed.contains(&receipt.hash()) {
+						log::info!(
+							"Runtime-cut bundle receipt {:?} enacted in finalized relay #{} {:?}",
+							receipt.hash(),
+							block.number(),
+							block.hash()
+						);
+						return Ok(());
+					}
+					continue;
+				}
+				if receipt.descriptor.version() != CandidateDescriptorVersion::V3 {
+					return Err(anyhow!("bundle-cut test submitted a non-V3 receipt"));
+				}
+				let mut tip = receiver
+					.blocks()
+					.at(H256::from(sp_crypto_hashing::blake2_256(&head.0)))
+					.await?;
+				let index = bundle_index(&tip)
+					.ok_or_else(|| anyhow!("receiver candidate has no bundle index"))?;
+				let mut consuming = 0;
+				for offset in 0..=index {
+					consuming += usize::from(consumed.contains(&tip.hash()));
+					if offset != index {
+						tip = receiver.blocks().at(tip.header().parent_hash).await?;
+					}
+				}
+				if consuming < 2 {
+					continue;
+				}
+				let pending: Vec<CommittedCandidateReceiptV2> = call_at(
+					relay,
+					Some(block.hash()),
+					"ParachainHost_candidates_pending_availability",
+					&ParaId::from(RECEIVER).encode(),
+				)
+				.await?;
+				let candidate = pending
+					.iter()
+					.find(|c| c.hash() == receipt.hash())
+					.ok_or_else(|| anyhow!("backed bundle is absent from its relay snapshot"))?;
+				let signals = candidate.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+				let requires = signals
+					.requires()
+					.ok_or_else(|| anyhow!("consuming bundle has no Requires"))?;
+				if requires.len() != 1 || requires.get(SENDER.into()).is_none() {
+					return Err(anyhow!("bundle must have one dependency entry for its sender"));
+				}
+				log::info!(
+					"Receipt {:?} bundles {consuming} consuming blocks under {:?}",
+					receipt.hash(),
+					requires.get(SENDER.into())
+				);
+				backed.insert(receipt.hash());
+			}
+		}
+		Err(anyhow!("relay subscription ended before the runtime-cut bundle enacted"))
+	};
+	tokio::time::timeout(Duration::from_secs(120), observe)
+		.await
+		.map_err(|_| anyhow!("no multi-block runtime-cut bundle enacted within 120 seconds"))?
 }
 
 async fn sender_bundle_contains_packet(
