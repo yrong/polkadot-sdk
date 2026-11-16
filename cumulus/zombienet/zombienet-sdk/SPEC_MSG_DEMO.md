@@ -6,7 +6,9 @@ send and the checkpoints take about 1.5 more minutes.
 
 ## 1. Build
 
-Build once. The runtimes are inside the binaries, so build again after a runtime or node change.
+Build the native binaries once. Harness-only changes need no node rebuild. For node-only changes,
+`SKIP_WASM_BUILD=1` reuses cached Wasm; first check that it exists and its runtime sources are unchanged.
+Runtime changes or a fresh cache need the full build below.
 
 ```
 cargo build --release -p polkadot -p polkadot-parachain-bin
@@ -148,3 +150,19 @@ primary, so the relay chain forks at most heights and reorgs revert sender inclu
 receiver's newest sender root has gone back at least once and a sender block was reorged away, then checks that the
 receiver consumed the same leaves as the sender sent, in order, and settled them. Coverage usually comes within a
 few minutes; `SPEC_MSG_FORK_SECS` caps the wait (1200 by default).
+
+## Catch-up recovery
+
+`spec_msg_v3_catch_up_recovery` runs with one core per parachain and the normal relay epoch, so it
+can arm the fault after opening the channel. It still requires both availability timeouts, finalized
+XCM delivery, fresh replacement work and preservation of the original sender blocks before expiry.
+
+With matching native binaries on `PATH` and a fresh base directory:
+
+```sh
+env -u SPEC_MSG_OUTAGE_RELAY_WASM SKIP_WASM_BUILD=1 cargo test --release \
+  -p cumulus-zombienet-sdk-tests --features zombie-ci --test tests spec_msg_v3_catch_up_recovery -- --ignored --nocapture --test-threads=1
+```
+
+Set `SPEC_MSG_OUTAGE_RELAY_WASM` only for the separate short-session experiment. A 30–60-slot override
+retains the wait for a fresh session and the longer deadline.

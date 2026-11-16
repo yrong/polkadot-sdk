@@ -2044,7 +2044,7 @@ fn build_recovery_network_config(
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
 	let to_replacement = peer_arg(SENDER, REPLACEMENT_COLLATOR, REPLACEMENT_P2P_PORT)?;
-	let outage_wasm = catch_up.then(|| std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM")).transpose()?;
+	let outage_wasm = catch_up.then(|| std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM").ok()).flatten();
 	let availability_args = |gate: &std::path::Path| -> Vec<zombienet_sdk::Arg> {
 		let mut args = vec![
 			"--experimental-collator-protocol".into(),
@@ -2096,8 +2096,9 @@ fn build_recovery_network_config(
 				} }
 			});
 			if gate.is_some() {
+				// Para genesis allocates one core for each registered parachain.
 				genesis["configuration"]["config"]["scheduler_params"]["num_cores"] =
-					serde_json::json!(2);
+					serde_json::json!(if catch_up { 0 } else { 2 });
 			}
 			if catch_up {
 				genesis["configuration"]["config"]["scheduler_params"]
@@ -2218,13 +2219,13 @@ async fn spec_msg_v3_timeout_recovery() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
+#[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_catch_up_recovery() -> Result<(), anyhow::Error> {
 	run_v3_timeout_recovery(true, false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires native validators, malus and a short-epoch relay Wasm"]
+#[ignore = "requires native validators and the malus binary"]
 async fn spec_msg_v3_two_way_recovery() -> Result<(), anyhow::Error> {
 	run_v3_timeout_recovery(true, true, false).await
 }
@@ -3302,9 +3303,10 @@ async fn run_v3_timeout_recovery(
 		node_features::FeatureIndex, CandidateDescriptorVersion, CandidateHash, CandidateReceiptV2,
 		CommittedCandidateReceiptV2, CoreState, HeadData, NodeFeatures, StreamsRoot,
 	};
+	let short_epoch = catch_up && std::env::var("SPEC_MSG_OUTAGE_RELAY_WASM").is_ok();
 	let test_timeout = Duration::from_secs(if reorg {
 		fork_secs() + 600
-	} else if catch_up {
+	} else if short_epoch {
 		900
 	} else {
 		600
@@ -3369,7 +3371,7 @@ async fn run_v3_timeout_recovery(
 		};
 		let epoch_length = scalar("epoch_length")?;
 		let slot_duration = scalar("slot_duration")?;
-		if !catch_up && epoch_length.saturating_mul(slot_duration) < test_timeout.as_millis() {
+		if !short_epoch && epoch_length.saturating_mul(slot_duration) < test_timeout.as_millis() {
 			return Err(anyhow!("relay epoch is shorter than the recovery test deadline"));
 		}
 		let mut session: u32 =
@@ -3399,6 +3401,8 @@ async fn run_v3_timeout_recovery(
 		if catch_up {
 			// Live imports retain proofs; catching up after an outage exercises sync imports.
 			network.get_node(REPLACEMENT_COLLATOR)?.pause().await?;
+		}
+		if short_epoch {
 			if !(30..=60).contains(&epoch_length) {
 				return Err(anyhow!(
 					"outage fixture requires a 30–60 slot epoch, got {epoch_length}"
@@ -4011,6 +4015,9 @@ async fn recover_after_catch_up(
 	let scheduler = config
 		.at("scheduler_params")
 		.ok_or_else(|| anyhow!("scheduler config missing"))?;
+	if scheduler.at("num_cores").and_then(|value| value.as_u128()) != Some(2) {
+		return Err(anyhow!("catch-up fixture must keep one core per parachain"));
+	}
 	log::info!("Outage config ws://127.0.0.1:{RELAY_RPC_PORT} at {at:?}, runtime {:?}: max_relay_parent_session_age={age}, scheduler={scheduler}; execution parent={execution_parent:?}, session={parent_session}", relay.runtime_version());
 	let info: Option<RelayParentInfo<H256, u32>> = call_at(
 		relay,
