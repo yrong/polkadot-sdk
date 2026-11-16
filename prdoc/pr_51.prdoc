@@ -4,10 +4,7 @@ doc:
   description: |-
     Store resubmission proofs for unfinalized blocks imported during catch-up, so a collator
     that only imported a sealed segment can resubmit it when the original author is offline.
-    Forwarding holds at most one proof, waits for a missing relay header, and proofs are
-    deleted at finality.
+    Forwarding holds at most one proof and waits for a missing relay header.
 crates:
 - name: cumulus-client-consensus-aura
   bump: patch
-- name: cumulus-client-resubmission-store
-  bump: minor

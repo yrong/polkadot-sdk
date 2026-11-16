@@ -24,8 +24,7 @@
 
 use super::SlotBasedBlockImportHandle;
 use cumulus_client_resubmission_store::{
-	finality_cleanup_ops, prepare_resubmission_aux_data, prune_finalized_entries,
-	prune_missed_finalized_entries,
+	prepare_resubmission_aux_data, prune_finalized_entries, prune_missed_finalized_entries,
 };
 use cumulus_primitives_core::{
 	relay_chain::{
@@ -309,21 +308,11 @@ async fn backfill_resubmission_entry<Block, R, Client>(
 			"Failed to store resubmission entry for imported block.",
 		),
 	}
-	if number <= para_client.info().finalized_number {
-		let ops = finality_cleanup_ops::<Block>(block_hash, &[], core::iter::empty());
-		let deletes: Vec<_> = ops.iter().map(|(key, _)| key.as_slice()).collect();
-		if let Err(err) = para_client.insert_aux(&[], &deletes) {
-			tracing::warn!(target: LOG_TARGET, ?block_hash, ?err, "Failed to delete finalized resubmission entry.");
-		}
-	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{
-		super::{tests::TestRelayClient, SlotBasedBlockImport},
-		*,
-	};
+	use super::{super::tests::TestRelayClient, *};
 	use codec::Encode;
 	use cumulus_client_resubmission_store::ResubmissionStore;
 	use cumulus_primitives_core::{
@@ -474,51 +463,6 @@ mod tests {
 			StateAction::ApplyChanges(StorageChanges::Changes(built.storage_changes));
 		client.import_block(params).await.expect("test block imports; qed");
 		header
-	}
-
-	#[tokio::test]
-	async fn finality_during_pvd_lookup_does_not_leave_a_proof_row() {
-		let client = Arc::new(TestClientBuilder::default().build());
-		let (_importer, _handle) = SlotBasedBlockImport::new(client.clone(), client.clone());
-		let (_, _, parent) = relay();
-		let header = imported_header(&client, &parent).await;
-		let Some(RelayBlockIdentifier::ByStorageRoot { storage_root, block_number }) =
-			CumulusDigestItem::find_relay_block_identifier(header.digest())
-		else {
-			panic!("test block carries a relay storage root");
-		};
-		let relay_parent = RelayHeader::new(
-			block_number,
-			Default::default(),
-			storage_root,
-			Default::default(),
-			Default::default(),
-		);
-		let relay = TestRelayClient::new_with_best(
-			HashMap::from([(relay_parent.hash(), relay_parent.clone())]),
-			relay_parent.hash(),
-		);
-		let (release, gate) = futures::channel::oneshot::channel();
-		*relay.pvd_response_gate.lock().expect("test mutex; qed") = Some(gate);
-		let backfill = backfill_resubmission_entry::<Block, _, _>(
-			&relay,
-			&*client,
-			&header,
-			Arc::new(StorageProof::empty()),
-			2000.into(),
-		);
-		futures::pin_mut!(backfill);
-		assert!(poll!(&mut backfill).is_pending());
-		assert!(relay.pvd_response_gate.lock().expect("test mutex; qed").is_none());
-		client
-			.finalize_block(header.hash(), None, true)
-			.expect("test finality commits; qed");
-		release.send(()).expect("PVD query is waiting; qed");
-		backfill.await;
-		assert!(ResubmissionStore::<Block, _>::new(client.clone())
-			.load(header.hash())
-			.expect("row lookup succeeds; qed")
-			.is_none());
 	}
 
 	#[tokio::test]

@@ -19,7 +19,6 @@ use crate::LOG_TARGET;
 use codec::{Decode, Encode};
 use cumulus_client_consensus_common::old_finalized_hash;
 use cumulus_client_proof_size_recording::prepare_proof_size_recording_aux_data;
-use cumulus_client_resubmission_store::finality_cleanup_ops;
 use cumulus_primitives_core::{BlockBundleInfo, CoreInfo, CumulusDigestItem, RelayBlockIdentifier};
 use sc_client_api::{
 	backend::AuxStore,
@@ -89,8 +88,9 @@ impl<Block> SlotBasedBlockImportHandle<Block> {
 	}
 }
 
-/// Remove recovery data in the transaction that commits finality.
-fn register_finality_cleanup<C, Block>(client: Arc<C>)
+/// Register the clean up method for cleaning ignored nodes from blocks on which no further blocks
+/// will be imported.
+fn register_ignored_nodes_cleanup<C, Block>(client: Arc<C>)
 where
 	C: PreCommitActions<Block> + HeaderBackend<Block> + 'static,
 	Block: BlockT,
@@ -120,11 +120,6 @@ where
 					.map(|hash| (ignored_nodes_key(hash), None)),
 			)
 			.chain(std::iter::once((ignored_nodes_key(old_finalized), None)))
-			.chain(finality_cleanup_ops::<Block>(
-				notification.hash,
-				&notification.tree_route,
-				notification.stale_blocks.iter().map(|block| block.hash),
-			))
 			.collect()
 	};
 
@@ -150,7 +145,7 @@ impl<Block: BlockT, BI, Client> SlotBasedBlockImport<Block, BI, Client> {
 	{
 		let (sender, receiver) = mpsc::channel(1);
 
-		register_finality_cleanup(client.clone());
+		register_ignored_nodes_cleanup(client.clone());
 
 		(Self { sender, client, inner }, SlotBasedBlockImportHandle { receiver })
 	}
@@ -408,7 +403,6 @@ mod tests {
 	};
 	use cumulus_test_relay_sproof_builder::RelayStateSproofBuilder;
 	use futures::FutureExt;
-	use sc_client_api::backend::Finalizer;
 	use sc_consensus::{BlockImportParams, ForkChoiceStrategy};
 
 	fn block(client: &Client) -> Block {
@@ -441,54 +435,6 @@ mod tests {
 			.build()
 			.expect("test block builds; qed")
 			.block
-	}
-
-	#[tokio::test]
-	async fn finality_prunes_proofs_across_gaps_without_the_backfill_task() {
-		use cumulus_client_resubmission_store::{prepare_resubmission_aux_data, ResubmissionStore};
-		let client = Arc::new(TestClientBuilder::default().build());
-		let (importer, mut handle) = SlotBasedBlockImport::new(client.clone(), client.clone());
-		let mut hashes = Vec::new();
-		for number in 1..=4 {
-			let block = block(&client);
-			let hash = block.header.hash();
-			let (header, body) = block.deconstruct();
-			let mut params = BlockImportParams::new(BlockOrigin::NetworkInitialSync, header);
-			params.body = Some(body);
-			params.fork_choice = Some(ForkChoiceStrategy::LongestChain);
-			importer.import_block(params).await.expect("test block imports; qed");
-			let (_, proof) = handle.next().await;
-			if number != 2 {
-				let pairs: Vec<_> = prepare_resubmission_aux_data::<Block>(
-					hash,
-					proof,
-					polkadot_primitives::Header::new(
-						1,
-						Default::default(),
-						Default::default(),
-						Default::default(),
-						Default::default(),
-					),
-					1,
-					1024,
-				)
-				.collect();
-				let refs: Vec<_> = pairs.iter().map(|(k, v)| (&k[..], &v[..])).collect();
-				client.insert_aux(&refs, &[]).expect("proof row is stored; qed");
-			}
-			hashes.push(hash);
-		}
-		let store = ResubmissionStore::<Block, _>::new(client.clone());
-		for &hash in &[hashes[0], hashes[2], hashes[3]] {
-			assert!(store.load(hash).expect("row lookup succeeds; qed").is_some());
-		}
-		client
-			.finalize_block(hashes[2], None, true)
-			.expect("test finality commits; qed");
-		for &hash in &hashes[..3] {
-			assert!(store.load(hash).expect("row lookup succeeds; qed").is_none());
-		}
-		assert!(store.load(hashes[3]).expect("row lookup succeeds; qed").is_some());
 	}
 
 	#[tokio::test]

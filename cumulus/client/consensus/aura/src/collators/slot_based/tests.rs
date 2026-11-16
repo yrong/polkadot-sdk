@@ -283,7 +283,6 @@ async fn determine_core_no_cores_available() {
 
 #[derive(Clone)]
 pub struct TestRelayClient {
-	pub pvd_response_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
 	pub import_notifications: Arc<Mutex<Option<Pin<Box<dyn Stream<Item = RelayHeader> + Send>>>>>,
 	headers: HashMap<RelayHash, RelayHeader>,
 	best_hash: Arc<Mutex<Option<RelayHash>>>,
@@ -295,7 +294,6 @@ impl TestRelayClient {
 		Self {
 			headers,
 			import_notifications: Default::default(),
-			pvd_response_gate: Default::default(),
 			best_hash: Default::default(),
 			best_notifications: Arc::new(Mutex::new(None)),
 		}
@@ -305,7 +303,6 @@ impl TestRelayClient {
 		Self {
 			headers,
 			import_notifications: Default::default(),
-			pvd_response_gate: Default::default(),
 			best_hash: Arc::new(Mutex::new(Some(best_hash))),
 			best_notifications: Arc::new(Mutex::new(None)),
 		}
@@ -362,12 +359,6 @@ impl RelayChainInterface for TestRelayClient {
 		_: OccupiedCoreAssumption,
 	) -> RelayChainResult<Option<PersistedValidationData>> {
 		use cumulus_primitives_core::PersistedValidationData;
-
-		// The fixture never panics while holding this gate mutex; qed
-		let gate = self.pvd_response_gate.lock().unwrap().take();
-		if let Some(gate) = gate {
-			gate.await.expect("test releases the PVD response; qed");
-		}
 
 		if self.headers.get(&hash).is_none() {
 			return Ok(None);
