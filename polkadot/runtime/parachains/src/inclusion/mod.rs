@@ -625,7 +625,7 @@ impl<T: Config> Pallet<T> {
 		}
 		let selected = enactment::select(&eligible, Self::provides_contains);
 		for paraid in pending_paraids {
-			let chain = &eligible[&paraid];
+			let Some(chain) = eligible.get(&paraid) else { continue };
 			let count = (0..chain.len()).take_while(|i| selected.contains(&(paraid, *i))).count();
 			PendingAvailability::<T>::mutate(paraid, |candidates| {
 				if let Some(candidates) = candidates {
