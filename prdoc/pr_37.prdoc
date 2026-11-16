@@ -1,0 +1,6 @@
+title: 'spec-msg: delivery integration tests'
+doc:
+- audience: Node Dev
+  description: Test spec-msg delivery, bundles, relay forks and history serving by late nodes.
+    Check that HRMP takes precedence while both messaging channels are open.
+crates: []

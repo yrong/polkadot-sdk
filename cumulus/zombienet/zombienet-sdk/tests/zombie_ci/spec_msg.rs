@@ -851,6 +851,81 @@ async fn late_node_steps(
 	Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let test = async {
+		let network =
+			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
+				.await?;
+		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+		let sender: OnlineClient<PolkadotConfig> =
+			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+		let receiver: OnlineClient<PolkadotConfig> =
+			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+
+		open_spec_msg_channel(&sender, &receiver).await?;
+		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
+		// The router reads the sender's relay snapshot, which can lag the relay's channel state.
+		wait_for("the sender to observe its HRMP channel", || async {
+			let query = subxt::dynamic::storage(
+				"ParachainSystem",
+				"RelevantMessagingState",
+				Vec::<Value>::new(),
+			);
+			let Some(state) = sender.storage().at(best_hash(&sender).await?).fetch(&query).await?
+			else {
+				return Ok(false);
+			};
+			let state = state.to_value()?;
+			let channels = state
+				.at("egress_channels")
+				.ok_or_else(|| anyhow!("no egress channels in the sender's relay snapshot"))?;
+			let ValueDef::Composite(channels) = &channels.value else {
+				return Err(anyhow!("invalid egress channels in the sender's relay snapshot"));
+			};
+			let open = channels.values().any(|channel| {
+				channel.at(0).and_then(|id| id.at(0)).and_then(|id| id.as_u128()) ==
+					Some(RECEIVER.into())
+			});
+			Ok(open)
+		})
+		.await?;
+		let (_, outbound) = channel_states(&sender, &receiver).await?;
+		if !outbound
+			.get(&out_channel())
+			.is_some_and(|state| state.open.is_some_and(|session| session.opened))
+		{
+			return Err(anyhow!("the spec-msg channel is not open alongside HRMP"));
+		}
+		let before = sent_count(&sender).await?;
+		if before == 0 {
+			return Err(anyhow!("the spec-msg stream has no channel handshake"));
+		}
+		let inclusions = track_inclusions(relay);
+		let (sample, origin) = deliver(&sender, &receiver, &inclusions).await?;
+		if origin != "Sibling" {
+			return Err(anyhow!("XCM arrived under {origin} while both channels were open"));
+		}
+		let after = sent_count(&sender).await?;
+		if after != before {
+			return Err(anyhow!("HRMP send changed spec-msg leaf count from {before} to {after}"));
+		}
+		log::info!(
+			"HRMP wins with both channels open: sender block #{}, finalized receiver block #{}, \
+			 spec-msg leaf count unchanged at {after}",
+			sample.sent_block,
+			sample.processed_block,
+		);
+		Ok(())
+	};
+	tokio::time::timeout(Duration::from_secs(360), test)
+		.await
+		.map_err(|_| anyhow!("HRMP preference test exceeded six minutes"))?
+}
+
 /// Samples per path.
 const SAMPLES: usize = 10;
 

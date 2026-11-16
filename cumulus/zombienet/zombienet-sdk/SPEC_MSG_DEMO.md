@@ -135,6 +135,16 @@ The test sets the node log filters in `build_network_config`, at `debug` level. 
 `cumulus-collator`, `runtime::spec-msg`, `runtime::parachain-system`. Relay validators: `runtime::inclusion`,
 `runtime::inclusion-inherent`.
 
+## HRMP preference
+
+`spec_msg_prefers_hrmp_when_both_channels_are_open` opens both transports, sends one XCM and requires
+successful processing under the sibling origin without adding a spec-msg stream leaf. It uses a fresh
+network and has a six-minute deadline:
+
+```
+cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci --test tests spec_msg_prefers_hrmp_when_both_channels_are_open -- --nocapture --test-threads=1
+```
+
 ## Latency against HRMP
 
 `spec_msg_vs_hrmp_latency -- --ignored --nocapture` replaces `spec_msg_delivers -- --nocapture`. It compares
