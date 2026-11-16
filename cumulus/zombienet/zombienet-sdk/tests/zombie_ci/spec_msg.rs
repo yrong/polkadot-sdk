@@ -3458,6 +3458,31 @@ async fn run_v3_timeout_recovery(
 		} else {
 			0
 		};
+		let return_slot = if two_way {
+			let duration: u64 = call_at(&sender, None, "AuraApi_slot_duration", &[]).await?;
+			let window_start = duration.saturating_sub(slot_duration as u64);
+			let before = sender.blocks().at(best_hash(&sender).await?).await?.number();
+			let mut authored = sender.blocks().subscribe_best().await?;
+			// Parachain timestamps identify the slot; the native clock locates its final relay
+			// period.
+			let slot = loop {
+				let block =
+					authored.next().await.ok_or_else(|| anyhow!("sender subscription ended"))??;
+				let slot_start = block_timestamp(&block).await?;
+				let now =
+					std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+				if block.number() > before &&
+					(u128::from(slot_start + window_start)..u128::from(slot_start + duration))
+						.contains(&now)
+				{
+					log::info!("Two-way fault window: sender #{} {:?}, slot start {slot_start}ms, duration {duration}ms, now {now}ms", block.number(), block.hash());
+					break slot_start;
+				}
+			};
+			Some(slot)
+		} else {
+			None
+		};
 		std::fs::write(&gate, baseline.0.as_bytes())?;
 		log::info!("Withholding sender candidates beyond included {baseline:?}");
 		// Keep the probe's identity when its transaction is re-executed after a fork.
@@ -3466,6 +3491,11 @@ async fn run_v3_timeout_recovery(
 			.blocks()
 			.at(sudo_in_block(&sender, send_xcm_with_topic(RECEIVER, topic)).await?)
 			.await?;
+		if let Some(slot) = return_slot {
+			if block_timestamp(&sent).await? != slot {
+				return Err(anyhow!("faulted send missed the selected sender authoring slot"));
+			}
+		}
 		let message_id = event_field(&sent, "PolkadotXcm", "Sent", "message_id")
 			.await?
 			.map(|id| flatten(&id))

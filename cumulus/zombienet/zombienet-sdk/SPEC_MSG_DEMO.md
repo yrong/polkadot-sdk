@@ -154,8 +154,10 @@ few minutes; `SPEC_MSG_FORK_SECS` caps the wait (1200 by default).
 ## Catch-up recovery
 
 `spec_msg_v3_catch_up_recovery` runs with one core per parachain and the normal relay epoch, so it
-can arm the fault after opening the channel. It still requires both availability timeouts, finalized
+needs no fresh-session wait. It still requires both availability timeouts, finalized
 XCM delivery, fresh replacement work and preservation of the original sender blocks before expiry.
+The two-way test sends near the end of the sender's authoring slot, leaving unincluded-segment
+capacity for its later return-credit read. It keeps the same two-core fixture and normal epoch.
 
 With matching native binaries on `PATH` and a fresh base directory:
 

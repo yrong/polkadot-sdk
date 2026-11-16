@@ -4,5 +4,5 @@ doc:
   description: Add focused optimistic messaging integration tests, including runtime-cut bundles,
     joint enactment and latency measurements, and controlled availability-fault tooling. Require
     timeout observations to match finalized relay history. Avoid session waits and unused cores
-    in the default catch-up fixture.
+    in the default catch-up fixture. Time the two-way fault so the sender can still read pending credit.
 crates: []
