@@ -2,5 +2,6 @@ title: 'spec-msg: optimistic V3 recovery and delivery tests'
 doc:
 - audience: Node Dev
   description: Add focused optimistic messaging integration tests, including runtime-cut bundles,
-    joint enactment and latency measurements, and controlled availability-fault tooling.
+    joint enactment and latency measurements, and controlled availability-fault tooling. Require
+    timeout observations to match finalized relay history.
 crates: []

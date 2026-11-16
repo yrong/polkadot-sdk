@@ -3779,6 +3779,7 @@ async fn run_v3_timeout_recovery(
 					"Two-way recovery preserved sender #{number} {expected:?} in finalized history"
 				);
 			}
+			check_finalized_timeouts(&relay, &timeout_blocks).await?;
 			return Ok(());
 		}
 		let collator = network.get_node(RECEIVER_COLLATOR)?;
@@ -3922,26 +3923,7 @@ async fn run_v3_timeout_recovery(
 								delivered.number(),
 								delivered.hash()
 							);
-							for (height, expected) in &timeout_blocks {
-								let query = subxt::dynamic::storage(
-									"System",
-									"BlockHash",
-									vec![Value::u128((*height).into())],
-								);
-								let actual = relay
-									.storage()
-									.at_latest()
-									.await?
-									.fetch(&query)
-									.await?
-									.ok_or_else(|| anyhow!("timeout block hash missing"))?
-									.as_type::<H256>()?;
-								if actual != *expected {
-									return Err(anyhow!(
-										"timeout observation was on an abandoned relay fork"
-									));
-								}
-							}
+							check_finalized_timeouts(&relay, &timeout_blocks).await?;
 							if reorg {
 								send_and_follow(&relay, &sender, &receiver).await?;
 								log::info!(
@@ -3961,6 +3943,28 @@ async fn run_v3_timeout_recovery(
 	result.map_err(|_| {
 		anyhow!("V3 recovery experiment exceeded {} seconds", test_timeout.as_secs())
 	})?
+}
+
+async fn check_finalized_timeouts(
+	relay: &OnlineClient<PolkadotConfig>,
+	timeout_blocks: &BTreeMap<u32, H256>,
+) -> Result<(), anyhow::Error> {
+	for (height, expected) in timeout_blocks {
+		let query =
+			subxt::dynamic::storage("System", "BlockHash", vec![Value::u128((*height).into())]);
+		let actual = relay
+			.storage()
+			.at_latest()
+			.await?
+			.fetch(&query)
+			.await?
+			.ok_or_else(|| anyhow!("timeout block hash missing"))?
+			.as_type::<H256>()?;
+		if actual != *expected {
+			return Err(anyhow!("timeout observation was on an abandoned relay fork"));
+		}
+	}
+	Ok(())
 }
 
 async fn recover_after_catch_up(
