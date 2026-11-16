@@ -1953,8 +1953,7 @@ async fn follow_delivery(
 					}
 					log::info!(
 						"Checkpoint 5/6, backing: {RECEIVER} block #{} is finalized, so its \
-						 candidate was backed and included: the relay matched its `Requires` \
-						 against {SENDER}'s provides window",
+						 candidate was backed and included: the relay accepted its `Requires`",
 						block.number(),
 					);
 					consumed = true;
@@ -2254,11 +2253,18 @@ async fn spec_msg_v3_optimistic_bundle_cut() -> Result<(), anyhow::Error> {
 	run_v3_delivery(V3Delivery::BundleCut).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_joint_enactment() -> Result<(), anyhow::Error> {
+	run_v3_delivery(V3Delivery::JointEnactment).await
+}
+
 #[derive(Clone, Copy, Debug)]
 enum V3Delivery {
 	IncludedOnly,
 	EarlyConsumption,
 	BundleCut,
+	JointEnactment,
 }
 
 async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
@@ -2271,6 +2277,7 @@ async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
 	);
 	let policy = match check {
 		V3Delivery::IncludedOnly => RootPolicy::IncludedOnly,
+		V3Delivery::JointEnactment => RootPolicy::ReceiverOptimistic,
 		_ => RootPolicy::BothOptimistic,
 	};
 	let control = tempfile::tempdir()?;
@@ -2312,6 +2319,8 @@ async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
 			prove_early_consumption(&relay, &sender, &receiver, &mut blocks).await?;
 		} else if matches!(check, V3Delivery::BundleCut) {
 			prove_bundle_cut(&relay, &sender, &receiver, &mut blocks).await?;
+		} else if matches!(check, V3Delivery::JointEnactment) {
+			prove_joint_enactment(&relay, &sender, &receiver, &gate, &mut blocks).await?;
 		} else {
 			send_and_follow(&relay, &sender, &receiver).await?;
 			let mut seen = std::collections::BTreeSet::new();
@@ -2446,6 +2455,239 @@ async fn prove_bundle_cut(
 	tokio::time::timeout(Duration::from_secs(120), observe)
 		.await
 		.map_err(|_| anyhow!("no multi-block runtime-cut bundle enacted within 120 seconds"))?
+}
+
+async fn receiver_bundle_contains_packet(
+	receiver: &OnlineClient<PolkadotConfig>,
+	head: &polkadot_primitives::HeadData,
+	packet: &[u8],
+) -> Result<bool, anyhow::Error> {
+	use cumulus_primitives_spec_messaging::MessagingInherentData;
+	let mut block =
+		receiver.blocks().at(H256::from(sp_crypto_hashing::blake2_256(&head.0))).await?;
+	let index = bundle_index(&block).ok_or_else(|| anyhow!("receiver has no bundle index"))?;
+	for offset in 0..=index {
+		for extrinsic in block.extrinsics().await?.iter() {
+			if extrinsic.pallet_name()? != "SpecMessaging" ||
+				extrinsic.variant_name()? != "enact_messages"
+			{
+				continue;
+			}
+			let data = MessagingInherentData::decode_all(&mut &extrinsic.field_bytes()[..])?;
+			if data
+				.channels
+				.get(&in_channel())
+				.is_some_and(|payloads| payloads.iter().any(|payload| payload.as_slice() == packet))
+			{
+				return Ok(true);
+			}
+		}
+		if offset != index {
+			block = receiver.blocks().at(block.header().parent_hash).await?;
+		}
+	}
+	Ok(false)
+}
+
+async fn prove_joint_enactment(
+	relay: &OnlineClient<PolkadotConfig>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+	gate: &std::path::Path,
+	finalized: &mut StreamOfResults<Block<PolkadotConfig, OnlineClient<PolkadotConfig>>>,
+) -> Result<(), anyhow::Error> {
+	use cumulus_primitives_spec_messaging::ChannelMessage;
+	use polkadot_primitives::{
+		CandidateDescriptorVersion, CandidateReceiptV2, CommittedCandidateReceiptV2, CoreState,
+		HeadData, StreamsRoot,
+	};
+	let check = async {
+		let before_send = receiver.blocks().at(best_hash(receiver).await?).await?.number();
+		let deliveries = receiver.blocks().subscribe_finalized().await?;
+		let mut best = relay.blocks().subscribe_best().await?;
+		let arm = relay.blocks().at(best_hash(relay).await?).await?;
+		let baseline: Option<StreamsRoot> = call_at(
+			relay,
+			Some(arm.hash()),
+			"ParachainHost_newest_included_provides",
+			&ParaId::from(SENDER).encode(),
+		)
+		.await?;
+		let baseline =
+			baseline.ok_or_else(|| anyhow!("sender has no included root after opening"))?;
+		std::fs::write(gate, baseline.0.as_bytes())?;
+		let id = H256::from([0x4a; 32]);
+		let (sent_hash, ids) =
+			submit_sudo(sender, send_xcm_with_topic(RECEIVER, Some(id.0)), false).await?;
+		if ids != vec![id.0.to_vec()] {
+			return Err(anyhow!("joint-enactment send did not retain its topic"));
+		}
+		let sent = sender.blocks().at(sent_hash).await?;
+		let committed = committed_stream_roots(&sent).await?;
+		let root = committed_root(&sent).ok_or_else(|| anyhow!("send has no committed root"))?;
+		let outbound: Vec<(StreamId, Vec<Vec<u8>>)> =
+			call_at(sender, Some(sent_hash), "SpecMsgApi_outbound_messages", &[]).await?;
+		let packets: Vec<_> = outbound
+			.into_iter()
+			.filter(|(stream, _)| *stream == out_channel().data_stream())
+			.flat_map(|(_, messages)| messages)
+			.filter(|payload| {
+				matches!(ChannelMessage::decode_all(&mut &payload[..]), Ok(ChannelMessage::Data(_)))
+			})
+			.collect();
+		if packets.len() != 1 {
+			return Err(anyhow!("joint enactment expects one outbound data packet"));
+		}
+		let packet = &packets[0];
+		log::info!(
+			"Withholding the joint-enactment provider beyond {baseline:?}; sender block {:?}",
+			sent.hash()
+		);
+		let (provider, dependent, height, checkpoint) = 'ready: loop {
+			let block =
+				best.next().await.ok_or_else(|| anyhow!("relay best subscription ended"))??;
+			if block.number() <= arm.number() {
+				continue;
+			}
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() == "ParaInclusion" &&
+					event.variant_name() == "CandidateTimedOut"
+				{
+					let (receipt, _) =
+						<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+					if [SENDER.into(), RECEIVER.into()].contains(&receipt.descriptor.para_id()) {
+						return Err(anyhow!(
+							"candidate timed out before the joint-enactment release"
+						));
+					}
+				}
+			}
+			let included: Option<StreamsRoot> = call_at(
+				relay,
+				Some(block.hash()),
+				"ParachainHost_newest_included_provides",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?;
+			if included != Some(baseline) {
+				return Err(anyhow!("sender advanced while its new commitments were withheld"));
+			}
+			let providers: Vec<CommittedCandidateReceiptV2> = call_at(
+				relay,
+				Some(block.hash()),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?;
+			let dependents: Vec<CommittedCandidateReceiptV2> = call_at(
+				relay,
+				Some(block.hash()),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(RECEIVER).encode(),
+			)
+			.await?;
+			let cores: Vec<CoreState> =
+				call_at(relay, Some(block.hash()), "ParachainHost_availability_cores", &[]).await?;
+			let available = |hash| {
+				cores.iter().find_map(|core| match core {
+					CoreState::Occupied(core) if core.candidate_hash == hash => Some(
+						core.availability.count_ones() >=
+							polkadot_primitives::supermajority_threshold(
+								core.availability.len(),
+							),
+					),
+					_ => None,
+				})
+			};
+			for provider in &providers {
+				let signals = provider.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+				let Some(provided) = signals.provides() else { continue };
+				if *provided == baseline ||
+					available(provider.hash()) != Some(false) ||
+					!sender_bundle_contains_packet(
+						sender,
+						&provider.commitments.head_data,
+						packet,
+					)
+					.await?
+				{
+					continue;
+				}
+				for dependent in &dependents {
+					let signals =
+						dependent.commitments.ump_signals().map_err(|e| anyhow!("{e:?}"))?;
+					if signals.requires().and_then(|r| r.get(SENDER.into())) != Some(provided) ||
+						available(dependent.hash()) != Some(true) ||
+						!receiver_bundle_contains_packet(
+							receiver,
+							&dependent.commitments.head_data,
+							packet,
+						)
+						.await?
+					{
+						continue;
+					}
+					if [provider, dependent]
+						.iter()
+						.any(|c| c.descriptor.version() != CandidateDescriptorVersion::V3)
+					{
+						return Err(anyhow!("joint-enactment pair is not V3"));
+					}
+					log::info!("Provider {:?} unavailable; dependent {:?} has an availability quorum at relay #{} {:?}, Requires {provided:?}",
+						provider.hash(), dependent.hash(), block.number(), block.hash());
+					break 'ready (provider.hash(), dependent.hash(), block.number(), block.hash());
+				}
+			}
+		};
+		std::fs::remove_file(gate)?;
+		log::info!("Released availability for joint-enactment pair {provider:?}, {dependent:?}");
+		loop {
+			let block = finalized
+				.next()
+				.await
+				.ok_or_else(|| anyhow!("relay finality subscription ended"))??;
+			let mut included = std::collections::BTreeSet::new();
+			for event in block.events().await?.iter() {
+				let event = event?;
+				if event.pallet_name() != "ParaInclusion" ||
+					!matches!(event.variant_name(), "CandidateIncluded" | "CandidateTimedOut")
+				{
+					continue;
+				}
+				let (receipt, _) =
+					<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+				let hash = receipt.hash();
+				if hash != provider && hash != dependent {
+					continue;
+				}
+				if event.variant_name() == "CandidateTimedOut" {
+					return Err(anyhow!("joint-enactment candidate timed out after release"));
+				}
+				included.insert(hash);
+			}
+			if included.is_empty() {
+				continue;
+			}
+			if included.len() != 2 {
+				return Err(anyhow!(
+					"provider and dependent enacted separately at relay #{}",
+					block.number()
+				));
+			}
+			if relay_ancestor(relay, block.hash(), height).await? != Some(checkpoint) {
+				return Err(anyhow!(
+					"availability checkpoint is not on the finalized joint-enactment chain"
+				));
+			}
+			log::info!("Joint enactment: provider {provider:?} and dependent {dependent:?} in finalized relay #{} {:?}", block.number(), block.hash());
+			break;
+		}
+		follow_delivery(receiver, deliveries, before_send, id, root, &committed).await
+	};
+	tokio::time::timeout(Duration::from_secs(120), check)
+		.await
+		.map_err(|_| anyhow!("joint-enactment check exceeded 120 seconds"))?
 }
 
 async fn sender_bundle_contains_packet(
