@@ -1817,6 +1817,21 @@ async fn call_at<T: Decode>(
 	Ok(T::decode(&mut &bytes[..])?)
 }
 
+/// [`call_at`] for a block from a best-block stream, or `None` once that block's state is pruned.
+async fn call_at_unpruned<T: Decode>(
+	client: &OnlineClient<PolkadotConfig>,
+	at: H256,
+	method: &str,
+	args: &[u8],
+) -> Result<Option<T>, anyhow::Error> {
+	match call_at(client, Some(at), method, args).await {
+		Ok(value) => Ok(Some(value)),
+		// The stream also yields fork blocks, whose state is discarded once their fork loses.
+		Err(e) if e.to_string().contains("State already discarded") => Ok(None),
+		Err(e) => Err(e),
+	}
+}
+
 /// Whether the relay chain has an HRMP channel `from -> to`.
 async fn hrmp_channel_open(
 	relay: &OnlineClient<PolkadotConfig>,
@@ -3539,26 +3554,39 @@ async fn run_v3_timeout_recovery(
 			};
 			let Some(block) = next else { break };
 			let block = block?;
-			let current_session: u32 =
-				call_at(&relay, Some(block.hash()), "ParachainHost_session_index_for_child", &[])
-					.await?;
+			let Some(current_session): Option<u32> = call_at_unpruned(
+				&relay,
+				block.hash(),
+				"ParachainHost_session_index_for_child",
+				&[],
+			)
+			.await?
+			else {
+				continue;
+			};
 			if current_session != session {
 				return Err(anyhow!("session cleanup occurred before the timeout assertions"));
 			}
-			let providers: Vec<CommittedCandidateReceiptV2> = call_at(
+			let Some(providers): Option<Vec<CommittedCandidateReceiptV2>> = call_at_unpruned(
 				&relay,
-				Some(block.hash()),
+				block.hash(),
 				"ParachainHost_candidates_pending_availability",
 				&ParaId::from(SENDER).encode(),
 			)
-			.await?;
-			let dependents: Vec<CommittedCandidateReceiptV2> = call_at(
+			.await?
+			else {
+				continue;
+			};
+			let Some(dependents): Option<Vec<CommittedCandidateReceiptV2>> = call_at_unpruned(
 				&relay,
-				Some(block.hash()),
+				block.hash(),
 				"ParachainHost_candidates_pending_availability",
 				&ParaId::from(RECEIVER).encode(),
 			)
-			.await?;
+			.await?
+			else {
+				continue;
+			};
 			if original.is_none() {
 				for candidate in &dependents {
 					let signals =
@@ -4098,23 +4126,33 @@ async fn recover_after_catch_up(
 	let mut delivery = false;
 	while let Some(block) = blocks.next().await {
 		let block = block?;
-		let session: u32 =
-			call_at(relay, Some(block.hash()), "ParachainHost_session_index_for_child", &[])
-				.await?;
-		let info: Option<RelayParentInfo<H256, u32>> = call_at(
+		let Some(session): Option<u32> =
+			call_at_unpruned(relay, block.hash(), "ParachainHost_session_index_for_child", &[])
+				.await?
+		else {
+			continue;
+		};
+		let Some(info): Option<Option<RelayParentInfo<H256, u32>>> = call_at_unpruned(
 			relay,
-			Some(block.hash()),
+			block.hash(),
 			"ParachainHost_ancestor_relay_parent_info",
 			&(parent_session, execution_parent).encode(),
 		)
-		.await?;
-		let pending: Vec<polkadot_primitives::CommittedCandidateReceiptV2> = call_at(
-			relay,
-			Some(block.hash()),
-			"ParachainHost_candidates_pending_availability",
-			&ParaId::from(SENDER).encode(),
-		)
-		.await?;
+		.await?
+		else {
+			continue;
+		};
+		let Some(pending): Option<Vec<polkadot_primitives::CommittedCandidateReceiptV2>> =
+			call_at_unpruned(
+				relay,
+				block.hash(),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?
+		else {
+			continue;
+		};
 		let finalized = finalized_number(&sender).await?;
 		log::info!("Outage +{}s: relay #{} {:?}, session={session}, relay_parent_present={}, sender_pending={}, sender_finalized={finalized}, receiver_finalized={}", stopped.elapsed().as_secs(), block.number(), block.hash(), info.is_some(), pending.len(), finalized_number(receiver).await?);
 		if info.is_none() || session != parent_session {
