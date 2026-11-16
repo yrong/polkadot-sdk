@@ -283,6 +283,8 @@ async fn determine_core_no_cores_available() {
 
 #[derive(Clone)]
 pub struct TestRelayClient {
+	pub pvd_response_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
+	pub import_notifications: Arc<Mutex<Option<Pin<Box<dyn Stream<Item = RelayHeader> + Send>>>>>,
 	headers: HashMap<RelayHash, RelayHeader>,
 	best_hash: Arc<Mutex<Option<RelayHash>>>,
 	best_notifications: Arc<Mutex<Option<Pin<Box<dyn Stream<Item = RelayHeader> + Send + Sync>>>>>,
@@ -292,6 +294,8 @@ impl TestRelayClient {
 	pub fn new(headers: HashMap<RelayHash, RelayHeader>) -> Self {
 		Self {
 			headers,
+			import_notifications: Default::default(),
+			pvd_response_gate: Default::default(),
 			best_hash: Default::default(),
 			best_notifications: Arc::new(Mutex::new(None)),
 		}
@@ -300,6 +304,8 @@ impl TestRelayClient {
 	pub fn new_with_best(headers: HashMap<RelayHash, RelayHeader>, best_hash: RelayHash) -> Self {
 		Self {
 			headers,
+			import_notifications: Default::default(),
+			pvd_response_gate: Default::default(),
 			best_hash: Arc::new(Mutex::new(Some(best_hash))),
 			best_notifications: Arc::new(Mutex::new(None)),
 		}
@@ -357,6 +363,12 @@ impl RelayChainInterface for TestRelayClient {
 	) -> RelayChainResult<Option<PersistedValidationData>> {
 		use cumulus_primitives_core::PersistedValidationData;
 
+		// The fixture never panics while holding this gate mutex; qed
+		let gate = self.pvd_response_gate.lock().unwrap().take();
+		if let Some(gate) = gate {
+			gate.await.expect("test releases the PVD response; qed");
+		}
+
 		if self.headers.get(&hash).is_none() {
 			return Ok(None);
 		}
@@ -395,13 +407,13 @@ impl RelayChainInterface for TestRelayClient {
 	}
 
 	async fn session_index_for_child(&self, _: RelayHash) -> RelayChainResult<SessionIndex> {
-		unimplemented!("Not needed for test")
+		Ok(1)
 	}
 
 	async fn import_notification_stream(
 		&self,
 	) -> RelayChainResult<Pin<Box<dyn Stream<Item = PHeader> + Send>>> {
-		unimplemented!("Not needed for test")
+		Ok(self.import_notifications.lock().unwrap().take().unwrap())
 	}
 
 	async fn finality_notification_stream(
@@ -459,7 +471,18 @@ impl RelayChainInterface for TestRelayClient {
 	) -> RelayChainResult<Option<PHeader>> {
 		let hash = match block_id {
 			BlockId::Hash(hash) => hash,
-			BlockId::Number(_) => unimplemented!("Not needed for test"),
+			BlockId::Number(number) => {
+				if let Some(best) = *self.best_hash.lock().unwrap() {
+					if self.headers[&best].number < number {
+						return Ok(None);
+					}
+				}
+				let Some(header) = self.headers.values().find(|header| header.number == number)
+				else {
+					return Ok(None);
+				};
+				header.hash()
+			},
 		};
 		let header = self.headers.get(&hash);
 

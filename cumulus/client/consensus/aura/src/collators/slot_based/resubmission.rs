@@ -19,12 +19,13 @@
 //!
 //! [`resolve_session`] is shared by the build path (block_builder_task) and the resubmission
 //! backfill task. [`run_resubmission_backfill`] is the task that records resubmission entries for
-//! blocks imported at the tip (built by other collators), doing the relay-chain queries off the
+//! unfinalized imported blocks, doing the relay-chain queries off the
 //! block-import path.
 
 use super::SlotBasedBlockImportHandle;
 use cumulus_client_resubmission_store::{
-	prepare_resubmission_aux_data, prune_finalized_entries, prune_missed_finalized_entries,
+	finality_cleanup_ops, prepare_resubmission_aux_data, prune_finalized_entries,
+	prune_missed_finalized_entries,
 };
 use cumulus_primitives_core::{
 	relay_chain::{
@@ -103,11 +104,7 @@ async fn resolve_relay_parent<R: RelayChainInterface + ?Sized>(
 	}
 }
 
-/// Maintain the resubmission store for blocks imported at the tip.
-///
-/// Receives imported `(block, storage proof)` pairs from the [`SlotBasedBlockImportHandle`] and
-/// records a resubmission entry for each via [`backfill_resubmission_entry`], and prunes entries as
-/// blocks are finalized.
+/// Record recovery data for unfinalized imports, with relay queries off the import path.
 pub(crate) async fn run_resubmission_backfill<Block, RClient, Client>(
 	mut block_import_handle: SlotBasedBlockImportHandle<Block>,
 	relay_client: RClient,
@@ -118,8 +115,6 @@ pub(crate) async fn run_resubmission_backfill<Block, RClient, Client>(
 	RClient: RelayChainInterface,
 	Client: AuxStore + HeaderBackend<Block> + BlockchainEvents<Block>,
 {
-	// Reclaim entries for blocks that were finalized without their prune being observed (e.g. while
-	// the node was down). The notification stream below only covers finalizations from now on.
 	if let Err(err) = prune_missed_finalized_entries::<Block, _>(&*para_client) {
 		tracing::warn!(
 			target: LOG_TARGET,
@@ -147,6 +142,7 @@ pub(crate) async fn run_resubmission_backfill<Block, RClient, Client>(
 					break;
 				};
 
+				// Reap late writes, including stale forks above the finalized height.
 				if let Err(err) = prune_finalized_entries(&*para_client, &notification) {
 					tracing::warn!(
 						target: LOG_TARGET,
@@ -187,7 +183,7 @@ async fn backfill_resubmission_entry<Block, R, Client>(
 ) where
 	Block: BlockT,
 	R: RelayChainInterface + ?Sized,
-	Client: AuxStore + HeaderBackend<Block>,
+	Client: AuxStore + HeaderBackend<Block> + BlockchainEvents<Block>,
 {
 	let block_hash = header.hash();
 	let number = *header.number();
@@ -209,9 +205,29 @@ async fn backfill_resubmission_entry<Block, R, Client>(
 		return;
 	};
 
-	let relay_parent_header =
+	let mut relay_imports = None;
+	let mut finality_notifications = None;
+	let relay_parent_header = loop {
+		if number <= para_client.info().finalized_number {
+			return;
+		}
 		match resolve_relay_parent(relay_client, &relay_block_identifier).await {
-			Ok(header) => header,
+			Ok(header) => break header,
+			Err(ResubmissionError::HeaderUnavailable(_)) => {
+				if relay_imports.is_none() {
+					let imports = match relay_client.import_notification_stream().await {
+						Ok(imports) => imports,
+						Err(err) => {
+							tracing::debug!(target: LOG_TARGET, ?block_hash, ?err, "Could not subscribe to relay imports; skipping resubmission entry.");
+							return;
+						},
+					};
+					relay_imports = Some(imports);
+					finality_notifications = Some(para_client.finality_notification_stream());
+					// Recheck after subscribing so a concurrent relay import cannot be missed.
+					continue;
+				}
+			},
 			Err(err) => {
 				tracing::debug!(
 					target: LOG_TARGET,
@@ -221,7 +237,15 @@ async fn backfill_resubmission_entry<Block, R, Client>(
 				);
 				return;
 			},
-		};
+		}
+
+		let imports = relay_imports.as_mut().expect("subscribed before waiting; qed");
+		let finalized = finality_notifications.as_mut().expect("subscribed before waiting; qed");
+		futures::select! {
+			import = imports.next().fuse() => if import.is_none() { return },
+			finality = finalized.next().fuse() => if finality.is_none() { return },
+		}
+	};
 	let relay_parent = relay_parent_header.hash();
 
 	let relay_parent_session = match resolve_session(relay_client, relay_parent).await {
@@ -284,5 +308,240 @@ async fn backfill_resubmission_entry<Block, R, Client>(
 			?err,
 			"Failed to store resubmission entry for imported block.",
 		),
+	}
+	if number <= para_client.info().finalized_number {
+		let ops = finality_cleanup_ops::<Block>(block_hash, &[], core::iter::empty());
+		let deletes: Vec<_> = ops.iter().map(|(key, _)| key.as_slice()).collect();
+		if let Err(err) = para_client.insert_aux(&[], &deletes) {
+			tracing::warn!(target: LOG_TARGET, ?block_hash, ?err, "Failed to delete finalized resubmission entry.");
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{
+		super::{tests::TestRelayClient, SlotBasedBlockImport},
+		*,
+	};
+	use codec::Encode;
+	use cumulus_client_resubmission_store::ResubmissionStore;
+	use cumulus_primitives_core::{
+		rpsr_digest::relay_parent_storage_root_item, BlockBundleInfo, CoreInfo,
+	};
+	use cumulus_test_client::{
+		runtime::Block, BuildBlockBuilder, Client, TestClientBuilder, TestClientBuilderExt,
+	};
+	use cumulus_test_relay_sproof_builder::RelayStateSproofBuilder;
+	use futures::{channel::mpsc, poll};
+	use sc_client_api::backend::Finalizer;
+	use sc_consensus::{
+		BlockImport, BlockImportParams, ForkChoiceStrategy, StateAction, StorageChanges,
+	};
+	use sp_consensus::BlockOrigin;
+	use std::collections::HashMap;
+
+	fn relay() -> (TestRelayClient, mpsc::UnboundedSender<RelayHeader>, RelayHeader) {
+		let old = RelayHeader::new(
+			63,
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+		);
+		let parent = RelayHeader::new(
+			64,
+			Default::default(),
+			RelayHash::repeat_byte(1),
+			old.hash(),
+			Default::default(),
+		);
+		let mut client = TestRelayClient::new_with_best(
+			HashMap::from([(old.hash(), old.clone()), (parent.hash(), parent.clone())]),
+			old.hash(),
+		);
+		let (tx, rx) = mpsc::unbounded();
+		*client.import_notifications.lock().unwrap() = Some(Box::pin(rx));
+		client.set_best_hash(Some(old.hash()));
+		(client, tx, parent)
+	}
+
+	#[tokio::test]
+	async fn backfill_retains_proof_until_relay_header_arrives() {
+		let client = Arc::new(TestClientBuilder::default().build());
+		let (mut relay, mut imports, parent) = relay();
+		let header = <Block as BlockT>::Header::new(
+			1,
+			Default::default(),
+			Default::default(),
+			client.info().genesis_hash,
+			sp_runtime::Digest {
+				logs: vec![relay_parent_storage_root_item(parent.state_root, parent.number)],
+			},
+		);
+		let proof = Arc::new(StorageProof::new(vec![vec![1, 2, 3]]));
+		let store = ResubmissionStore::<Block, _>::new(client.clone());
+		let recovery_relay = relay.clone();
+		let backfill = backfill_resubmission_entry::<Block, _, _>(
+			&recovery_relay,
+			&*client,
+			&header,
+			proof.clone(),
+			2000.into(),
+		);
+		futures::pin_mut!(backfill);
+		assert!(poll!(&mut backfill).is_pending());
+		assert!(store.load(header.hash()).expect("store lookup succeeds; qed").is_none());
+
+		relay.set_best_hash(Some(parent.hash()));
+		imports.start_send(parent.clone()).expect("relay subscriber is alive; qed");
+		backfill.await;
+		let entry = store
+			.load(header.hash())
+			.expect("store lookup succeeds; qed")
+			.expect("proof was retained; qed");
+		assert_eq!(entry.proof, proof);
+		assert_eq!(entry.relay_parent_header, parent);
+		assert_eq!(entry.relay_parent_session, 1);
+		assert_eq!(entry.max_pov_size, 1024 * 1024);
+	}
+
+	#[tokio::test]
+	async fn backfill_rejects_a_relay_header_from_another_fork() {
+		let client = Arc::new(TestClientBuilder::default().build());
+		let (mut relay, _imports, parent) = relay();
+		relay.set_best_hash(Some(parent.hash()));
+		let header = <Block as BlockT>::Header::new(
+			1,
+			Default::default(),
+			Default::default(),
+			client.info().genesis_hash,
+			sp_runtime::Digest {
+				logs: vec![relay_parent_storage_root_item(
+					RelayHash::repeat_byte(2),
+					parent.number,
+				)],
+			},
+		);
+		backfill_resubmission_entry::<Block, _, _>(
+			&relay,
+			&*client,
+			&header,
+			Arc::new(StorageProof::empty()),
+			2000.into(),
+		)
+		.await;
+		assert!(ResubmissionStore::<Block, _>::new(client)
+			.load(header.hash())
+			.expect("store lookup succeeds; qed")
+			.is_none());
+	}
+
+	async fn imported_header(client: &Client, parent: &RelayHeader) -> <Block as BlockT>::Header {
+		let mut sproof = RelayStateSproofBuilder::default();
+		sproof.para_id = cumulus_test_client::runtime::PARACHAIN_ID.into();
+		sproof.included_para_head = Some(
+			client
+				.header(client.info().genesis_hash)
+				.expect("header lookup succeeds; qed")
+				.expect("genesis exists; qed")
+				.encode()
+				.into(),
+		);
+		let built = client
+			.init_block_builder_builder()
+			.with_relay_sproof_builder(sproof)
+			.with_pre_digests(vec![
+				relay_parent_storage_root_item(parent.state_root, parent.number),
+				CumulusDigestItem::CoreInfo(CoreInfo {
+					selector: 0.into(),
+					claim_queue_offset: 0.into(),
+					number_of_cores: 1.into(),
+				})
+				.to_digest_item(),
+				CumulusDigestItem::BlockBundleInfo(BlockBundleInfo { index: 0, is_last: true })
+					.to_digest_item(),
+			])
+			.build()
+			.block_builder
+			.build()
+			.expect("test block builds; qed");
+		let (header, body) = built.block.deconstruct();
+		let mut params = BlockImportParams::new(BlockOrigin::Own, header.clone());
+		params.body = Some(body);
+		params.fork_choice = Some(ForkChoiceStrategy::LongestChain);
+		params.state_action =
+			StateAction::ApplyChanges(StorageChanges::Changes(built.storage_changes));
+		client.import_block(params).await.expect("test block imports; qed");
+		header
+	}
+
+	#[tokio::test]
+	async fn finality_during_pvd_lookup_does_not_leave_a_proof_row() {
+		let client = Arc::new(TestClientBuilder::default().build());
+		let (_importer, _handle) = SlotBasedBlockImport::new(client.clone(), client.clone());
+		let (_, _, parent) = relay();
+		let header = imported_header(&client, &parent).await;
+		let Some(RelayBlockIdentifier::ByStorageRoot { storage_root, block_number }) =
+			CumulusDigestItem::find_relay_block_identifier(header.digest())
+		else {
+			panic!("test block carries a relay storage root");
+		};
+		let relay_parent = RelayHeader::new(
+			block_number,
+			Default::default(),
+			storage_root,
+			Default::default(),
+			Default::default(),
+		);
+		let relay = TestRelayClient::new_with_best(
+			HashMap::from([(relay_parent.hash(), relay_parent.clone())]),
+			relay_parent.hash(),
+		);
+		let (release, gate) = futures::channel::oneshot::channel();
+		*relay.pvd_response_gate.lock().expect("test mutex; qed") = Some(gate);
+		let backfill = backfill_resubmission_entry::<Block, _, _>(
+			&relay,
+			&*client,
+			&header,
+			Arc::new(StorageProof::empty()),
+			2000.into(),
+		);
+		futures::pin_mut!(backfill);
+		assert!(poll!(&mut backfill).is_pending());
+		assert!(relay.pvd_response_gate.lock().expect("test mutex; qed").is_none());
+		client
+			.finalize_block(header.hash(), None, true)
+			.expect("test finality commits; qed");
+		release.send(()).expect("PVD query is waiting; qed");
+		backfill.await;
+		assert!(ResubmissionStore::<Block, _>::new(client.clone())
+			.load(header.hash())
+			.expect("row lookup succeeds; qed")
+			.is_none());
+	}
+
+	#[tokio::test]
+	async fn finality_releases_a_proof_waiting_for_its_relay_header() {
+		let client = Arc::new(TestClientBuilder::default().build());
+		let (relay, _imports, parent) = relay();
+		let header = imported_header(&client, &parent).await;
+		let backfill = backfill_resubmission_entry::<Block, _, _>(
+			&relay,
+			&*client,
+			&header,
+			Arc::new(StorageProof::empty()),
+			2000.into(),
+		);
+		futures::pin_mut!(backfill);
+		assert!(poll!(&mut backfill).is_pending());
+		client
+			.finalize_block(header.hash(), None, true)
+			.expect("test block finalizes; qed");
+		backfill.await;
+		assert!(ResubmissionStore::<Block, _>::new(client.clone())
+			.load(header.hash())
+			.expect("store lookup succeeds; qed")
+			.is_none());
 	}
 }

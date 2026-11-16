@@ -185,7 +185,7 @@ where
 /// Emits deletes for stale-fork blocks, intermediate tree-route blocks, and the just-finalized
 /// block itself. Once a block is finalized it is no longer in any unincluded segment, so its
 /// proof entry is dead weight.
-fn finality_cleanup_ops<Block: BlockT>(
+pub fn finality_cleanup_ops<Block: BlockT>(
 	just_finalized_hash: Block::Hash,
 	tree_route: &[Block::Hash],
 	stale_block_hashes: impl IntoIterator<Item = Block::Hash>,
