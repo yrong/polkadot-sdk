@@ -69,16 +69,12 @@ pub mod migration;
 mod enactment;
 
 pub trait WeightInfo {
-	/// Weight for `enact_candidate` extrinsic given the number of sent messages
-	/// (ump, hrmp), whether there is a new code for a runtime upgrade, and whether the candidate
-	/// records a `Provides` root.
-	///
-	/// NOTE: due to a shortcoming of the current benchmarking framework,
-	/// we use `u32` for the code upgrade and `Provides` flags, even though they are `bool`s.
+	/// Enactment weight for UMP/HRMP messages and code-upgrade/`Provides` flags.
+	/// The benchmark framework represents boolean flags as `u32`.
 	fn enact_candidate(u: u32, h: u32, c: u32, p: u32) -> Weight;
 	/// Append a root to a full provides window.
 	fn record_provides() -> Weight;
-	/// Pending queue scans, vote updates, and candidate selection.
+	/// Pending queue scans, vote updates and selection for `c` candidates.
 	fn enactment_selection(c: u32) -> Weight;
 	/// Matching and propagation for `e` total requirements.
 	fn enactment_selection_requirements(e: u32) -> Weight;
@@ -187,7 +183,6 @@ impl<H, N> CandidatePendingAvailability<H, N> {
 		&self.commitments
 	}
 
-	/// Mutable access to the candidate commitments, for tests that add UMP signals.
 	#[cfg(all(test, not(feature = "runtime-benchmarks")))]
 	pub(crate) fn candidate_commitments_mut(&mut self) -> &mut CandidateCommitments {
 		&mut self.commitments
@@ -402,12 +397,8 @@ pub mod pallet {
 		VecDeque<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
-	/// Per-sender window of recently committed `StreamsRoot`s for speculative messaging, newest
-	/// last, at most [`MAX_PROVIDES_WINDOW_SIZE`]. A receiver's `Requires` matches a root in it.
-	/// Reverted with the chain, dropped when the sender offboards.
-	/// Not cleared by a forced head update (`force_set_current_head`, `force_note_new_head`): that
-	/// is a Root recovery, and undoing what receivers already consumed is an off-chain runbook
-	/// step.
+	/// Recent included roots per sender, oldest first.
+	/// Forced head updates retain the window because receivers may have consumed its roots.
 	#[pallet::storage]
 	pub(crate) type RecentProvides<T: Config> = StorageMap<
 		_,
@@ -423,8 +414,7 @@ pub mod pallet {
 
 const LOG_TARGET: &str = "runtime::inclusion";
 
-/// Length of a sender's provides window. It must cover the authoring→inclusion pipeline, including
-/// elastic-scaling bursts, with ample slack.
+/// Covers the authoring-to-inclusion pipeline, including elastic-scaling bursts.
 pub const MAX_PROVIDES_WINDOW_SIZE: u32 = 128;
 
 /// The reason that a candidate's outputs were rejected for.
@@ -600,9 +590,6 @@ impl<T: Config> Pallet<T> {
 			for candidate in candidates.iter_mut() {
 				if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
 					for validator_index in validator_indices.iter() {
-						// defensive check - this is constructed by loading the
-						// availability bitfield record, which is always `Some` if
-						// the core is occupied - that's why we're here.
 						if let Some(mut bit) =
 							candidate.availability_votes.get_mut(validator_index.0 as usize)
 						{
@@ -630,8 +617,6 @@ impl<T: Config> Pallet<T> {
 			PendingAvailability::<T>::mutate(paraid, |candidates| {
 				if let Some(candidates) = candidates {
 					if let Some(last_enacted_index) = count.checked_sub(1) {
-						// Trim the pending availability candidates storage and enact candidates of
-						// this para now.
 						let evicted_candidates = candidates.drain(0..=last_enacted_index);
 						for candidate in evicted_candidates {
 							freed_cores.push((candidate.core, candidate.hash));
@@ -922,7 +907,6 @@ impl<T: Config> Pallet<T> {
 		let commitments = receipt.commitments;
 		let config = configuration::ActiveConfig::<T>::get();
 
-		// Read `Provides` before `commitments` is moved out below.
 		let provides = commitments.ump_signals().ok().and_then(|s| s.provides().copied());
 
 		T::RewardValidators::reward_backing(
@@ -1063,24 +1047,18 @@ impl<T: Config> Pallet<T> {
 			.set_proof_size(0)
 	}
 
-	/// Whether `root` is present in `source`'s provides window.
 	fn provides_contains(source: ParaId, root: &StreamsRoot) -> bool {
-		// Scan newest-first: a `requires` almost always references a recent commitment, which sits
-		// at the tail of the drop-oldest window, so this short-circuits sooner on a match.
+		// Recent requirements usually target the newest roots.
 		RecentProvides::<T>::get(source).iter().rev().any(|committed| committed == root)
 	}
 
-	/// The newest entry of `source`'s provides window: its latest `StreamsRoot` committed in an
-	/// included candidate, if any.
 	pub(crate) fn newest_provides(source: ParaId) -> Option<StreamsRoot> {
 		RecentProvides::<T>::get(source).last().copied()
 	}
 
-	/// Whether every `(source, root)` of `requires` is in that source's window; `Err` names the
-	/// first miss.
+	/// Return the first requirement absent from stored windows.
 	#[cfg(test)]
 	pub(crate) fn requires_satisfied(requires: &RequiresSet) -> Result<(), (ParaId, StreamsRoot)> {
-		// One `RecentProvides` read per required source.
 		for (source, expected) in requires.iter() {
 			if !Self::provides_contains(*source, expected) {
 				return Err((*source, *expected));
@@ -1089,11 +1067,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Push a sender's `StreamsRoot` into its window, dropping the oldest when full.
+	/// Append a root, evicting the oldest when full.
 	pub(crate) fn record_provides(source: ParaId, root: StreamsRoot) {
 		log::debug!(target: LOG_TARGET, "Recording provides root {root:?} of para {source:?}");
 		RecentProvides::<T>::mutate(source, |window| {
-			// Appending at `len` never fails; a full window evicts its oldest root.
 			let _evicted = window.force_insert_keep_right(window.len(), root);
 		});
 	}

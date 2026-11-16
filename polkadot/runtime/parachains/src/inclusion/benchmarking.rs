@@ -32,8 +32,7 @@ use crate::{
 	initializer, HeadData, ValidationCode,
 };
 
-/// A distinct `StreamsRoot` per `n`. `H256::from_low_u64_be` is std-only, and benchmarks build for
-/// the wasm runtime too.
+// Avoid `H256::from_low_u64_be`, which requires std.
 fn root(n: u64) -> StreamsRoot {
 	let mut bytes = [0u8; 32];
 	bytes[24..].copy_from_slice(&n.to_be_bytes());
@@ -219,8 +218,7 @@ mod benchmarks {
 		let mut commitments =
 			create_candidate_commitments::<T>(para, head_data, max_len, u, h, c != 0);
 
-		// With `p`, carry a `Provides` into a full window, so the record reads the whole window,
-		// drops the oldest root and writes it back.
+		// Use a full window to include eviction costs.
 		if p != 0 {
 			commitments.upward_messages.force_push(UMP_SEPARATOR);
 			commitments
@@ -301,7 +299,6 @@ mod benchmarks {
 		);
 	}
 
-	/// Isolate payload copying from the much larger dependency graph workload.
 	#[benchmark]
 	fn enactment_selection_payload(b: Linear<0, { polkadot_primitives::MAX_CODE_SIZE }>) {
 		let validators = prepare_selection::<T>(0, 0, b);

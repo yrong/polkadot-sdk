@@ -345,9 +345,8 @@ sp_api::decl_runtime_apis! {
 		) -> Option<RelayParentInfo<Hash, BlockNumber>>;
 
 		/***** Added in v17 *****/
-		/// The newest `StreamsRoot` the para committed in an included candidate: the head of its
-		/// speculative-messaging provides window. `None` if it never provided, its window was
-		/// cleared, or the para is offboarding. Receivers fetch and target lifts under it.
+		/// The para's latest included `StreamsRoot`, or `None` if its provides window is empty
+		/// or it is offboarding.
 		#[api_version(17)]
 		fn newest_included_provides(para_id: ppp::Id) -> Option<StreamsRoot>;
 	}

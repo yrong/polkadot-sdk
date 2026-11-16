@@ -2549,8 +2549,6 @@ mod enter {
 		polkadot_primitives::StreamsRoot(polkadot_primitives::Hash::repeat_byte(byte))
 	}
 
-	/// Append a `Provides` signal to para 0's candidate pending availability, which becomes
-	/// available, and so is enacted, in the next `enter`.
 	fn add_provides_to_pending_candidate_of_para_0(root: polkadot_primitives::StreamsRoot) {
 		inclusion::PendingAvailability::<Test>::mutate(ParaId::from(0), |maybe_candidates| {
 			let commitments = maybe_candidates
@@ -2563,9 +2561,6 @@ mod enter {
 		});
 	}
 
-	/// A receiver backed in the same relay block as its sender's candidate is enacted still
-	/// matches: availability is processed, and the root recorded, before backed candidates are
-	/// sanitized.
 	#[test]
 	fn requires_matches_provides_enacted_in_the_same_block() {
 		new_test_ext(default_config()).execute_with(|| {
@@ -2585,8 +2580,6 @@ mod enter {
 				approved_peer_signal: None,
 				candidate_modifier: Some(|mut candidate: CommittedCandidateReceiptV2| {
 					if candidate.descriptor.para_id() == 1.into() {
-						// Para 1 requires the root para 0's concluding candidate provides in this
-						// very block.
 						candidate.commitments.upward_messages.force_push(
 							UMPSignal::Requires(
 								polkadot_primitives::RequiresSet::try_from_iter([(
@@ -2607,17 +2600,14 @@ mod enter {
 
 			let data = scenario.data.clone();
 			assert_eq!(data.backed_candidates.len(), 2);
-			// Dependency membership no longer filters candidates at backing.
 			assert_ok!(Pallet::<Test>::enter(frame_system::RawOrigin::None.into(), data));
 
-			// The root went through the real enactment path.
 			let requires = polkadot_primitives::RequiresSet::try_from_iter([(
 				ParaId::from(0),
 				streams_root(42),
 			)])
 			.unwrap();
 			assert!(inclusion::Pallet::<Test>::requires_satisfied(&requires).is_ok());
-			// Para 1's concluding candidate provided nothing.
 			assert!(!inclusion::RecentProvides::<Test>::contains_key(ParaId::from(1)));
 		});
 	}
@@ -2633,7 +2623,6 @@ mod enter {
 		.encode()
 	}
 
-	/// The paras of the candidates the block author keeps from `scenario`.
 	fn kept_paras(scenario: Bench<Test>) -> Vec<ParaId> {
 		let mut inherent_data = InherentData::new();
 		inherent_data.put_data(PARACHAINS_INHERENT_IDENTIFIER, &scenario.data).unwrap();
@@ -2645,7 +2634,6 @@ mod enter {
 			.collect()
 	}
 
-	/// Matching waits for enactment; a missing root does not prevent backing.
 	#[test]
 	fn requires_on_a_pending_root_does_not_prevent_backing() {
 		new_test_ext(default_config()).execute_with(|| {
@@ -2675,12 +2663,10 @@ mod enter {
 			assert_eq!(scenario.data.backed_candidates.len(), 2);
 
 			assert_eq!(kept_paras(scenario), vec![ParaId::from(0), ParaId::from(1)]);
-			// The sender's candidate is now pending availability, so its root is not settled.
 			assert_eq!(inclusion::Pallet::<Test>::newest_provides(ParaId::from(0)), None);
 		});
 	}
 
-	/// Signal validation rejects malformed requirements independently of root membership.
 	#[test]
 	fn a_malformed_requires_is_dropped_before_the_window_check() {
 		new_test_ext(default_config()).execute_with(|| {
@@ -2701,12 +2687,11 @@ mod enter {
 				candidate_modifier: Some(|mut candidate: CommittedCandidateReceiptV2| {
 					let messages = &mut candidate.commitments.upward_messages;
 					match u32::from(candidate.descriptor.para_id()) {
-						// A second `Requires` signal.
 						1 => {
 							messages.force_push(requires_on(0, 1));
 							messages.force_push(requires_on(0, 2));
 						},
-						// A `Requires` whose sources are out of order, encoded by hand.
+						// Bypass the constructor's source sorting.
 						2 => {
 							let unsorted = alloc::vec![
 								(ParaId::from(5), streams_root(1)),
@@ -2735,7 +2720,6 @@ mod enter {
 		});
 	}
 
-	/// Unmatched dependencies leave the backed chain intact until enactment selection.
 	#[test]
 	fn an_unmet_requires_does_not_filter_backed_descendants() {
 		new_test_ext(default_config()).execute_with(|| {
@@ -2748,14 +2732,12 @@ mod enter {
 				backed_and_concluding,
 				num_validators_per_core: 1,
 				code_upgrade: None,
-				// Para 1 backs a chain of three candidates.
 				elastic_paras: [(1, 3)].into_iter().collect(),
 				unavailable_cores: vec![],
 				descriptor_version: CandidateDescriptorVersionConfig::V2,
 				approved_peer_signal: None,
 				candidate_modifier: Some(|mut candidate: CommittedCandidateReceiptV2| {
-					// The builder marks a chain's later candidates by their head's first byte; the
-					// middle one requires a root no window holds.
+					// The builder identifies successors by the head's first byte.
 					if candidate.descriptor.para_id() == 1.into() &&
 						candidate.commitments.head_data.0[0] == 1
 					{
