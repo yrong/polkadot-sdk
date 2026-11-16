@@ -444,6 +444,18 @@ pub(crate) fn process_bitfields(
 }
 
 #[test]
+fn process_bitfields_skips_undecodable_pending_queue() {
+	new_test_ext(genesis_config(vec![])).execute_with(|| {
+		let para = ParaId::from(1);
+		sp_io::storage::set(&PendingAvailability::<Test>::hashed_key_for(para), &[4]);
+		assert_eq!(PendingAvailability::<Test>::iter_keys().collect::<Vec<_>>(), vec![para]);
+		assert!(PendingAvailability::<Test>::get(para).is_none());
+
+		assert!(process_bitfields(vec![]).is_empty());
+	});
+}
+
+#[test]
 fn free_timedout() {
 	let chain_a = ParaId::from(1_u32);
 	let chain_b = ParaId::from(2_u32);
