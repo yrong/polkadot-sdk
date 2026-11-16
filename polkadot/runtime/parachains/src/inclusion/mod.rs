@@ -69,8 +69,13 @@ pub mod migration;
 mod enactment;
 
 pub trait WeightInfo {
-	/// Enactment weight for UMP/HRMP messages and code-upgrade/`Provides` flags.
-	/// The benchmark framework represents boolean flags as `u32`.
+	/// Weight for `enact_candidate` extrinsic given the number of sent messages
+	/// (ump, hrmp) and whether there is a new code for a runtime upgrade.
+	///
+	/// NOTE: due to a shortcoming of the current benchmarking framework,
+	/// we use `u32` for the code upgrade, even though it is a `bool`.
+	///
+	/// `p` indicates whether the candidate records a `Provides` root.
 	fn enact_candidate(u: u32, h: u32, c: u32, p: u32) -> Weight;
 	/// Append a root to a full provides window.
 	fn record_provides() -> Weight;
@@ -590,6 +595,9 @@ impl<T: Config> Pallet<T> {
 			for candidate in candidates.iter_mut() {
 				if let Some(validator_indices) = votes_per_core.remove(&candidate.core) {
 					for validator_index in validator_indices.iter() {
+						// defensive check - this is constructed by loading the
+						// availability bitfield record, which is always `Some` if
+						// the core is occupied - that's why we're here.
 						if let Some(mut bit) =
 							candidate.availability_votes.get_mut(validator_index.0 as usize)
 						{
@@ -617,6 +625,8 @@ impl<T: Config> Pallet<T> {
 			PendingAvailability::<T>::mutate(paraid, |candidates| {
 				if let Some(candidates) = candidates {
 					if let Some(last_enacted_index) = count.checked_sub(1) {
+						// Trim the pending availability candidates storage and enact candidates of
+						// this para now.
 						let evicted_candidates = candidates.drain(0..=last_enacted_index);
 						for candidate in evicted_candidates {
 							freed_cores.push((candidate.core, candidate.hash));
@@ -1071,6 +1081,7 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn record_provides(source: ParaId, root: StreamsRoot) {
 		log::debug!(target: LOG_TARGET, "Recording provides root {root:?} of para {source:?}");
 		RecentProvides::<T>::mutate(source, |window| {
+			// Cannot fail: the index is `len` and the bound is non-zero.
 			let _evicted = window.force_insert_keep_right(window.len(), root);
 		});
 	}
@@ -1268,6 +1279,7 @@ impl<T: Config> Pallet<T> {
 	/// If there are multiple candidates pending availability for this para-id, it will enact all of
 	/// them. This should generally not be used but it is useful during execution of Runtime APIs,
 	/// where the changes to the state are expected to be discarded directly after.
+	/// It does not check the candidates' `Requires`.
 	pub(crate) fn force_enact(para: ParaId) {
 		PendingAvailability::<T>::mutate(&para, |candidates| {
 			if let Some(candidates) = candidates {
