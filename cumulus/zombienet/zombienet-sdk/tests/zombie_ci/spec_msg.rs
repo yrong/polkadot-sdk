@@ -2259,12 +2259,26 @@ async fn spec_msg_v3_joint_enactment() -> Result<(), anyhow::Error> {
 	run_v3_delivery(V3Delivery::JointEnactment).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_latency_included_only() -> Result<(), anyhow::Error> {
+	run_v3_delivery(V3Delivery::LatencyIncluded).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires native validators and the malus binary"]
+async fn spec_msg_v3_latency_optimistic() -> Result<(), anyhow::Error> {
+	run_v3_delivery(V3Delivery::LatencyOptimistic).await
+}
+
 #[derive(Clone, Copy, Debug)]
 enum V3Delivery {
 	IncludedOnly,
 	EarlyConsumption,
 	BundleCut,
 	JointEnactment,
+	LatencyIncluded,
+	LatencyOptimistic,
 }
 
 async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
@@ -2276,7 +2290,7 @@ async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let policy = match check {
-		V3Delivery::IncludedOnly => RootPolicy::IncludedOnly,
+		V3Delivery::IncludedOnly | V3Delivery::LatencyIncluded => RootPolicy::IncludedOnly,
 		V3Delivery::JointEnactment => RootPolicy::ReceiverOptimistic,
 		_ => RootPolicy::BothOptimistic,
 	};
@@ -2321,6 +2335,8 @@ async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
 			prove_bundle_cut(&relay, &sender, &receiver, &mut blocks).await?;
 		} else if matches!(check, V3Delivery::JointEnactment) {
 			prove_joint_enactment(&relay, &sender, &receiver, &gate, &mut blocks).await?;
+		} else if matches!(check, V3Delivery::LatencyIncluded | V3Delivery::LatencyOptimistic) {
+			measure_v3_latency(&relay, &sender, &receiver, &mut blocks, check).await?;
 		} else {
 			send_and_follow(&relay, &sender, &receiver).await?;
 			let mut seen = std::collections::BTreeSet::new();
@@ -2365,6 +2381,264 @@ async fn run_v3_delivery(check: V3Delivery) -> Result<(), anyhow::Error> {
 	let result = tokio::time::timeout(Duration::from_secs(600), run).await;
 	network.destroy().await?;
 	result.map_err(|_| anyhow!("V3 delivery exceeded 600 seconds"))?
+}
+
+async fn bundle_contains_block(
+	client: &OnlineClient<PolkadotConfig>,
+	head: &polkadot_primitives::HeadData,
+	number: u32,
+	hash: H256,
+) -> Result<bool, anyhow::Error> {
+	let mut block = client.blocks().at(H256::from(sp_crypto_hashing::blake2_256(&head.0))).await?;
+	if block.number() < number {
+		return Ok(false);
+	}
+	let index = bundle_index(&block).ok_or_else(|| anyhow!("latency bundle has no index"))?;
+	for offset in 0..=index {
+		if block.number() == number {
+			return Ok(block.hash() == hash);
+		}
+		if offset != index {
+			block = client.blocks().at(block.header().parent_hash).await?;
+		}
+	}
+	Ok(false)
+}
+
+async fn latency_processed(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	id: H256,
+) -> Result<bool, anyhow::Error> {
+	for event in block.events().await?.iter() {
+		let event = event?;
+		if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
+			continue;
+		}
+		let fields = event.field_values()?;
+		if fields.at("id").map(flatten) != Some(id.0.to_vec()) {
+			continue;
+		}
+		if fields.at("success").and_then(|v| v.as_bool()) != Some(true) ||
+			!format!("{fields:?}").contains("SpecMsg")
+		{
+			return Err(anyhow!("latency XCM did not execute successfully over spec-msg"));
+		}
+		return Ok(true);
+	}
+	Ok(false)
+}
+
+async fn block_timestamp(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+) -> Result<u64, anyhow::Error> {
+	let query = subxt::dynamic::storage("Timestamp", "Now", Vec::<Value>::new());
+	Ok(block
+		.storage()
+		.fetch(&query)
+		.await?
+		.ok_or_else(|| anyhow!("no timestamp"))?
+		.as_type()?)
+}
+
+async fn measure_v3_latency(
+	relay: &OnlineClient<PolkadotConfig>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+	blocks: &mut StreamOfResults<Block<PolkadotConfig, OnlineClient<PolkadotConfig>>>,
+	policy: V3Delivery,
+) -> Result<(), anyhow::Error> {
+	use polkadot_primitives::{
+		CandidateDescriptorVersion, CandidateReceiptV2, CommittedCandidateReceiptV2, HeadData,
+	};
+	let mut measured = Vec::new();
+	for sample in 0..=samples() {
+		let check = async {
+			let mut imports = receiver.blocks().subscribe_all().await?;
+			let mut finalized = receiver.blocks().subscribe_finalized().await?;
+			let mut topic = [0x4c; 32];
+			topic[24..].copy_from_slice(&(sample as u64).to_le_bytes());
+			let id = H256::from(topic);
+			let started = std::time::Instant::now();
+			let (sent_hash, ids) =
+				submit_sudo(sender, send_xcm_with_topic(RECEIVER, Some(topic)), false).await?;
+			if ids != vec![topic.to_vec()] {
+				return Err(anyhow!("latency send did not retain its topic"));
+			}
+			let send_observed_ms = started.elapsed().as_millis();
+			let sent = sender.blocks().at(sent_hash).await?;
+			log::info!(
+				"Latency send: {policy:?} sample {sample}, {id:?}, sender #{} {sent_hash:?}",
+				sent.number()
+			);
+			let processed = loop {
+				let block =
+					imports.next().await.ok_or_else(|| anyhow!("receiver imports ended"))??;
+				if latency_processed(&block, id).await? {
+					break block;
+				}
+			};
+			let import_observed_ms = started.elapsed().as_millis();
+			let checkpoint = relay.blocks().at(best_hash(relay).await?).await?;
+			let pending: Vec<CommittedCandidateReceiptV2> = call_at(
+				relay,
+				Some(checkpoint.hash()),
+				"ParachainHost_candidates_pending_availability",
+				&ParaId::from(SENDER).encode(),
+			)
+			.await?;
+			let mut pending_provider = None;
+			for candidate in pending {
+				if bundle_contains_block(
+					sender,
+					&candidate.commitments.head_data,
+					sent.number(),
+					sent_hash,
+				)
+				.await?
+				{
+					pending_provider = Some(candidate.hash());
+					break;
+				}
+			}
+			let record: ConsumptionRecord =
+				call_at(receiver, Some(processed.hash()), "SpecMsgApi_consumption_record", &[])
+					.await?;
+			if !record.entries.get(&SENDER.into()).is_some_and(|entries| {
+				entries.iter().any(|(s, _)| *s == out_channel().data_stream())
+			}) {
+				return Err(anyhow!("latency execution block has no channel consumption record"));
+			}
+			loop {
+				let block =
+					finalized.next().await.ok_or_else(|| anyhow!("receiver finality ended"))??;
+				if block.number() < processed.number() {
+					continue;
+				}
+				if block.number() != processed.number() || block.hash() != processed.hash() {
+					return Err(anyhow!("observed latency execution block was reverted"));
+				}
+				if !latency_processed(&block, id).await? {
+					return Err(anyhow!("latency XCM missing from finalized execution block"));
+				}
+				break;
+			}
+			let finalized_observed_ms = started.elapsed().as_millis();
+			let mut receipts = BTreeMap::new();
+			let last_relay = loop {
+				let block =
+					blocks.next().await.ok_or_else(|| anyhow!("relay finality ended"))??;
+				for event in block.events().await?.iter() {
+					let event = event?;
+					if event.pallet_name() != "ParaInclusion" ||
+						!matches!(
+							event.variant_name(),
+							"CandidateBacked" | "CandidateIncluded" | "CandidateTimedOut"
+						) {
+						continue;
+					}
+					let (receipt, head) =
+						<(CandidateReceiptV2, HeadData)>::decode(&mut &event.field_bytes()[..])?;
+					let para = receipt.descriptor.para_id();
+					let (client, target) = if para == SENDER.into() {
+						(sender, &sent)
+					} else if para == RECEIVER.into() {
+						(receiver, &processed)
+					} else {
+						continue;
+					};
+					if !bundle_contains_block(client, &head, target.number(), target.hash()).await?
+					{
+						continue;
+					}
+					if event.variant_name() == "CandidateTimedOut" {
+						return Err(anyhow!("latency candidate timed out"));
+					}
+					if receipt.descriptor.version() != CandidateDescriptorVersion::V3 {
+						return Err(anyhow!("latency receipt is not V3"));
+					}
+					receipts.insert(
+						(u32::from(para), event.variant_name().to_owned()),
+						(block.number(), block.hash(), receipt.hash()),
+					);
+				}
+				if receipts.len() == 4 {
+					break block;
+				}
+			};
+			let source = receipts[&(SENDER, "CandidateIncluded".to_owned())];
+			let destination = receipts[&(RECEIVER, "CandidateIncluded".to_owned())];
+			let checkpoint_on_finalized_chain = checkpoint.number() <= last_relay.number() &&
+				relay_ancestor(relay, last_relay.hash(), checkpoint.number()).await? ==
+					Some(checkpoint.hash());
+			let sent_relay = relay_parent(&sent).await?;
+			let processed_relay = relay_parent(&processed).await?;
+			let relay_blocks = processed_relay
+				.checked_sub(sent_relay)
+				.ok_or_else(|| anyhow!("receiver relay parent predates sender"))?;
+			let row = serde_json::json!({
+				"policy": format!("{policy:?}"),
+				"sample": sample,
+				"warmup": sample == 0,
+				"id": id,
+				"sender": {
+					"number": sent.number(),
+					"hash": sent_hash,
+					"relay_parent": sent_relay,
+					"timestamp_ms": block_timestamp(&sent).await?
+				},
+				"receiver": {
+					"number": processed.number(),
+					"hash": processed.hash(),
+					"relay_parent": processed_relay,
+					"timestamp_ms": block_timestamp(&processed).await?,
+					"consumption_record_scale": format!("0x{}", hex::encode(record.encode()))
+				},
+				"observed_since_submit_ms": {
+					"send": send_observed_ms,
+					"receiver_import": import_observed_ms,
+					"receiver_finalized": finalized_observed_ms
+				},
+				"checkpoint": {
+					"number": checkpoint.number(),
+					"hash": checkpoint.hash(),
+					"on_finalized_chain": checkpoint_on_finalized_chain,
+					"pending_provider": pending_provider.map(|hash| hash.0)
+				},
+				"receipts": receipts.iter()
+					.map(|((para, event), (number, hash, receipt))| serde_json::json!({
+						"para": para,
+						"event": event,
+						"relay_number": number,
+						"relay_hash": hash,
+						"receipt": receipt.0
+					})).collect::<Vec<_>>(),
+				"relay_parent_gap": relay_blocks,
+				"joint_enactment": source.0 == destination.0,
+			});
+			log::info!("V3 latency sample: {row}");
+			Ok::<_, anyhow::Error>(Sample {
+				relay_blocks,
+				sent_relay,
+				included_relay: source.0,
+				processed_relay,
+				sent_block: sent.number(),
+				processed_block: processed.number(),
+			})
+		};
+		let result = tokio::time::timeout(Duration::from_secs(120), check).await;
+		let sample_result = match result {
+			Ok(Ok(result)) => result,
+			other => {
+				log::error!("V3 latency attempt failed: {policy:?} sample {sample}: {other:?}");
+				return Err(anyhow!("V3 latency attempt failed: {other:?}"));
+			},
+		};
+		if sample != 0 {
+			measured.push(sample_result);
+		}
+	}
+	report(&format!("{policy:?}"), &measured);
+	Ok(())
 }
 
 async fn prove_bundle_cut(
