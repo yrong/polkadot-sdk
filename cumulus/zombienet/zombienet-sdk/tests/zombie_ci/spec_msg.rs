@@ -3369,11 +3369,13 @@ async fn promote_relay_fork(
 				.await?;
 			alice.resume().await?;
 			alice_paused = false;
+			// The pause can outlast the websocket keepalive of the caller's client.
+			let relay: OnlineClient<PolkadotConfig> = alice.wait_client().await?;
 			let mut adopted = relay.blocks().subscribe_best().await?;
 			while let Some(block) = adopted.next().await {
 				let block = block?;
-				if relay_ancestor(relay, block.hash(), current.number()).await? == Some(fork) &&
-					!relay_has_sender_root(relay, block.hash(), root).await?
+				if relay_ancestor(&relay, block.hash(), current.number()).await? == Some(fork) &&
+					!relay_has_sender_root(&relay, block.hash(), root).await?
 				{
 					return Ok(Some((fork, block.number(), block.hash())));
 				}
