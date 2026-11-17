@@ -28,7 +28,7 @@ use polkadot_cli::{
 use polkadot_node_primitives::ValidationResult;
 use polkadot_node_subsystem::SpawnGlue;
 use polkadot_node_subsystem_types::{ChainApiBackend, RuntimeApiSubsystemClient};
-use polkadot_primitives::{BackedCandidate, CandidateHash, Id as ParaId, StreamsRoot};
+use polkadot_primitives::{CandidateHash, Id as ParaId, StreamsRoot};
 use sp_core::traits::SpawnNamed;
 use std::{
 	collections::BTreeMap,
@@ -44,9 +44,6 @@ pub struct WithholdAvailabilityOptions {
 	/// File containing the baseline StreamsRoot that remains available.
 	#[arg(long)]
 	pub availability_gate: PathBuf,
-	/// Also omit gated candidates from this validator's authored blocks.
-	#[arg(long)]
-	pub omit_backed_candidates: bool,
 	#[command(flatten)]
 	pub cli: Cli,
 }
@@ -54,7 +51,6 @@ pub struct WithholdAvailabilityOptions {
 pub(crate) struct WithholdAvailability {
 	pub para: ParaId,
 	pub gate: PathBuf,
-	pub omit_backed_candidates: bool,
 }
 
 #[derive(Clone)]
@@ -65,20 +61,6 @@ struct Fault {
 }
 
 impl Fault {
-	fn filter_backed_candidates(&self, candidates: &mut Vec<BackedCandidate>) {
-		let Ok(baseline) = std::fs::read(&self.gate) else { return };
-		candidates.retain(|candidate| {
-			candidate.descriptor().para_id() != self.para ||
-				candidate
-					.candidate()
-					.commitments
-					.ump_signals()
-					.ok()
-					.and_then(|signals| signals.provides().copied())
-					.is_none_or(|root| baseline.as_slice() == root.0.as_bytes())
-		});
-	}
-
 	fn blocked(&self, hash: &CandidateHash) -> bool {
 		let Ok(baseline) = std::fs::read(&self.gate) else { return false };
 		self.candidates
@@ -114,48 +96,6 @@ impl Fault {
 			msg => return Some(msg),
 		}
 		None
-	}
-}
-
-#[derive(Clone)]
-struct OmitBackedCandidates<Spawner> {
-	fault: Fault,
-	spawner: Spawner,
-}
-
-impl<Sender, Spawner> MessageInterceptor<Sender> for OmitBackedCandidates<Spawner>
-where
-	Sender: overseer::ProvisionerSenderTrait + Clone + Send + 'static,
-	Spawner: overseer::gen::Spawner + Clone + 'static,
-{
-	type Message = ProvisionerMessage;
-
-	fn intercept_incoming(
-		&self,
-		_: &mut Sender,
-		mut msg: FromOrchestra<Self::Message>,
-	) -> Option<FromOrchestra<Self::Message>> {
-		if let FromOrchestra::Communication {
-			msg: ProvisionerMessage::RequestInherentData(_, response_sender),
-		} = &mut msg
-		{
-			let fault = self.fault.clone();
-			let (tx, rx) = oneshot::channel();
-			let response = std::mem::replace(response_sender, tx);
-			self.spawner.spawn(
-				"malus-omit-backed-candidates",
-				Some("malus"),
-				Box::pin(async move {
-					if let Ok(mut data) = rx.await {
-						if fault.gate.with_extension("fork").exists() {
-							fault.filter_backed_candidates(&mut data.backed_candidates);
-						}
-						let _ = response.send(data);
-					}
-				}),
-			);
-		}
-		Some(msg)
 	}
 }
 
@@ -251,24 +191,15 @@ impl OverseerGen for WithholdAvailability {
 		let fault =
 			Fault { para: self.para, gate: self.gate.clone(), candidates: Default::default() };
 		let note = NoteCandidate { fault: fault.clone(), spawner: SpawnGlue(args.spawner.clone()) };
-		let omit =
-			OmitBackedCandidates { fault: fault.clone(), spawner: SpawnGlue(args.spawner.clone()) };
-		let builder =
-			validator_overseer_builder(args, ext_args.expect("validator overseer arguments"))?
-				.replace_candidate_validation(move |subsystem| {
-					InterceptedSubsystem::new(subsystem, note)
-				})
-				.replace_availability_store(move |subsystem| {
-					InterceptedSubsystem::new(subsystem, fault)
-				});
-		if self.omit_backed_candidates {
-			builder
-				.replace_provisioner(move |subsystem| InterceptedSubsystem::new(subsystem, omit))
-				.build_with_connector(connector)
-				.map_err(Into::into)
-		} else {
-			builder.build_with_connector(connector).map_err(Into::into)
-		}
+		validator_overseer_builder(args, ext_args.expect("validator overseer arguments"))?
+			.replace_candidate_validation(move |subsystem| {
+				InterceptedSubsystem::new(subsystem, note)
+			})
+			.replace_availability_store(move |subsystem| {
+				InterceptedSubsystem::new(subsystem, fault)
+			})
+			.build_with_connector(connector)
+			.map_err(Into::into)
 	}
 }
 
@@ -276,61 +207,7 @@ impl OverseerGen for WithholdAvailability {
 mod tests {
 	use super::*;
 	use futures::{channel::oneshot, executor::block_on};
-	use polkadot_primitives::{
-		CandidateCommitments, CandidateDescriptorV2, CommittedCandidateReceiptV2, CoreIndex, Hash,
-		UMPSignal, ValidatorIndex, UMP_SEPARATOR,
-	};
-	use sp_core::Encode;
-
-	fn candidate(para: u32, root: Option<u8>) -> BackedCandidate {
-		let mut commitments = CandidateCommitments::default();
-		if let Some(root) = root {
-			commitments.upward_messages.force_push(UMP_SEPARATOR);
-			commitments
-				.upward_messages
-				.force_push(UMPSignal::Provides(StreamsRoot(Hash::repeat_byte(root))).encode());
-		}
-		let descriptor = CandidateDescriptorV2::new(
-			para.into(),
-			Hash::default(),
-			CoreIndex(0),
-			0,
-			Default::default(),
-			Default::default(),
-			Default::default(),
-			Default::default(),
-			Hash::zero().into(),
-		);
-		BackedCandidate::new(
-			CommittedCandidateReceiptV2 { descriptor, commitments },
-			vec![],
-			Default::default(),
-			CoreIndex(0),
-		)
-	}
-
-	#[test]
-	fn gated_inherents_omit_new_source_roots_without_local_validation() {
-		let gate = std::env::temp_dir().join(format!("malus-inherent-{}", std::process::id()));
-		let fault = Fault { para: 2000.into(), gate: gate.clone(), candidates: Default::default() };
-		let candidates = vec![
-			candidate(2000, Some(0)),
-			candidate(2000, Some(1)),
-			candidate(2001, Some(1)),
-			candidate(2000, None),
-		];
-		std::fs::write(&gate, Hash::zero().as_bytes()).expect("test gate is writable; qed");
-		let mut gated = candidates.clone();
-		fault.filter_backed_candidates(&mut gated);
-		assert_eq!(
-			gated,
-			vec![candidates[0].clone(), candidates[2].clone(), candidates[3].clone()]
-		);
-		std::fs::remove_file(&gate).expect("test gate exists; qed");
-		let mut released = candidates.clone();
-		fault.filter_backed_candidates(&mut released);
-		assert_eq!(released, candidates);
-	}
+	use polkadot_primitives::{Hash, ValidatorIndex};
 
 	#[test]
 	fn availability_is_withheld_only_for_selected_candidates_while_the_gate_exists() {

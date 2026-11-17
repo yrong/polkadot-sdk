@@ -5,6 +5,6 @@ doc:
     joint enactment and latency measurements, and controlled availability-fault tooling. Require
     timeout observations to match finalized relay history. Avoid session waits and unused cores
     in the default catch-up fixture. Time the two-way fault so the sender can still read pending credit.
-    Isolate the competing relay branch before provider resubmission and omit faulted providers
-    from its authored blocks, so relay-reorg recovery does not depend on a natural fork.
+    Isolate the competing relay branch before provider resubmission, so relay-reorg recovery
+    does not depend on a natural fork.
 crates: []

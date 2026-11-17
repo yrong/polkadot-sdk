@@ -2017,8 +2017,8 @@ fn peer_arg(para: u32, name: &str, port: u16) -> Result<String, anyhow::Error> {
 
 /// The network; the receiver fetches the sender's streams from `sender_node`, a node name and its
 /// p2p port.
-/// With `relay_forks`, both relay validators claim most slots as primary (BABE `c` = 99/100, which
-/// must stay below 1), so the relay chain forks at most heights.
+/// With `relay_forks` and no gate, both relay validators claim most slots as primary (BABE `c` =
+/// 99/100, which must stay below 1), so the relay chain forks at most heights.
 fn build_network_config(
 	sender_node: (&str, u16),
 	relay_forks: bool,
@@ -2127,13 +2127,16 @@ fn build_recovery_network_config(
 			}
 			if relay_forks {
 				if gate.is_some() {
+					// Let Alice back both paras while Bob is paused.
 					genesis["configuration"]["config"]["scheduler_params"]
 						["group_rotation_frequency"] = serde_json::json!(1);
+				} else {
+					// The gated case forks the relay itself; random forks would retract its setup.
+					genesis["babe"] = serde_json::json!({ "epochConfig": {
+						"c": [99, 100],
+						"allowed_slots": "PrimaryAndSecondaryVRFSlots",
+					} });
 				}
-				genesis["babe"] = serde_json::json!({ "epochConfig": {
-					"c": [99, 100],
-					"allowed_slots": "PrimaryAndSecondaryVRFSlots",
-				} });
 			}
 			let chain = if gate.is_some() { "rococo-dev" } else { "rococo-local" };
 			let r = r
@@ -2163,9 +2166,10 @@ fn build_recovery_network_config(
 					if let Some(gate) = gate {
 						let mut args = availability_args(gate);
 						if relay_forks {
-							args.push("--omit-backed-candidates".into());
 							args.push("--reserved-only".into());
+							// Libp2p disconnects removed reserved peers in reserved-only mode.
 							args.push(("--network-backend", "libp2p").into());
+							// Bob must author while isolated from all sync peers.
 							args.push("--force-authoring".into());
 						}
 						node.with_command("malus")
@@ -2936,8 +2940,13 @@ async fn prove_joint_enactment(
 					{
 						return Err(anyhow!("joint-enactment pair is not V3"));
 					}
-					log::info!("Provider {:?} unavailable; dependent {:?} has an availability quorum at relay #{} {:?}, Requires {provided:?}",
-						provider.hash(), dependent.hash(), block.number(), block.hash());
+					log::info!(
+						"Provider {:?} unavailable; dependent {:?} has an availability quorum at relay #{} {:?}, Requires {provided:?}",
+						provider.hash(),
+						dependent.hash(),
+						block.number(),
+						block.hash()
+					);
 					break 'ready (provider.hash(), dependent.hash(), block.number(), block.hash());
 				}
 			}
@@ -2982,7 +2991,11 @@ async fn prove_joint_enactment(
 					"availability checkpoint is not on the finalized joint-enactment chain"
 				));
 			}
-			log::info!("Joint enactment: provider {provider:?} and dependent {dependent:?} in finalized relay #{} {:?}", block.number(), block.hash());
+			log::info!(
+				"Joint enactment: provider {provider:?} and dependent {dependent:?} in finalized relay #{} {:?}",
+				block.number(),
+				block.hash()
+			);
 			break;
 		}
 		follow_delivery(receiver, deliveries, before_send, id, root, &committed).await
@@ -3256,7 +3269,6 @@ async fn relay_has_sender_root(
 
 async fn isolate_relay_fork(
 	network: &Network<LocalFileSystem>,
-	gate: &std::path::Path,
 	relay: &OnlineClient<PolkadotConfig>,
 	competing: &OnlineClient<PolkadotConfig>,
 	root: polkadot_primitives::StreamsRoot,
@@ -3268,7 +3280,6 @@ async fn isolate_relay_fork(
 			!relay_has_sender_root(competing, best_hash(competing).await?, root).await?)
 	})
 	.await?;
-	std::fs::write(gate.with_extension("fork"), [])?;
 	let bob = network.get_node("bob")?;
 	let rpc = bob.rpc().await?;
 	let (_, alice) = zombienet_orchestrator::generators::generate_node_identity("alice")
@@ -3296,32 +3307,45 @@ async fn promote_relay_fork(
 	network: &Network<LocalFileSystem>,
 	relay: &OnlineClient<PolkadotConfig>,
 	competing: &OnlineClient<PolkadotConfig>,
-	current: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	current: &mut Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
 	checkpoint: (u32, H256),
 	root: polkadot_primitives::StreamsRoot,
-) -> Result<(H256, u32, H256), anyhow::Error> {
+) -> Result<Option<(H256, u32, H256)>, anyhow::Error> {
 	use subxt::ext::subxt_rpcs::rpc_params;
 
-	if best_hash(relay).await? != current.hash() ||
-		!relay_has_sender_root(relay, current.hash(), root).await?
-	{
-		return Err(anyhow!("provider resubmission is no longer at Alice's relay tip"));
-	}
 	let sender = network.get_node(SENDER_COLLATOR)?;
 	let alice = network.get_node("alice")?;
 	let bob = network.get_node("bob")?;
 	sender.pause().await?;
-	alice.pause().await?;
-	bob.resume().await?;
-	let mut alice_paused = true;
-	log::info!(
-		"Promoting Bob's isolated branch from #{} {:?} over Alice's #{} {:?}",
-		checkpoint.0,
-		checkpoint.1,
-		current.number(),
-		current.hash()
-	);
+	let mut alice_paused = false;
 	let promote = async {
+		*current = relay.blocks().at(best_hash(relay).await?).await?;
+		let pending: Vec<polkadot_primitives::CommittedCandidateReceiptV2> = call_at(
+			relay,
+			Some(current.hash()),
+			"ParachainHost_candidates_pending_availability",
+			&ParaId::from(SENDER).encode(),
+		)
+		.await?;
+		if !pending.iter().any(|candidate| {
+			candidate
+				.commitments
+				.ump_signals()
+				.ok()
+				.is_some_and(|s| s.provides() == Some(&root))
+		}) {
+			return Ok(None);
+		}
+		alice.pause().await?;
+		alice_paused = true;
+		bob.resume().await?;
+		log::info!(
+			"Promoting Bob's isolated branch from #{} {:?} over Alice's #{} {:?}",
+			checkpoint.0,
+			checkpoint.1,
+			current.number(),
+			current.hash()
+		);
 		let mut blocks = competing.blocks().subscribe_best().await?;
 		while let Some(block) = blocks.next().await {
 			let block = block?;
@@ -3351,7 +3375,7 @@ async fn promote_relay_fork(
 				if relay_ancestor(relay, block.hash(), current.number()).await? == Some(fork) &&
 					!relay_has_sender_root(relay, block.hash(), root).await?
 				{
-					return Ok((fork, block.number(), block.hash()));
+					return Ok(Some((fork, block.number(), block.hash())));
 				}
 			}
 			return Err(anyhow!("relay subscription ended before adopting the promoted fork"));
@@ -3399,8 +3423,8 @@ async fn run_v3_timeout_recovery(
 		if two_way { RootPolicy::BothOptimistic } else { RootPolicy::ReceiverOptimistic },
 	)?)
 	.await?;
-	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
-	let sender: OnlineClient<PolkadotConfig> =
+	let mut relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+	let mut sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 	let receiver: OnlineClient<PolkadotConfig> =
 		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
@@ -3430,9 +3454,14 @@ async fn run_v3_timeout_recovery(
 				.into_iter()
 				.any(|para| !claims.values().flatten().any(|id| *id == para.into()))
 		{
-			return Err(anyhow!("recovery fixture has no assigned core for both paras at {ready_at:?}: cores={}, claims={claims:?}", cores.len()));
+			return Err(anyhow!(
+				"recovery fixture has no assigned core for both paras at {ready_at:?}: cores={}, claims={claims:?}",
+				cores.len()
+			));
 		}
-		log::info!("Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {ready_at:?}: two cores initialized, claims={claims:?}");
+		log::info!(
+			"Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {ready_at:?}: two cores initialized, claims={claims:?}"
+		);
 		wait_for("both V3 chains to finalize their first block", || {
 			advanced(&sender, &receiver, (1, 1))
 		})
@@ -3457,7 +3486,9 @@ async fn run_v3_timeout_recovery(
 		}
 		let mut session: u32 =
 			call_at(&relay, Some(relay_at), "ParachainHost_session_index_for_child", &[]).await?;
-		log::info!("Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {relay_at:?}: epoch_length={epoch_length}, slot_duration={slot_duration}, session={session}");
+		log::info!(
+			"Relay ws://127.0.0.1:{RELAY_RPC_PORT} at {relay_at:?}: epoch_length={epoch_length}, slot_duration={slot_duration}, session={session}"
+		);
 		let features: NodeFeatures =
 			call_at(&relay, Some(relay_at), "ParachainHost_node_features", &[]).await?;
 		if !FeatureIndex::CandidateReceiptV3.is_set(&features) {
@@ -3473,7 +3504,9 @@ async fn run_v3_timeout_recovery(
 			if !enabled {
 				return Err(anyhow!("parachain {at:?} does not enable V3 scheduling"));
 			}
-			log::info!("Parachain {para} ws://127.0.0.1:{port} at {at:?}: V3 scheduling enabled; relay features verified at {relay_at:?}");
+			log::info!(
+				"Parachain {para} ws://127.0.0.1:{port} at {at:?}: V3 scheduling enabled; relay features verified at {relay_at:?}"
+			);
 		}
 		if hrmp_channel_open(&relay, SENDER, RECEIVER).await? {
 			return Err(anyhow!("the recovery test requires no HRMP channel"));
@@ -3556,7 +3589,11 @@ async fn run_v3_timeout_recovery(
 					(u128::from(slot_start + window_start)..u128::from(slot_start + duration))
 						.contains(&now)
 				{
-					log::info!("Two-way fault window: sender #{} {:?}, slot start {slot_start}ms, duration {duration}ms, now {now}ms", block.number(), block.hash());
+					log::info!(
+						"Two-way fault window: sender #{} {:?}, slot start {slot_start}ms, duration {duration}ms, now {now}ms",
+						block.number(),
+						block.hash()
+					);
 					break slot_start;
 				}
 			};
@@ -3596,6 +3633,14 @@ async fn run_v3_timeout_recovery(
 			sent.number(),
 			sent.hash()
 		);
+		// The sender archives only its best chain, and the gate keeps a side branch from becoming
+		// best, so a probe there is never served.
+		if reorg &&
+			relay_ancestor(&sender, best_hash(&sender).await?, sent.number()).await? !=
+				Some(sent.hash())
+		{
+			return Err(anyhow!("reorg probe landed off the sender's best chain"));
+		}
 		let mut original: Option<(CandidateHash, CandidateHash, HeadData, StreamsRoot)> = None;
 		let mut original_at = None;
 		let mut fork_checkpoint = None;
@@ -3620,7 +3665,7 @@ async fn run_v3_timeout_recovery(
 				blocks.next().await
 			};
 			let Some(block) = next else { break };
-			let block = block?;
+			let mut block = block?;
 			let Some(current_session): Option<u32> = call_at_unpruned(
 				&relay,
 				block.hash(),
@@ -3770,7 +3815,14 @@ async fn run_v3_timeout_recovery(
 								});
 							if return_dependency {
 								return_head = Some((authored.number(), authored.hash()));
-								log::info!("Two-way dependency at relay #{} {:?}: sender #{} {:?} read credit frontier {} under pending receiver {required:?}, on the stalled receiver chain", block.number(), block.hash(), authored.number(), authored.hash(), ack.leaf_count());
+								log::info!(
+									"Two-way dependency at relay #{} {:?}: sender #{} {:?} read credit frontier {} under pending receiver {required:?}, on the stalled receiver chain",
+									block.number(),
+									block.hash(),
+									authored.number(),
+									authored.hash(),
+									ack.leaf_count()
+								);
 								break;
 							}
 							authored = sender.blocks().at(authored.header().parent_hash).await?;
@@ -3791,10 +3843,13 @@ async fn run_v3_timeout_recovery(
 						.is_some_and(|s| s.provides() == Some(required))
 				});
 				if still_pending {
-					let (fork, height, best) = promote_relay_fork(
-						&network, &relay, competing, &block, checkpoint, *required,
+					let Some((fork, height, best)) = promote_relay_fork(
+						&network, &relay, competing, &mut block, checkpoint, *required,
 					)
-					.await?;
+					.await?
+					else {
+						continue;
+					};
 					let (observed_height, observed) =
 						original_at.ok_or_else(|| anyhow!("consumption observation missing"))?;
 					target_removed = true;
@@ -3807,6 +3862,9 @@ async fn run_v3_timeout_recovery(
 						block.number(),
 						block.hash()
 					);
+					// Pausing Alice and the sender can outlast the websocket keepalive.
+					relay = network.get_node("alice")?.wait_client().await?;
+					sender = network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 					break;
 				}
 			}
@@ -3862,10 +3920,8 @@ async fn run_v3_timeout_recovery(
 			if provider_timed_out && dependent_timed_out {
 				if let Some(competing) = &competing {
 					if fork_checkpoint.is_none() {
-						fork_checkpoint = Some(
-							isolate_relay_fork(&network, &gate, &relay, competing, *required)
-								.await?,
-						);
+						fork_checkpoint =
+							Some(isolate_relay_fork(&network, &relay, competing, *required).await?);
 					}
 				} else {
 					break;
@@ -3878,7 +3934,9 @@ async fn run_v3_timeout_recovery(
 			return Err(anyhow!("no consumed pending target was removed by a relay reorg"));
 		}
 		if !reorg && (!provider_timed_out || !dependent_timed_out || !dependent_available) {
-			return Err(anyhow!("missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"));
+			return Err(anyhow!(
+				"missing available-dependent timeout: provider={provider_timed_out}, dependent={dependent_timed_out}, available={dependent_available}"
+			));
 		}
 		if two_way && !return_dependency {
 			return Err(anyhow!(
@@ -3915,7 +3973,9 @@ async fn run_v3_timeout_recovery(
 					})?
 					.as_type::<H256>()?;
 				if actual != expected {
-					return Err(anyhow!("recovery did not preserve the sender block that read the pending receiver register"));
+					return Err(anyhow!(
+						"recovery did not preserve the sender block that read the pending receiver register"
+					));
 				}
 				log::info!(
 					"Two-way recovery preserved sender #{number} {expected:?} in finalized history"
@@ -3983,7 +4043,10 @@ async fn run_v3_timeout_recovery(
 				.await?;
 				if *required != old_required && included == Some(*required) {
 					retargeted.insert(candidate.hash());
-					log::info!("Receiver's unchanged head retargeted from {old_required:?} to included {required:?} at relay {:?}", block.hash());
+					log::info!(
+						"Receiver's unchanged head retargeted from {old_required:?} to included {required:?} at relay {:?}",
+						block.hash()
+					);
 				}
 			}
 			for event in block.events().await?.iter() {
@@ -4161,7 +4224,10 @@ async fn recover_after_catch_up(
 	if scheduler.at("num_cores").and_then(|value| value.as_u128()) != Some(2) {
 		return Err(anyhow!("catch-up fixture must keep one core per parachain"));
 	}
-	log::info!("Outage config ws://127.0.0.1:{RELAY_RPC_PORT} at {at:?}, runtime {:?}: max_relay_parent_session_age={age}, scheduler={scheduler}; execution parent={execution_parent:?}, session={parent_session}", relay.runtime_version());
+	log::info!(
+		"Outage config ws://127.0.0.1:{RELAY_RPC_PORT} at {at:?}, runtime {:?}: max_relay_parent_session_age={age}, scheduler={scheduler}; execution parent={execution_parent:?}, session={parent_session}",
+		relay.runtime_version()
+	);
 	let info: Option<RelayParentInfo<H256, u32>> = call_at(
 		relay,
 		Some(at),
@@ -4193,7 +4259,10 @@ async fn recover_after_catch_up(
 		.request("author_insertKey", rpc_params!["aura", "//Eve", public])
 		.await?;
 	let stopped = std::time::Instant::now();
-	log::info!("Author stopped at relay {at:?}; replacement holds bundle #{}, {hash:?}, sender finalized #{initial_finalized}", head.number);
+	log::info!(
+		"Author stopped at relay {at:?}; replacement holds bundle #{}, {hash:?}, sender finalized #{initial_finalized}",
+		head.number
+	);
 	let result = replacement
 		.wait_log_line_count_with_timeout(
 			"Submitting segment for core.*resubmitted.*[1-9]",
@@ -4239,7 +4308,15 @@ async fn recover_after_catch_up(
 			continue;
 		};
 		let finalized = finalized_number(&sender).await?;
-		log::info!("Outage +{}s: relay #{} {:?}, session={session}, relay_parent_present={}, sender_pending={}, sender_finalized={finalized}, receiver_finalized={}", stopped.elapsed().as_secs(), block.number(), block.hash(), info.is_some(), pending.len(), finalized_number(receiver).await?);
+		log::info!(
+			"Outage +{}s: relay #{} {:?}, session={session}, relay_parent_present={}, sender_pending={}, sender_finalized={finalized}, receiver_finalized={}",
+			stopped.elapsed().as_secs(),
+			block.number(),
+			block.hash(),
+			info.is_some(),
+			pending.len(),
+			finalized_number(receiver).await?
+		);
 		if info.is_none() || session != parent_session {
 			return Err(anyhow!("catch-up recovery waited for the relay-parent session to expire"));
 		}
