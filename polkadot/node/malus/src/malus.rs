@@ -66,6 +66,7 @@ impl MalusCli {
 					WithholdAvailability {
 						para: opts.withhold_para.into(),
 						gate: opts.availability_gate,
+						omit_backed_candidates: opts.omit_backed_candidates,
 					},
 					finality_delay,
 				)?;
