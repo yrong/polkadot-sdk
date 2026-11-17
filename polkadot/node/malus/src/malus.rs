@@ -30,6 +30,8 @@ use variants::*;
 #[derive(Debug, Parser)]
 #[command(about = "Malus - the nemesis of polkadot.", version, rename_all = "kebab-case")]
 enum NemesisVariant {
+	/// Withhold a parachain's chunks and data while a local control file exists.
+	WithholdAvailability(WithholdAvailabilityOptions),
 	/// Suggest a candidate with an invalid proof of validity.
 	SuggestGarbageCandidate(SuggestGarbageCandidateOptions),
 	/// Support disabled validators in backing and statement distribution.
@@ -58,6 +60,16 @@ impl MalusCli {
 	fn launch(self) -> eyre::Result<()> {
 		let finality_delay = self.finality_delay;
 		match self.variant {
+			NemesisVariant::WithholdAvailability(opts) => {
+				polkadot_cli::run_node(
+					opts.cli,
+					WithholdAvailability {
+						para: opts.withhold_para.into(),
+						gate: opts.availability_gate,
+					},
+					finality_delay,
+				)?;
+			},
 			NemesisVariant::BackGarbageCandidate(opts) => {
 				let BackGarbageCandidateOptions { percentage, cli } = opts;
 

@@ -1,0 +1,10 @@
+title: 'spec-msg: optimistic V3 recovery and delivery tests'
+doc:
+- audience: Node Dev
+  description: Add focused optimistic messaging integration tests, including runtime-cut bundles,
+    joint enactment and latency measurements, and controlled availability-fault tooling. Require
+    timeout observations to match finalized relay history. Avoid session waits and unused cores
+    in the default catch-up fixture. Time the two-way fault so the sender can still read pending credit.
+    Isolate the competing relay branch before provider resubmission, so relay-reorg recovery
+    does not depend on a natural fork.
+crates: []
