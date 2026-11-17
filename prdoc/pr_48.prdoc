@@ -1,0 +1,10 @@
+title: 'spec-msg: Penpal wiring and scheduling verification'
+doc:
+- audience: Runtime Dev
+  description: Wire speculative messaging into Penpal and verify Aura scheduling signatures for resubmitted
+    candidates.
+crates:
+- name: penpal-runtime
+  bump: major
+- name: xcm-emulator
+  bump: minor

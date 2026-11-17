@@ -455,6 +455,13 @@ pub type PriceForParentDelivery =
 pub type XcmRouter = WithUniqueTopic<(
 	// Two routers - use UMP to communicate with the relay chain:
 	cumulus_primitives_utility::ParentAsUmp<ParachainSystem, PolkadotXcm, PriceForParentDelivery>,
+	// Must precede `XcmpQueue`, which accepts any sibling destination.
+	cumulus_pallet_spec_messaging::SpecMsgRouter<
+		Runtime,
+		ParachainSystem,
+		PolkadotXcm,
+		ExponentialPrice<FeeAssetId, BaseDeliveryFee, TransactionByteFee, crate::SpecMessaging>,
+	>,
 	// ..and XCMP to communicate with the sibling chains.
 	XcmpQueue,
 )>;
