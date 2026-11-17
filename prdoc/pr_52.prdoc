@@ -1,0 +1,9 @@
+title: 'spec-msg: opt-in consumption from backed roots'
+doc:
+- audience: Node Operator
+  description: Add opt-in backed-root consumption with bundle-aware lift assembly.
+crates:
+- name: cumulus-client-spec-msg
+  bump: major
+- name: polkadot-omni-node-lib
+  bump: major

@@ -40,3 +40,4 @@ cumulus-relay-chain-interface = { workspace = true, default-features = true }
 
 [dev-dependencies]
 sp-core = { workspace = true, default-features = true }
+sp-version = { workspace = true, default-features = true }

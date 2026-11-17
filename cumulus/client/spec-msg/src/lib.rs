@@ -44,7 +44,7 @@ pub use fetch::{fetch, NetworkTransport, RequestError, Transport};
 pub use protocol::{fetch_protocol_config, run_request_handler, PROTOCOL_NAME};
 pub use receiver::{Budget, ChainView, Receiver, SourceWants};
 pub use relay::{
-	newest_included_provides, relay_has_api, FinalizedRoots, RelayFinalizedRoots,
+	newest_included_provides, relay_has_api, FinalizedRoots, RelayFinalizedRoots, SourceRoots,
 	NEWEST_INCLUDED_PROVIDES, NEWEST_INCLUDED_PROVIDES_VERSION,
 };
 pub use service::{assembler, inherent_data, run_receiver};
