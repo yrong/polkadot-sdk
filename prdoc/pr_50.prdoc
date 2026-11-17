@@ -2,7 +2,8 @@ title: 'spec-msg: included-root receiver on the enactment stack'
 doc:
 - audience: Node Operator
   description: Fetch and verify messages under included roots and wire receiver inherents and lifts
-    into collation.
+    into collation. Replay unfinalized consumption after a restart and track recovery sources until
+    their consuming blocks finalize.
 crates:
 - name: cumulus-client-collator
   bump: major

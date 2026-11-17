@@ -47,7 +47,7 @@ use polkadot_core_primitives::Hash;
 use sc_network::PeerId;
 use std::{
 	cell::RefCell,
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fmt::Debug,
 	hash::Hash as StdHash,
 	sync::{
@@ -259,6 +259,15 @@ where
 	/// The chain this receiver consumes for.
 	pub fn para_id(&self) -> ParaId {
 		self.us
+	}
+
+	pub(crate) fn live_sources(&self) -> BTreeSet<ParaId> {
+		self.state
+			.lock()
+			.live
+			.values()
+			.flat_map(|block| block.record.entries.keys().copied())
+			.collect()
 	}
 
 	/// The newest root seen for `source`.

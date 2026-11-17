@@ -502,6 +502,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 						spec_msg::start(
 							config,
 							client.clone(),
+							backend.clone(),
 							network.clone(),
 							relay_chain_interface.clone(),
 							&task_manager,
