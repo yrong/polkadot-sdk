@@ -284,22 +284,6 @@ where
 		}
 	}
 
-	#[cfg(test)]
-	pub(crate) fn verified_stream_len(
-		&self,
-		source: ParaId,
-		stream: StreamId,
-		root: StreamsRoot,
-	) -> Option<u64> {
-		self.state
-			.lock()
-			.sources
-			.get(&source)?
-			.stream_len
-			.get(&(stream, root.0))
-			.copied()
-	}
-
 	/// Whether the record of block `hash` is noted and not final yet.
 	#[cfg(test)]
 	pub(crate) fn is_live(&self, hash: &H) -> bool {
@@ -347,14 +331,13 @@ where
 			pool.eligible == *roots &&
 			pool.newest_root() == Some(newest) &&
 			pool.settled &&
-			state.live_endpoints(source).iter().all(|((stream, _), end)| {
-				std::iter::once(newest).chain(roots.included).all(|root| {
-					lifts_to(pool, stream, end, &root) ||
-						(root != newest && pool.predates(stream, end.leaf_count(), &root))
-				})
-			}) && wants.channels.iter().all(|(id, stored)| {
-			covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
-		})
+			state
+				.live_endpoints(source)
+				.iter()
+				.all(|((stream, _), end)| lifts_to(pool, stream, end, &newest)) &&
+			wants.channels.iter().all(|(id, stored)| {
+				covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
+			})
 	}
 
 	/// `root` is `source`'s newest included root (with no pending roots): fetch under it what
@@ -494,8 +477,7 @@ where
 					.into_iter()
 					.filter(|((stream, count), endpoint)| {
 						pool.is_none_or(|pool| {
-							!pool.predates(stream, *count, &target_root) &&
-								pool.binding(stream, *count, &target_root).is_none() &&
+							pool.binding(stream, *count, &target_root).is_none() &&
 								!lifts_to(pool, stream, endpoint, &target_root)
 						})
 					})
@@ -503,19 +485,7 @@ where
 			};
 			for ((stream, _), endpoint) in unbound {
 				let bound = self.fetch_binding(source, stream, &endpoint, target_root).await;
-				if !bound && target_root != root {
-					// A refusal alone cannot prove that an included root is too old.
-					let request =
-						MessagesRequest { stream, under: target_root, start: None, max_bytes: 0 };
-					if let Ok(response) = fetch(&self.transport, source, &request, None).await {
-						let mut state = self.state.lock();
-						let pool = state.sources.entry(source).or_default();
-						if pool.roots.contains(&target_root) {
-							pool.stream_len
-								.insert((stream, target_root.0), response.extension.leaf_count);
-						}
-					}
-				}
+				// Binding under an older included root is best effort: it may predate the endpoint.
 				if target_root == root {
 					settled &= bound;
 				}

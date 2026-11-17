@@ -19,13 +19,10 @@
 //! pending-availability ones ahead of it.
 
 use crate::LOG_TARGET;
-use codec::Decode;
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::StreamsRoot;
 use cumulus_relay_chain_interface::{call_runtime_api, PHash, RelayChainInterface};
-use polkadot_primitives::{
-	runtime_api::ParachainHost, well_known_keys, CommittedCandidateReceiptV2,
-};
+use polkadot_primitives::{runtime_api::ParachainHost, CommittedCandidateReceiptV2};
 use sp_api::RuntimeApiInfo;
 use std::sync::Arc;
 
@@ -34,12 +31,6 @@ pub const NEWEST_INCLUDED_PROVIDES: &str = "ParachainHost_newest_included_provid
 
 /// The `ParachainHost` version that added [`NEWEST_INCLUDED_PROVIDES`].
 pub const NEWEST_INCLUDED_PROVIDES_VERSION: u32 = 17;
-
-/// The relay storage prefix of `Paras::ParaLifecycles`.
-const PARA_LIFECYCLES_PREFIX: [u8; 32] = [
-	0xcd, 0x71, 0x0b, 0x30, 0xbd, 0x2e, 0xab, 0x03, 0x52, 0xdd, 0xcc, 0x26, 0x41, 0x7a, 0xa1, 0x94,
-	0x28, 0x1e, 0x0b, 0xfd, 0xe1, 0x7b, 0x36, 0x57, 0x32, 0x08, 0xa0, 0x6c, 0xb5, 0xcf, 0xba, 0x6b,
-];
 
 /// A source's eligible roots at one relay block: its newest included root and the ordered
 /// `Provides` roots of its candidates pending availability.
@@ -75,7 +66,7 @@ impl SourceRoots {
 /// `Provides` is skipped, whereas a candidate whose UMP signals fail to decode stops the scan and
 /// excludes itself and all later candidates. Roots equal to `included` or an earlier pending root
 /// are skipped so repeated commitments do not create bogus progress.
-pub fn extract_pending_provides(
+pub(crate) fn extract_pending_provides(
 	included: Option<StreamsRoot>,
 	candidates: &[CommittedCandidateReceiptV2],
 ) -> Vec<StreamsRoot> {
@@ -89,36 +80,6 @@ pub fn extract_pending_provides(
 		}
 	}
 	pending
-}
-
-/// The relay storage key of `Paras::ParaLifecycles` for `para_id`.
-pub(crate) fn para_lifecycle_key(para_id: ParaId) -> Vec<u8> {
-	// `well_known_keys::para_head(para_id)` is `Twox128("Paras") ++ Twox128("Heads") ++
-	// Twox64(para_id) ++ Encode(para_id)`; replace the 32-byte pallet+item prefix with
-	// `PARA_LIFECYCLES_PREFIX`.
-	let mut key = well_known_keys::para_head(para_id);
-	key[..32].copy_from_slice(&PARA_LIFECYCLES_PREFIX);
-	key
-}
-
-/// Whether `source` is a live (non-onboarding, non-offboarding) para at relay block `at`.
-async fn is_live_para(
-	relay: &(impl RelayChainInterface + ?Sized),
-	at: PHash,
-	source: ParaId,
-) -> Result<bool, ()> {
-	// `ParaLifecycle` variants in `polkadot_runtime_parachains::paras`:
-	// 0 = Onboarding, 1 = Parathread, 2 = Parachain, 3 = UpgradingParathread,
-	// 4 = DowngradingParachain, 5 = OffboardingParathread, 6 = OffboardingParachain.
-	if let Some(raw) = relay
-		.get_storage_by_key(at, &para_lifecycle_key(source))
-		.await
-		.map_err(|e| log::debug!(target: LOG_TARGET, "ParaLifecycles lookup failed: {e}"))?
-	{
-		let tag = u8::decode(&mut &raw[..]).map_err(|_| ())?;
-		return Ok(matches!(tag, 1..=4));
-	}
-	Ok(false)
 }
 
 /// `source`'s newest included root as of relay block `at`. `None` also when the call failed or
@@ -146,30 +107,22 @@ pub(crate) async fn answered_newest_included_provides(
 /// `source`'s eligible roots at relay block `at`: its newest included root and the `Provides`
 /// roots of its candidates pending availability, queried at the same relay hash `at`.
 ///
-/// `Ok(None)` is the relay runtime's own answer that `source` has no eligible roots (or is
-/// offboarding); `Err` when a relay call failed.
-pub async fn answered_source_roots(
+/// `Ok(None)` is the relay runtime's own answer that `source` has no included root; `Err` when a
+/// relay call failed.
+pub(crate) async fn answered_source_roots(
 	relay: &(impl RelayChainInterface + ?Sized),
 	at: PHash,
 	source: ParaId,
 ) -> Result<Option<SourceRoots>, ()> {
-	let included = answered_newest_included_provides(relay, at, source).await?;
+	// No included root also means offboarding, so pending roots wait for the first inclusion.
+	let Some(included) = answered_newest_included_provides(relay, at, source).await? else {
+		return Ok(None);
+	};
 	let candidates = relay.candidates_pending_availability(at, source).await.map_err(
 		|e| log::debug!(target: LOG_TARGET, "candidates_pending_availability failed: {e}"),
 	)?;
-	let pending = extract_pending_provides(included, &candidates);
-	if included.is_none() {
-		if pending.is_empty() {
-			return Ok(None);
-		}
-		// `newest_included_provides` returns `None` both when `source` has not yet had a `Provides`
-		// included and when `source` is offboarding. Check the lifecycle before accepting pending
-		// roots without an included root.
-		if !is_live_para(relay, at, source).await? {
-			return Ok(None);
-		}
-	}
-	Ok(Some(SourceRoots { included, pending }))
+	let pending = extract_pending_provides(Some(included), &candidates);
+	Ok(Some(SourceRoots { included: Some(included), pending }))
 }
 
 pub(crate) async fn receiver_roots(
@@ -233,7 +186,7 @@ impl FinalizedRoots for RelayFinalizedRoots {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use codec::Encode;
+	use codec::{Decode, Encode};
 	use cumulus_primitives_core::relay_chain::vstaging::RelayParentInfo;
 	use cumulus_relay_chain_interface::{
 		ChildInfo, CommittedCandidateReceipt, CoreIndex, InboundDownwardMessage,
@@ -308,7 +261,6 @@ mod tests {
 	struct MockRelay {
 		included: Mutex<BTreeMap<(PHash, ParaId), Result<Option<StreamsRoot>, ()>>>,
 		pending: Mutex<BTreeMap<(PHash, ParaId), Result<Vec<CommittedCandidateReceiptV2>, ()>>>,
-		storage: Mutex<BTreeMap<(PHash, Vec<u8>), Vec<u8>>>,
 		queried_included_at: Mutex<Vec<PHash>>,
 		queried_pending_at: Mutex<Vec<PHash>>,
 	}
@@ -360,10 +312,10 @@ mod tests {
 
 		async fn get_storage_by_key(
 			&self,
-			relay_parent: PHash,
-			key: &[u8],
+			_: PHash,
+			_: &[u8],
 		) -> RelayChainResult<Option<StorageValue>> {
-			Ok(self.storage.lock().get(&(relay_parent, key.to_vec())).cloned())
+			unimplemented!()
 		}
 
 		async fn retrieve_dmq_contents(
@@ -515,14 +467,6 @@ mod tests {
 	}
 
 	#[test]
-	fn lifecycle_storage_prefix_matches_its_names() {
-		let expected =
-			[sp_crypto_hashing::twox_128(b"Paras"), sp_crypto_hashing::twox_128(b"ParaLifecycles")]
-				.concat();
-		assert_eq!(PARA_LIFECYCLES_PREFIX.as_slice(), expected.as_slice());
-	}
-
-	#[test]
 	fn pending_roots_require_explicit_optimistic_policy() {
 		let relay = MockRelay::default();
 		let source = ParaId::from(1000u32);
@@ -600,34 +544,15 @@ mod tests {
 	}
 
 	#[test]
-	fn first_ever_commitment_pending_without_included_root_is_accepted_when_live() {
+	fn pending_roots_wait_for_an_included_root() {
 		let relay = MockRelay::default();
 		let source = ParaId::from(1000u32);
 		let at = PHash::repeat_byte(0x11);
+		// Before the first inclusion, or while the source offboards.
 		relay.included.lock().insert((at, source), Ok(None));
 		relay.pending.lock().insert((at, source), Ok(vec![receipt_provides(root(1))]));
-		// Lifecycle 2 = `ParaLifecycle::Parachain`.
-		relay.storage.lock().insert((at, para_lifecycle_key(source)), vec![2u8]);
 
-		let roots = block_on(answered_source_roots(&relay, at, source)).unwrap().unwrap();
-		assert_eq!(roots, SourceRoots { included: None, pending: vec![root(1)] });
-		assert_eq!(roots.newest(), Some(root(1)));
-	}
-
-	#[test]
-	fn offboarding_source_with_pending_receipt_returns_none() {
-		let relay = MockRelay::default();
-		let source = ParaId::from(1000u32);
-		let at = PHash::repeat_byte(0x22);
-		// `newest_included_provides` returns `None` when offboarding, even if a pending receipt
-		// still sits on a core.
-		relay.included.lock().insert((at, source), Ok(None));
-		relay.pending.lock().insert((at, source), Ok(vec![receipt_provides(root(1))]));
-		// Lifecycle 6 = `ParaLifecycle::OffboardingParachain`.
-		relay.storage.lock().insert((at, para_lifecycle_key(source)), vec![6u8]);
-
-		let roots = block_on(answered_source_roots(&relay, at, source)).unwrap();
-		assert_eq!(roots, None);
+		assert_eq!(block_on(answered_source_roots(&relay, at, source)), Ok(None));
 	}
 
 	#[test]

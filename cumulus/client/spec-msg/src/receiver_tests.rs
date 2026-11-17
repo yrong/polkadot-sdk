@@ -1293,7 +1293,7 @@ fn discarded_pending_roots_do_not_feed_new_consumption() {
 }
 
 #[test]
-fn failed_included_bindings_retry_without_a_snapshot_change() {
+fn a_failed_included_binding_falls_back_to_the_pending_root() {
 	let sender = Sender::new();
 	let included = sender.author(vec![(channel(US), payloads(1, 3))]);
 	let pending = sender.author(vec![(channel(US), payloads(2, 3))]);
@@ -1307,44 +1307,9 @@ fn failed_included_bindings_retry_without_a_snapshot_change() {
 	let record = chain.block(&receiver);
 	let roots = crate::SourceRoots { included: Some(included), pending: vec![pending] };
 	*sender.down_under.write() = Some(included);
-	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
-	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
+	block_on(receiver.on_roots(source(), roots, &chain.wants()));
 	let lifts = receiver.assemble(&[record.clone()]).unwrap();
-	assert_eq!(
-		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
-		Some(&pending)
-	);
-
-	*sender.down_under.write() = None;
-	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
-	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	let lifts = receiver.assemble(&[record.clone()]).unwrap();
-	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&included));
-}
-
-#[test]
-fn importing_a_live_endpoint_reopens_recovery_binding_work() {
-	let sender = Sender::new();
-	let included = sender.author(vec![(channel(US), payloads(1, 3))]);
-	let pending = sender.author(vec![(channel(US), payloads(2, 3))]);
-	let receiver = receiver(&sender, Budget { max_payloads: 2, ..Budget::default() });
-	let mut chain = Chain::default();
-	let roots = crate::SourceRoots { included: Some(included), pending: vec![pending] };
-	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
-	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-
-	*sender.down_under.write() = Some(included);
-	let record = chain.block(&receiver);
-	assert!(!receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	let lifts = receiver.assemble(&[record.clone()]).unwrap();
-	assert_eq!(
-		build_requires(&[record.clone()], &lifts).unwrap().unwrap().get(source()),
-		Some(&pending)
-	);
-	*sender.down_under.write() = None;
-	block_on(receiver.on_roots(source(), roots.clone(), &chain.wants()));
-	assert!(receiver.is_roots_settled(&source(), &roots, &chain.wants()));
-	assert!(receiver.assemble(&[record]).is_ok());
+	assert_eq!(build_requires(&[record], &lifts).unwrap().unwrap().get(source()), Some(&pending));
 }
 
 #[test]
@@ -1396,7 +1361,7 @@ fn consumption_past_included_settles_without_repeating_binding_requests() {
 }
 
 #[test]
-fn an_included_head_probe_does_not_bind_another_forks_endpoint() {
+fn an_included_root_does_not_bind_another_forks_endpoint() {
 	struct Forks {
 		included: StreamsRoot,
 		a: Arc<Sender>,
@@ -1438,11 +1403,6 @@ fn an_included_head_probe_does_not_bind_another_forks_endpoint() {
 	};
 	block_on(receiver.on_block(1, 0, 1, false, record));
 	block_on(receiver.on_roots(source(), roots, &chain.wants()));
-	assert!(a
-		.requests(channel(US))
-		.iter()
-		.any(|request| request.start.is_none() && request.max_bytes == 0));
-	assert_eq!(receiver.verified_stream_len(source(), channel(US), included), Some(3));
 	let pending_data = block_on(receiver.inherent_data(&chain.view(), &[]));
 	let planned = pending_data.channels.get(&in_id(0)).unwrap();
 	assert_eq!(planned.len(), 2);

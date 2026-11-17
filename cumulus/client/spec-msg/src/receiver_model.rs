@@ -16,7 +16,7 @@
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
 //! The receiver against a model of its source, the relay chain and its own chain, under random
-//! sends, source forks, pending-availability roots,pending timeouts, relay reorgs (back to older
+//! sends, source forks, pending-availability roots, pending timeouts, relay reorgs (back to older
 //! roots too), runtime cuts, rounds that fail, a lying peer, node restarts, finality that lands
 //! between building a block and noting it, the source offboarding, blocks bundled into one
 //! candidate, and stored-bundle recovery assembly.
@@ -338,15 +338,14 @@ impl World {
 
 	/// Current relay snapshot of the source's eligible roots.
 	fn snapshot(&self) -> Option<SourceRoots> {
-		let included = self.included.checked_sub(1).map(|i| self.blocks[i].root);
+		let included = self.blocks[self.included.checked_sub(1)?].root;
 		let mut pending = Vec::new();
 		for block in &self.blocks[self.included..self.backed] {
-			if included != Some(block.root) && !pending.contains(&block.root) {
+			if included != block.root && !pending.contains(&block.root) {
 				pending.push(block.root);
 			}
 		}
-		let roots = SourceRoots { included, pending };
-		(!roots.is_empty()).then_some(roots)
+		Some(SourceRoots { included: Some(included), pending })
 	}
 
 	/// A relay block: the receiver fetches under the newest eligible root.
