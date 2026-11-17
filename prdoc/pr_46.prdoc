@@ -1,0 +1,16 @@
+title: 'spec-msg: runtime pallet on the enactment stack'
+doc:
+- audience: Runtime Dev
+  description: Add the messaging pallet, channel lifecycle and inherent, with sealed-block lift retargeting
+    coverage.
+crates:
+- name: cumulus-pallet-parachain-system
+  bump: none
+- name: cumulus-pallet-spec-messaging
+  bump: minor
+- name: polkadot-omni-node-lib
+  bump: none
+- name: cumulus-primitives-core
+  bump: minor
+- name: frame-benchmarking-cli
+  bump: none
