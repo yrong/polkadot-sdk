@@ -17,8 +17,7 @@
 
 //! The archiver: keeps the [`Archive`] current.
 //!
-//! - **New best block:** rewind past retracted blocks, then archive each enacted block's sends,
-//!   during major sync too.
+//! - **Every imported block:** archive its sends against its parent, during major sync too.
 //! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. If that block's
 //!   state is pruned (warp sync, or spec-msg enabled late), seed the archive at the newest
 //!   finalized block instead: each stream is then served from its leaf count there, until
@@ -41,9 +40,9 @@ use cumulus_primitives_spec_messaging::{
 };
 use futures::{select, FutureExt, StreamExt};
 use parking_lot::{Mutex, RwLock};
-use sc_client_api::BlockchainEvents;
+use sc_client_api::{Backend, BlockchainEvents, FinalityNotifications, ImportNotifications};
 use sp_api::{ApiExt, ProvideRuntimeApi};
-use sp_blockchain::{HeaderBackend, HeaderMetadata};
+use sp_blockchain::Backend as BlockchainBackend;
 use sp_runtime::{
 	traits::{Block as BlockT, Header as HeaderT, Zero},
 	SaturatedConversion,
@@ -66,47 +65,26 @@ fn now() -> u64 {
 /// runtime and the store synchronously; spawn it as a blocking task.
 pub async fn run_archiver<Block, C, S>(
 	client: Arc<C>,
+	backend: Arc<impl Backend<Block>>,
 	archive: Arc<RwLock<Archive<Block::Hash, S>>>,
 	watermarks: Arc<Mutex<BTreeMap<StreamId, u64>>>,
 ) where
 	Block: BlockT,
-	C: ProvideRuntimeApi<Block>
-		+ BlockchainEvents<Block>
-		+ HeaderBackend<Block>
-		+ HeaderMetadata<Block, Error = sp_blockchain::Error>
-		+ Send
-		+ Sync
-		+ 'static,
+	C: ProvideRuntimeApi<Block> + BlockchainEvents<Block> + Send + Sync + 'static,
 	C::Api: SpecMsgApi<Block>,
 	S: ArchiveStore,
 {
 	// Every import, major sync included. A notification pins its block's state until it is
 	// dropped, so state pruning cannot remove a block's sends before they are archived.
-	let mut imports = client.every_import_notification_stream().fuse();
-	let mut finality = client.finality_notification_stream().fuse();
-	let mut archiver = Archiver { client, archive, watermarks, stuck_at: None };
-	// A fresh node's best block is genesis. Wait for its first import instead: a warp-synced node
-	// would archive genesis and then find every block after it without state, and never seed.
-	let info = archiver.client.info();
-	if !info.best_number.is_zero() {
-		archiver.follow(info.best_hash);
-	}
-	loop {
-		select! {
-			import = imports.next() => match import {
-				Some(import) if import.is_new_best => archiver.follow(import.hash),
-				Some(_) => {},
-				None => return,
-			},
-			finalized = finality.next() => match finalized {
-				Some(finalized) => archiver.retain(finalized.hash),
-				None => return,
-			},
-		}
-	}
+	let imports = client.every_import_notification_stream();
+	let finality = client.finality_notification_stream();
+	Archiver { client, chain: backend.blockchain(), archive, watermarks, stuck_at: None }
+		.run(imports, finality)
+		.await;
 }
 
-struct Archiver<Block: BlockT, C, S> {
+struct Archiver<'a, Block: BlockT, C, S> {
+	chain: &'a dyn BlockchainBackend<Block>,
 	client: Arc<C>,
 	archive: Arc<RwLock<Archive<Block::Hash, S>>>,
 	watermarks: Arc<Mutex<BTreeMap<StreamId, u64>>>,
@@ -114,92 +92,127 @@ struct Archiver<Block: BlockT, C, S> {
 	stuck_at: Option<Block::Hash>,
 }
 
-impl<Block, C, S> Archiver<Block, C, S>
+impl<Block, C, S> Archiver<'_, Block, C, S>
 where
 	Block: BlockT,
-	C: ProvideRuntimeApi<Block>
-		+ HeaderBackend<Block>
-		+ HeaderMetadata<Block, Error = sp_blockchain::Error>,
+	C: ProvideRuntimeApi<Block>,
 	C::Api: SpecMsgApi<Block>,
 	S: ArchiveStore,
 {
+	async fn run(
+		mut self,
+		imports: ImportNotifications<Block>,
+		finality: FinalityNotifications<Block>,
+	) {
+		let mut imports = imports.fuse();
+		let mut finality = finality.fuse();
+		// A fresh node's best block is genesis. Wait for its first import instead: a warp-synced
+		// node would archive genesis and then find every block after it without state, and never
+		// seed.
+		let mut retry_leaves = true;
+		loop {
+			if retry_leaves {
+				let info = self.chain.info();
+				retry_leaves = false;
+				if !info.best_number.is_zero() {
+					retry_leaves |= !self.finalize(info.finalized_hash);
+					match self.chain.leaves() {
+						Ok(leaves) => {
+							for hash in leaves {
+								if !self.follow(hash) {
+									retry_leaves = true;
+								}
+							}
+						},
+						Err(e) => {
+							log::warn!(target: LOG_TARGET, "Cannot enumerate archive heads: {e}");
+							retry_leaves = true;
+						},
+					}
+				}
+			}
+			select! {
+				import = imports.next() => match import {
+					Some(import) => {
+						if !self.follow(import.hash) { retry_leaves = true; }
+					},
+					None => return,
+				},
+				finalized = finality.next() => match finalized {
+					Some(notification) => retry_leaves |= !self.finalize(notification.hash),
+					None => return,
+				},
+			}
+		}
+	}
+
 	fn has_api(&self, hash: Block::Hash) -> Result<bool, sp_api::ApiError> {
 		self.client.runtime_api().has_api::<dyn SpecMsgApi<Block>>(hash)
 	}
 
-	/// Bring the archive's tip to `target`.
-	fn follow(&mut self, target: Block::Hash) {
-		let tip = self.archive.read().tip();
-		match tip {
-			Some(tip) if tip.hash == target => {},
-			Some(tip) => {
-				let route = match sp_blockchain::tree_route(&*self.client, tip.hash, target) {
-					Ok(route) => route,
-					Err(e) => {
-						log::warn!(target: LOG_TARGET, "No route from the archived tip: {e}");
-						return;
-					},
-				};
-				if !route.retracted().is_empty() {
-					let common = route.common_block();
-					if let Err(e) =
-						self.archive.write().rewind_to(common.hash, common.number.saturated_into())
-					{
-						log::warn!(target: LOG_TARGET, "Archive rewind failed: {e:?}");
-						return;
-					}
-				}
-				for block in route.enacted() {
-					if !self.import(block.hash) {
-						return;
-					}
-				}
-			},
-			None => {
-				let origin = match self.find_origin(target) {
-					Some(Origin::Start(origin)) => origin,
-					Some(Origin::Pruned) => {
-						if self.seed() {
-							self.follow(target);
-						}
-						return;
-					},
-					None => return,
-				};
-				let mut chain = vec![target];
-				while chain.last() != Some(&origin) {
-					let Some(parent) = chain
-						.last()
-						.and_then(|hash| self.client.header(*hash).ok().flatten())
-						.map(|header| *header.parent_hash())
-					else {
-						return;
-					};
-					chain.push(parent);
-				}
-				log::info!(
-					target: LOG_TARGET,
-					"Building the spec-msg archive from {origin:?}: {} blocks",
-					chain.len(),
-				);
-				for hash in chain.into_iter().rev() {
-					if !self.import(hash) {
-						return;
-					}
-				}
-			},
+	/// Walk back to archived state, then read the missing blocks parent first.
+	fn follow(&mut self, target: Block::Hash) -> bool {
+		match self.archive.read().has_boundary(&target) {
+			Ok(true) => return true,
+			Ok(false) => {},
+			Err(_) => return false,
 		}
+		let origin = if self.archive.read().tip().is_none() {
+			match self.has_api(target) {
+				Ok(true) => {},
+				Ok(false) => return true,
+				Err(_) => return false,
+			}
+			let finalized = self.chain.info().finalized_hash;
+			if target != finalized && matches!(self.has_api(finalized), Ok(false)) {
+				// Activation can occur independently on siblings above this common ancestor.
+				if !self.import(finalized) || !self.retain(finalized) {
+					return false;
+				}
+				None
+			} else {
+				match self.find_origin(target) {
+					Some(Origin::Start(hash)) => Some(hash),
+					Some(Origin::Pruned) if self.seed() => None,
+					_ => return false,
+				}
+			}
+		} else {
+			None
+		};
+		let Ok(anchor) = self.archive.read().anchor() else { return false };
+		let mut path = Vec::new();
+		let mut hash = target;
+		loop {
+			match self.archive.read().has_boundary(&hash) {
+				Ok(true) => break,
+				Ok(false) => {},
+				Err(_) => return false,
+			}
+			let Ok(Some(header)) = self.chain.header(hash) else { return false };
+			if anchor.is_some_and(|at| (*header.number()).saturated_into::<u64>() <= at.number) {
+				return true;
+			}
+			path.push(hash);
+			if Some(hash) == origin || header.number().is_zero() {
+				break;
+			}
+			hash = *header.parent_hash();
+			if anchor.is_none() &&
+				self.archive.read().is_origin_parent(&hash, (*header.number()).saturated_into())
+			{
+				break;
+			}
+		}
+		path.into_iter().rev().all(|hash| self.import(hash))
 	}
 
 	/// Where the run of API-bearing blocks that ends at `target` starts, or `None` if `target` has
 	/// no API or a runtime version cannot be read.
 	fn find_origin(&mut self, target: Block::Hash) -> Option<Origin<Block::Hash>> {
-		if !self.has_api(target).unwrap_or(false) {
-			return None;
-		}
 		let mut origin = target;
 		loop {
-			let header = self.client.header(origin).ok().flatten()?;
+			let header = self.chain.header(origin).ok().flatten()?;
 			if header.number().is_zero() {
 				return Some(Origin::Start(origin));
 			}
@@ -223,8 +236,8 @@ where
 	/// Seed the empty archive at the newest finalized block, whose state the node keeps, from its
 	/// `outbound_frontiers()`. `false` if that failed.
 	fn seed(&mut self) -> bool {
-		let hash = self.client.info().finalized_hash;
-		let Ok(Some(header)) = self.client.header(hash) else {
+		let hash = self.chain.info().finalized_hash;
+		let Ok(Some(header)) = self.chain.header(hash) else {
 			log::warn!(target: LOG_TARGET, "Missing header {hash:?}");
 			return false;
 		};
@@ -259,7 +272,7 @@ where
 
 	/// Archive one block. `false` stops the current walk; the next best block retries.
 	fn import(&mut self, hash: Block::Hash) -> bool {
-		let Ok(Some(header)) = self.client.header(hash) else {
+		let Ok(Some(header)) = self.chain.header(hash) else {
 			log::warn!(target: LOG_TARGET, "Missing header {hash:?}");
 			return false;
 		};
@@ -309,34 +322,41 @@ where
 		true
 	}
 
-	/// The state of `hash`, which the archive needs next, is gone: the archive cannot move past
-	/// it, so the node serves no newer sends. Every later best block retries and fails the same
-	/// way, hence an error, once per block.
+	/// Report unavailable state once per blocked branch tip.
 	fn unavailable(&mut self, hash: Block::Hash, e: &sp_api::ApiError) {
 		if self.stuck_at.replace(hash) == Some(hash) {
 			log::debug!(target: LOG_TARGET, "State of {hash:?} still unavailable: {e}");
 			return;
 		}
-		let number = self.client.number(hash).ok().flatten().map(|n| n.to_string());
+		let number = self.chain.number(hash).ok().flatten().map(|n| n.to_string());
 		log::error!(
 			target: LOG_TARGET,
-			"The spec-msg archive cannot advance: the state of block #{} ({hash:?}) is \
-			 unavailable ({e}). This node serves no newer sends. The archive needs each \
-			 canonical block's state when the block is archived.",
+			"Cannot archive this branch: state unavailable at block #{} ({hash:?}): {e}",
 			number.as_deref().unwrap_or("?"),
 		);
 	}
 
-	/// Apply retention at `finalized`, if archived.
-	fn retain(&self, finalized: Block::Hash) {
-		if !self.archive.read().contains(&finalized) {
-			return;
+	fn finalize(&mut self, hash: Block::Hash) -> bool {
+		if !self.follow(hash) {
+			return false;
 		}
+		let known = self.archive.read().has_boundary(&hash);
+		match known {
+			Ok(true) => self.retain(hash),
+			Ok(false) => true,
+			Err(_) => false,
+		}
+	}
+
+	/// Apply retention at `finalized`, if archived.
+	fn retain(&self, finalized: Block::Hash) -> bool {
 		let watermarks = self.watermarks.lock().clone();
 		let cutoff = now().saturating_sub(SERVING_HORIZON.as_secs());
 		if let Err(e) = self.archive.write().retain(finalized, &watermarks, cutoff) {
 			log::warn!(target: LOG_TARGET, "Archive retention failed: {e:?}");
+			return false;
 		}
+		true
 	}
 }
 
@@ -399,9 +419,9 @@ pub(crate) async fn backfill<H, S, T>(
 	for stream in pending {
 		let (served, floor) = {
 			let archive = archive.read();
-			(archive.served_at(finalized, &stream), archive.payload_floor(&stream))
+			(archive.served_at(finalized, &stream), archive.seeded_payload_floor(&stream))
 		};
-		let Some((under, count)) = served else { continue };
+		let (Some((under, count)), Some(floor)) = (served, floor) else { continue };
 		let target = match stream {
 			StreamId::Channel { .. } => match watermarks.lock().get(&stream) {
 				Some(mark) => *mark,
@@ -409,8 +429,8 @@ pub(crate) async fn backfill<H, S, T>(
 			},
 			_ => count.saturating_sub(1),
 		};
-		let result = if target >= floor {
-			archive.write().backfill_done(&stream)
+		let response = if target >= floor {
+			None
 		} else {
 			let Some((frontier, payloads)) =
 				fetch_range(transport, us, stream, under, target, floor).await
@@ -418,7 +438,16 @@ pub(crate) async fn backfill<H, S, T>(
 				log::debug!(target: LOG_TARGET, "No own peer served {stream:?} below {floor}");
 				continue;
 			};
-			let result = archive.write().backfill(stream, &frontier, &payloads);
+			Some((frontier, payloads))
+		};
+		let mut archive = archive.write();
+		if !archive.backfill_pending().contains(&stream) ||
+			archive.seeded_payload_floor(&stream) != Some(floor)
+		{
+			continue;
+		}
+		let result = if let Some((frontier, payloads)) = response {
+			let result = archive.backfill(stream, &frontier, &payloads);
 			if result.is_ok() {
 				log::info!(
 					target: LOG_TARGET,
@@ -427,6 +456,8 @@ pub(crate) async fn backfill<H, S, T>(
 				);
 			}
 			result
+		} else {
+			archive.backfill_done(&stream)
 		};
 		if let Err(e) = result {
 			log::warn!(target: LOG_TARGET, "Backfilling {stream:?} failed: {e:?}");
@@ -531,6 +562,98 @@ pub(crate) async fn read_watermarks<H, S, T, R>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	use crate::tests::{channel, messages, payloads, Model};
+	use cumulus_primitives_spec_messaging::{
+		verify_messages, ConsumedStreams, ConsumptionRecord, SPMS_ENGINE_ID,
+	};
+	use polkadot_core_primitives::Hash;
+	use sc_client_api::{in_mem::Blockchain, BlockImportNotification, NewBlockState};
+	use sc_utils::mpsc::tracing_unbounded;
+	use sp_runtime::{generic::DigestItem, testing::Header};
+
+	type Block = sp_runtime::generic::Block<Header, sp_runtime::OpaqueExtrinsic>;
+	type Sends = Vec<(StreamId, Vec<Vec<u8>>)>;
+
+	#[derive(Clone, Default)]
+	struct Runtime(Arc<Mutex<BTreeMap<Hash, Sends>>>);
+
+	sp_api::mock_impl_runtime_apis! {
+		impl SpecMsgApi<Block> for Runtime {
+			#[advanced]
+			fn outbound_messages(&self, at: Hash) -> Result<Sends, sp_api::ApiError> {
+				Ok(self.0.lock().get(&at).cloned().unwrap_or_default())
+			}
+			fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)> { unreachable!() }
+			fn consumed_streams() -> ConsumedStreams { unreachable!() }
+			fn max_touched_streams() -> u32 { unreachable!() }
+			fn consumption_record() -> ConsumptionRecord { unreachable!() }
+		}
+	}
+
+	impl ProvideRuntimeApi<Block> for Runtime {
+		type Api = Self;
+		fn runtime_api(&self) -> sp_api::ApiRef<'_, Self> {
+			self.clone().into()
+		}
+	}
+
+	#[test]
+	fn worker_serves_never_best_siblings_from_startup_and_notifications() {
+		let chain = Blockchain::<Block>::new();
+		let runtime = Arc::new(Runtime::default());
+		let archive = Arc::new(RwLock::new(Archive::open(crate::MemoryStore::default())));
+		let genesis = Header::new_from_number(0);
+		chain
+			.insert(genesis.hash(), genesis.clone(), None, None, NewBlockState::Final, true)
+			.unwrap();
+		let stream = channel(2000);
+		let insert = |tag, state| {
+			let sends = vec![(stream, payloads(tag, 1))];
+			let root = Model::default().send(&sends);
+			let mut header = Header::new_from_number(1);
+			header.parent_hash = genesis.hash();
+			header.digest.push(DigestItem::Consensus(SPMS_ENGINE_ID, root.encode()));
+			runtime.0.lock().insert(header.hash(), sends);
+			chain.insert(header.hash(), header.clone(), None, None, state, true).unwrap();
+			(header, root)
+		};
+		let (_, best) = insert(1, NewBlockState::Best);
+		let (_, startup) = insert(2, NewBlockState::Normal);
+		let (tx, imports) = tracing_unbounded("archive-imports", 8);
+		let (_final_tx, finality) = tracing_unbounded("archive-finality", 8);
+		let (unpin, _rx) = tracing_unbounded("archive-unpin", 8);
+		let worker = Archiver {
+			chain: &chain,
+			client: runtime.clone(),
+			archive: archive.clone(),
+			watermarks: Default::default(),
+			stuck_at: None,
+		};
+		futures::executor::block_on(async {
+			let run = worker.run(imports, finality);
+			futures::pin_mut!(run);
+			assert!(futures::poll!(&mut run).is_pending());
+			let (header, live) = insert(3, NewBlockState::Normal);
+			tx.unbounded_send(BlockImportNotification::new(
+				header.hash(),
+				sp_consensus::BlockOrigin::NetworkBroadcast,
+				header,
+				false,
+				None,
+				unpin,
+			))
+			.unwrap();
+			drop(tx);
+			run.await;
+			for (tag, root) in [(1, best), (2, startup), (3, live)] {
+				let request = messages(stream, 0, root, u32::MAX);
+				let response = archive.read().serve_messages(&request, u32::MAX).unwrap();
+				verify_messages(&request, &response).unwrap();
+				assert_eq!(response.payloads.into_inner(), payloads(tag, 1));
+			}
+		});
+	}
 
 	#[test]
 	fn pruned_state_is_told_apart_from_other_runtime_call_failures() {

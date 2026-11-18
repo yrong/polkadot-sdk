@@ -30,8 +30,8 @@
 //! A failing run is shrunk to a minimal sequence of operations before it is reported.
 
 use crate::{
-	tests::{ack, channel, frontier_at, TestArchive},
-	MemoryStore, Tip,
+	tests::{ack, channel, frontier_at, messages, TestArchive},
+	MemoryStore,
 };
 use codec::Encode;
 use cumulus_primitives_spec_messaging::{
@@ -127,7 +127,16 @@ struct Block {
 	served: bool,
 }
 
+struct SideBlock {
+	block: Block,
+	parent: u64,
+	common: u64,
+	leaves: BTreeMap<StreamId, Vec<Vec<u8>>>,
+	before: BTreeMap<StreamId, u64>,
+}
+
 struct Sim {
+	side: Vec<SideBlock>,
 	store: Arc<MemoryStore>,
 	archive: TestArchive,
 	/// The current chain by number; 0 is the parent of the first archived block.
@@ -159,7 +168,7 @@ fn genesis() -> Block {
 
 /// The archive's key layout, rebuilt here so the store can be audited.
 fn key(kind: u8, parts: &[&[u8]]) -> Vec<u8> {
-	let mut key = b"spec-msg/archive/v1/".to_vec();
+	let mut key = b"spec-msg/archive/v2/".to_vec();
 	key.push(kind);
 	for part in parts {
 		key.extend_from_slice(part);
@@ -190,6 +199,7 @@ impl Sim {
 			oldest: None,
 			floors: BTreeMap::new(),
 			abandoned: Vec::new(),
+			side: Vec::new(),
 		}
 	}
 
@@ -257,12 +267,24 @@ impl Sim {
 				if self.tip() == 0 || *to < self.finalized || *to > self.tip() {
 					return Ok(false);
 				}
-				let ancestor = &self.chain[*to as usize];
-				self.archive
-					.rewind_to(ancestor.hash, *to)
-					.map_err(|e| format!("[apply] rewind to #{to}: {e:?}"))?;
-				for block in self.chain.drain(*to as usize + 1..) {
-					self.abandoned.extend(block.recomputed);
+				for side in &mut self.side {
+					side.common = side.common.min(*to);
+				}
+				while self.tip() > *to {
+					let block = self.chain.pop().unwrap();
+					let parent = self.chain.last().unwrap();
+					let leaves = block
+						.counts
+						.iter()
+						.map(|(s, n)| (*s, self.leaves[s][..*n as usize].to_vec()))
+						.collect();
+					self.side.push(SideBlock {
+						block,
+						common: *to,
+						parent: parent.hash,
+						before: parent.counts.clone(),
+						leaves,
+					});
 				}
 				let counts = self.chain[*to as usize].counts.clone();
 				self.leaves.retain(|stream, _| counts.contains_key(stream));
@@ -280,6 +302,13 @@ impl Sim {
 				self.archive
 					.retain(self.chain[*to as usize].hash, marks, cutoff)
 					.map_err(|e| format!("[apply] retain at #{to}: {e:?}"))?;
+				self.side.retain(|side| {
+					if side.common >= *to {
+						return true;
+					}
+					self.abandoned.extend(side.block.recomputed);
+					false
+				});
 				self.finalized = *to;
 				let mut oldest = self.oldest.unwrap_or(1);
 				while oldest < *to && self.chain[oldest as usize].imported_at < cutoff {
@@ -309,11 +338,6 @@ impl Sim {
 	}
 
 	fn check(&self) -> Result<(), String> {
-		let tip = (self.tip() > 0)
-			.then(|| Tip { hash: self.chain.last().unwrap().hash, number: self.tip() });
-		if self.archive.tip() != tip {
-			return Err(format!("[tip] archive {:?}, model {tip:?}", self.archive.tip()));
-		}
 		self.check_keys()?;
 
 		// The roots read in full: the tip's, the finalized block's and the oldest kept one's.
@@ -321,18 +345,52 @@ impl Sim {
 		full.extend(self.chain.last().unwrap().state_at);
 		full.extend(self.chain[self.finalized as usize].state_at);
 		full.extend(self.oldest.and_then(|o| self.chain[o as usize].state_at));
+		let live: BTreeSet<_> = self
+			.chain
+			.iter()
+			.enumerate()
+			.filter(|(n, block)| block.served && self.kept(*n as u64))
+			.filter_map(|(_, block)| block.recomputed)
+			.chain(
+				self.side
+					.iter()
+					.filter(|side| side.block.served)
+					.filter_map(|side| side.block.recomputed),
+			)
+			.map(|root| root.0)
+			.collect();
 		for n in 1..=self.tip() {
 			let block = &self.chain[n as usize];
 			let Some(root) = block.recomputed else { continue };
 			if block.served && self.kept(n) {
 				self.check_root(n, root, full.contains(&n))?;
-			} else {
+			} else if !live.contains(&root.0) {
 				let why = if block.served { "pruned" } else { "unserved" };
 				self.unknown(root, &format!("{why} root of #{n}"))?;
 			}
 		}
+		for side in &self.side {
+			let Some(root) = side.block.recomputed.filter(|_| side.block.served) else { continue };
+			for (stream, leaves) in &side.leaves {
+				let start = self.floor(stream).min(leaves.len() as u64);
+				let req = messages(*stream, start, root, u32::MAX);
+				let actual = self
+					.archive
+					.serve_messages(&req, u32::MAX)
+					.map_err(|e| format!("live sibling {}: {e:?}", side.block.hash))?;
+				verify_messages(&req, &actual).map_err(|e| format!("sibling proof: {e:?}"))?;
+				let start = start as usize;
+				let end =
+					leaves.len().min(start + crate::archive::MAX_LEAVES_PER_RESPONSE as usize);
+				if actual.payloads.as_slice() != &leaves[start..end] {
+					return Err("wrong sibling payloads".into());
+				}
+			}
+		}
 		for root in &self.abandoned {
-			self.unknown(*root, "abandoned root")?;
+			if !live.contains(&root.0) {
+				self.unknown(*root, "abandoned root")?;
+			}
 		}
 
 		if self.finalized > 0 {
@@ -448,11 +506,40 @@ impl Sim {
 		}
 	}
 
+	fn fork_keys(
+		want: &mut BTreeSet<Vec<u8>>,
+		block: &Block,
+		parent: u64,
+		before: &BTreeMap<StreamId, u64>,
+	) {
+		want.insert(key(b'd', &[&parent.encode()]));
+		want.insert(key(b'b', &[&block.hash.encode()]));
+		if block.sent.is_empty() {
+			return;
+		}
+		want.insert(key(b's', &[&block.hash.encode()]));
+		if block.served {
+			want.insert(key(b'r', &[block.recomputed.unwrap().0.as_bytes()]));
+		}
+		for stream in &block.sent {
+			let first = before.get(stream).copied().unwrap_or(0);
+			let count = block.counts[stream];
+			for (kind, range) in [(b'p', first..count), (b'n', mmr_size(first)..mmr_size(count))] {
+				for pos in range {
+					want.insert(key(
+						b'w',
+						&[&block.hash.encode(), &[kind], &stream.encode(), &pos.to_be_bytes()],
+					));
+				}
+			}
+		}
+	}
+
 	/// The store holds exactly what the model says retention keeps.
 	fn check_keys(&self) -> Result<(), String> {
 		let mut want = BTreeSet::new();
 		let tip = self.tip();
-		if tip > 0 {
+		if tip > 0 || !self.side.is_empty() {
 			want.insert(key(b't', &[]));
 		}
 		let first = self.oldest.unwrap_or(1);
@@ -465,6 +552,7 @@ impl Sim {
 			}
 		}
 		if let Some(oldest) = self.oldest {
+			want.insert(key(b'a', &[]));
 			want.insert(key(b'o', &[]));
 			for n in oldest..=self.finalized {
 				want.insert(key(b'c', &[&n.to_be_bytes()]));
@@ -486,7 +574,18 @@ impl Sim {
 				want.insert(key(b'f', &[&stream.encode()]));
 			}
 		}
-		for (stream, count) in &self.chain[tip as usize].counts {
+		if self.finalized == 0 && (tip > 0 || !self.side.is_empty()) {
+			want.insert(key(b'i', &[]));
+		}
+		for n in self.finalized + 1..=tip {
+			let parent = &self.chain[n as usize - 1];
+			Self::fork_keys(&mut want, &self.chain[n as usize], parent.hash, &parent.counts);
+		}
+		for side in &self.side {
+			Self::fork_keys(&mut want, &side.block, side.parent, &side.before);
+		}
+		for (stream, count) in &self.chain[self.finalized as usize].counts {
+			want.insert(key(b'F', &[&stream.encode()]));
 			let floor = self.floor(stream);
 			let peaks = if floor > 0 { get_peaks(mmr_size(floor)) } else { vec![] };
 			for pos in peaks.into_iter().chain(mmr_size(floor)..mmr_size(*count)) {

@@ -38,4 +38,6 @@ cumulus-primitives-spec-messaging = { workspace = true, default-features = true 
 cumulus-relay-chain-interface = { workspace = true, default-features = true }
 
 [dev-dependencies]
+sc-utils = { workspace = true, default-features = true }
+sp-consensus = { workspace = true, default-features = true }
 sp-core = { workspace = true, default-features = true }

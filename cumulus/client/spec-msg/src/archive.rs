@@ -22,7 +22,7 @@
 //! - **Per block:** a `Boundary` with each stream's leaf count and root. The recomputed
 //!   `StreamsRoot` is indexed only if it equals the header digest, so a divergence shows as an
 //!   unknown root, never a wrong proof.
-//! - **Per root:** the block that committed it, to resolve a request's `under`.
+//! - **Per root:** the retained blocks that committed it, to resolve a request's `under`.
 //!
 //! [`Archive::retain`] prunes channels below their watermark and the rest past the serving horizon.
 
@@ -46,7 +46,7 @@ use mmr_lib::{
 use polkadot_core_primitives::Hash;
 use std::collections::{BTreeMap, BTreeSet};
 
-const PREFIX: &[u8] = b"spec-msg/archive/v1/";
+const PREFIX: &[u8] = b"spec-msg/archive/v2/";
 
 /// Maximum payloads served per response, whatever the byte budget: each costs a store read, so
 /// tiny leaves under a large budget would make a 1 KiB request cost many reads. The protocol's
@@ -56,7 +56,7 @@ pub const MAX_LEAVES_PER_RESPONSE: u64 = MAX_MESSAGES_PER_RESPONSE as u64;
 /// Errors of the archive's write paths. Serving refuses with a [`FetchError`] instead.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArchiveError {
-	/// The block is not a child of the archive's tip.
+	/// The parent is outside the live archive.
 	NotChild,
 	/// Only an empty archive can be seeded.
 	NotEmpty,
@@ -70,7 +70,7 @@ pub enum ArchiveError {
 	Store(String),
 }
 
-/// The archived tip: the newest block the archive reflects.
+/// An archived block and its height.
 #[derive(Encode, Decode, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tip<H> {
 	/// Block hash.
@@ -80,25 +80,26 @@ pub struct Tip<H> {
 }
 
 /// One stream's state at a block: leaf count and MMR root.
-#[derive(Encode, Decode, Clone, Copy, Debug, PartialEq, Eq)]
-struct StreamState {
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+struct StreamState<H> {
+	owners: Vec<(u64, H)>,
 	leaf_count: u64,
 	root: Hash,
 }
 
 /// The stream states after a block with sends, and the root over them.
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
-struct BlockState {
+struct BlockState<H> {
 	/// The recomputed `StreamsRoot`, if it matched the header digest. `None` means the block is
 	/// archived but not served.
 	root: Option<StreamsRoot>,
 	/// Every stream with at least one leaf, in `StreamId` order.
-	streams: Vec<(StreamId, StreamState)>,
+	streams: Vec<(StreamId, StreamState<H>)>,
 }
 
-impl BlockState {
-	fn stream(&self, stream: &StreamId) -> Option<StreamState> {
-		self.streams.iter().find(|(s, _)| s == stream).map(|(_, state)| *state)
+impl<H> BlockState<H> {
+	fn stream(&self, stream: &StreamId) -> Option<&StreamState<H>> {
+		self.streams.iter().find(|(s, _)| s == stream).map(|(_, state)| state)
 	}
 
 	fn entries(&self) -> BTreeMap<StreamId, Hash> {
@@ -124,6 +125,8 @@ struct Boundary<H> {
 /// peaks at `node`.
 #[derive(Encode, Decode, Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Floors {
+	/// Confirmed pruning can advance within a sparse seed before backfill fills it.
+	retained_from: u64,
 	payload: u64,
 	node: u64,
 }
@@ -191,26 +194,54 @@ fn backfill_key() -> Vec<u8> {
 	key(b'k', &[])
 }
 
+fn children_key<H: Encode>(parent: &H) -> Vec<u8> {
+	key(b'd', &[&parent.encode()])
+}
+
+fn owned_key<H: Encode>(owner: &H, base_key: &[u8]) -> Vec<u8> {
+	key(b'w', &[&owner.encode(), &base_key[PREFIX.len()..]])
+}
+
+fn count_key(stream: &StreamId) -> Vec<u8> {
+	key(b'F', &[&stream.encode()])
+}
+
 /// One stream's MMR nodes, read from the store with an overlay for nodes written but not yet
 /// committed.
-struct Nodes<'a, S> {
+struct Nodes<'a, S, H> {
+	owners: &'a [(u64, H)],
+	base: u64,
 	store: &'a S,
 	stream: StreamId,
 	pending: RefCell<BTreeMap<u64, Hash>>,
 }
 
-impl<'a, S: ArchiveStore> Nodes<'a, S> {
-	fn new(store: &'a S, stream: StreamId) -> Self {
-		Self { store, stream, pending: Default::default() }
+impl<'a, S: ArchiveStore, H: Encode> Nodes<'a, S, H> {
+	fn new(store: &'a S, stream: StreamId, owners: &'a [(u64, H)], base: u64) -> Self {
+		Self { store, stream, owners, base, pending: Default::default() }
+	}
+
+	fn row(&self, pos: u64, node: bool) -> Option<Vec<u8>> {
+		let (base, key) = if node {
+			(mmr_size(self.base), node_key(&self.stream, pos))
+		} else {
+			(self.base, payload_key(&self.stream, pos))
+		};
+		if pos < base {
+			return self.store.get(&key);
+		}
+		let end = self
+			.owners
+			.partition_point(|(first, _)| (if node { mmr_size(*first) } else { *first }) <= pos);
+		let (_, writer) = self.owners.get(end.checked_sub(1)?)?;
+		self.store.get(&owned_key(writer, &key))
 	}
 
 	fn get(&self, pos: u64) -> Option<Hash> {
 		if let Some(hash) = self.pending.borrow().get(&pos) {
 			return Some(*hash);
 		}
-		self.store
-			.get(&node_key(&self.stream, pos))
-			.and_then(|v| Hash::decode(&mut &v[..]).ok())
+		self.row(pos, true).and_then(|v| Hash::decode(&mut &v[..]).ok())
 	}
 
 	/// The peaks of the MMR with `leaf_count` leaves, highest first.
@@ -223,13 +254,13 @@ impl<'a, S: ArchiveStore> Nodes<'a, S> {
 	}
 }
 
-impl<S: ArchiveStore> MMRStoreReadOps<Hash> for &Nodes<'_, S> {
+impl<S: ArchiveStore, H: Encode> MMRStoreReadOps<Hash> for &Nodes<'_, S, H> {
 	fn get_elem(&self, pos: u64) -> mmr_lib::Result<Option<Hash>> {
 		Ok(self.get(pos))
 	}
 }
 
-impl<S: ArchiveStore> MMRStoreWriteOps<Hash> for &Nodes<'_, S> {
+impl<S: ArchiveStore, H: Encode> MMRStoreWriteOps<Hash> for &Nodes<'_, S, H> {
 	fn append(&mut self, pos: u64, elems: Vec<Hash>) -> mmr_lib::Result<()> {
 		let mut pending = self.pending.borrow_mut();
 		for (i, elem) in elems.into_iter().enumerate() {
@@ -242,9 +273,7 @@ impl<S: ArchiveStore> MMRStoreWriteOps<Hash> for &Nodes<'_, S> {
 /// The sender-side archive. See the module docs.
 pub struct Archive<H, S> {
 	store: S,
-	tip: Option<Tip<H>>,
-	/// Every stream's state at the tip.
-	streams: BTreeMap<StreamId, StreamState>,
+	hash: core::marker::PhantomData<H>,
 }
 
 impl<H, S> Archive<H, S>
@@ -254,22 +283,29 @@ where
 {
 	/// Open the archive in `store`, resuming at its persisted tip.
 	pub fn open(store: S) -> Self {
-		let tip: Option<Tip<H>> = store.get(&tip_key()).and_then(|v| Tip::decode(&mut &v[..]).ok());
-		let mut archive = Self { store, tip, streams: BTreeMap::new() };
-		if let Some(tip) = tip {
-			archive.streams = archive.state_at(&tip.hash).unwrap_or_default();
-		}
-		archive
+		Self { store, hash: Default::default() }
 	}
 
-	/// The archived tip, if any block was archived.
+	/// The last imported block, or the anchor if finality discarded that block.
 	pub fn tip(&self) -> Option<Tip<H>> {
-		self.tip
+		self.load(&tip_key()).ok().flatten()
+	}
+
+	pub(crate) fn anchor(&self) -> Result<Option<Tip<H>>, ArchiveError> {
+		self.load(&key(b'a', &[]))
+	}
+
+	pub(crate) fn is_origin_parent(&self, parent: &H, number: u64) -> bool {
+		self.store.get(&key(b'i', &[])) == Some((parent, number).encode())
 	}
 
 	/// Whether `hash` is archived.
 	pub fn contains(&self, hash: &H) -> bool {
-		self.boundary(hash).is_some()
+		self.has_boundary(hash).unwrap_or(false)
+	}
+
+	pub(crate) fn has_boundary(&self, hash: &H) -> Result<bool, ArchiveError> {
+		Ok(self.load::<Boundary<H>>(&boundary_key(hash))?.is_some())
 	}
 
 	fn boundary(&self, hash: &H) -> Option<Boundary<H>> {
@@ -278,7 +314,7 @@ where
 			.and_then(|v| Boundary::decode(&mut &v[..]).ok())
 	}
 
-	fn block_state(&self, hash: &H) -> Option<BlockState> {
+	fn block_state(&self, hash: &H) -> Option<BlockState<H>> {
 		self.store
 			.get(&state_key(hash))
 			.and_then(|v| BlockState::decode(&mut &v[..]).ok())
@@ -297,14 +333,34 @@ where
 
 	/// The stream states after `hash`. `None` if `hash` is not archived; empty for a block before
 	/// any send.
-	fn state_at(&self, hash: &H) -> Option<BTreeMap<StreamId, StreamState>> {
+	fn state_at(&self, hash: &H) -> Option<BTreeMap<StreamId, StreamState<H>>> {
 		let boundary = self.boundary(hash)?;
-		let state = boundary.state_at.and_then(|at| self.block_state(&at));
-		Some(state.map(|s| s.streams.into_iter().collect()).unwrap_or_default())
+		match boundary.state_at {
+			Some(at) => Some(self.block_state(&at)?.streams.into_iter().collect()),
+			None => Some(BTreeMap::new()),
+		}
 	}
 
-	/// Archive `hash`, a child of the tip (or the first block), with its sends and the
-	/// `StreamsRoot` its header committed to.
+	fn base_count(&self, stream: &StreamId) -> Result<u64, ArchiveError> {
+		Ok(self.load(&count_key(stream))?.unwrap_or(0))
+	}
+
+	fn load<T: Decode>(&self, key: &[u8]) -> Result<Option<T>, ArchiveError> {
+		self.store
+			.try_get(key)
+			.map_err(ArchiveError::Store)?
+			.map(|v| {
+				T::decode(&mut &v[..])
+					.map_err(|_| ArchiveError::Store("invalid archive metadata".into()))
+			})
+			.transpose()
+	}
+
+	fn hashes(&self, key: &[u8]) -> Result<Vec<H>, ArchiveError> {
+		Ok(self.load(key)?.unwrap_or_default())
+	}
+
+	/// Archive sends against the state of the block's own parent.
 	pub fn import_block(
 		&mut self,
 		hash: H,
@@ -314,35 +370,67 @@ where
 		sends: Vec<(StreamId, Vec<Vec<u8>>)>,
 		committed: Option<StreamsRoot>,
 	) -> Result<(), ArchiveError> {
-		if let Some(tip) = self.tip {
-			if tip.hash != parent {
+		if self.load::<Boundary<H>>(&boundary_key(&hash))?.is_some() {
+			return Ok(());
+		}
+		let anchor = self.anchor()?;
+		if anchor.is_some_and(|at| number <= at.number) {
+			return Err(ArchiveError::NotChild);
+		}
+		let mut batch = Batch::default();
+		let parent_boundary = self.load::<Boundary<H>>(&boundary_key(&parent))?;
+		if let Some(b) = &parent_boundary {
+			if b.number.checked_add(1) != Some(number) {
 				return Err(ArchiveError::NotChild);
 			}
-		}
-
-		let mut batch = Batch::default();
-		let mut streams = self.streams.clone();
-		let mut touched = false;
-		for (stream, payloads) in sends {
-			if payloads.is_empty() {
-				continue;
+		} else {
+			let origin_key = key(b'i', &[]);
+			match self.load::<(H, u64)>(&origin_key)? {
+				Some(origin) if origin == (parent, number) && anchor.is_none() => {},
+				None if anchor.is_none() => {
+					batch.insert.push((origin_key, (parent, number).encode()))
+				},
+				_ => return Err(ArchiveError::NotChild),
 			}
-			touched = true;
+		}
+		let mut updates = BTreeMap::<_, Vec<_>>::new();
+		for (stream, payloads) in sends {
+			if !payloads.is_empty() {
+				updates.entry(stream).or_default().extend(payloads);
+			}
+		}
+		let touched = !updates.is_empty();
+		let inherited = parent_boundary.and_then(|b| b.state_at);
+		let mut streams = BTreeMap::new();
+		if let Some(at) = inherited.filter(|_| touched) {
+			let state = self.block_state(&at).ok_or(ArchiveError::UnknownBlock)?;
+			for (stream, mut s) in state.streams {
+				let base = self.base_count(&stream)?;
+				s.owners.retain(|(first, _)| *first >= base);
+				streams.insert(stream, s);
+			}
+		}
+		for (stream, payloads) in updates {
 			let first = streams.get(&stream).map_or(0, |s| s.leaf_count);
-			let nodes = Nodes::new(&self.store, stream);
+			let mut owners = streams.remove(&stream).map(|s| s.owners).unwrap_or_default();
+			let nodes = Nodes::new(&self.store, stream, &owners, self.base_count(&stream)?);
 			let mut mmr = nodes.mmr(first);
 			for (i, payload) in payloads.iter().enumerate() {
 				mmr.push(leaf_hash(payload)).map_err(|_| ArchiveError::MissingNode)?;
-				batch.insert.push((payload_key(&stream, first + i as u64), payload.clone()));
+				batch.insert.push((
+					owned_key(&hash, &payload_key(&stream, first + i as u64)),
+					payload.clone(),
+				));
 			}
 			let leaf_count = first + payloads.len() as u64;
 			let bag = mmr.get_root().map_err(|_| ArchiveError::MissingNode)?;
 			let root = MmrRoot::from_bag(leaf_count, bag).0;
 			mmr.commit().map_err(|_| ArchiveError::MissingNode)?;
 			for (pos, node) in nodes.pending.take() {
-				batch.insert.push((node_key(&stream, pos), node.encode()));
+				batch.insert.push((owned_key(&hash, &node_key(&stream, pos)), node.encode()));
 			}
-			streams.insert(stream, StreamState { leaf_count, root });
+			owners.push((first, hash));
+			streams.insert(stream, StreamState { leaf_count, root, owners });
 		}
 
 		let (state, state_at) = if touched {
@@ -358,7 +446,7 @@ where
 				);
 				None
 			};
-			(Some(BlockState { root, streams: streams.clone().into_iter().collect() }), Some(hash))
+			(Some(BlockState { root, streams: streams.into_iter().collect() }), Some(hash))
 		} else {
 			if committed.is_some() {
 				log::warn!(
@@ -366,25 +454,25 @@ where
 					"Block {number} ({hash:?}) commits a StreamsRoot but sent nothing",
 				);
 			}
-			let from = self.tip.and_then(|tip| self.boundary(&tip.hash)).and_then(|b| b.state_at);
-			(None, from)
+			(None, inherited)
 		};
 
 		if let Some(state) = state {
 			if let Some(root) = state.root {
-				batch.insert.push((root_key(&root), hash.encode()));
+				let mut occurrences = self.hashes(&root_key(&root))?;
+				occurrences.push(hash);
+				batch.insert.push((root_key(&root), occurrences.encode()));
 			}
 			batch.insert.push((state_key(&hash), state.encode()));
 		}
+		let mut children = self.hashes(&children_key(&parent))?;
+		children.push(hash);
+		batch.insert.push((children_key(&parent), children.encode()));
 		let boundary = Boundary { number, parent, imported_at, state_at };
 		batch.insert.push((boundary_key(&hash), boundary.encode()));
 		let tip = Tip { hash, number };
 		batch.insert.push((tip_key(), tip.encode()));
-		self.store.commit(batch).map_err(ArchiveError::Store)?;
-
-		self.tip = Some(tip);
-		self.streams = streams;
-		Ok(())
+		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
 	/// Start an empty archive at `hash` from every stream's frontier there, for a node without the
@@ -401,12 +489,12 @@ where
 		frontiers: Vec<(StreamId, MmrFrontier)>,
 		committed: Option<StreamsRoot>,
 	) -> Result<(), ArchiveError> {
-		if self.tip.is_some() {
+		if self.load::<Tip<H>>(&tip_key())?.is_some() {
 			return Err(ArchiveError::NotEmpty);
 		}
 
 		let mut batch = Batch::default();
-		let mut streams = BTreeMap::new();
+		let mut streams = BTreeMap::<StreamId, StreamState<H>>::new();
 		let mut backfill = BTreeSet::new();
 		for (stream, frontier) in frontiers {
 			let leaf_count = frontier.leaf_count();
@@ -417,9 +505,13 @@ where
 			for (pos, peak) in positions.into_iter().zip(frontier.peaks()) {
 				batch.insert.push((node_key(&stream, pos), peak.encode()));
 			}
-			let floors = Floors { payload: leaf_count, node: leaf_count };
+			let floors = Floors { payload: leaf_count, node: leaf_count, retained_from: 0 };
 			batch.insert.push((floors_key(&stream), floors.encode()));
-			streams.insert(stream, StreamState { leaf_count, root: frontier.root().0 });
+			streams.insert(
+				stream,
+				StreamState { leaf_count, root: frontier.root().0, owners: Vec::new() },
+			);
+			batch.insert.push((count_key(&stream), leaf_count.encode()));
 			backfill.insert(stream);
 		}
 		batch.insert.push((backfill_key(), backfill.encode()));
@@ -437,19 +529,18 @@ where
 			None
 		};
 		if let Some(root) = root {
-			batch.insert.push((root_key(&root), hash.encode()));
+			batch.insert.push((root_key(&root), vec![hash].encode()));
 		}
-		let state = BlockState { root, streams: streams.clone().into_iter().collect() };
+		let state = BlockState { root, streams: streams.into_iter().collect() };
 		batch.insert.push((state_key(&hash), state.encode()));
 		let boundary = Boundary { number, parent, imported_at, state_at: Some(hash) };
 		batch.insert.push((boundary_key(&hash), boundary.encode()));
 		let tip = Tip { hash, number };
 		batch.insert.push((tip_key(), tip.encode()));
-		self.store.commit(batch).map_err(ArchiveError::Store)?;
-
-		self.tip = Some(tip);
-		self.streams = streams;
-		Ok(())
+		batch.insert.push((key(b'a', &[]), tip.encode()));
+		batch.insert.push((canon_key(number), hash.encode()));
+		batch.insert.push((oldest_key(), number.encode()));
+		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
 	/// The seeded streams not yet backfilled or found complete.
@@ -463,23 +554,27 @@ where
 	/// `stream` owes nothing below its floor.
 	pub(crate) fn backfill_done(&mut self, stream: &StreamId) -> Result<(), ArchiveError> {
 		let mut batch = Batch::default();
-		self.clear_backfill(&mut batch, stream);
+		self.clear_backfill(&mut batch, stream)?;
 		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
-	fn clear_backfill(&self, batch: &mut Batch, stream: &StreamId) {
-		let mut pending = self.backfill_pending();
+	fn clear_backfill(&self, batch: &mut Batch, stream: &StreamId) -> Result<(), ArchiveError> {
+		let mut pending: BTreeSet<StreamId> = self.load(&backfill_key())?.unwrap_or_default();
 		pending.remove(stream);
 		if pending.is_empty() {
 			batch.delete.push(backfill_key());
 		} else {
 			batch.insert.push((backfill_key(), pending.encode()));
 		}
+		Ok(())
 	}
 
-	/// The leaf below which `stream` serves no payload.
-	pub(crate) fn payload_floor(&self, stream: &StreamId) -> u64 {
-		self.floors(stream).payload
+	/// A pending seed always has a persisted floor, even before its first backfill.
+	pub(crate) fn seeded_payload_floor(&self, stream: &StreamId) -> Option<u64> {
+		self.load::<Floors>(&floors_key(stream))
+			.ok()
+			.flatten()
+			.map(|floors| floors.payload)
 	}
 
 	/// The root `hash` is served under, and `stream`'s leaf count there.
@@ -499,13 +594,16 @@ where
 		payloads: &[Vec<u8>],
 	) -> Result<(), ArchiveError> {
 		let start = frontier.leaf_count();
-		let floors = self.floors(&stream);
-		if floors.payload != floors.node || start + payloads.len() as u64 != floors.node {
+		let floors: Floors = self.load(&floors_key(&stream))?.unwrap_or_default();
+		if start < floors.retained_from ||
+			floors.payload != floors.node ||
+			start.checked_add(payloads.len() as u64) != Some(floors.node)
+		{
 			return Err(ArchiveError::Diverged);
 		}
 
 		let mut batch = Batch::default();
-		let nodes = Nodes::new(&self.store, stream);
+		let nodes = Nodes::<_, H>::new(&self.store, stream, &[], floors.node);
 		{
 			let mut pending = nodes.pending.borrow_mut();
 			for (pos, peak) in get_peaks(mmr_size(start)).into_iter().zip(frontier.peaks()) {
@@ -519,7 +617,7 @@ where
 		}
 		mmr.commit().map_err(|_| ArchiveError::MissingNode)?;
 		let built = nodes.pending.take();
-		let stored = Nodes::new(&self.store, stream);
+		let stored = Nodes::<_, H>::new(&self.store, stream, &[], floors.node);
 		let linked = get_peaks(mmr_size(floors.node))
 			.into_iter()
 			.all(|pos| built.get(&pos).is_some() && built.get(&pos) == stored.get(pos).as_ref());
@@ -529,71 +627,103 @@ where
 		for (pos, node) in built {
 			batch.insert.push((node_key(&stream, pos), node.encode()));
 		}
-		batch
-			.insert
-			.push((floors_key(&stream), Floors { payload: start, node: start }.encode()));
-		self.clear_backfill(&mut batch, &stream);
+		batch.insert.push((
+			floors_key(&stream),
+			Floors { payload: start, node: start, retained_from: floors.retained_from }.encode(),
+		));
+		self.clear_backfill(&mut batch, &stream)?;
 		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
-	/// Rewind to `ancestor` after a reorg: forget every block above it and every leaf they added.
-	/// `ancestor` must be the tip or one of its archived ancestors, or the parent of the first
-	/// archived block (the archive is then empty).
-	pub fn rewind_to(&mut self, ancestor: H, ancestor_number: u64) -> Result<(), ArchiveError> {
-		let Some(tip) = self.tip else { return Err(ArchiveError::UnknownBlock) };
+	/// Promote one child and retire the sibling subtrees in the same atomic write.
+	fn promote(&mut self, hash: H, boundary: Boundary<H>) -> Result<(), ArchiveError> {
 		let mut batch = Batch::default();
-		let mut current = tip.hash;
-		let mut first_parent = None;
-		while current != ancestor {
-			let boundary = self.boundary(&current).ok_or(ArchiveError::UnknownBlock)?;
-			batch.delete.push(boundary_key(&current));
-			if boundary.state_at == Some(current) {
-				if let Some(root) = self.block_state(&current).and_then(|s| s.root) {
-					batch.delete.push(root_key(&root));
-				}
-				batch.delete.push(state_key(&current));
-			}
-			first_parent = Some(boundary.parent);
-			current = boundary.parent;
-			if boundary.number <= ancestor_number {
-				break;
-			}
-		}
-		if current != ancestor {
+		let mut removed = BTreeMap::<Hash, Vec<H>>::new();
+		let mut siblings = self.hashes(&children_key(&boundary.parent))?;
+		if !siblings.contains(&hash) {
 			return Err(ArchiveError::UnknownBlock);
 		}
-
-		// The ancestor is archived, or it is the parent of the first archived block.
-		let (streams, new_tip) = match self.state_at(&ancestor) {
-			Some(streams) => (streams, Some(Tip { hash: ancestor, number: ancestor_number })),
-			None if first_parent == Some(ancestor) => (BTreeMap::new(), None),
-			None => return Err(ArchiveError::UnknownBlock),
-		};
-		for (stream, state) in &self.streams {
-			let keep = streams.get(stream).map_or(0, |s| s.leaf_count);
-			for pos in mmr_size(keep)..mmr_size(state.leaf_count) {
-				batch.delete.push(node_key(stream, pos));
+		siblings.retain(|h| *h != hash);
+		batch.delete.push(children_key(&boundary.parent));
+		let mut tip = self.load::<Tip<H>>(&tip_key())?;
+		while let Some(stale) = siblings.pop() {
+			let b = self.boundary(&stale).ok_or(ArchiveError::UnknownBlock)?;
+			siblings.extend(self.hashes(&children_key(&stale))?);
+			batch.delete.extend([children_key(&stale), boundary_key(&stale)]);
+			if b.state_at == Some(stale) {
+				let state = self.block_state(&stale).ok_or(ArchiveError::UnknownBlock)?;
+				self.writer_rows(&mut batch, stale, &state, false)?;
+				if let Some(root) = state.root {
+					removed.entry(root.0).or_default().push(stale);
+				}
+				batch.delete.push(state_key(&stale));
 			}
-			for index in keep..state.leaf_count {
-				batch.delete.push(payload_key(stream, index));
+			if tip.is_some_and(|t| t.hash == stale) {
+				tip = None;
 			}
 		}
-		match new_tip {
-			Some(tip) => batch.insert.push((tip_key(), tip.encode())),
-			None => batch.delete.push(tip_key()),
+		self.remove_occurrences(&mut batch, removed)?;
+		if boundary.state_at == Some(hash) {
+			let state = self.block_state(&hash).ok_or(ArchiveError::UnknownBlock)?;
+			self.writer_rows(&mut batch, hash, &state, true)?;
 		}
-		self.store.commit(batch).map_err(ArchiveError::Store)?;
+		let anchor = Tip { hash, number: boundary.number };
+		batch.insert.push((key(b'a', &[]), anchor.encode()));
+		batch.insert.push((canon_key(boundary.number), hash.encode()));
+		if self.load::<u64>(&oldest_key())?.is_none() {
+			batch.insert.push((oldest_key(), boundary.number.encode()));
+			batch.delete.push(key(b'i', &[]));
+		}
+		let tip = tip.unwrap_or(anchor);
+		batch.insert.push((tip_key(), tip.encode()));
+		self.store.commit(batch).map_err(ArchiveError::Store)
+	}
 
-		self.tip = new_tip;
-		self.streams = streams;
+	fn writer_rows(
+		&self,
+		batch: &mut Batch,
+		hash: H,
+		state: &BlockState<H>,
+		promote: bool,
+	) -> Result<(), ArchiveError> {
+		for (stream, s) in &state.streams {
+			let Some(&(first, owner)) = s.owners.last() else { continue };
+			if owner != hash {
+				continue;
+			}
+			let payloads = (first..s.leaf_count).map(|i| payload_key(stream, i));
+			let nodes = (mmr_size(first)..mmr_size(s.leaf_count)).map(|i| node_key(stream, i));
+			for key in payloads.chain(nodes) {
+				let owned = owned_key(&hash, &key);
+				if promote {
+					let value = self.store.get(&owned).ok_or(ArchiveError::MissingNode)?;
+					batch.insert.push((key, value));
+				}
+				batch.delete.push(owned);
+			}
+			if promote {
+				batch.insert.push((count_key(stream), s.leaf_count.encode()));
+			}
+		}
 		Ok(())
 	}
 
-	/// Resolve a request's `under` to the stream states it commits to.
-	fn resolve(&self, under: &StreamsRoot) -> Option<BlockState> {
-		let hash = self.store.get(&root_key(under)).and_then(|v| H::decode(&mut &v[..]).ok())?;
-		let state = self.block_state(&hash)?;
-		(state.root == Some(*under)).then_some(state)
+	fn remove_occurrences(
+		&self,
+		batch: &mut Batch,
+		removed: BTreeMap<Hash, Vec<H>>,
+	) -> Result<(), ArchiveError> {
+		for (root, hashes) in removed {
+			let key = root_key(&StreamsRoot(root));
+			let mut owners = self.hashes(&key)?;
+			owners.retain(|owner| !hashes.contains(owner));
+			if owners.is_empty() {
+				batch.delete.push(key);
+			} else {
+				batch.insert.push((key, owners.encode()));
+			}
+		}
+		Ok(())
 	}
 
 	/// Serve a [`MessagesRequest`] with at most `payload_cap` payload bytes.
@@ -601,8 +731,34 @@ where
 	/// `start: None` serves the last leaf under `under`: its payload if it fits the budget, else
 	/// only its position, with the extension covering the leaf.
 	pub fn serve_messages(&self, req: &MessagesRequest, payload_cap: u32) -> FetchResponse {
-		let state = self.resolve(&req.under).ok_or(FetchError::UnknownRoot)?;
-		let leaf_count = state.stream(&req.stream).ok_or(FetchError::UnknownStream)?.leaf_count;
+		let owners = self.hashes(&root_key(&req.under)).map_err(|_| FetchError::UnknownRoot)?;
+		for hash in owners {
+			if let Some(state) = self.block_state(&hash) {
+				if state.root == Some(req.under) {
+					let result = self.serve_state(req, payload_cap, &state);
+					if !matches!(result, Err(FetchError::UnknownRoot)) {
+						return result;
+					}
+				}
+			}
+		}
+		Err(FetchError::UnknownRoot)
+	}
+
+	fn serve_state(
+		&self,
+		req: &MessagesRequest,
+		payload_cap: u32,
+		state: &BlockState<H>,
+	) -> FetchResponse {
+		let stream = state.stream(&req.stream).ok_or(FetchError::UnknownStream)?;
+		let leaf_count = stream.leaf_count;
+		let nodes = Nodes::new(
+			&self.store,
+			req.stream,
+			&stream.owners,
+			self.base_count(&req.stream).map_err(|_| FetchError::UnknownRoot)?,
+		);
 		let start = match req.start {
 			Some(start) if start.0 > leaf_count => return Err(FetchError::BeyondHead),
 			Some(start) => start.0,
@@ -624,10 +780,7 @@ where
 		if wants_payloads {
 			let mut used = 0u64;
 			for index in start..leaf_count.min(start.saturating_add(MAX_LEAVES_PER_RESPONSE)) {
-				let payload = self
-					.store
-					.get(&payload_key(&req.stream, index))
-					.ok_or_else(|| self.fault(req, "payload"))?;
+				let payload = nodes.row(index, false).ok_or_else(|| self.fault(req, "payload"))?;
 				used += payload.len() as u64;
 				if used > budget {
 					break;
@@ -638,7 +791,6 @@ where
 		let end = start + payloads.len() as u64;
 		let payloads = payloads.try_into().map_err(|_| self.fault(req, "payload count"))?;
 
-		let nodes = Nodes::new(&self.store, req.stream);
 		let frontier = nodes
 			.peaks(start)
 			.and_then(|peaks| MmrFrontier::from_parts(peaks, start))
@@ -663,7 +815,7 @@ where
 	}
 
 	/// The extension proof from `from` to `to` leaves.
-	fn extension(nodes: &Nodes<'_, S>, from: u64, to: u64) -> Option<MmrExtensionProof> {
+	fn extension(nodes: &Nodes<'_, S, H>, from: u64, to: u64) -> Option<MmrExtensionProof> {
 		if from == to {
 			return Some(MmrExtensionProof {
 				leaf_count: to,
@@ -717,30 +869,38 @@ where
 		watermarks: &BTreeMap<StreamId, u64>,
 		horizon_cutoff: u64,
 	) -> Result<(), ArchiveError> {
+		let anchor = self.anchor()?;
 		let top = self.boundary(&finalized).ok_or(ArchiveError::UnknownBlock)?.number;
-		let mut oldest = self.store.get(&oldest_key()).and_then(|v| u64::decode(&mut &v[..]).ok());
-
-		// Index the newly finalized blocks by number, walking back to the last indexed one.
-		let mut batch = Batch::default();
-		let (mut current, mut number) = (finalized, top);
-		while self.canon(number).is_none() {
-			batch.insert.push((canon_key(number), current.encode()));
-			oldest = Some(oldest.map_or(number, |o| o.min(number)));
-			let Some(boundary) = self.boundary(&current) else { break };
-			if number == 0 || !self.contains(&boundary.parent) {
+		if anchor.is_some_and(|a| a.number > top) {
+			return Ok(());
+		}
+		let mut path = Vec::new();
+		let mut cursor = finalized;
+		while !anchor.is_some_and(|a| a.hash == cursor) {
+			let b = self.boundary(&cursor).ok_or(ArchiveError::UnknownBlock)?;
+			if anchor.is_some_and(|a| b.number <= a.number) {
+				return Err(ArchiveError::NotChild);
+			}
+			let parent = b.parent;
+			let origin = anchor.is_none() &&
+				self.store.get(&key(b'i', &[])) == Some((parent, b.number).encode());
+			path.push((cursor, b));
+			if origin {
 				break;
 			}
-			(current, number) = (boundary.parent, number - 1);
+			cursor = parent;
 		}
-		let mut oldest = oldest.unwrap_or(top);
-		// The pruning below reads the index.
-		self.store.commit(core::mem::take(&mut batch)).map_err(ArchiveError::Store)?;
+		for (h, b) in path.into_iter().rev() {
+			self.promote(h, b)?;
+		}
+		let mut oldest = self.load::<u64>(&oldest_key())?.ok_or(ArchiveError::UnknownBlock)?;
+		let mut batch = Batch::default();
 
 		// Drop boundaries past the horizon, oldest first.
 		let mut dropped_states = Vec::new();
 		while oldest < top {
-			let Some(hash) = self.canon(oldest) else { break };
-			let Some(boundary) = self.boundary(&hash) else { break };
+			let hash = self.canon(oldest).ok_or(ArchiveError::UnknownBlock)?;
+			let boundary = self.boundary(&hash).ok_or(ArchiveError::UnknownBlock)?;
 			if boundary.imported_at >= horizon_cutoff {
 				break;
 			}
@@ -755,21 +915,24 @@ where
 		// they all point at it, and for an idle sender its root is the newest included one. Keep
 		// that state and its root; delete every other dropped state with its root. Only the oldest
 		// kept block can point at a dropped state, and every later kept one then points at it too.
-		let current = self.canon(oldest).and_then(|hash| self.boundary(&hash)?.state_at);
-		let previous: Option<H> =
-			self.store.get(&pruned_state_key()).and_then(|v| H::decode(&mut &v[..]).ok());
+		let oldest_hash = self.canon(oldest).ok_or(ArchiveError::UnknownBlock)?;
+		let oldest_boundary = self.boundary(&oldest_hash).ok_or(ArchiveError::UnknownBlock)?;
+		let current = oldest_boundary.state_at;
+		let previous: Option<H> = self.load(&pruned_state_key())?;
 		let mut pruned_state = None;
+		let mut removed = BTreeMap::<Hash, Vec<H>>::new();
 		for hash in previous.into_iter().chain(dropped_states) {
 			if Some(hash) == current {
 				pruned_state = Some(hash);
 				continue;
 			}
-			if let Some(root) = self.block_state(&hash).and_then(|s| s.root) {
-				batch.delete.push(root_key(&root));
+			if let Some(root) = self.block_state(&hash).ok_or(ArchiveError::UnknownBlock)?.root {
+				removed.entry(root.0).or_default().push(hash);
 			}
 			batch.delete.push(state_key(&hash));
 		}
 		batch.insert.push((oldest_key(), oldest.encode()));
+		self.remove_occurrences(&mut batch, removed)?;
 		match pruned_state {
 			Some(hash) => batch.insert.push((pruned_state_key(), hash.encode())),
 			None => batch.delete.push(pruned_state_key()),
@@ -777,18 +940,20 @@ where
 
 		// Raise the floors, in the same batch: the parent of the oldest kept block is read here,
 		// before its boundary goes.
-		let oldest_hash = self.canon(oldest);
-		let oldest_boundary = oldest_hash.and_then(|hash| self.boundary(&hash));
-		let kept = oldest_hash.and_then(|hash| self.state_at(&hash)).unwrap_or_default();
-		// If the oldest kept block sent, the leaf counts before its sends: every leaf it sent stays
-		// servable. They read as 0 when its parent is not archived: it is the first archived
-		// block, or an earlier run dropped the parent and already raised the floors this far.
-		let before = oldest_boundary
-			.filter(|boundary| boundary.state_at == oldest_hash)
-			.map(|boundary| self.state_at(&boundary.parent).unwrap_or_default());
-		let at_finalized = self.state_at(&finalized).unwrap_or_default();
+		let kept = self.state_at(&oldest_hash).ok_or(ArchiveError::UnknownBlock)?;
+		let before = if oldest_boundary.state_at == Some(oldest_hash) {
+			match self.load::<Boundary<H>>(&boundary_key(&oldest_boundary.parent))? {
+				Some(_) => {
+					self.state_at(&oldest_boundary.parent).ok_or(ArchiveError::UnknownBlock)?
+				},
+				None => BTreeMap::new(),
+			}
+		} else {
+			BTreeMap::new()
+		};
+		let at_finalized = self.state_at(&finalized).ok_or(ArchiveError::UnknownBlock)?;
 		for (stream, state) in &at_finalized {
-			let count = |streams: &BTreeMap<StreamId, StreamState>| {
+			let count = |streams: &BTreeMap<StreamId, StreamState<H>>| {
 				streams.get(stream).map_or(0, |s| s.leaf_count)
 			};
 			let target = match stream {
@@ -799,20 +964,29 @@ where
 				// and so does every leaf a kept block sent.
 				_ => {
 					let head = count(&kept).saturating_sub(1);
-					before.as_ref().map_or(head, |before| count(before).min(head))
+					if oldest_boundary.state_at == Some(oldest_hash) {
+						count(&before).min(head)
+					} else {
+						head
+					}
 				},
 			};
-			self.raise_floor(&mut batch, stream, target);
+			self.raise_floor(&mut batch, stream, target)?;
 		}
 		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
 	/// Drop `stream`'s payloads below `target`, and its nodes below `target` except the peaks
 	/// there. Floors only rise.
-	fn raise_floor(&self, batch: &mut Batch, stream: &StreamId, target: u64) {
-		let floors = self.floors(stream);
-		if target <= floors.node && target <= floors.payload {
-			return;
+	fn raise_floor(
+		&self,
+		batch: &mut Batch,
+		stream: &StreamId,
+		target: u64,
+	) -> Result<(), ArchiveError> {
+		let floors: Floors = self.load(&floors_key(stream))?.unwrap_or_default();
+		if target <= floors.retained_from {
+			return Ok(());
 		}
 		for index in floors.payload..target {
 			batch.delete.push(payload_key(stream, index));
@@ -829,7 +1003,12 @@ where
 				}
 			}
 		}
-		let floors = Floors { payload: floors.payload.max(target), node: floors.node.max(target) };
+		let floors = Floors {
+			payload: floors.payload.max(target),
+			node: floors.node.max(target),
+			retained_from: target,
+		};
 		batch.insert.push((floors_key(stream), floors.encode()));
+		Ok(())
 	}
 }
