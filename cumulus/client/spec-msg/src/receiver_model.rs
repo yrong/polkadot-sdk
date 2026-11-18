@@ -31,7 +31,7 @@
 use crate::{
 	fetch::Transport,
 	protocol,
-	tests::{ack, channel, import, Model, TestArchive},
+	tests::{ack, channel, Model, TestArchive},
 	Archive, Budget, ChainView, MemoryStore, Receiver,
 };
 use codec::{Decode, Encode};
@@ -129,6 +129,7 @@ impl Transport for Peers {
 
 /// One source block, with the state after it.
 struct SourceBlock {
+	hash: u64,
 	root: StreamsRoot,
 	model: Model,
 	/// The channel's payloads so far.
@@ -311,9 +312,16 @@ impl World {
 			}
 		}
 		let number = self.blocks.len() as u64 + 1;
-		let root = import(&mut self.peers.archive.write(), &mut model, number, sends);
+		let hash = self.every_root.len() as u64 + 1;
+		let parent = self.blocks.last().map_or(0, |block| block.hash);
+		let root = model.send(&sends);
+		self.peers
+			.archive
+			.write()
+			.import_block(hash, parent, number, 0, sends, Some(root))
+			.unwrap();
 		self.every_root.push(root);
-		self.blocks.push(SourceBlock { root, model, channel: payloads, acks });
+		self.blocks.push(SourceBlock { hash, root, model, channel: payloads, acks });
 	}
 
 	/// The source drops its blocks above the included ones and authors another.
@@ -322,8 +330,6 @@ impl World {
 			return;
 		}
 		self.blocks.truncate(self.included);
-		let number = self.included as u64;
-		self.peers.archive.write().rewind_to(number, number).unwrap();
 		self.source_block();
 	}
 
@@ -369,6 +375,13 @@ impl World {
 	/// The relay chain finalizes what it includes; our blocks naming those roots become final.
 	fn relay_finalize(&mut self) {
 		self.relay_final = self.included;
+		if let Some(n) = self.relay_final.checked_sub(1) {
+			self.peers
+				.archive
+				.write()
+				.retain(self.blocks[n].hash, &BTreeMap::new(), 0)
+				.unwrap();
+		}
 		let last = self.unfinalized.iter().take_while(|b| b.root_block <= self.relay_final).count();
 		if let Some(block) = self.unfinalized.drain(..last).last() {
 			self.finalized = block.chain;

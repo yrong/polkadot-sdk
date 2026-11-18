@@ -21,7 +21,10 @@
 //! static peers (`--spec-msg-peer`), feeds the messaging inherent and assembles the lifts of each
 //! collation. All of it stays idle while the runtime has no `SpecMsgApi`.
 
-use crate::common::{types::ParachainClient, ConstructNodeRuntimeApi, NodeBlock};
+use crate::common::{
+	types::{ParachainBackend, ParachainClient},
+	ConstructNodeRuntimeApi, NodeBlock,
+};
 use cumulus_client_spec_msg::{
 	fetch_protocol_config, run_archiver, run_receiver, run_request_handler, run_watermark_reader,
 	Archive, AuxArchiveStore, Budget, NetworkTransport, Receiver, RelayFinalizedRoots, Transport,
@@ -61,6 +64,7 @@ pub(crate) fn register_protocol<Block: NodeBlock, Net: NetworkBackend<Block, Has
 pub(crate) fn start<Block, RuntimeApi>(
 	config: &SpecMsgConfig,
 	client: Arc<ParachainClient<Block, RuntimeApi>>,
+	backend: Arc<ParachainBackend<Block>>,
 	network: Arc<dyn NetworkService>,
 	relay_chain_interface: Arc<dyn RelayChainInterface>,
 	task_manager: &TaskManager,
@@ -90,7 +94,12 @@ where
 	spawner.spawn_blocking(
 		"spec-msg-archiver",
 		Some("spec-msg"),
-		run_archiver::<Block, _, _>(client.clone(), archive.clone(), watermarks.clone()),
+		run_archiver::<Block, _, _>(
+			client.clone(),
+			backend.clone(),
+			archive.clone(),
+			watermarks.clone(),
+		),
 	);
 	spawner.spawn(
 		"spec-msg-watermark-reader",
@@ -117,7 +126,7 @@ where
 	spawner.spawn(
 		"spec-msg-receiver",
 		Some("spec-msg"),
-		run_receiver::<Block, _, _>(client, relay_chain_interface, receiver.clone()),
+		run_receiver::<Block, _, _, _>(client, backend, relay_chain_interface, receiver.clone()),
 	);
 	Some(receiver)
 }

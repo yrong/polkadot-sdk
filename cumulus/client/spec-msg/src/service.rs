@@ -38,13 +38,17 @@ use cumulus_relay_chain_interface::{PHash, RelayChainInterface};
 use futures::{select, stream::FuturesUnordered, Stream, StreamExt};
 use sc_client_api::BlockchainEvents;
 use sp_api::{ApiExt, ProvideRuntimeApi};
-use sp_blockchain::HeaderBackend;
+use sp_blockchain::{Backend as _, HeaderBackend};
 use sp_runtime::{
 	traits::{Block as BlockT, Header as HeaderT},
 	SaturatedConversion,
 };
 use std::{
-	collections::BTreeMap, fmt::Debug, hash::Hash as StdHash, marker::PhantomData, sync::Arc,
+	collections::{BTreeMap, HashSet},
+	fmt::Debug,
+	hash::Hash as StdHash,
+	marker::PhantomData,
+	sync::Arc,
 };
 
 /// The consumption view at `at`, or `None` if its runtime has no `SpecMsgApi`.
@@ -135,14 +139,16 @@ pub(crate) struct Imported<H> {
 }
 
 /// Keep `receiver` fed from `client` and `relay` until a notification stream ends.
-pub async fn run_receiver<Block, C, T>(
+pub async fn run_receiver<Block, C, B, T>(
 	client: Arc<C>,
+	backend: Arc<B>,
 	relay: Arc<dyn RelayChainInterface>,
 	receiver: Arc<Receiver<Block::Hash, T>>,
 ) where
 	Block: BlockT,
 	C: ProvideRuntimeApi<Block> + BlockchainEvents<Block> + HeaderBackend<Block> + Send + Sync,
 	C::Api: SpecMsgApi<Block>,
+	B: sc_client_api::Backend<Block>,
 	T: Transport + ?Sized,
 {
 	let heads = match relay.new_best_notification_stream().await {
@@ -152,7 +158,7 @@ pub async fn run_receiver<Block, C, T>(
 			return;
 		},
 	};
-	let imports = client.import_notification_stream().filter_map({
+	let imports = client.every_import_notification_stream().filter_map({
 		let client = client.clone();
 		move |import| {
 			let imported = match consumption_record(&*client, import.hash) {
@@ -182,8 +188,68 @@ pub async fn run_receiver<Block, C, T>(
 			((*finalized.header.number()).saturated_into(), view)
 		}
 	});
+	// After a restart, the blocks already imported above finality hold consumption a
+	// resubmission must lift again; resubmission can pick any fork, so every leaf is replayed.
+	let info = client.info();
+	let finalized = info.finalized_number.saturated_into();
+	receiver
+		.on_finalized(finalized, &chain_view(&*client, info.finalized_hash).unwrap_or_default());
+	let leaves = backend.blockchain().leaves().unwrap_or_else(|e| {
+		log::warn!(target: LOG_TARGET, "Leaves unknown, replaying the best chain only: {e}");
+		vec![info.best_hash]
+	});
+	let replay = unfinalized_imports(
+		leaves,
+		finalized,
+		|hash| {
+			let header = client.header(hash).ok().flatten()?;
+			Some((
+				*header.parent_hash(),
+				(*header.number()).saturated_into(),
+				extends_bundle(&header),
+			))
+		},
+		|hash| consumption_record(&*client, hash),
+	);
+	let imports = futures::stream::iter(replay).chain(imports);
 	let chains = ClientChains { client, relay, _block: PhantomData };
 	drive(&chains, &receiver, heads, imports, finality).await
+}
+
+/// The blocks from each of `leaves` down to the finalized number `finalized`, parents first.
+/// `header` gives a block's parent, number and whether it extends its bundle; a block whose
+/// header is unknown ends that walk, and one whose record fails is skipped, as a live import is.
+fn unfinalized_imports<H: Copy + Eq + StdHash + Debug>(
+	leaves: impl IntoIterator<Item = H>,
+	finalized: u64,
+	mut header: impl FnMut(H) -> Option<(H, u64, bool)>,
+	mut record: impl FnMut(H) -> Result<ConsumptionRecord, String>,
+) -> Vec<Imported<H>> {
+	let mut seen = HashSet::new();
+	let mut imports = Vec::new();
+	for leaf in leaves {
+		let mut hash = leaf;
+		while seen.insert(hash) {
+			let Some((parent, number, extends_bundle)) = header(hash) else {
+				log::warn!(target: LOG_TARGET, "Header of unfinalized {hash:?} unknown: replay stops");
+				break;
+			};
+			if number <= finalized {
+				break;
+			}
+			match record(hash) {
+				Ok(record) => {
+					imports.push(Imported { hash, parent, number, extends_bundle, record })
+				},
+				Err(e) => {
+					log::warn!(target: LOG_TARGET, "consumption_record at {hash:?} failed: {e}")
+				},
+			}
+			hash = parent;
+		}
+	}
+	imports.sort_by_key(|block| block.number);
+	imports
 }
 
 /// The receiver loop over `heads` (relay best blocks), `imports` and `finality` (the finalized
@@ -209,6 +275,14 @@ pub(crate) async fn drive<H, T, S>(
 	let mut slots = RoundSlots::default();
 	let mut rounds = FuturesUnordered::new();
 	let mut gap_fetches = FuturesUnordered::new();
+	// Closed channels can still have sealed blocks whose dependencies need recovery.
+	let watched = || {
+		let mut view = chains.view().unwrap_or_default();
+		for source in receiver.live_sources() {
+			view.sources.entry(source).or_default();
+		}
+		view
+	};
 	let round = |source: ParaId, head: PHash, wants: SourceWants| async move {
 		match chains.root(head, source).await {
 			Ok(Some(root)) => receiver.on_root(source, root, &wants).await,
@@ -221,7 +295,7 @@ pub(crate) async fn drive<H, T, S>(
 		select! {
 			head = heads.next() => {
 				let Some(head) = head else { return };
-				let mut view = chains.view().unwrap_or_default();
+				let mut view = watched();
 				for source in slots.on_head(head, view.sources.keys().copied()) {
 					if let Some(wants) = view.sources.remove(&source) {
 						rounds.push(round(source, head, wants));
@@ -243,8 +317,7 @@ pub(crate) async fn drive<H, T, S>(
 			},
 			source = rounds.select_next_some() => {
 				let Some(head) = slots.on_done(source) else { continue };
-				let wants = chains.view().and_then(|mut view| view.sources.remove(&source));
-				if let Some(wants) = wants {
+				if let Some(wants) = watched().sources.remove(&source) {
 					slots.start(source, head);
 					rounds.push(round(source, head, wants));
 				}
@@ -414,6 +487,42 @@ mod tests {
 		PHash::repeat_byte(n)
 	}
 
+	#[test]
+	fn startup_replays_every_unfinalized_fork_parents_first() {
+		// Finalized #1; best chain 2-3-4 and a fork 23 on 2. Hash is `number` on the best chain.
+		let parent = |hash: u64| match hash {
+			23 => 2,
+			hash => hash - 1,
+		};
+		let number = |hash: u64| if hash == 23 { 3 } else { hash };
+		let header = |hash: u64| Some((parent(hash), number(hash), hash == 4));
+		let imports =
+			unfinalized_imports([4u64, 23], 1, header, |_| Ok(ConsumptionRecord::default()));
+		let hashes: Vec<_> = imports.iter().map(|block| block.hash).collect();
+		assert_eq!(hashes, vec![2, 3, 23, 4]);
+		assert!(imports.iter().all(|block| block.number > 1));
+		assert!(imports.iter().find(|block| block.hash == 4).unwrap().extends_bundle);
+
+		// A failed record skips its block only; an unknown header ends that walk.
+		let skipped = unfinalized_imports([4u64], 1, header, |hash| {
+			if hash == 3 {
+				Err("record failed".into())
+			} else {
+				Ok(ConsumptionRecord::default())
+			}
+		});
+		assert_eq!(skipped.iter().map(|block| block.hash).collect::<Vec<_>>(), vec![2, 4]);
+		let cut = unfinalized_imports(
+			[4u64],
+			1,
+			|hash| (hash != 3).then(|| header(hash)).flatten(),
+			|_| Ok(ConsumptionRecord::default()),
+		);
+		assert_eq!(cut.iter().map(|block| block.hash).collect::<Vec<_>>(), vec![4]);
+		assert!(unfinalized_imports([1u64], 1, header, |_| panic!("finalized is not replayed"))
+			.is_empty());
+	}
+
 	/// A source chain's collator.
 	struct Source {
 		peer: PeerId,
@@ -484,6 +593,7 @@ mod tests {
 	/// channel to it, and the sources' roots per relay head.
 	struct TestChains {
 		view: ChainView,
+		view_override: Mutex<Option<ChainView>>,
 		roots: Mutex<BTreeMap<(PHash, ParaId), StreamsRoot>>,
 		/// While set, the relay chain gives no answer.
 		failing: AtomicBool,
@@ -492,7 +602,7 @@ mod tests {
 	#[async_trait::async_trait]
 	impl Chains for TestChains {
 		fn view(&self) -> Option<ChainView> {
-			Some(self.view.clone())
+			Some(self.view_override.lock().clone().unwrap_or_else(|| self.view.clone()))
 		}
 
 		async fn root(&self, head: PHash, source: ParaId) -> Result<Option<StreamsRoot>, ()> {
@@ -537,6 +647,7 @@ mod tests {
 			};
 			let chains = Arc::new(TestChains {
 				view: ChainView::new(consumed, 16),
+				view_override: Mutex::new(None),
 				roots: Mutex::new(BTreeMap::new()),
 				failing: AtomicBool::new(false),
 			});
@@ -584,6 +695,86 @@ mod tests {
 
 	fn register(up_to: u64) -> Vec<u8> {
 		Register { up_to: MessagePosition(up_to), status: RegisterStatus::Opened }.encode()
+	}
+
+	fn recovery_record(h: &Harness) -> ConsumptionRecord {
+		let data = futures::executor::block_on(h.receiver.inherent_data(&h.chains.view, &[]));
+		let payloads = &data.channels[&InChannelId { sender: live(), domain: 0, num: 0 }];
+		assert_eq!(payloads.len(), 4);
+		let mut end = MmrFrontier::new();
+		for payload in payloads {
+			end.try_append(cumulus_primitives_spec_messaging::leaf_hash(payload))
+				.expect("four test leaves fit in a frontier; qed");
+		}
+		ConsumptionRecord {
+			entries: BTreeMap::from([(
+				live(),
+				vec![(channel(US), Interval { start: MmrFrontier::new().root(), end })],
+			)]),
+		}
+	}
+
+	#[test]
+	fn recovery_refreshes_a_source_after_its_last_channel_closes() {
+		let mut h = Harness::new();
+		h.source(live()).author(vec![(channel(US), payloads(1, 2))]);
+		let included = h.source(live()).author(vec![(channel(US), payloads(2, 2))]);
+		h.relay_block(1, &[(live(), included)]);
+		let record = recovery_record(&h);
+		h.import(1, record.clone());
+		assert!(h.receiver.assemble(&[record.clone()]).is_ok());
+		let mut view = h.chains.view.clone();
+		view.sources.remove(&live());
+		*h.chains.view_override.lock() = Some(view);
+		let replacement = h.source(live()).author(vec![(channel(US), payloads(3, 1))]);
+		h.source(live()).hold.store(true, Ordering::SeqCst);
+		h.relay_block(2, &[(live(), replacement)]);
+		assert!(!h.source(live()).held.lock().is_empty(), "the recovery binding is in flight");
+		let newest = h.source(live()).author(vec![(channel(US), payloads(4, 1))]);
+		h.relay_block(3, &[(live(), newest)]);
+		h.source(live()).hold.store(false, Ordering::SeqCst);
+		h.source(live()).release();
+		h.pool.run_until_stalled();
+		let lifts = h.receiver.assemble(&[record.clone()]).expect("recovery lifts exist; qed");
+		let requires = cumulus_primitives_spec_messaging::build_requires(&[record], &lifts)
+			.expect("recovery lifts verify; qed")
+			.expect("the record consumes messages; qed");
+		assert_eq!(
+			requires.get(live()),
+			Some(&newest),
+			"recovery must follow the new included root after the source leaves the watch set"
+		);
+	}
+
+	#[test]
+	fn restart_fetches_a_replayed_source_no_longer_watched() {
+		let mut original = Harness::new();
+		let root = original.source(live()).author(vec![(channel(US), payloads(1, 4))]);
+		original.relay_block(1, &[(live(), root)]);
+		let record = recovery_record(&original);
+		let mut restarted = Harness::new();
+		let served = restarted.source(live()).author(vec![(channel(US), payloads(1, 4))]);
+		assert_eq!(root, served);
+		let mut view = restarted.chains.view.clone();
+		view.sources.remove(&live());
+		*restarted.chains.view_override.lock() = Some(view);
+		restarted.import(1, record.clone());
+		restarted.relay_block(2, &[(live(), root)]);
+		let replacement = restarted.source(live()).author(vec![(channel(US), payloads(2, 1))]);
+		restarted.relay_block(3, &[(live(), replacement)]);
+		let lifts = restarted
+			.receiver
+			.assemble(&[record.clone()])
+			.expect("replayed record assembles");
+		let requires = cumulus_primitives_spec_messaging::build_requires(&[record], &lifts)
+			.unwrap()
+			.unwrap();
+		assert_eq!(requires.get(live()), Some(&replacement));
+		restarted.relay_block(4, &[]);
+		assert!(restarted.receiver.live_sources().contains(&live()));
+		restarted.finality.unbounded_send((1, ChainView::default())).unwrap();
+		restarted.pool.run_until_stalled();
+		assert!(!restarted.receiver.live_sources().contains(&live()));
 	}
 
 	#[test]

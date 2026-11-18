@@ -17846,7 +17846,7 @@ dependencies = [
  "pallet-transaction-payment-rpc-runtime-api",
  "parachains-common-types",
  "parity-scale-codec",
- "parking_lot 0.12.3",
+ "parking_lot 0.12.5",
  "polkadot-cli",
  "polkadot-primitives",
  "sc-authority-discovery",
