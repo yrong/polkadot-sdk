@@ -27,7 +27,7 @@ use crate::{
 		skip_proof, FETCH_MAX_BYTES, INHERENT_FETCH_TIMEOUT, MAX_BUFFERED_BYTES,
 		MAX_BUFFERED_PAYLOADS,
 	},
-	tests::{ack, channel, frontier_at, import, payloads, Model, TestArchive},
+	tests::{ack, channel, frontier_at, messages, payloads, served, Model, TestArchive},
 	Archive, Budget, ChainView, MemoryStore, Receiver, SourceWants,
 };
 use codec::{Decode, Encode};
@@ -40,7 +40,13 @@ use cumulus_primitives_spec_messaging::{
 use futures::executor::block_on;
 use parking_lot::{Mutex, RwLock};
 use sc_network::PeerId;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+	collections::BTreeMap,
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		Arc,
+	},
+};
 
 const SOURCE: u32 = 1000;
 const US: u32 = 2000;
@@ -72,7 +78,8 @@ struct Sender {
 	/// How long each request takes.
 	delay: RwLock<std::time::Duration>,
 	model: RwLock<Model>,
-	number: RwLock<u64>,
+	branch: Mutex<Vec<u64>>,
+	next_hash: AtomicU64,
 	peers: Vec<PeerId>,
 	/// Every request served, with the peer it went to.
 	log: Mutex<Vec<(PeerId, MessagesRequest)>>,
@@ -89,7 +96,8 @@ impl Sender {
 			down: RwLock::new(false),
 			delay: RwLock::new(Default::default()),
 			model: RwLock::new(Model::default()),
-			number: RwLock::new(0),
+			branch: Mutex::new(Vec::new()),
+			next_hash: AtomicU64::new(1),
 			peers: (0..peers).map(|_| PeerId::random()).collect(),
 			log: Mutex::new(Vec::new()),
 		})
@@ -97,17 +105,21 @@ impl Sender {
 
 	/// Author the next source block with `sends`; return its committed root.
 	fn author(&self, sends: Vec<(StreamId, Vec<Vec<u8>>)>) -> StreamsRoot {
-		let mut number = self.number.write();
-		*number += 1;
-		import(&mut self.archive.write(), &mut self.model.write(), *number, sends)
+		let mut branch = self.branch.lock();
+		let hash = self.next_hash.fetch_add(1, Ordering::Relaxed);
+		let parent = branch.last().copied().unwrap_or(0);
+		let root = self.model.write().send(&sends);
+		self.archive
+			.write()
+			.import_block(hash, parent, branch.len() as u64 + 1, 0, sends, Some(root))
+			.unwrap();
+		branch.push(hash);
+		root
 	}
 
-	/// Drop the blocks above `number`, as after a reorg: the next block is authored on it. `model`
-	/// holds the sends up to `number`.
-	fn fork_at(&self, number: u64, model: Model) {
-		self.archive.write().rewind_to(number, number).unwrap();
+	fn fork_at(&self, number: usize, model: Model) {
+		self.branch.lock().truncate(number);
 		*self.model.write() = model;
-		*self.number.write() = number;
 	}
 
 	/// The requests of `stream` served so far.
@@ -713,6 +725,14 @@ fn payloads_of_an_abandoned_sender_fork_are_replaced() {
 	sender.fork_at(1, at_fork);
 	let other = payloads(3, 4);
 	let root2b = sender.author(vec![(channel(US), other.clone())]);
+	assert_eq!(
+		served(&sender.archive.read(), &messages(channel(US), 1, root2, u32::MAX)),
+		Ok(payloads(2, 3))
+	);
+	assert_eq!(
+		served(&sender.archive.read(), &messages(channel(US), 1, root2b, u32::MAX)),
+		Ok(other.clone())
+	);
 	let records = rounds_after_a_reorg(&receiver, &mut chain, root2b);
 	assert_eq!(
 		chain.frontier,
@@ -721,6 +741,48 @@ fn payloads_of_an_abandoned_sender_fork_are_replaced() {
 	);
 	assert!(receiver.is_settled(&source(), &root2b, &chain.wants()));
 	assert_eq!(requires(&receiver, &records[..1]), Some(root2b));
+	let winner = sender.branch.lock()[1];
+	sender.archive.write().retain(winner, &BTreeMap::new(), 0).unwrap();
+	assert_eq!(
+		served(&sender.archive.read(), &messages(channel(US), 1, root2, u32::MAX)),
+		Err(cumulus_primitives_spec_messaging::FetchError::UnknownRoot)
+	);
+	assert!(served(&sender.archive.read(), &messages(channel(US), 1, root2b, u32::MAX)).is_ok());
+}
+
+#[test]
+fn a_late_import_cannot_restore_a_finalized_source_watch() {
+	let sender = Sender::new();
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let root = sender.author(vec![(channel(US), payloads(1, 1))]);
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	let record = chain.block(&receiver);
+	assert!(receiver.live_sources().contains(&source()));
+
+	receiver.on_finalized(1, &chain.view());
+	receiver.note_block(1, 0, 1, true, record);
+	assert!(!receiver.live_sources().contains(&source()));
+}
+
+#[test]
+fn receiver_finality_retires_a_watch_for_consumption_on_a_losing_sender_fork() {
+	let sender = Sender::new();
+	let receiver = receiver(&sender, Budget::default());
+	let mut chain = Chain::default();
+	let root = sender.author(vec![(channel(US), payloads(1, 1))]);
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	let record = chain.block(&receiver);
+	assert!(record.entries.contains_key(&source()));
+
+	sender.fork_at(0, Model::default());
+	let sibling = sender.author(vec![(channel(US), payloads(2, 1))]);
+	let winner = sender.branch.lock()[0];
+	sender.archive.write().retain(winner, &BTreeMap::new(), 0).unwrap();
+	block_on(receiver.on_root(source(), sibling, &SourceWants::default()));
+	assert!(receiver.live_sources().contains(&source()));
+	receiver.on_finalized(chain.number, &ChainView::default());
+	assert!(!receiver.live_sources().contains(&source()));
 }
 
 #[test]
