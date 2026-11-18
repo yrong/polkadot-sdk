@@ -38,6 +38,11 @@ pub trait ArchiveStore: Send + Sync {
 	/// The value at `key`. A read error counts as absent; the archive then refuses to serve.
 	fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
 
+	/// Read metadata used to update an existing fork index without losing entries on an I/O error.
+	fn try_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+		Ok(self.get(key))
+	}
+
 	/// Apply `batch` atomically.
 	fn commit(&self, batch: Batch) -> Result<(), String>;
 }
@@ -59,6 +64,10 @@ impl<C: AuxStore + Send + Sync> ArchiveStore for AuxArchiveStore<C> {
 			.map_err(|e| log::warn!(target: crate::LOG_TARGET, "Archive read failed: {e}"))
 			.ok()
 			.flatten()
+	}
+
+	fn try_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+		self.0.get_aux(key).map_err(|e| e.to_string())
 	}
 
 	fn commit(&self, batch: Batch) -> Result<(), String> {
@@ -111,6 +120,10 @@ impl ArchiveStore for MemoryStore {
 impl<S: ArchiveStore + ?Sized> ArchiveStore for Arc<S> {
 	fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
 		(**self).get(key)
+	}
+
+	fn try_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+		(**self).try_get(key)
 	}
 
 	fn commit(&self, batch: Batch) -> Result<(), String> {
