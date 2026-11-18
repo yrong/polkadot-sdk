@@ -47,7 +47,7 @@ use polkadot_core_primitives::Hash;
 use sc_network::PeerId;
 use std::{
 	cell::RefCell,
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fmt::Debug,
 	hash::Hash as StdHash,
 	sync::{
@@ -170,6 +170,7 @@ struct LiveBlock<H> {
 }
 
 struct State<H> {
+	finalized: u64,
 	sources: BTreeMap<ParaId, SourcePool>,
 	live: HashMap<H, LiveBlock<H>>,
 }
@@ -251,7 +252,11 @@ where
 			us,
 			budget,
 			transport: Rotating { inner: transport, rounds: Mutex::new(BTreeMap::new()) },
-			state: Mutex::new(State { sources: BTreeMap::new(), live: HashMap::new() }),
+			state: Mutex::new(State {
+				finalized: 0,
+				sources: BTreeMap::new(),
+				live: HashMap::new(),
+			}),
 			rotation: AtomicUsize::new(0),
 		}
 	}
@@ -259,6 +264,15 @@ where
 	/// The chain this receiver consumes for.
 	pub fn para_id(&self) -> ParaId {
 		self.us
+	}
+
+	pub(crate) fn live_sources(&self) -> BTreeSet<ParaId> {
+		self.state
+			.lock()
+			.live
+			.values()
+			.flat_map(|block| block.record.entries.keys().copied())
+			.collect()
 	}
 
 	/// The newest root seen for `source`.
@@ -761,6 +775,9 @@ where
 		record: ConsumptionRecord,
 	) -> Vec<Gap> {
 		let mut state = self.state.lock();
+		if number <= state.finalized {
+			return Vec::new();
+		}
 		let mut gaps = Vec::new();
 		for (source, streams) in record.entries.iter().filter(|_| extends_bundle) {
 			for (stream, interval) in streams {
@@ -848,6 +865,10 @@ where
 	/// cursors there, since the best chain may still sit on an earlier fork's cursor.
 	pub fn on_finalized(&self, number: u64, finalized: &ChainView) {
 		let mut state = self.state.lock();
+		if number < state.finalized {
+			return;
+		}
+		state.finalized = number;
 		state.live.retain(|_, block| block.number > number);
 		for (source, wants) in &finalized.sources {
 			if let Some(pool) = state.sources.get_mut(source) {
