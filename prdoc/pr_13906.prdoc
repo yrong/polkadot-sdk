@@ -1,0 +1,18 @@
+title: 'spec-msg: Implement inclusion-tier match on relay chain'
+doc:
+- audience: Runtime Dev
+  description: |-
+    Retain recent speculative-messaging commitments (`RecentProvides`) per parachain, drop backed
+    candidates whose `Requires` are missing from the senders' windows, and expose the latest
+    included root via `ParachainHost::newest_included_provides` (v17), returning `None` while the
+    sender is offboarding. Enactment weight counts queued upward messages and the provides-window
+    write separately. Its benchmark includes decoding a full `Requires` set.
+crates:
+- name: polkadot-runtime-parachains
+  bump: major
+- name: polkadot-primitives
+  bump: major
+- name: rococo-runtime
+  bump: minor
+- name: westend-runtime
+  bump: minor
