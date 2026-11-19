@@ -2,8 +2,9 @@ title: 'spec-msg: included-root receiver and collator wiring'
 doc:
 - audience: Node Operator
   description: Fetch and verify messages under included roots and wire receiver inherents and lifts
-    into collation. Replay unfinalized consumption after a restart and track recovery sources until
-    their consuming blocks finalize.
+    into collation. Retry unwritten streams and refresh channel coverage when the included root
+    changes. Replay unfinalized consumption after a restart and track recovery sources until their
+    consuming blocks finalize.
 crates:
 - name: cumulus-client-collator
   bump: major

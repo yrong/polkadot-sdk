@@ -628,21 +628,14 @@ mod tests {
 		fn new() -> Self {
 			let sources = [stalled(), live()];
 			let consumed = ConsumedStreams {
-				channels: sources
-					.iter()
-					.map(|sender| {
-						(InChannelId { sender: *sender, domain: 0, num: 0 }, MmrFrontier::new())
-					})
-					.collect(),
-				registers: sources
-					.iter()
-					.map(|recipient| {
-						(
-							OutChannelId { recipient: *recipient, domain: 0, num: 0 },
-							MessagePosition(0),
-						)
-					})
-					.collect(),
+				channels: BTreeMap::from([(
+					InChannelId { sender: live(), domain: 0, num: 0 },
+					MmrFrontier::new(),
+				)]),
+				registers: BTreeMap::from([(
+					OutChannelId { recipient: stalled(), domain: 0, num: 0 },
+					MessagePosition(0),
+				)]),
 				events: BTreeMap::new(),
 			};
 			let chains = Arc::new(TestChains {

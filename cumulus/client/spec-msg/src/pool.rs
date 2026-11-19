@@ -64,9 +64,8 @@ impl HeadRead {
 pub struct SourcePool {
 	/// Roots material was fetched under, newest last.
 	pub(crate) roots: VecDeque<StreamsRoot>,
-	/// A successful round under the newest root stores the registers reported absent at cursor
-	/// zero. Before success or after a failed round, this is `None`.
-	pub(crate) absent_registers: Option<BTreeSet<StreamId>>,
+	/// Whether the last round under the newest root completed every fetch.
+	pub(crate) settled: bool,
 	/// Channel payloads, by stream and position.
 	pub(crate) payloads: BTreeMap<StreamId, BTreeMap<u64, Vec<u8>>>,
 	/// The newest head read per `Ack` stream.
@@ -79,7 +78,7 @@ pub struct SourcePool {
 	/// The root each read context was fetched under, by `(stream, leaf count)`. An advance to that
 	/// context is fetched under it.
 	pub(crate) read_under: BTreeMap<(StreamId, u64), StreamsRoot>,
-	/// Per channel stream, the leaf count the source had at the last successful fetch.
+	/// Per channel stream, the leaf count proved under the newest root.
 	pub(crate) reach: BTreeMap<StreamId, u64>,
 	/// The relay chain has no root for the source: nothing new is planned from it. Its roots,
 	/// bindings, advances and payloads stay, for blocks already built: a cut one lifts by
@@ -92,7 +91,7 @@ impl SourcePool {
 	pub fn forget(&mut self) {
 		self.heads.clear();
 		self.reach.clear();
-		self.absent_registers = None;
+		self.settled = false;
 		self.forgotten = true;
 	}
 
@@ -109,7 +108,8 @@ impl SourcePool {
 		}
 		self.roots.retain(|r| *r != root);
 		self.roots.push_back(root);
-		self.absent_registers = None;
+		self.reach.clear();
+		self.settled = false;
 		while self.roots.len() > ROOTS_KEPT {
 			if let Some(old) = self.roots.pop_front() {
 				for by_root in self.bindings.values_mut() {
