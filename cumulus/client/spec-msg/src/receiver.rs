@@ -313,12 +313,11 @@ where
 	pub fn is_settled(&self, source: &ParaId, root: &StreamsRoot, wants: &SourceWants) -> bool {
 		let state = self.state.lock();
 		let Some(pool) = state.sources.get(source) else { return false };
-		let Some(absent) = &pool.absent_registers else { return false };
-		pool.newest_root().as_ref() == Some(root) &&
-			wants.registers.iter().all(|(id, cursor)| {
+		pool.settled &&
+			pool.newest_root().as_ref() == Some(root) &&
+			wants.registers.keys().all(|id| {
 				let stream = id.peer_ack_stream(self.us).1;
-				pool.heads.get(&stream).is_some_and(|head| head.under == *root) ||
-					(cursor.0 == 0 && absent.contains(&stream))
+				pool.heads.get(&stream).is_some_and(|head| head.under == *root)
 			}) && wants.channels.iter().all(|(id, stored)| {
 			covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
 		})
@@ -394,25 +393,16 @@ where
 						Binding { extension: response.extension, tree_proof: response.tree_proof };
 					pool.insert_binding(stream, end, root, binding);
 				},
-				Err(e) if start == 0 && unknown_stream(&e) => {
-					log::trace!(target: LOG_TARGET, "{stream:?} of {source:?} does not exist yet");
-					self.state.lock().sources.entry(source).or_default().reach.insert(stream, 0);
-				},
 				Err(_) => settled = false,
 			}
 		}
 
-		let mut absent_registers = BTreeSet::new();
-		for (id, cursor) in &wants.registers {
+		for id in wants.registers.keys() {
 			let stream = id.peer_ack_stream(self.us).1;
 			match self.fetch_head(source, stream, root).await {
 				Ok((head, tree_proof)) => {
 					let mut state = self.state.lock();
 					state.sources.entry(source).or_default().insert_head(stream, head, tree_proof);
-				},
-				Err(e) if cursor.0 == 0 && unknown_stream(&e) => {
-					absent_registers.insert(stream);
-					log::trace!(target: LOG_TARGET, "{stream:?} of {source:?} does not exist yet");
 				},
 				Err(_) => settled = false,
 			}
@@ -437,7 +427,7 @@ where
 		if let Some(pool) = state.sources.get_mut(&source) {
 			// A newer root may have arrived meanwhile; it settles on its own.
 			if pool.newest_root() == Some(root) {
-				pool.absent_registers = settled.then_some(absent_registers);
+				pool.settled = settled;
 			}
 		}
 		log::debug!(
@@ -1025,25 +1015,16 @@ fn last_endpoints(records: &[ConsumptionRecord]) -> BTreeMap<(ParaId, StreamId),
 		.collect()
 }
 
-/// Whether a failed fetch was refused because the stream does not exist under the root.
-fn unknown_stream(error: &RequestError) -> bool {
-	matches!(
-		error,
-		RequestError::Unserved { refusals }
-			if refusals.iter().any(|(_, refusal)| *refusal == FetchError::UnknownStream)
-	)
-}
-
 fn buffer_full(count: u64, bytes: u64) -> bool {
 	count >= MAX_BUFFERED_PAYLOADS as u64 || bytes >= MAX_BUFFERED_BYTES
 }
 
-/// Whether the pool holds `stream`'s payloads from `cursor` up to what the source had at the last
-/// fetch, or enough that fetching pauses.
+/// Whether the pool holds `stream`'s payloads from `cursor` up to what the newest root commits,
+/// or enough that fetching pauses.
 fn covers(pool: &SourcePool, stream: &StreamId, cursor: u64) -> bool {
+	let Some(reach) = pool.reach.get(stream) else { return false };
 	let (count, bytes) = pool.buffered(stream, cursor);
-	buffer_full(count, bytes) ||
-		pool.reach.get(stream).is_some_and(|reach| cursor + count >= *reach)
+	buffer_full(count, bytes) || cursor + count >= *reach
 }
 
 /// `frontier` with the leaves of `payloads` appended.

@@ -338,7 +338,10 @@ fn a_block_cut_before_an_inadmissible_payload_lifts() {
 	let sender = Sender::new();
 	// A payload the runtime admits, then one it never does, sent in one block: every fetch returns
 	// both, and binds only the endpoint after the second.
-	let root = sender.author(vec![(channel(US), vec![vec![1, 0, 0xAB], vec![0xFF; 3]])]);
+	let root = sender.author(vec![
+		(ack(US), vec![register(0).encode()]),
+		(channel(US), vec![vec![1, 0, 0xAB], vec![0xFF; 3]]),
+	]);
 	let receiver = receiver(&sender, Budget::default());
 	let mut chain = Chain::default();
 	block_on(receiver.on_root(source(), root, &chain.wants()));
@@ -420,6 +423,25 @@ fn skip_proofs_verify_from_the_peaks_and_the_leaves() {
 }
 
 #[test]
+fn a_returning_channel_fetches_past_its_previous_roots_reach() {
+	let sender = Sender::new();
+	let receiver = receiver(&sender, Budget::default());
+	let first = payloads(1, 1);
+	let root = sender.author(vec![(channel(US), first.clone())]);
+	block_on(receiver.on_root(source(), root, &lanes(1, false)));
+
+	let next = payloads(2, 1);
+	let root = sender.author(vec![(channel(US), next.clone())]);
+	block_on(receiver.on_root(source(), root, &lanes(0, false)));
+	let mut wants = lanes(1, false);
+	wants.channels.insert(in_id(0), frontier_at(&first, 1));
+	block_on(receiver.on_root(source(), root, &wants));
+
+	let offer = block_on(receiver.inherent_data(&view_of(wants, 8), &[]));
+	assert_eq!(offer.channels.get(&in_id(0)), Some(&next));
+}
+
+#[test]
 fn a_new_register_watch_fetches_under_an_already_settled_root() {
 	let sender = Sender::new();
 	let accepted = Register {
@@ -481,21 +503,18 @@ fn a_head_too_big_for_the_first_request_is_asked_for_at_its_position() {
 }
 
 #[test]
-fn a_stream_that_does_not_exist_yet_is_expected_at_cursor_zero_only() {
+fn an_unwritten_stream_is_polled_again_under_the_same_root() {
 	let sender = Sender::new();
 	let root = sender.author(vec![(channel(9), payloads(1, 2))]);
 
-	// Cursor 0: the source has no stream to us yet, and nothing is wrong.
-	let receiver_0 = receiver(&sender, Budget::default());
-	let wants = lanes(1, true);
-	block_on(receiver_0.on_root(source(), root, &wants));
-	assert!(receiver_0.is_settled(&source(), &root, &wants));
-	let attempts = sender.requests(ack(US)).len();
-	block_on(receiver_0.on_root(source(), root, &wants));
-	assert_eq!(sender.requests(ack(US)).len(), attempts);
-	let mut advanced = wants.clone();
-	advanced.registers.insert(out_id(), MessagePosition(1));
-	assert!(!receiver_0.is_settled(&source(), &root, &advanced));
+	for (wants, stream) in [(lanes(1, false), channel(US)), (lanes(0, true), ack(US))] {
+		let receiver = receiver(&sender, Budget::default());
+		block_on(receiver.on_root(source(), root, &wants));
+		let attempts = sender.requests(stream).len();
+		assert!(!receiver.is_settled(&source(), &root, &wants));
+		block_on(receiver.on_root(source(), root, &wants));
+		assert!(sender.requests(stream).len() > attempts);
+	}
 
 	// Past cursor 0 the stream cannot be missing: the round stays open.
 	let receiver_2 = receiver(&sender, Budget::default());
@@ -737,7 +756,8 @@ fn payloads_of_an_abandoned_sender_fork_are_replaced() {
 	let receiver = receiver(&sender, Budget::default());
 	let mut chain = Chain::default();
 	let first = payloads(1, 1);
-	let root1 = sender.author(vec![(channel(US), first.clone())]);
+	let root1 =
+		sender.author(vec![(ack(US), vec![register(0).encode()]), (channel(US), first.clone())]);
 	block_on(receiver.on_root(source(), root1, &chain.wants()));
 	chain.block(&receiver);
 
@@ -843,7 +863,10 @@ fn a_full_buffer_of_an_abandoned_sender_fork_is_replaced() {
 	let sender = Sender::new();
 	let receiver = receiver(&sender, Budget::default());
 	let mut chain = Chain::default();
-	let root1 = sender.author(vec![(channel(US), payloads(1, MAX_BUFFERED_PAYLOADS))]);
+	let root1 = sender.author(vec![
+		(ack(US), vec![register(0).encode()]),
+		(channel(US), payloads(1, MAX_BUFFERED_PAYLOADS)),
+	]);
 	for _ in 0..8 {
 		block_on(receiver.on_root(source(), root1, &chain.wants()));
 	}
@@ -888,7 +911,8 @@ fn payloads_ahead_of_an_older_root_are_kept() {
 	let receiver = receiver(&sender, Budget::default());
 	let chain = Chain::default();
 	let data = payloads(1, 3);
-	let root1 = sender.author(vec![(channel(US), data[..1].to_vec())]);
+	let root1 = sender
+		.author(vec![(ack(US), vec![register(0).encode()]), (channel(US), data[..1].to_vec())]);
 	let root2 = sender.author(vec![(channel(US), data[1..].to_vec())]);
 	block_on(receiver.on_root(source(), root2, &chain.wants()));
 
