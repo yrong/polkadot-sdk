@@ -17,8 +17,12 @@ use crate as cumulus_pallet_spec_messaging;
 use core::ops::RangeInclusive;
 use cumulus_primitives_spec_messaging::InChannelId;
 use frame_support::{
-	derive_impl, pallet_prelude::Weight, parameter_types, traits::EnqueueMessage,
-	weights::constants::WEIGHT_REF_TIME_PER_SECOND, BoundedSlice,
+	derive_impl,
+	pallet_prelude::Weight,
+	parameter_types,
+	traits::EnqueueMessage,
+	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, RuntimeDbWeight},
+	BoundedSlice,
 };
 use frame_system::EnsureRoot;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
@@ -37,9 +41,11 @@ frame_support::construct_runtime!(
 impl frame_system::Config for Test {
 	type Block = Block;
 	type BlockWeights = MockBlockWeights;
+	type DbWeight = MockDbWeight;
 }
 
 parameter_types! {
+	pub const MockDbWeight: RuntimeDbWeight = RuntimeDbWeight { read: 1_000, write: 2_000 };
 	// A finite proof limit, which `MaxBundleStreams` must cover.
 	pub MockBlockWeights: frame_system::limits::BlockWeights =
 		frame_system::limits::BlockWeights::with_sensible_defaults(

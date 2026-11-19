@@ -2114,12 +2114,16 @@ mod xcm_layer {
 		});
 	}
 
+	fn expected_delivery_weight(len: u32) -> Weight {
+		SpecMessaging::send_weight(xcm_out(), len) + MockDbWeight::get().reads_writes(1, 1)
+	}
+
 	#[test]
-	fn a_delivery_charges_the_send_weight() {
+	fn a_delivery_charges_the_full_delivery_weight() {
 		new_test_ext().execute_with(|| {
 			open_xcm_channel();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let first = SpecMessaging::send_weight(xcm_out(), len);
+			let first = expected_delivery_weight(len);
 			let before = System::block_weight().total();
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 			assert_eq!(System::block_weight().total() - before, first);
@@ -2131,11 +2135,11 @@ mod xcm_layer {
 		new_test_ext().execute_with(|| {
 			open_xcm_channel();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let first = SpecMessaging::send_weight(xcm_out(), len);
+			let first = expected_delivery_weight(len);
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 
 			// The stream is touched now: a further send adds a leaf, not a fold.
-			let again = SpecMessaging::send_weight(xcm_out(), len);
+			let again = expected_delivery_weight(len);
 			assert!(again.all_lt(first));
 			let before = System::block_weight().total();
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
@@ -2143,7 +2147,7 @@ mod xcm_layer {
 
 			// The next block folds the stream again.
 			System::set_block_number(System::block_number() + 1);
-			assert_eq!(SpecMessaging::send_weight(xcm_out(), len), first);
+			assert_eq!(expected_delivery_weight(len), first);
 		});
 	}
 
@@ -2319,13 +2323,17 @@ mod xcm_layer {
 				<Test as frame_system::Config>::BlockWeights::get();
 			let limit = weights.get(DispatchClass::Normal).max_total.unwrap();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let room = limit.saturating_sub(SpecMessaging::send_weight(xcm_out(), len));
-			frame_system::BlockWeight::<Test>::mutate(|w| w.set(room, DispatchClass::Normal));
-			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			let used = limit.saturating_sub(expected_delivery_weight(len));
+			frame_system::BlockWeight::<Test>::mutate(|w| {
+				w.set(used + Weight::from_parts(1, 0), DispatchClass::Normal)
+			});
 			assert_eq!(
-				send_xcm::<Router>(sibling(), xcm()),
+				validate(),
 				Err(SendError::Transport("block has no room for the spec-msg send"))
 			);
+			frame_system::BlockWeight::<Test>::mutate(|w| w.set(used, DispatchClass::Normal));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(*System::block_weight().get(DispatchClass::Normal), limit);
 		});
 	}
 
@@ -2339,14 +2347,17 @@ mod xcm_layer {
 			let weights: frame_system::limits::BlockWeights =
 				<Test as frame_system::Config>::BlockWeights::get();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let room = weights.max_block.saturating_sub(SpecMessaging::send_weight(xcm_out(), len));
-			frame_system::BlockWeight::<Test>::mutate(|w| w.set(room, DispatchClass::Mandatory));
-			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			let used = weights.max_block.saturating_sub(expected_delivery_weight(len));
+			frame_system::BlockWeight::<Test>::mutate(|w| {
+				w.set(used + Weight::from_parts(1, 0), DispatchClass::Mandatory)
+			});
 			assert_eq!(
-				send_xcm::<Router>(sibling(), xcm()),
+				validate(),
 				Err(SendError::Transport("block has no room for the spec-msg send"))
 			);
-			assert!(System::block_weight().total().all_lte(weights.max_block));
+			frame_system::BlockWeight::<Test>::mutate(|w| w.set(used, DispatchClass::Mandatory));
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(System::block_weight().total(), weights.max_block);
 		});
 	}
 
@@ -2369,7 +2380,7 @@ mod xcm_layer {
 
 			let before = used();
 			let len = VersionedXcm::from(xcm()).encode().len() as u32;
-			let send = SpecMessaging::send_weight(xcm_out(), len);
+			let send = expected_delivery_weight(len);
 			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
 			assert_eq!(*used().get(DispatchClass::Normal), *before.get(DispatchClass::Normal));
 			assert_eq!(
