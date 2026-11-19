@@ -21,7 +21,7 @@ use codec::{Decode, DecodeAll, Encode};
 use cumulus_primitives_core::{CumulusDigestItem, ParaId, CUMULUS_CONSENSUS_ID};
 use cumulus_primitives_spec_messaging::{
 	streams_root::streams_root, ConsumptionRecord, InChannelId, InChannelState, MmrFrontier,
-	OutChannelId, OutChannelState, StreamId, SPMS_ENGINE_ID,
+	OutChannelId, OutChannelState, RegisterStatus, StreamId, SPMS_ENGINE_ID,
 };
 use cumulus_zombienet_sdk_helpers::{assert_para_throughput, open_hrmp_channel};
 use std::{
@@ -76,8 +76,7 @@ fn flag(name: &str) -> bool {
 }
 
 /// Whether to run the delivery test's step `name`: every step unless `SPEC_MSG_STEPS` lists some,
-/// comma-separated (`deliver`, `batch`, `limits`, `outage`, `backpressure`), to rerun only failing
-/// ones.
+/// comma-separated (`deliver`, `batch`, `limits`, `outage`, `backpressure`, `two-way`).
 fn step(name: &str) -> bool {
 	std::env::var("SPEC_MSG_STEPS").map_or(true, |steps| steps.split(',').any(|s| s.trim() == name))
 }
@@ -131,7 +130,7 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	}
 	log::info!("No HRMP channel {SENDER} -> {RECEIVER} on the relay chain");
 
-	open_spec_msg_channel(&sender, &receiver).await?;
+	open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
 
 	if step("deliver") {
 		send_and_follow(&relay, &sender, &receiver).await?;
@@ -150,6 +149,39 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	}
 	if step("backpressure") {
 		backpressure_and_follow(&sender, &receiver).await?;
+	}
+
+	if step("two-way") {
+		anyhow::ensure!(
+			!hrmp_channel_open(&relay, RECEIVER, SENDER).await?,
+			"reverse HRMP channel exists"
+		);
+		open_spec_msg_channel(&receiver, &sender, RECEIVER, SENDER).await?;
+		let (at_sender, at_receiver) = tokio::try_join!(
+			sender.blocks().subscribe_finalized(),
+			receiver.blocks().subscribe_finalized()
+		)?;
+		let ((_, forward), (_, reverse)) = tokio::try_join!(
+			submit_sudo(&sender, send_xcm_to(RECEIVER), true),
+			submit_sudo(&receiver, send_xcm_to(SENDER), true)
+		)?;
+		let observe = |mut blocks, ids: Vec<Vec<u8>>, dest: u32| async move {
+			let [id] = ids.as_slice() else { return Err(anyhow!("expected one XCM send")) };
+			log::info!("Waiting for XCM 0x{} on parachain {dest}", hex::encode(id));
+			let expected = BTreeMap::from([(id.clone(), "SpecMsg")]);
+			let mut received = BTreeSet::new();
+			wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
+			// Check the next finalized block for a repeated execution as well.
+			wait_for_routed_messages(&mut blocks, &expected, &mut received).await
+		};
+		tokio::time::timeout(Duration::from_secs(180), async {
+			tokio::try_join!(
+				observe(at_receiver, forward, RECEIVER),
+				observe(at_sender, reverse, SENDER)
+			)
+		})
+		.await
+		.map_err(|_| anyhow!("two-way XCM delivery timed out"))??;
 	}
 
 	let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
@@ -807,7 +839,7 @@ async fn late_node_steps(
 	.await?;
 
 	// The receiver accepts and the sender sends `Hello`, which nothing serves the receiver yet.
-	submit_open(&sender, &receiver).await?;
+	submit_open(&sender, &receiver, SENDER, RECEIVER).await?;
 	wait_for("the sender to send `Hello`", || async {
 		let (_, out_channels) = channel_states(&sender, &receiver).await?;
 		Ok(out_channels.get(&out_channel()).is_some_and(|state| state.open.is_some()))
@@ -840,7 +872,7 @@ async fn late_node_steps(
 	};
 	network.add_collator(LATE_NODE, options, SENDER).await?;
 
-	wait_opened(&sender, &receiver).await?;
+	wait_opened(&sender, &receiver, RECEIVER).await?;
 	log::info!("{LATE_NODE} served the `Hello` from #{hello}: the channel is open");
 	send_and_follow(&relay, &sender, &receiver).await?;
 
@@ -871,7 +903,7 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
 
-		open_spec_msg_channel(&sender, &receiver).await?;
+		open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
 		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
 		wait_for_hrmp_snapshot(&sender).await?;
 		let (_, outbound) = channel_states(&sender, &receiver).await?;
@@ -937,6 +969,117 @@ async fn wait_for_hrmp_snapshot(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_drains_channels_closed_by_either_peer() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let test = async {
+		let network =
+			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
+				.await?;
+		let a: OnlineClient<PolkadotConfig> =
+			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+		let b: OnlineClient<PolkadotConfig> =
+			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+		open_spec_msg_channel(&a, &b, SENDER, RECEIVER).await?;
+		open_spec_msg_channel(&b, &a, RECEIVER, SENDER).await?;
+
+		let inbound = |peer: u32| InChannelId { sender: peer.into(), domain: 0, num: 0 };
+		let at_a = inbound(RECEIVER);
+		let at_b = inbound(SENDER);
+		let reverse_start = channel_map::<InChannelId, InChannelState>(&a, "InChannels")
+			.await?
+			.get(&at_a)
+			.ok_or_else(|| anyhow!("missing reverse channel"))?
+			.frontier
+			.leaf_count();
+		let blocks_a = a.blocks().subscribe_finalized().await?;
+		let blocks_b = b.blocks().subscribe_finalized().await?;
+		let close = |name| {
+			tx(
+				"SpecMessaging",
+				name,
+				vec![Value::u128(RECEIVER.into()), Value::u128(0), Value::u128(0)],
+			)
+			.into_value()
+		};
+		// A closes both channels. Its forward send precedes the close marker in one batch.
+		// B's reverse batch spans several receiver blocks, leaving data for A to drain.
+		let at_sender = batch_all(vec![
+			send_xcm_to(RECEIVER),
+			close("close_channel"),
+			close("close_inbound_channel"),
+		]);
+		let reverse = batch_all((0..BATCH).map(|_| send_xcm_to(SENDER)).collect());
+		let mut best = a.blocks().subscribe_best().await?;
+		let reverse_ids = sudo_sent(&b, reverse).await?;
+		anyhow::ensure!(reverse_ids.len() as u64 == BATCH);
+		let end = reverse_start + BATCH;
+		loop {
+			let block =
+				best.next().await.ok_or_else(|| anyhow!("receiver best stream ended"))??;
+			if !processed_ids(&block, &reverse_ids).await?.is_empty() {
+				break;
+			}
+		}
+		let (close_hash, forward_ids) = submit_sudo(&a, at_sender, true).await?;
+		anyhow::ensure!(forward_ids.len() == 1);
+		let states =
+			channel_map_at::<InChannelId, InChannelState>(&a, "InChannels", close_hash).await?;
+		let state = states.get(&at_a).ok_or_else(|| anyhow!("missing reverse channel at close"))?;
+		let consumed = state.frontier.leaf_count();
+		let close_number = a.blocks().at(close_hash).await?.number();
+		anyhow::ensure!(
+			state.draining && reverse_start < consumed && consumed < end,
+			"receiver must close mid-batch: start {reverse_start}, at close {consumed}, end {end}"
+		);
+		log::info!(
+			"Receiver close at finalized block #{close_number} ({close_hash:#x}): \
+			 frontier {reverse_start} -> {consumed}, batch end {end}"
+		);
+		let observe = |client: OnlineClient<PolkadotConfig>,
+		               key: InChannelId,
+		               source: OnlineClient<PolkadotConfig>,
+		               dest: u32,
+		               ids: Vec<Vec<u8>>,
+		               mut blocks| async move {
+			let expected: BTreeMap<_, _> = ids.iter().cloned().map(|id| (id, "SpecMsg")).collect();
+			anyhow::ensure!(expected.len() == ids.len(), "duplicate sent XCM id");
+			wait_for_routed_messages(&mut blocks, &expected, &mut BTreeSet::new()).await?;
+			wait_for("the finalized receiver frontier to consume the close marker", || async {
+				let hash = client.blocks().at_latest().await?.hash();
+				let states =
+					channel_map_at::<InChannelId, InChannelState>(&client, "InChannels", hash)
+						.await?;
+				let Some(state) = states.get(&key) else { return Ok(false) };
+				if !matches!(state.status, RegisterStatus::Closed { session } if session == state.session) ||
+					state.draining || state.open.is_some()
+				{
+					return Ok(false);
+				}
+				let source_hash = source.blocks().at_latest().await?.hash();
+				let streams: Vec<(StreamId, MmrFrontier)> =
+					call_at(&source, Some(source_hash), "SpecMsgApi_outbound_frontiers", &[])
+						.await?;
+				let stream = key.sender_data_stream(dest.into()).1;
+				Ok(streams
+					.iter()
+					.any(|(id, frontier)| *id == stream && *frontier == state.frontier))
+			})
+			.await
+		};
+		tokio::try_join!(
+			observe(b.clone(), at_b, a.clone(), RECEIVER, forward_ids, blocks_b),
+			observe(a, at_a, b, SENDER, reverse_ids, blocks_a)
+		)?;
+		Ok(())
+	};
+	tokio::time::timeout(Duration::from_secs(600), test)
+		.await
+		.map_err(|_| anyhow!("channel close test exceeded ten minutes"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
@@ -950,7 +1093,7 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
-		open_spec_msg_channel(&sender, &receiver).await?;
+		open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
 		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
 		wait_for_hrmp_snapshot(&sender).await?;
 
@@ -1035,7 +1178,7 @@ async fn wait_for_routed_messages(
 			);
 			anyhow::ensure!(received.insert(id.clone()), "repeated {id:?}");
 			log::info!(
-				"Cutover XCM 0x{} finalized via {route} at receiver block #{}",
+				"XCM 0x{} finalized via {route} at receiver block #{}",
 				hex::encode(id),
 				block.number()
 			);
@@ -1044,7 +1187,7 @@ async fn wait_for_routed_messages(
 			return Ok(());
 		}
 	}
-	Err(anyhow!("receiver block subscription ended during cutover"))
+	Err(anyhow!("destination block subscription ended"))
 }
 
 /// Samples per path.
@@ -1092,7 +1235,7 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 	.await?;
 
 	let inclusions = track_inclusions(relay.clone());
-	open_spec_msg_channel(&sender, &receiver).await?;
+	open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
 	let spec_msg = measure(&sender, &receiver, &inclusions, "SpecMsg").await?;
 
 	log::info!("Force-opening HRMP {SENDER} -> {RECEIVER}");
@@ -1246,7 +1389,7 @@ async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
 		advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
 	})
 	.await?;
-	open_spec_msg_channel(&sender, &receiver).await?;
+	open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
 
 	let log = std::sync::Arc::new(std::sync::Mutex::new(ForkLog::default()));
 	let mut all = relay.blocks().subscribe_all().await?;
@@ -1478,7 +1621,7 @@ async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> 
 		advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
 	})
 	.await?;
-	open_spec_msg_channel(&sender, &receiver).await?;
+	open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
 
 	let consuming = track_bundles(receiver.clone(), SENDER);
 	let reading = track_bundles(sender.clone(), RECEIVER);
@@ -1719,27 +1862,30 @@ fn report(path: &str, samples: &[Sample]) {
 async fn open_spec_msg_channel(
 	sender: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
+	from: u32,
+	to: u32,
 ) -> Result<(), anyhow::Error> {
 	// A rerun against the same network finds the channel open: skip the open and send again.
 	let (_, out_channels) = channel_states(sender, receiver).await?;
 	if out_channels
-		.get(&out_channel())
+		.get(&OutChannelId { recipient: to.into(), domain: 0, num: 0 })
 		.is_some_and(|state| state.open.is_some_and(|session| session.opened))
 	{
-		log::info!("Channel {SENDER} -> {RECEIVER} is already open: skipping the open");
+		log::info!("Channel {from} -> {to} is already open: skipping the open");
 	} else {
-		submit_open(sender, receiver).await?;
-		wait_opened(sender, receiver).await?;
+		submit_open(sender, receiver, from, to).await?;
+		wait_opened(sender, receiver, to).await?;
 	}
 
 	let (in_channels, out_channels) = channel_states(sender, receiver).await?;
-	if let (Some(in_state), Some(out_state)) =
-		(in_channels.get(&in_channel()), out_channels.get(&out_channel()))
-	{
+	if let (Some(in_state), Some(out_state)) = (
+		in_channels.get(&InChannelId { sender: from.into(), domain: 0, num: 0 }),
+		out_channels.get(&OutChannelId { recipient: to.into(), domain: 0, num: 0 }),
+	) {
 		if let (Some(published), Some(read)) = (in_state.published, out_state.register) {
 			log::info!(
-				"Checkpoint 1/6, channel: {SENDER} -> {RECEIVER} is open ({RECEIVER} consumed \
-				 {SENDER}'s stream up to leaf {}, {SENDER} read the `Ack` register at leaf {}: \
+				"Checkpoint 1/6, channel: {from} -> {to} is open ({to} consumed \
+				 {from}'s stream up to leaf {}, {from} read the `Ack` register at leaf {}: \
 				 up to {}, session {})",
 				published.up_to.0,
 				read.position.0,
@@ -1752,12 +1898,14 @@ async fn open_spec_msg_channel(
 }
 
 /// Submit the sender's `open_channel` and the receiver's `accept_open_channel` for the XCM
-/// channel `SENDER -> RECEIVER`.
+/// channel.
 async fn submit_open(
 	sender: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
+	from: u32,
+	to: u32,
 ) -> Result<(), anyhow::Error> {
-	log::info!("Opening channel {SENDER} -> {RECEIVER}");
+	log::info!("Opening channel {from} -> {to}");
 	// Either order works, so submit both at once; the wait below polls best blocks.
 	let open = sudo_in_block(
 		sender,
@@ -1766,7 +1914,7 @@ async fn submit_open(
 			[Value::named_variant(
 				"open_channel",
 				[
-					("recipient", Value::u128(RECEIVER.into())),
+					("recipient", Value::u128(to.into())),
 					("domain", Value::u128(0)),
 					("num", Value::u128(0)),
 				],
@@ -1780,7 +1928,7 @@ async fn submit_open(
 			[Value::named_variant(
 				"accept_open_channel",
 				[
-					("sender", Value::u128(SENDER.into())),
+					("sender", Value::u128(from.into())),
 					("domain", Value::u128(0)),
 					("num", Value::u128(0)),
 				],
@@ -1792,10 +1940,11 @@ async fn submit_open(
 	Ok(())
 }
 
-/// Wait until the channel `SENDER -> RECEIVER` carries sends.
+/// Wait until the outbound channel carries sends.
 async fn wait_opened(
 	sender: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
+	to: u32,
 ) -> Result<(), anyhow::Error> {
 	// The handshake takes two register reads: the sender reads `Accepting` and sends `Hello`,
 	// the receiver consumes it and publishes `Opened`, and the sender's read of that opens the
@@ -1804,7 +1953,7 @@ async fn wait_opened(
 	wait_for("the sender to read the receiver's `Opened` register", || async {
 		let (_, out_channels) = channel_states(sender, receiver).await?;
 		Ok(out_channels
-			.get(&out_channel())
+			.get(&OutChannelId { recipient: to.into(), domain: 0, num: 0 })
 			.is_some_and(|state| state.open.is_some_and(|session| session.opened)))
 	})
 	.await
@@ -1945,8 +2094,16 @@ async fn channel_map<K: Decode + Ord, V: Decode>(
 	client: &OnlineClient<PolkadotConfig>,
 	map: &str,
 ) -> Result<BTreeMap<K, V>, anyhow::Error> {
+	channel_map_at(client, map, best_hash(client).await?).await
+}
+
+async fn channel_map_at<K: Decode + Ord, V: Decode>(
+	client: &OnlineClient<PolkadotConfig>,
+	map: &str,
+	hash: H256,
+) -> Result<BTreeMap<K, V>, anyhow::Error> {
 	let query = subxt::dynamic::storage("SpecMessaging", map, Vec::<Value>::new());
-	let storage = client.storage().at(best_hash(client).await?);
+	let storage = client.storage().at(hash);
 	let mut entries = storage.iter(query).await?;
 	let mut out = BTreeMap::new();
 	while let Some(entry) = entries.next().await {
