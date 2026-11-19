@@ -18,7 +18,9 @@
 use crate::utils::initialize_network;
 use anyhow::anyhow;
 use codec::{Decode, DecodeAll, Encode};
-use cumulus_primitives_core::{CumulusDigestItem, ParaId, CUMULUS_CONSENSUS_ID};
+use cumulus_primitives_core::{
+	AggregateMessageOrigin, CumulusDigestItem, ParaId, CUMULUS_CONSENSUS_ID,
+};
 use cumulus_primitives_spec_messaging::{
 	streams_root::streams_root, ConsumptionRecord, InChannelId, InChannelState, MmrFrontier,
 	OutChannelId, OutChannelState, RegisterStatus, StreamId, SPMS_ENGINE_ID,
@@ -48,6 +50,7 @@ use zombienet_sdk::{
 
 const SENDER: u32 = 2000;
 const RECEIVER: u32 = 2001;
+const THIRD: u32 = 2002;
 const SENDER_COLLATOR: &str = "charlie";
 const RECEIVER_COLLATOR: &str = "dave";
 const SENDER_P2P_PORT: u16 = 30_500;
@@ -98,9 +101,11 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 			connect(RECEIVER_RPC_PORT).await?,
 		)
 	} else {
-		let network =
-			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
-				.await?;
+		let network = initialize_network(build_network_config(
+			(SENDER_COLLATOR, SENDER_P2P_PORT),
+			NetworkMode::Ordinary,
+		)?)
+		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -443,10 +448,9 @@ async fn spec_msg_delivers_across_collator_restarts() -> Result<(), anyhow::Erro
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(network_config_with_teardown(
+		let network = initialize_network(build_network_config(
 			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			false,
-			false,
+			NetworkMode::Restarts,
 		)?)
 		.await?;
 		let source = network.get_node(SENDER_COLLATOR)?;
@@ -907,8 +911,11 @@ async fn late_node_serves_history(join: Join) -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let mut network =
-		initialize_network(build_network_config((LATE_NODE, LATE_P2P_PORT), false)?).await?;
+	let mut network = initialize_network(build_network_config(
+		(LATE_NODE, LATE_P2P_PORT),
+		NetworkMode::Ordinary,
+	)?)
+	.await?;
 	// Both late-node tests bind the same ports: free them before the next one starts.
 	let result = late_node_steps(&mut network, join).await;
 	network.destroy().await?;
@@ -986,9 +993,11 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network =
-			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
-				.await?;
+		let network = initialize_network(build_network_config(
+			(SENDER_COLLATOR, SENDER_P2P_PORT),
+			NetworkMode::Ordinary,
+		)?)
+		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1061,14 +1070,101 @@ async fn wait_for_hrmp_snapshot(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_routes_across_three_parachains() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let test = async {
+		let network = initialize_network(build_network_config(
+			(SENDER_COLLATOR, SENDER_P2P_PORT),
+			NetworkMode::ThreeParachains,
+		)?)
+		.await?;
+		let a: OnlineClient<PolkadotConfig> =
+			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+		let b: OnlineClient<PolkadotConfig> =
+			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+		let c: OnlineClient<PolkadotConfig> = network.get_node("eve")?.wait_client().await?;
+		open_spec_msg_channel(&a, &b, SENDER, RECEIVER).await?;
+		open_spec_msg_channel(&a, &c, SENDER, THIRD).await?;
+		open_spec_msg_channel(&c, &b, THIRD, RECEIVER).await?;
+
+		let at_b = b.blocks().subscribe_finalized().await?;
+		let at_c = c.blocks().subscribe_finalized().await?;
+		let fanout = batch_all(vec![send_xcm_to(RECEIVER), send_xcm_to(THIRD)]);
+		let ((_, from_a), (_, from_c)) = tokio::try_join!(
+			submit_sudo(&a, fanout, true),
+			submit_sudo(&c, send_xcm_to(RECEIVER), true)
+		)?;
+		let ([ab, ac], [cb]) = (from_a.as_slice(), from_c.as_slice()) else {
+			return Err(anyhow!("expected two sends from {SENDER} and one from {THIRD}"));
+		};
+		let routes = BTreeMap::from([
+			(ab.clone(), (SENDER, RECEIVER)),
+			(ac.clone(), (SENDER, THIRD)),
+			(cb.clone(), (THIRD, RECEIVER)),
+		]);
+		anyhow::ensure!(routes.len() == 3, "route probes must have distinct ids");
+		tokio::try_join!(
+			check_destination(at_b, RECEIVER, &routes),
+			check_destination(at_c, THIRD, &routes)
+		)?;
+		Ok(())
+	};
+	tokio::time::timeout(Duration::from_secs(720), test)
+		.await
+		.map_err(|_| anyhow!("three-parachain routing exceeded twelve minutes"))?
+}
+
+async fn check_destination(
+	mut blocks: StreamOfResults<Block<PolkadotConfig, OnlineClient<PolkadotConfig>>>,
+	dest: u32,
+	routes: &BTreeMap<Vec<u8>, (u32, u32)>,
+) -> Result<(), anyhow::Error> {
+	let expected = routes.values().filter(|(_, to)| *to == dest).count();
+	let mut received = BTreeSet::new();
+	while let Some(block) = blocks.next().await {
+		let block = block?;
+		let complete_before = received.len() == expected;
+		for event in block.events().await?.iter() {
+			let event = event?;
+			if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
+				continue;
+			}
+			let (id, origin, _, success) =
+				<(H256, AggregateMessageOrigin, frame_support::weights::Weight, bool)>::decode_all(
+					&mut event.field_bytes(),
+				)?;
+			let Some(&(from, to)) = routes.get(id.as_bytes()) else { continue };
+			let channel = InChannelId { sender: from.into(), domain: 0, num: 0 };
+			anyhow::ensure!(
+				dest == to && origin == AggregateMessageOrigin::SpecMsg(channel),
+				"XCM {id:#x} expected {from} -> {to}, got {origin:?} on {dest}"
+			);
+			anyhow::ensure!(success && received.insert(id), "failed or repeated XCM {id:#x}");
+			log::info!(
+				"XCM {id:#x} finalized on route {from} -> {dest} at block #{}",
+				block.number()
+			);
+		}
+		if complete_before {
+			return Ok(());
+		}
+	}
+	Err(anyhow!("finalized block subscription ended on {dest}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn spec_msg_drains_channels_closed_by_either_peer() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network =
-			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
-				.await?;
+		let network = initialize_network(build_network_config(
+			(SENDER_COLLATOR, SENDER_P2P_PORT),
+			NetworkMode::Ordinary,
+		)?)
+		.await?;
 		let a: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 		let b: OnlineClient<PolkadotConfig> =
@@ -1177,9 +1273,11 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network =
-			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
-				.await?;
+		let network = initialize_network(build_network_config(
+			(SENDER_COLLATOR, SENDER_P2P_PORT),
+			NetworkMode::Ordinary,
+		)?)
+		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1319,9 +1417,11 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 
-	let network =
-		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
-			.await?;
+	let network = initialize_network(build_network_config(
+		(SENDER_COLLATOR, SENDER_P2P_PORT),
+		NetworkMode::Ordinary,
+	)?)
+	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1478,8 +1578,11 @@ async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let network =
-		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), true)?).await?;
+	let network = initialize_network(build_network_config(
+		(SENDER_COLLATOR, SENDER_P2P_PORT),
+		NetworkMode::RelayForks,
+	)?)
+	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1710,9 +1813,11 @@ async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> 
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let network =
-		initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
-			.await?;
+	let network = initialize_network(build_network_config(
+		(SENDER_COLLATOR, SENDER_P2P_PORT),
+		NetworkMode::Ordinary,
+	)?)
+	.await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 	let receiver: OnlineClient<PolkadotConfig> =
@@ -2443,97 +2548,85 @@ fn peer_arg(para: u32, name: &str, port: u16) -> Result<String, anyhow::Error> {
 	Ok(format!("{para}=/ip4/127.0.0.1/tcp/{port}/ws/p2p/{peer_id}"))
 }
 
-/// The network; the receiver fetches the sender's streams from `sender_node`, a node name and its
-/// p2p port.
-/// With `relay_forks`, both relay validators claim most slots as primary (BABE `c` = 99/100, which
-/// must stay below 1), so the relay chain forks at most heights.
-fn build_network_config(
-	sender_node: (&str, u16),
-	relay_forks: bool,
-) -> Result<NetworkConfig, anyhow::Error> {
-	network_config_with_teardown(sender_node, relay_forks, true)
+#[derive(PartialEq, Eq)]
+enum NetworkMode {
+	Ordinary,
+	RelayForks,
+	Restarts,
+	ThreeParachains,
 }
 
-fn network_config_with_teardown(
+/// Peers fetch the sender's streams from `sender_node`, which can be a late full node.
+fn build_network_config(
 	sender_node: (&str, u16),
-	relay_forks: bool,
-	tear_down_on_failure: bool,
+	mode: NetworkMode,
 ) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
-	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
-	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
-	let collator_args = |peer: &str| -> Vec<zombienet_sdk::Arg> {
-		vec![
+	let mut nodes = vec![
+		(SENDER, SENDER_COLLATOR, SENDER_P2P_PORT, SENDER_RPC_PORT),
+		(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT, RECEIVER_RPC_PORT),
+	];
+	if mode == NetworkMode::ThreeParachains {
+		nodes.push((THIRD, "eve", 30_502, 30_513));
+	}
+	let mut network = NetworkConfigBuilder::new().with_relaychain(|r| {
+		let r = r.with_chain("rococo-local");
+		let r = if mode == NetworkMode::RelayForks {
+			r.with_genesis_overrides(serde_json::json!({
+				"babe": { "epochConfig": {
+					"c": [99, 100],
+					"allowed_slots": "PrimaryAndSecondaryVRFSlots",
+				} },
+			}))
+		} else {
+			r
+		};
+		let r = r
+			.with_default_command("polkadot")
+			.with_default_image(images.polkadot.as_str())
+			.with_default_args(vec![
+				("-lparachain=debug,runtime::inclusion=debug,runtime::inclusion-inherent=debug")
+					.into(),
+			])
+			.with_validator(|node| node.with_name("alice").with_rpc_port(RELAY_RPC_PORT))
+			.with_validator(|node| node.with_name("bob"));
+		if mode == NetworkMode::ThreeParachains {
+			r.with_validator(|node| node.with_name("ferdie"))
+		} else {
+			r
+		}
+	});
+	for &(id, name, p2p, rpc) in &nodes {
+		let mut args = vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
 			  runtime::spec-msg=debug,runtime::parachain-system=debug")
 				.into(),
 			("--force-authoring").into(),
 			("--authoring", "slot-based").into(),
 			("--enable-spec-msg").into(),
-			("--spec-msg-peer", peer).into(),
-		]
-	};
-
-	// Distinct `protocolId`s: chains sharing one negotiate the legacy block-announce name, fail its
-	// genesis check and ban each other, refusing every spec-msg fetch for about a minute.
-	// Network setup:
-	// - relay chain: alice and bob, validators
-	// - penpal 2000: charlie, collator, fetching from dave
-	// - penpal 2001: dave, collator, fetching from charlie
-	NetworkConfigBuilder::new()
-		.with_relaychain(|r| {
-			let r = r.with_chain("rococo-local");
-			let r = if relay_forks {
-				r.with_genesis_overrides(serde_json::json!({
-					"babe": { "epochConfig": {
-						"c": [99, 100],
-						"allowed_slots": "PrimaryAndSecondaryVRFSlots",
-					} },
-				}))
-			} else {
-				r
-			};
-			r.with_default_command("polkadot")
-				.with_default_image(images.polkadot.as_str())
-				.with_default_args(vec![
-					("-lparachain=debug,runtime::inclusion=debug,runtime::inclusion-inherent=debug")
-						.into(),
-				])
-				.with_validator(|node| node.with_name("alice").with_rpc_port(RELAY_RPC_PORT))
-				.with_validator(|node| node.with_name("bob"))
-		})
-		.with_parachain(|p| {
-			p.with_id(SENDER)
+		];
+		for &(peer_id, peer_name, peer_port, _) in &nodes {
+			if peer_id != id {
+				let (name, port) =
+					if peer_id == SENDER { sender_node } else { (peer_name, peer_port) };
+				let peer = peer_arg(peer_id, name, port)?;
+				args.push(("--spec-msg-peer", peer.as_str()).into());
+			}
+		}
+		network = network.with_parachain(|p| {
+			p.with_id(id)
 				.with_default_command("polkadot-parachain")
 				.with_default_image(images.cumulus.as_str())
-				.with_chain(format!("penpal-rococo-{SENDER}").as_str())
-				.with_raw_spec_override(
-					serde_json::json!({ "protocolId": format!("penpal-{SENDER}") }),
-				)
-				.with_default_args(collator_args(&to_receiver))
-				.with_collator(|n| {
-					n.with_name(SENDER_COLLATOR)
-						.with_p2p_port(SENDER_P2P_PORT)
-						.with_rpc_port(SENDER_RPC_PORT)
-				})
-		})
-		.with_parachain(|p| {
-			p.with_id(RECEIVER)
-				.with_default_command("polkadot-parachain")
-				.with_default_image(images.cumulus.as_str())
-				.with_chain(format!("penpal-rococo-{RECEIVER}").as_str())
-				.with_raw_spec_override(
-					serde_json::json!({ "protocolId": format!("penpal-{RECEIVER}") }),
-				)
-				.with_default_args(collator_args(&to_sender))
-				.with_collator(|n| {
-					n.with_name(RECEIVER_COLLATOR)
-						.with_p2p_port(RECEIVER_P2P_PORT)
-						.with_rpc_port(RECEIVER_RPC_PORT)
-				})
-		})
+				.with_chain(format!("penpal-rococo-{id}").as_str())
+				// Separate protocol IDs prevent cross-chain block announcements and genesis bans.
+				.with_raw_spec_override(serde_json::json!({ "protocolId": format!("penpal-{id}") }))
+				.with_default_args(args)
+				.with_collator(|n| n.with_name(name).with_p2p_port(p2p).with_rpc_port(rpc))
+		});
+	}
+	network
 		.with_global_settings(|settings| {
-			let settings = settings.with_tear_down_on_failure(tear_down_on_failure);
+			let settings = settings.with_tear_down_on_failure(mode != NetworkMode::Restarts);
 			match std::env::var("ZOMBIENET_SDK_BASE_DIR") {
 				Ok(val) => settings.with_base_dir(val),
 				_ => settings,
