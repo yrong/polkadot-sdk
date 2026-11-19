@@ -145,6 +145,8 @@ network and has a six-minute deadline:
 cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci --test tests spec_msg_prefers_hrmp_when_both_channels_are_open -- --nocapture --test-threads=1
 ```
 
+Run the same command with `spec_msg_hrmp_cutover_and_rollback` to follow queued HRMP and spec-msg sends through cutover, rollback, and relay channel closure. The test checks each message ID and transport in finalized receiver blocks.
+
 ## Latency against HRMP
 
 `spec_msg_vs_hrmp_latency -- --ignored --nocapture` replaces `spec_msg_delivers -- --nocapture`. It compares
