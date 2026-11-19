@@ -24,7 +24,11 @@ use cumulus_primitives_spec_messaging::{
 	OutChannelId, OutChannelState, StreamId, SPMS_ENGINE_ID,
 };
 use cumulus_zombienet_sdk_helpers::{assert_para_throughput, open_hrmp_channel};
-use std::{collections::BTreeMap, future::Future, time::Duration};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	future::Future,
+	time::Duration,
+};
 use zombienet_orchestrator::network::node::LogLineCountOptions;
 use zombienet_sdk::{
 	subxt::{
@@ -32,7 +36,7 @@ use zombienet_sdk::{
 		backend::StreamOfResults,
 		blocks::Block,
 		config::{polkadot::PolkadotExtrinsicParamsBuilder, substrate::DigestItem},
-		dynamic::Value,
+		dynamic::{tx, Value},
 		ext::scale_value::{At, Primitive, ValueDef},
 		tx::TxStatus,
 		utils::H256,
@@ -244,10 +248,7 @@ async fn send_batch_and_follow(
 	let before_send = receiver.blocks().at(best_hash(receiver).await?).await?.number();
 	let mut blocks = receiver.blocks().subscribe_finalized().await?;
 	let calls = (0..BATCH).map(|_| send_xcm_to(RECEIVER)).collect::<Vec<_>>();
-	let batch = Value::unnamed_variant(
-		"Utility",
-		[Value::named_variant("batch_all", [("calls", Value::unnamed_composite(calls))])],
-	);
+	let batch = batch_all(calls);
 	let sent = sender.blocks().at(sudo(sender, batch).await?).await?;
 	let mut ids = Vec::new();
 	for event in sent.events().await?.iter() {
@@ -617,6 +618,10 @@ async fn backpressure_and_follow(
 	Ok(())
 }
 
+fn batch_all(calls: Vec<Value>) -> Value {
+	tx("Utility", "batch_all", vec![Value::unnamed_composite(calls)]).into_value()
+}
+
 /// Dispatch `calls` as root in one `Utility::force_batch`, in a best block; the ids of the XCMs
 /// it sent.
 async fn force_batch(
@@ -868,31 +873,7 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 
 		open_spec_msg_channel(&sender, &receiver).await?;
 		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
-		// The router reads the sender's relay snapshot, which can lag the relay's channel state.
-		wait_for("the sender to observe its HRMP channel", || async {
-			let query = subxt::dynamic::storage(
-				"ParachainSystem",
-				"RelevantMessagingState",
-				Vec::<Value>::new(),
-			);
-			let Some(state) = sender.storage().at(best_hash(&sender).await?).fetch(&query).await?
-			else {
-				return Ok(false);
-			};
-			let state = state.to_value()?;
-			let channels = state
-				.at("egress_channels")
-				.ok_or_else(|| anyhow!("no egress channels in the sender's relay snapshot"))?;
-			let ValueDef::Composite(channels) = &channels.value else {
-				return Err(anyhow!("invalid egress channels in the sender's relay snapshot"));
-			};
-			let open = channels.values().any(|channel| {
-				channel.at(0).and_then(|id| id.at(0)).and_then(|id| id.as_u128()) ==
-					Some(RECEIVER.into())
-			});
-			Ok(open)
-		})
-		.await?;
+		wait_for_hrmp_snapshot(&sender).await?;
 		let (_, outbound) = channel_states(&sender, &receiver).await?;
 		if !outbound
 			.get(&out_channel())
@@ -924,6 +905,146 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 	tokio::time::timeout(Duration::from_secs(360), test)
 		.await
 		.map_err(|_| anyhow!("HRMP preference test exceeded six minutes"))?
+}
+
+async fn wait_for_hrmp_snapshot(
+	sender: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	// The router reads the sender's relay snapshot, which can lag the relay's channel state.
+	wait_for("the sender to observe its HRMP channel", || async {
+		let query = subxt::dynamic::storage(
+			"ParachainSystem",
+			"RelevantMessagingState",
+			Vec::<Value>::new(),
+		);
+		let Some(state) = sender.storage().at(best_hash(sender).await?).fetch(&query).await? else {
+			return Ok(false);
+		};
+		let state = state.to_value()?;
+		let channels = state
+			.at("egress_channels")
+			.ok_or_else(|| anyhow!("no egress channels in the sender's relay snapshot"))?;
+		let ValueDef::Composite(channels) = &channels.value else {
+			return Err(anyhow!("invalid egress channels in the sender's relay snapshot"));
+		};
+		let open = channels.values().any(|channel| {
+			channel.at(0).and_then(|id| id.at(0)).and_then(|id| id.as_u128()) ==
+				Some(RECEIVER.into())
+		});
+		Ok(open)
+	})
+	.await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let test = async {
+		let network =
+			initialize_network(build_network_config((SENDER_COLLATOR, SENDER_P2P_PORT), false)?)
+				.await?;
+		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+		let sender: OnlineClient<PolkadotConfig> =
+			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+		let receiver: OnlineClient<PolkadotConfig> =
+			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+		open_spec_msg_channel(&sender, &receiver).await?;
+		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
+		wait_for_hrmp_snapshot(&sender).await?;
+
+		let mut blocks = receiver.blocks().subscribe_finalized().await?;
+		let mut expected = BTreeMap::new();
+		let mut received = BTreeSet::new();
+		let flag = |name: &'static str| {
+			tx("SpecMessaging", name, vec![Value::u128(RECEIVER.into())]).into_value()
+		};
+		// No block boundary between A and the cutover: A is still in the sender's XCMP queue.
+		let cutover =
+			batch_all(vec![send_xcm_to(RECEIVER), flag("set_hrmp_closing"), send_xcm_to(RECEIVER)]);
+		let (_, ids) = submit_sudo(&sender, cutover, true).await?;
+		let [a, b] = ids.as_slice() else { return Err(anyhow!("expected two cutover sends")) };
+		anyhow::ensure!(a != b, "cutover sends have the same id");
+		expected.insert(a.clone(), "Sibling");
+		expected.insert(b.clone(), "SpecMsg");
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
+
+		let rollback = batch_all(vec![
+			flag("clear_hrmp_closing"),
+			send_xcm_to(RECEIVER),
+			flag("set_hrmp_closing"),
+		]);
+		let (_, ids) = submit_sudo(&sender, rollback, true).await?;
+		let [c] = ids.as_slice() else { return Err(anyhow!("expected one rollback send")) };
+		anyhow::ensure!(expected.insert(c.clone(), "Sibling").is_none(), "duplicate send id");
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
+
+		let channel = Value::named_composite([
+			("sender", Value::u128(SENDER.into())),
+			("recipient", Value::u128(RECEIVER.into())),
+		]);
+		let close = tx("Hrmp", "hrmp_close_channel", vec![channel]).into_value();
+		let origin = Value::unnamed_variant(
+			"ParachainsOrigin",
+			[Value::unnamed_variant("Parachain", [Value::u128(SENDER.into())])],
+		);
+		sudo(
+			&relay,
+			batch_all(vec![
+				tx("Utility", "dispatch_as_fallible", vec![origin, close]).into_value(),
+				tx("Hrmp", "force_process_hrmp_close", vec![Value::u128(1)]).into_value(),
+			]),
+		)
+		.await?;
+		anyhow::ensure!(!hrmp_channel_open(&relay, SENDER, RECEIVER).await?, "HRMP still open");
+
+		let (_, ids) = submit_sudo(&sender, send_xcm_to(RECEIVER), true).await?;
+		let [d] = ids.as_slice() else { return Err(anyhow!("expected one send after closure")) };
+		anyhow::ensure!(expected.insert(d.clone(), "SpecMsg").is_none(), "duplicate send id");
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await
+	};
+	tokio::time::timeout(Duration::from_secs(600), test)
+		.await
+		.map_err(|_| anyhow!("HRMP cutover test exceeded ten minutes"))?
+}
+
+async fn wait_for_routed_messages(
+	blocks: &mut StreamOfResults<Block<PolkadotConfig, OnlineClient<PolkadotConfig>>>,
+	expected: &BTreeMap<Vec<u8>, &str>,
+	received: &mut BTreeSet<Vec<u8>>,
+) -> Result<(), anyhow::Error> {
+	while let Some(block) = blocks.next().await {
+		let block = block?;
+		for event in block.events().await?.iter() {
+			let event = event?;
+			if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
+				continue;
+			}
+			let fields = event.field_values()?;
+			let Some(id) = fields.at("id").map(flatten) else { continue };
+			let Some(&route) = expected.get(&id) else { continue };
+			let origin = fields.at("origin").ok_or_else(|| anyhow!("missing message origin"))?;
+			anyhow::ensure!(
+				matches!(&origin.value, ValueDef::Variant(v) if v.name == route),
+				"expected {route} for {id:?}, got {origin:?}"
+			);
+			anyhow::ensure!(
+				fields.at("success").and_then(|v| v.as_bool()) == Some(true),
+				"execution failed for {id:?}"
+			);
+			anyhow::ensure!(received.insert(id.clone()), "repeated {id:?}");
+			log::info!(
+				"Cutover XCM 0x{} finalized via {route} at receiver block #{}",
+				hex::encode(id),
+				block.number()
+			);
+		}
+		if received.len() == expected.len() {
+			return Ok(());
+		}
+	}
+	Err(anyhow!("receiver block subscription ended during cutover"))
 }
 
 /// Samples per path.
