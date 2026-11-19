@@ -1217,6 +1217,26 @@ fn create_inherent_trims_to_the_remaining_ref_time() {
 }
 
 #[test]
+fn integrity_bound_covers_encoded_channel_and_register_items() {
+	use cumulus_primitives_spec_messaging::mmr::MAX_MMR_LEAF_COUNT;
+
+	let payloads =
+		vec![vec![0u8; MaxMsgLen::get() as usize]; MaxInboundMessagesPerItem::get() as usize];
+	let channel = (in_channel(), payloads);
+	let leaves = MAX_MMR_LEAF_COUNT - 1;
+	let frontier =
+		MmrFrontier::from_parts(vec![Hash::default(); leaves.count_ones() as usize], leaves)
+			.expect("one peak for each set bit");
+	let read = (out_channel(), LossyRead { frontier, payloads: vec![accepting(1).encode()] });
+	for registers in 0..=MaxTouchedStreams::get() {
+		let channels = MaxTouchedStreams::get() - registers;
+		let encoded = u64::from(channels) * channel.encoded_size() as u64 +
+			u64::from(registers) * read.encoded_size() as u64;
+		assert!(max_inherent_item_bytes::<Test>(channels, registers) >= encoded);
+	}
+}
+
+#[test]
 fn mixed_inherent_fits_the_weight_booked_for_its_bare_extrinsic() {
 	use frame_support::dispatch::GetDispatchInfo;
 	use frame_system::mocking::MockUncheckedExtrinsic;
