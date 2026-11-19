@@ -132,6 +132,7 @@ impl<T: Config> frame_support::traits::QueuePausedQuery<InChannelId> for crate::
 ///
 /// - HRMP wins while a channel exists (`Full` included), unless the sibling is [`HrmpClosing`].
 /// - Otherwise the XCM goes over the spec-msg XCM channel if it is open, else falls through.
+/// - During HRMP cutover, a closed spec-msg channel refuses new sends so HRMP can drain.
 /// - An open channel without capacity is a hard [`SendError::Transport`]: falling through would
 ///   lose the XCM in `XcmpQueue`.
 /// - `Price` is usually `ExponentialPrice` over [`Pallet`], which tracks the channel's congestion
@@ -172,10 +173,14 @@ where
 			},
 		};
 		let channel = xcm_channel(id);
-		let hrmp_open = !HrmpClosing::<T>::contains_key(id) &&
-			!matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
+		let closing = HrmpClosing::<T>::contains_key(id);
+		let hrmp_open =
+			!closing && !matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
 		let spec_msg_open = OutChannels::<T>::get(channel)
 			.is_some_and(|state| state.active_session(T::SupportedVersions::get()).is_some());
+		if closing && !spec_msg_open {
+			return Err(SendError::Transport("spec-msg XCM channel is closed during HRMP cutover"));
+		}
 		if hrmp_open || !spec_msg_open {
 			*dest = Some(d);
 			return Err(SendError::NotApplicable);
