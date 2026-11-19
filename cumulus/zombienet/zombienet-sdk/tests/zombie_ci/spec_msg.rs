@@ -437,6 +437,98 @@ async fn outage_and_follow(
 	Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_delivers_across_collator_restarts() -> Result<(), anyhow::Error> {
+	let _ = env_logger::try_init_from_env(
+		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+	);
+	let test = async {
+		let network = initialize_network(network_config_with_teardown(
+			(SENDER_COLLATOR, SENDER_P2P_PORT),
+			false,
+			false,
+		)?)
+		.await?;
+		let source = network.get_node(SENDER_COLLATOR)?;
+		let destination = network.get_node(RECEIVER_COLLATOR)?;
+		let sender: OnlineClient<PolkadotConfig> = source.wait_client().await?;
+		let receiver: OnlineClient<PolkadotConfig> = destination.wait_client().await?;
+		open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER).await?;
+
+		let before = receiver.blocks().at_latest().await?.hash();
+		let mut best = receiver.blocks().subscribe_best().await?;
+		let batch = batch_all((0..BACKLOG).map(|_| send_xcm_to(RECEIVER)).collect());
+		let ids = sudo_sent(&sender, batch).await?;
+		anyhow::ensure!(ids.len() as u64 == BACKLOG, "incomplete restart batch");
+		let interrupted = loop {
+			let block =
+				best.next().await.ok_or_else(|| anyhow!("receiver best stream ended"))??;
+			let count = processed_ids(&block, &ids).await?.len();
+			if count > 0 {
+				anyhow::ensure!(count < ids.len(), "receiver already processed the batch");
+				log::info!(
+					"Restarting receiver after {count} messages in best block #{}",
+					block.number()
+				);
+				break block.number();
+			}
+		};
+		destination.restart(None).await?;
+		let receiver: OnlineClient<PolkadotConfig> = destination.wait_client().await?;
+		let resumed = receiver.blocks().at(best_hash(&receiver).await?).await?.number();
+		log::info!("Receiver restarted at best block #{resumed}");
+		let expected: BTreeMap<_, _> = ids.into_iter().map(|id| (id, "SpecMsg")).collect();
+		anyhow::ensure!(expected.len() as u64 == BACKLOG, "duplicate restart batch id");
+		let mut received = BTreeSet::new();
+		let mut blocks = receiver.blocks().subscribe_finalized().await?;
+		let mut block = blocks.next().await.ok_or_else(|| anyhow!("receiver finality ended"))??;
+		// Replay the disconnected interval, then continue from the same finalized subscription.
+		let mut history = Vec::new();
+		while block.hash() != before {
+			anyhow::ensure!(block.number() > 0, "receiver lost the pre-restart finalized block");
+			let parent = block.header().parent_hash;
+			history.push(block);
+			block = receiver.blocks().at(parent).await?;
+		}
+		let past = futures::stream::iter(history.into_iter().rev().map(Ok));
+		let mut blocks = StreamOfResults::new(Box::pin(futures::StreamExt::chain(past, blocks)));
+		loop {
+			let block = blocks.next().await.ok_or_else(|| anyhow!("receiver finality ended"))??;
+			check_routed_block(&block, &expected, &mut received).await?;
+			if received.len() == expected.len() {
+				anyhow::ensure!(
+					block.number() > resumed.max(interrupted),
+					"the batch completed before receiver recovery"
+				);
+				log::info!(
+					"Receiver restart: all {BACKLOG} messages finalized by #{}",
+					block.number()
+				);
+				break;
+			}
+		}
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
+
+		// With the receiver paused before the send, only the restarted sender can serve it.
+		let mut blocks = receiver.blocks().subscribe_finalized().await?;
+		destination.pause().await?;
+		let (sent_at, ids) = submit_sudo(&sender, send_xcm_to(RECEIVER), true).await?;
+		let [id] = ids.as_slice() else { return Err(anyhow!("expected one send before restart")) };
+		source.restart(None).await?;
+		let sender: OnlineClient<PolkadotConfig> = source.wait_client().await?;
+		let sent = sender.blocks().at(sent_at).await?;
+		log::info!("Sender reopened finalized send block #{} ({sent_at:#x})", sent.number());
+		destination.resume().await?;
+		let expected = BTreeMap::from([(id.clone(), "SpecMsg")]);
+		let mut received = BTreeSet::new();
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await
+	};
+	tokio::time::timeout(Duration::from_secs(600), test)
+		.await
+		.map_err(|_| anyhow!("collator restart test exceeded ten minutes"))?
+}
+
 /// Penpal's `MaxMsgLen`: the largest leaf a channel carries.
 const MAX_LEAF: usize = 102_400;
 /// The remark length that makes [`send_large_xcm_to`]'s leaf exactly `MAX_LEAF` bytes: the `Data`
@@ -1159,35 +1251,44 @@ async fn wait_for_routed_messages(
 ) -> Result<(), anyhow::Error> {
 	while let Some(block) = blocks.next().await {
 		let block = block?;
-		for event in block.events().await?.iter() {
-			let event = event?;
-			if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
-				continue;
-			}
-			let fields = event.field_values()?;
-			let Some(id) = fields.at("id").map(flatten) else { continue };
-			let Some(&route) = expected.get(&id) else { continue };
-			let origin = fields.at("origin").ok_or_else(|| anyhow!("missing message origin"))?;
-			anyhow::ensure!(
-				matches!(&origin.value, ValueDef::Variant(v) if v.name == route),
-				"expected {route} for {id:?}, got {origin:?}"
-			);
-			anyhow::ensure!(
-				fields.at("success").and_then(|v| v.as_bool()) == Some(true),
-				"execution failed for {id:?}"
-			);
-			anyhow::ensure!(received.insert(id.clone()), "repeated {id:?}");
-			log::info!(
-				"XCM 0x{} finalized via {route} at receiver block #{}",
-				hex::encode(id),
-				block.number()
-			);
-		}
+		check_routed_block(&block, expected, received).await?;
 		if received.len() == expected.len() {
 			return Ok(());
 		}
 	}
 	Err(anyhow!("destination block subscription ended"))
+}
+
+async fn check_routed_block(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	expected: &BTreeMap<Vec<u8>, &str>,
+	received: &mut BTreeSet<Vec<u8>>,
+) -> Result<(), anyhow::Error> {
+	for event in block.events().await?.iter() {
+		let event = event?;
+		if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
+			continue;
+		}
+		let fields = event.field_values()?;
+		let Some(id) = fields.at("id").map(flatten) else { continue };
+		let Some(&route) = expected.get(&id) else { continue };
+		let origin = fields.at("origin").ok_or_else(|| anyhow!("missing message origin"))?;
+		anyhow::ensure!(
+			matches!(&origin.value, ValueDef::Variant(v) if v.name == route),
+			"expected {route} for {id:?}, got {origin:?}"
+		);
+		anyhow::ensure!(
+			fields.at("success").and_then(|v| v.as_bool()) == Some(true),
+			"execution failed for {id:?}"
+		);
+		anyhow::ensure!(received.insert(id.clone()), "repeated {id:?}");
+		log::info!(
+			"XCM 0x{} finalized via {route} at receiver block #{}",
+			hex::encode(id),
+			block.number()
+		);
+	}
+	Ok(())
 }
 
 /// Samples per path.
@@ -2350,6 +2451,14 @@ fn build_network_config(
 	sender_node: (&str, u16),
 	relay_forks: bool,
 ) -> Result<NetworkConfig, anyhow::Error> {
+	network_config_with_teardown(sender_node, relay_forks, true)
+}
+
+fn network_config_with_teardown(
+	sender_node: (&str, u16),
+	relay_forks: bool,
+	tear_down_on_failure: bool,
+) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let to_receiver = peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?;
 	let to_sender = peer_arg(SENDER, sender_node.0, sender_node.1)?;
@@ -2423,9 +2532,12 @@ fn build_network_config(
 						.with_rpc_port(RECEIVER_RPC_PORT)
 				})
 		})
-		.with_global_settings(|global_settings| match std::env::var("ZOMBIENET_SDK_BASE_DIR") {
-			Ok(val) => global_settings.with_base_dir(val),
-			_ => global_settings,
+		.with_global_settings(|settings| {
+			let settings = settings.with_tear_down_on_failure(tear_down_on_failure);
+			match std::env::var("ZOMBIENET_SDK_BASE_DIR") {
+				Ok(val) => settings.with_base_dir(val),
+				_ => settings,
+			}
 		})
 		.build()
 		.map_err(|e| {
