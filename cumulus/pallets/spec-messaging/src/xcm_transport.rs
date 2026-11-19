@@ -132,12 +132,13 @@ impl<T: Config> frame_support::traits::QueuePausedQuery<InChannelId> for crate::
 ///
 /// - HRMP wins while a channel exists (`Full` included), unless the sibling is [`HrmpClosing`].
 /// - Otherwise the XCM goes over the spec-msg XCM channel if it is open, else falls through.
+/// - During HRMP cutover, a closed spec-msg channel refuses new sends so HRMP can drain.
 /// - An open channel without capacity is a hard [`SendError::Transport`]: falling through would
 ///   lose the XCM in `XcmpQueue`.
 /// - `Price` is usually `ExponentialPrice` over [`Pallet`], which tracks the channel's congestion
 ///   in [`DeliveryFeeFactor`].
-/// - Each delivery charges [`Pallet::send_weight`] to the block. A transaction's send goes to the
-///   normal class, and one it would push past that class's limit or the block's is a hard
+/// - Each delivery charges its weight to the block. A transaction's send goes to the normal class,
+///   and one it would push past that class's limit or the block's is a hard
 ///   [`SendError::Transport`] too: the transaction fails and reverts. A hook's send, such as XCM
 ///   the message queue executes in `on_initialize` or `on_idle`, goes to the mandatory class with
 ///   no room check, as `XcmpQueue` charges nothing at send: the queue already metered the XCM, and
@@ -172,10 +173,14 @@ where
 			},
 		};
 		let channel = xcm_channel(id);
-		let hrmp_open = !HrmpClosing::<T>::contains_key(id) &&
-			!matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
+		let closing = HrmpClosing::<T>::contains_key(id);
+		let hrmp_open =
+			!closing && !matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
 		let spec_msg_open = OutChannels::<T>::get(channel)
 			.is_some_and(|state| state.active_session(T::SupportedVersions::get()).is_some());
+		if closing && !spec_msg_open {
+			return Err(SendError::Transport("spec-msg XCM channel is closed during HRMP cutover"));
+		}
 		if hrmp_open || !spec_msg_open {
 			*dest = Some(d);
 			return Err(SendError::NotApplicable);
@@ -200,7 +205,7 @@ where
 		if send_class::<T>() == DispatchClass::Normal {
 			let weights = T::BlockWeights::get();
 			let limit = weights.get(DispatchClass::Normal).max_total.unwrap_or(weights.max_block);
-			let send = Pallet::<T>::send_weight(channel, encoded.len() as u32);
+			let send = delivery_weight::<T>(channel, encoded.len() as u32);
 			let used = frame_system::BlockWeight::<T>::get();
 			if !used.get(DispatchClass::Normal).saturating_add(send).all_lte(limit) ||
 				!used.total().saturating_add(send).all_lte(weights.max_block)
@@ -214,8 +219,7 @@ where
 	fn deliver((channel, encoded): Self::Ticket) -> Result<XcmHash, SendError> {
 		let hash = sp_io::hashing::blake2_256(&encoded);
 		let len = encoded.len();
-		let weight = Pallet::<T>::send_weight(channel, len as u32)
-			.saturating_add(T::DbWeight::get().reads_writes(1, 1));
+		let weight = delivery_weight::<T>(channel, len as u32);
 		let position = Pallet::<T>::send(channel, encoded)
 			.map_err(|_| SendError::Transport("spec-msg XCM send failed"))?;
 		track_congestion::<T>(channel, position, len);
@@ -223,6 +227,11 @@ where
 		frame_system::Pallet::<T>::register_extra_weight_unchecked(weight, send_class::<T>());
 		Ok(hash)
 	}
+}
+
+/// Delivery also charges the fee-factor read and write for congestion tracking.
+fn delivery_weight<T: Config>(channel: OutChannelId, len: u32) -> Weight {
+	Pallet::<T>::send_weight(channel, len).saturating_add(T::DbWeight::get().reads_writes(1, 1))
 }
 
 /// Raise the channel's [`DeliveryFeeFactor`] after a send that leaves more than half of

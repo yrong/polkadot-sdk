@@ -2,7 +2,9 @@ title: 'spec-msg: XCM routing on the enactment stack'
 doc:
 - audience: Runtime Dev
   description: Route XCM through speculative messaging and preserve its origin through message queue
-    processing.
+    processing. If the speculative messaging channel closes during HRMP cutover, new sends
+    fail until it reopens or the runtime clears the HRMP closing flag. Transaction sends must fit
+    both the normal-class and total block limits, including the congestion fee update.
 crates:
 - name: cumulus-pallet-spec-messaging
   bump: major
