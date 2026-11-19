@@ -641,13 +641,16 @@ pub mod pallet {
 
 			let us = T::SelfParaId::get();
 			let mut budget = BundleBudget::load::<T>();
-			let mut remaining = Self::proof_budget(inherent_data);
+			let overhead = inherent_overhead::<T>();
+			let mut remaining =
+				Self::proof_budget(inherent_data).saturating_sub(overhead.proof_size());
 			// The call is mandatory, so nothing refuses it past the block's ref time or proof size:
 			// keep within both, counting the storage proof the call is charged for.
 			let ref_time = T::BlockWeights::get()
 				.max_block
 				.ref_time()
-				.saturating_sub(frame_system::Pallet::<T>::block_weight().total().ref_time());
+				.saturating_sub(frame_system::Pallet::<T>::block_weight().total().ref_time())
+				.saturating_sub(overhead.ref_time());
 			let mut tally = EnactTally::default();
 			// Register reads go first: they carry our flow-control grants, and a channel backlog
 			// that fills the block's ref time would otherwise drop them in every block. They leave
@@ -791,6 +794,16 @@ fn enact_weight<T: Config>(data: &MessagingInherentData) -> Weight {
 	tally.weight::<T>()
 }
 
+/// The mandatory base weight plus the bare extrinsic framing outside the encoded items.
+fn inherent_overhead<T: Config>() -> Weight {
+	// Length prefixes for the extrinsic and three maps, the version byte and the call indices.
+	let framing = 4 * Compact::<u32>::max_encoded_len() + 3;
+	T::BlockWeights::get()
+		.get(frame_support::dispatch::DispatchClass::Mandatory)
+		.base_extrinsic
+		.saturating_add_proof_size(framing as u64)
+}
+
 /// The most an `enact_messages` within the caps can weigh, with its extrinsic bytes, which the
 /// block length limit bounds too, and its lift reservation.
 fn max_inherent_weight<T: Config>() -> Weight {
@@ -818,7 +831,9 @@ fn max_inherent_weight<T: Config>() -> Weight {
 		};
 		worst = worst.max(tally.weight::<T>());
 	}
-	worst.saturating_add(Weight::from_parts(0, u64::from(bytes).saturating_add(reservation)))
+	worst
+		.saturating_add(inherent_overhead::<T>())
+		.saturating_add(Weight::from_parts(0, u64::from(bytes).saturating_add(reservation)))
 }
 
 /// What [`enact_weight`] charges for, so `create_inherent` can grow an inherent payload by payload.

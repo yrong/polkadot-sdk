@@ -1193,7 +1193,7 @@ fn create_inherent_trims_to_the_remaining_ref_time() {
 			if register {
 				data.registers = offered.registers.clone();
 			}
-			enact_weight::<Test>(&data).ref_time()
+			(inherent_overhead::<Test>() + enact_weight::<Test>(&data)).ref_time()
 		};
 		let max = <Test as frame_system::Config>::BlockWeights::get().max_block.ref_time();
 		// `(payloads kept, register kept)` with `left` ref time in the block.
@@ -1213,6 +1213,42 @@ fn create_inherent_trims_to_the_remaining_ref_time() {
 		assert_eq!(kept(weight(3, true) - 1), (2, true));
 		assert_eq!(kept(weight(3, false) - 1), (2, false));
 		assert_eq!(kept(weight(1, false) - 1), (0, false));
+	});
+}
+
+#[test]
+fn mixed_inherent_fits_the_weight_booked_for_its_bare_extrinsic() {
+	use frame_support::dispatch::GetDispatchInfo;
+	use frame_system::mocking::MockUncheckedExtrinsic;
+
+	new_test_ext().execute_with(|| {
+		let ch = in_channel();
+		accept(ch);
+		want_open(out_channel());
+		let mut offered = channel_item(ch, vec![hello(1), data(b"a"), data(b"b")]);
+		offered.registers = register_read(0).registers;
+		assert_eq!(created(&offered), Some(offered.clone()));
+
+		let xt = MockUncheckedExtrinsic::<Test>::new_bare(
+			Call::<Test>::enact_messages { data: offered.clone() }.into(),
+		);
+		let weights = MockBlockWeights::get();
+		let booked = frame_system::calculate_consumed_extrinsic_weight::<RuntimeCall>(
+			&weights,
+			&xt.get_dispatch_info(),
+			xt.encoded_size(),
+		);
+		// Both streams belong to the same source.
+		let needed = booked + Weight::from_parts(0, first_lift_bytes() + lift_len() as u64);
+		let trimmed = [Weight::from_parts(1, 0), Weight::from_parts(0, 1)].map(|short| {
+			frame_system::BlockWeight::<Test>::kill();
+			System::register_extra_weight_unchecked(
+				weights.max_block - needed + short,
+				DispatchClass::Mandatory,
+			);
+			created(&offered) != Some(offered.clone())
+		});
+		assert_eq!(trimmed, [true, true], "trim when ref time or proof size is one unit short");
 	});
 }
 
@@ -1243,7 +1279,8 @@ fn create_inherent_counts_its_own_proof_size() {
 				.iter()
 				.map(|r| first_lift_bytes() + r.encoded_size() as u64)
 				.sum();
-			channels + registers + enact_weight::<Test>(data).proof_size()
+			channels +
+				registers + (inherent_overhead::<Test>() + enact_weight::<Test>(data)).proof_size()
 		};
 		let kept = |offered: &MessagingInherentData, left: u64| {
 			frame_system::BlockWeight::<Test>::kill();
@@ -1279,7 +1316,10 @@ fn a_channel_item_that_fills_the_ref_time_leaves_room_for_the_register_read() {
 		// backlogged channel offers that much in every block.
 		frame_system::BlockWeight::<Test>::kill();
 		System::register_extra_weight_unchecked(
-			Weight::from_parts(max - channel_alone.max(register_alone), 0),
+			Weight::from_parts(
+				max - inherent_overhead::<Test>().ref_time() - channel_alone.max(register_alone),
+				0,
+			),
 			DispatchClass::Mandatory,
 		);
 		let data = created(&offered).expect("something fits");
@@ -1325,7 +1365,7 @@ fn a_ref_time_trim_does_not_always_cut_the_same_channels() {
 			System::set_block_number(n);
 			frame_system::BlockWeight::<Test>::kill();
 			System::register_extra_weight_unchecked(
-				Weight::from_parts(max - one.ref_time(), 0),
+				Weight::from_parts(max - (inherent_overhead::<Test>() + one).ref_time(), 0),
 				DispatchClass::Mandatory,
 			);
 			let data = created(&offered).expect("one channel item fits");
