@@ -420,6 +420,26 @@ fn skip_proofs_verify_from_the_peaks_and_the_leaves() {
 }
 
 #[test]
+fn a_new_register_watch_fetches_under_an_already_settled_root() {
+	let sender = Sender::new();
+	let accepted = Register {
+		up_to: MessagePosition(0),
+		status: RegisterStatus::Accepting { session: 1, min: 1, max: 1, max_message_size: 1024 },
+	};
+	let root =
+		sender.author(vec![(channel(US), payloads(1, 1)), (ack(US), vec![accepted.encode()])]);
+	let receiver = receiver(&sender, Budget::default());
+	let before = lanes(1, false);
+	block_on(receiver.on_root(source(), root, &before));
+	assert!(receiver.is_settled(&source(), &root, &before));
+
+	let after = lanes(1, true);
+	block_on(receiver.on_root(source(), root, &after));
+	let offer = block_on(receiver.inherent_data(&view_of(after, 8), &[]));
+	assert!(offer.registers.contains_key(&out_id()), "offer the newly watched register");
+}
+
+#[test]
 fn a_register_at_or_below_the_cursor_is_not_offered() {
 	let sender = Sender::new();
 	let root1 = sender.author(vec![(ack(US), vec![register(0).encode()])]);
@@ -470,6 +490,12 @@ fn a_stream_that_does_not_exist_yet_is_expected_at_cursor_zero_only() {
 	let wants = lanes(1, true);
 	block_on(receiver_0.on_root(source(), root, &wants));
 	assert!(receiver_0.is_settled(&source(), &root, &wants));
+	let attempts = sender.requests(ack(US)).len();
+	block_on(receiver_0.on_root(source(), root, &wants));
+	assert_eq!(sender.requests(ack(US)).len(), attempts);
+	let mut advanced = wants.clone();
+	advanced.registers.insert(out_id(), MessagePosition(1));
+	assert!(!receiver_0.is_settled(&source(), &root, &advanced));
 
 	// Past cursor 0 the stream cannot be missing: the round stays open.
 	let receiver_2 = receiver(&sender, Budget::default());

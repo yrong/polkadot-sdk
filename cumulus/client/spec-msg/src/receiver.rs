@@ -313,11 +313,15 @@ where
 	pub fn is_settled(&self, source: &ParaId, root: &StreamsRoot, wants: &SourceWants) -> bool {
 		let state = self.state.lock();
 		let Some(pool) = state.sources.get(source) else { return false };
+		let Some(absent) = &pool.absent_registers else { return false };
 		pool.newest_root().as_ref() == Some(root) &&
-			pool.settled &&
-			wants.channels.iter().all(|(id, stored)| {
-				covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
-			})
+			wants.registers.iter().all(|(id, cursor)| {
+				let stream = id.peer_ack_stream(self.us).1;
+				pool.heads.get(&stream).is_some_and(|head| head.under == *root) ||
+					(cursor.0 == 0 && absent.contains(&stream))
+			}) && wants.channels.iter().all(|(id, stored)| {
+			covers(pool, &id.sender_data_stream(self.us).1, stored.leaf_count())
+		})
 	}
 
 	/// `root` is `source`'s newest included root: fetch under it what `wants` names, and bind the
@@ -398,6 +402,7 @@ where
 			}
 		}
 
+		let mut absent_registers = BTreeSet::new();
 		for (id, cursor) in &wants.registers {
 			let stream = id.peer_ack_stream(self.us).1;
 			match self.fetch_head(source, stream, root).await {
@@ -406,6 +411,7 @@ where
 					state.sources.entry(source).or_default().insert_head(stream, head, tree_proof);
 				},
 				Err(e) if cursor.0 == 0 && unknown_stream(&e) => {
+					absent_registers.insert(stream);
 					log::trace!(target: LOG_TARGET, "{stream:?} of {source:?} does not exist yet");
 				},
 				Err(_) => settled = false,
@@ -431,7 +437,7 @@ where
 		if let Some(pool) = state.sources.get_mut(&source) {
 			// A newer root may have arrived meanwhile; it settles on its own.
 			if pool.newest_root() == Some(root) {
-				pool.settled = settled;
+				pool.absent_registers = settled.then_some(absent_registers);
 			}
 		}
 		log::debug!(
