@@ -2014,9 +2014,10 @@ async fn follow_delivery(
 						);
 					}
 					log::info!(
-						"Checkpoint 5/6, backing: {RECEIVER} block #{} is finalized, so its \
-						 candidate was backed and included: the relay matched its `Requires` \
-						 against {SENDER}'s provides window",
+						"Checkpoint 5/6: {RECEIVER} block #{} consumed from {SENDER} \
+						 in checkpoint 4, so its candidate carried `Requires`. \
+						 The block finalized, so the relay matched that root \
+						 against the sender's provides window",
 						block.number(),
 					);
 					consumed = true;
