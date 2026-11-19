@@ -2264,6 +2264,30 @@ mod xcm_layer {
 	}
 
 	#[test]
+	fn closing_spec_msg_during_cutover_refuses_new_sends_until_rollback() {
+		new_test_ext().execute_with(|| {
+			let peer = out_channel().recipient;
+			HrmpState::set(HrmpChannel::Ready);
+			open_xcm_channel();
+			assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), peer));
+			let channel = xcm_channel(peer);
+			assert_ok!(SpecMessaging::close_channel(
+				RuntimeOrigin::root(),
+				peer,
+				channel.domain,
+				channel.num
+			));
+			assert_eq!(
+				send_xcm::<Router>(sibling(), xcm()),
+				Err(SendError::Transport("spec-msg XCM channel is closed during HRMP cutover"))
+			);
+
+			assert_ok!(SpecMessaging::clear_hrmp_closing(RuntimeOrigin::root(), peer));
+			declines(sibling());
+		});
+	}
+
+	#[test]
 	fn the_delivery_fee_rises_while_more_than_half_the_window_is_unconfirmed() {
 		new_test_ext().execute_with(|| {
 			let peer = out_channel().recipient;
