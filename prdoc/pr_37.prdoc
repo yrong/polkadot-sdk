@@ -3,5 +3,6 @@ doc:
 - audience: Node Dev
   description: Test spec-msg delivery, bundles, relay forks and history serving by late nodes.
     Send application XCM in both directions and drain channels closed by either peer.
+    Verify delivery across sender and receiver collator restarts.
     Check HRMP preference, queued delivery during cutover, and rollback.
 crates: []
