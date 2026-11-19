@@ -563,18 +563,12 @@ where
 			.collect();
 		// A binding at the endpoint, or a later one to rebase from over the pooled payloads: an
 		// item the budget cuts short of what the pool holds needs no fetch.
-		let bound = |p: &Planned| {
-			let state = self.state.lock();
-			state.sources.get(&p.source).is_some_and(|pool| {
-				pool.binding(&p.stream, p.endpoint.leaf_count(), &p.root).is_some() ||
-					lifts_to(pool, &p.stream, &p.endpoint, &p.root)
-			})
-		};
 		let liftable =
-			|(source, stream, end, root): &(ParaId, StreamId, MmrFrontier, StreamsRoot)| {
+			|source: &ParaId, stream: &StreamId, end: &MmrFrontier, root: &StreamsRoot| {
 				let state = self.state.lock();
 				state.sources.get(source).is_some_and(|pool| lifts_to(pool, stream, end, root))
 			};
+		let bound = |p: &Planned| liftable(&p.source, &p.stream, &p.endpoint, &p.root);
 		// Fetch every missing binding at once, under one deadline: authoring waits at most
 		// `INHERENT_FETCH_TIMEOUT`, however many items there are and whatever their peers do.
 		{
@@ -582,7 +576,12 @@ where
 				.iter()
 				.filter(|p| !bound(p))
 				.map(|p| (p.source, p.stream, p.endpoint.clone(), p.root))
-				.chain(earlier.iter().filter(|e| !liftable(e)).cloned())
+				.chain(
+					earlier
+						.iter()
+						.filter(|(source, stream, end, root)| !liftable(source, stream, end, root))
+						.cloned(),
+				)
 				.collect();
 			if !missing.is_empty() {
 				let fetches = missing.iter().map(|(source, stream, endpoint, root)| {
@@ -596,7 +595,7 @@ where
 		}
 		let stuck: std::collections::BTreeSet<ParaId> = earlier
 			.iter()
-			.filter(|e| !liftable(e))
+			.filter(|(source, stream, end, root)| !liftable(source, stream, end, root))
 			.map(|(source, stream, end, _)| {
 				log::debug!(
 					target: LOG_TARGET,
