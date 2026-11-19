@@ -804,6 +804,24 @@ fn inherent_overhead<T: Config>() -> Weight {
 		.saturating_add_proof_size(framing as u64)
 }
 
+/// Maximum encoded size of the items for a given split between channels and registers.
+fn max_inherent_item_bytes<T: Config>(channels: u32, registers: u32) -> u64 {
+	let channel = <(
+		InChannelId,
+		BoundedVec<BoundedVec<u8, T::MaxMsgLen>, T::MaxInboundMessagesPerItem>,
+	)>::max_encoded_len();
+	// An admitted LossyRead carries a frontier and exactly one encoded register payload.
+	let register = Register::max_encoded_len();
+	let read = OutChannelId::max_encoded_len() +
+		MmrFrontier::max_encoded_len() +
+		Compact(1u32).encoded_size() +
+		Compact(register as u32).encoded_size() +
+		register;
+	u64::from(channels)
+		.saturating_mul(channel as u64)
+		.saturating_add(u64::from(registers) * read as u64)
+}
+
 /// The most an `enact_messages` within the caps can weigh, with its extrinsic bytes, which the
 /// block length limit bounds too, and its lift reservation.
 fn max_inherent_weight<T: Config>() -> Weight {
@@ -812,7 +830,6 @@ fn max_inherent_weight<T: Config>() -> Weight {
 	let length = *<T as frame_system::Config>::BlockLength::get()
 		.max
 		.get(frame_support::dispatch::DispatchClass::Mandatory);
-	let bytes = streams.saturating_mul(per_item).saturating_mul(T::MaxMsgLen::get()).min(length);
 	let reservation = Compact(MAX_COMMITMENT_ENTRIES).encoded_size() as u64 +
 		u64::from(streams) *
 			(lift_len() + ParaId::max_encoded_len() + Compact::<u32>::max_encoded_len()) as u64;
@@ -824,16 +841,17 @@ fn max_inherent_weight<T: Config>() -> Weight {
 		let tally = EnactTally {
 			channels,
 			payloads,
-			bytes: if channels == 0 { 0 } else { bytes },
+			bytes: payloads.saturating_mul(T::MaxMsgLen::get()).min(length),
 			handler: T::DataHandler::on_data_weight(T::MaxMsgLen::get())
 				.saturating_mul(payloads.into()),
 			registers,
 		};
-		worst = worst.max(tally.weight::<T>());
+		let item_bytes = max_inherent_item_bytes::<T>(channels, registers).min(u64::from(length));
+		worst = worst.max(tally.weight::<T>().saturating_add_proof_size(item_bytes));
 	}
 	worst
 		.saturating_add(inherent_overhead::<T>())
-		.saturating_add(Weight::from_parts(0, u64::from(bytes).saturating_add(reservation)))
+		.saturating_add_proof_size(reservation)
 }
 
 /// What [`enact_weight`] charges for, so `create_inherent` can grow an inherent payload by payload.
