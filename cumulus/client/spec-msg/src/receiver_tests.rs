@@ -550,6 +550,12 @@ fn a_channel_fetch_must_start_from_the_stored_frontier() {
 	assert!(receiver_b.is_settled(&source(), &root, &wants));
 	let consumed = block_on(receiver_b.inherent_data(&view_of(wants, 16), &[]));
 	assert_eq!(consumed.channels[&in_id(0)], data[2..].to_vec());
+
+	// A sibling receiver parent has consumed two different messages at the same positions.
+	let mut fork = lanes(1, false);
+	fork.channels.insert(in_id(0), frontier_at(&payloads(9, 2), 2));
+	let offered = block_on(receiver_b.inherent_data(&view_of(fork, 16), &[]));
+	assert!(offered.channels.is_empty(), "an endpoint off the source's stream is not offered");
 }
 
 #[test]
