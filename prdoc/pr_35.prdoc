@@ -4,7 +4,8 @@ doc:
   description: Fetch and verify messages under included roots and wire receiver inherents and lifts
     into collation. Retry unwritten streams and refresh channel coverage when the included root
     changes. Replay unfinalized consumption after a restart and track recovery sources until their
-    consuming blocks finalize.
+    consuming blocks finalize. Check cached proofs against the receiver parent's frontier before
+    authoring.
 crates:
 - name: cumulus-client-collator
   bump: major
