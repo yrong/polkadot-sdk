@@ -2133,6 +2133,22 @@ mod xcm_layer {
 		});
 	}
 
+	#[cfg(feature = "runtime-benchmarks")]
+	#[test]
+	fn benchmark_setup_routes_xcm_over_spec_msg() {
+		use polkadot_runtime_parachains::EnsureForParachain;
+
+		new_test_ext().execute_with(|| {
+			SupportedVersions::set(2..=2);
+			SpecMessaging::ensure(xcm_out().recipient);
+			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+			assert_eq!(
+				sent_on(xcm_out().data_stream()),
+				vec![ChannelMessage::Data(VersionedXcm::<()>::from(xcm()).encode()).encode()]
+			);
+		});
+	}
+
 	#[test]
 	fn xcm_goes_over_the_open_channel_and_dry_runs_see_it() {
 		new_test_ext().execute_with(|| {

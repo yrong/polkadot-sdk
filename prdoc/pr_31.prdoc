@@ -12,6 +12,10 @@ doc:
     Cumulus and bridge-hub queue origins. Each inbound channel has its own queue and
     executes XCM with the sender's sibling origin. Runtimes using the messaging pallet must
     configure `ChannelManagementOrigin` for HRMP cutover and inbound queue pause or resume.
+
+    For sibling XCM benchmarks over spec-msg, use the messaging pallet as the
+    `ToParachainDeliveryHelper` setup type and the router's `Price` as `PriceForDelivery`.
+    Leave HRMP closed for the benchmark destination.
 crates:
 - name: cumulus-pallet-spec-messaging
   bump: major
