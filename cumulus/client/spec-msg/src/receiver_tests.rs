@@ -294,6 +294,53 @@ fn requires(
 }
 
 #[test]
+fn cursor_age_tracks_only_verified_backlog_at_finality() {
+	let sender = Sender::new();
+	let mut receiver = receiver(&sender, Budget::default());
+	let registry = prometheus_endpoint::Registry::new();
+	receiver.register_cursor_age(&registry).unwrap();
+	let age = || {
+		registry
+			.gather()
+			.first()
+			.map(|family| family.get_metric()[0].get_gauge().get_value())
+	};
+
+	let stream = in_id(0).sender_data_stream(US.into()).1;
+	let messages = payloads(1, 3);
+	let root = sender.author(vec![(stream, messages.clone())]);
+	let mut chain = Chain::default();
+	receiver.on_finalized(10, &chain.view());
+	assert_eq!(age(), None);
+
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	receiver.on_finalized(12, &chain.view());
+	assert_eq!(age(), Some(0.0));
+	receiver.on_finalized(15, &chain.view());
+	assert_eq!(age(), Some(3.0));
+
+	chain.frontier = frontier_at(&messages, 1);
+	receiver.on_finalized(16, &chain.view());
+	assert_eq!(age(), Some(0.0));
+	chain.frontier = frontier_at(&messages, 3);
+	receiver.on_finalized(17, &chain.view());
+	assert_eq!(age(), None);
+
+	let root = sender.author(vec![(stream, payloads(2, 1))]);
+	block_on(receiver.on_root(source(), root, &chain.wants()));
+	receiver.on_finalized(18, &chain.view());
+	assert_eq!(age(), Some(0.0));
+	receiver.on_finalized(19, &ChainView::default());
+	assert_eq!(age(), None);
+
+	receiver.on_finalized(20, &chain.view());
+	assert_eq!(age(), Some(0.0));
+	receiver.forget(&source());
+	receiver.on_finalized(21, &chain.view());
+	assert_eq!(age(), None);
+}
+
+#[test]
 fn a_block_consumes_what_verified_and_lifts_to_the_newest_root() {
 	let sender = Sender::new();
 	let data = payloads(1, 5);

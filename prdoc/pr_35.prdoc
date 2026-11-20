@@ -5,7 +5,7 @@ doc:
     into collation. Retry unwritten streams and refresh channel coverage when the included root
     changes. Replay unfinalized consumption after a restart and track recovery sources until their
     consuming blocks finalize. Check cached proofs against the receiver parent's frontier before
-    authoring.
+    authoring. Export the finalized cursor age for inbound channels with a verified backlog.
 crates:
 - name: cumulus-client-collator
   bump: major

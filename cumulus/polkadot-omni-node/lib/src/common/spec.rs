@@ -509,6 +509,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 							requests,
 							para_id,
 							validator,
+							prometheus_registry.as_ref(),
 						)
 					},
 				);

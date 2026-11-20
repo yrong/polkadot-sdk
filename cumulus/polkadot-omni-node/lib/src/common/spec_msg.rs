@@ -71,6 +71,7 @@ pub(crate) fn start<Block, RuntimeApi>(
 	requests: async_channel::Receiver<IncomingRequest>,
 	para_id: ParaId,
 	collator: bool,
+	prometheus_registry: Option<&prometheus_endpoint::Registry>,
 ) -> Option<SpecMsgReceiver>
 where
 	Block: NodeBlock,
@@ -122,7 +123,13 @@ where
 		return None;
 	}
 
-	let receiver: SpecMsgReceiver = Arc::new(Receiver::new(para_id, Budget::default(), transport));
+	let mut receiver = Receiver::new(para_id, Budget::default(), transport);
+	if let Some(registry) = prometheus_registry {
+		if let Err(error) = receiver.register_cursor_age(registry) {
+			log::warn!("Failed to register spec-msg receiver cursor age: {error}");
+		}
+	}
+	let receiver: SpecMsgReceiver = Arc::new(receiver);
 	spawner.spawn(
 		"spec-msg-receiver",
 		Some("spec-msg"),

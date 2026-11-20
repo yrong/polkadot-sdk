@@ -20,6 +20,7 @@ futures-timer = { workspace = true }
 log = { workspace = true, default-features = true }
 mmr-lib = { workspace = true, default-features = true }
 parking_lot = { workspace = true, default-features = true }
+prometheus-endpoint = { workspace = true, default-features = true }
 
 # Substrate
 sc-client-api = { workspace = true, default-features = true }

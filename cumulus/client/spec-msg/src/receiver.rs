@@ -44,6 +44,7 @@ use mmr_lib::{
 };
 use parking_lot::Mutex;
 use polkadot_core_primitives::Hash;
+use prometheus_endpoint::{register, GaugeVec, Opts, PrometheusError, Registry, U64};
 use sc_network::PeerId;
 use std::{
 	cell::RefCell,
@@ -169,8 +170,40 @@ struct LiveBlock<H> {
 	record: ConsumptionRecord,
 }
 
+struct CursorAge {
+	gauge: GaugeVec<U64>,
+	/// Per channel, the last sampled cursor and the block where its current backlog age began.
+	channels: BTreeMap<InChannelId, (u64, u64)>,
+}
+
+impl CursorAge {
+	fn update(&mut self, number: u64, behind: impl Iterator<Item = (InChannelId, u64)>) {
+		let mut previous = std::mem::take(&mut self.channels);
+		for (id, cursor) in behind {
+			let since = match previous.remove(&id) {
+				Some((last, since)) if cursor == last => since,
+				_ => number,
+			};
+			self.channels.insert(id, (cursor, since));
+			let labels = Self::labels(id);
+			self.gauge
+				.with_label_values(&labels.each_ref().map(String::as_str))
+				.set(number.saturating_sub(since));
+		}
+		for id in previous.into_keys() {
+			let _ =
+				self.gauge.remove_label_values(&Self::labels(id).each_ref().map(String::as_str));
+		}
+	}
+
+	fn labels(id: InChannelId) -> [String; 3] {
+		[u32::from(id.sender).to_string(), id.domain.to_string(), id.num.to_string()]
+	}
+}
+
 struct State<H> {
 	finalized: u64,
+	cursor_age: Option<CursorAge>,
 	sources: BTreeMap<ParaId, SourcePool>,
 	live: HashMap<H, LiveBlock<H>>,
 }
@@ -254,11 +287,28 @@ where
 			transport: Rotating { inner: transport, rounds: Mutex::new(BTreeMap::new()) },
 			state: Mutex::new(State {
 				finalized: 0,
+				cursor_age: None,
 				sources: BTreeMap::new(),
 				live: HashMap::new(),
 			}),
 			rotation: AtomicUsize::new(0),
 		}
+	}
+
+	/// Export finalized cursor age for watched channels with a verified sender backlog.
+	pub fn register_cursor_age(&mut self, registry: &Registry) -> Result<(), PrometheusError> {
+		let gauge = register(
+			GaugeVec::new(
+				Opts::new(
+					"cumulus_spec_msg_receiver_cursor_age_blocks",
+					"Finalized receiver blocks without cursor progress while behind a verified included sender root",
+				),
+				&["sender", "domain", "channel"],
+			)?,
+			registry,
+		)?;
+		self.state.get_mut().cursor_age = Some(CursorAge { gauge, channels: BTreeMap::new() });
+		Ok(())
 	}
 
 	/// The chain this receiver consumes for.
@@ -864,6 +914,18 @@ where
 			return;
 		}
 		state.finalized = number;
+		let State { cursor_age, sources, .. } = &mut *state;
+		if let Some(metric) = cursor_age {
+			let behind = finalized.sources.iter().flat_map(|(source, wants)| {
+				let pool = sources.get(source);
+				wants.channels.iter().filter_map(move |(id, frontier)| {
+					let reach = pool?.reach.get(&id.sender_data_stream(self.us).1)?;
+					let cursor = frontier.leaf_count();
+					(*reach > cursor).then_some((*id, cursor))
+				})
+			});
+			metric.update(number, behind);
+		}
 		state.live.retain(|_, block| block.number > number);
 		for (source, wants) in &finalized.sources {
 			if let Some(pool) = state.sources.get_mut(source) {
