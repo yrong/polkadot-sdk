@@ -149,8 +149,18 @@ fn open_inbound<T: Config>(channel: InChannelId) {
 	);
 }
 
+impl<T: Config> polkadot_runtime_parachains::EnsureForParachain for Pallet<T> {
+	fn ensure(para: ParaId) {
+		if frame_system::Pallet::<T>::execution_phase().is_none() {
+			frame_system::Pallet::<T>::note_finished_initialize();
+		}
+		mark_rolled_over::<T>();
+		open_outbound::<T>(xcm_channel(para), *T::SupportedVersions::get().start());
+	}
+}
+
 /// An outbound channel that took part in session 1 and applied its `Opened`.
-fn open_outbound<T: Config>(channel: OutChannelId) {
+fn open_outbound<T: Config>(channel: OutChannelId, version: u8) {
 	OutChannels::<T>::insert(
 		channel,
 		OutChannelState {
@@ -162,7 +172,7 @@ fn open_outbound<T: Config>(channel: OutChannelId) {
 			}),
 			open: Some(OpenSession {
 				session: 1,
-				params: SessionParams { version: 1, max_message_size: T::MaxMsgLen::get() },
+				params: SessionParams { version, max_message_size: T::MaxMsgLen::get() },
 				opened: true,
 			}),
 			closed_session: None,
@@ -223,7 +233,7 @@ mod benchmarks {
 		let origin = T::ChannelManagementOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let peer = sibling::<T>(0);
-		open_outbound::<T>(xcm_channel(peer));
+		open_outbound::<T>(xcm_channel(peer), 1);
 
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, peer);
@@ -314,7 +324,7 @@ mod benchmarks {
 		let origin = T::OpenChannelOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		open_outbound::<T>(channel);
+		open_outbound::<T>(channel, 1);
 		mark_rolled_over::<T>();
 
 		#[extrinsic_call]
@@ -510,7 +520,7 @@ mod benchmarks {
 	#[benchmark]
 	fn send(b: Linear<0, { T::MaxMsgLen::get().saturating_sub(8) }>) {
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		open_outbound::<T>(channel);
+		open_outbound::<T>(channel, 1);
 		OutboundFrontier::<T>::insert(channel.data_stream(), wide_frontier());
 		OutChannels::<T>::mutate(channel, |state| {
 			if let Some(AppliedRegister { register, .. }) =
