@@ -1896,6 +1896,66 @@ fn a_changed_range_starts_a_pass_that_sends_the_due_hello_next_block() {
 }
 
 #[test]
+fn dropping_the_open_version_requires_a_close_and_reopen() {
+	new_test_ext().execute_with(|| {
+		let ch = out_channel();
+		let open =
+			|| SpecMessaging::open_channel(RuntimeOrigin::root(), ch.recipient, ch.domain, ch.num);
+		let mut frontier = MmrFrontier::new();
+		let mut apply = |register: Register| {
+			let payload = register.encode();
+			let read = LossyRead { frontier: frontier.clone(), payloads: vec![payload.clone()] };
+			assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), registers(ch, read)));
+			frontier.append(leaf_hash_with_version(LEAF_VERSION, &payload));
+		};
+		SpecMessaging::on_runtime_upgrade();
+		assert_ok!(open());
+		apply(accepting(1));
+		roll_one_block();
+		apply(Register { up_to: MessagePosition(1), status: RegisterStatus::Opened });
+		assert_ok!(SpecMessaging::send(ch, b"v1".to_vec()));
+
+		upgrade_to(2..=2);
+		assert!(HelloPassCursor::<Test>::get().is_some());
+		roll_one_block();
+		assert!(HelloPassCursor::<Test>::get().is_none());
+		assert_err!(SpecMessaging::send(ch, b"v1".to_vec()), Error::<Test>::NotOpen);
+		assert!(sent_on(ch.data_stream()).is_empty());
+
+		assert_ok!(SpecMessaging::close_channel(
+			RuntimeOrigin::root(),
+			ch.recipient,
+			ch.domain,
+			ch.num
+		));
+		assert_eq!(
+			sent_on(ch.data_stream()),
+			vec![ChannelMessage::CloseChannel { session: 1 }.encode()]
+		);
+		roll_one_block();
+		assert_ok!(open());
+		assert!(sent_on(ch.data_stream()).is_empty());
+		apply(Register {
+			up_to: MessagePosition(3),
+			status: RegisterStatus::Accepting {
+				session: 2,
+				min: 2,
+				max: 2,
+				max_message_size: 1024,
+			},
+		});
+		assert_eq!(
+			sent_on(ch.data_stream()),
+			vec![ChannelMessage::Hello { session: 2, version: 2 }.encode()]
+		);
+		roll_one_block();
+		apply(Register { up_to: MessagePosition(4), status: RegisterStatus::Opened });
+		assert_ok!(SpecMessaging::send(ch, b"v2".to_vec()));
+		assert_eq!(sent_on(ch.data_stream()), vec![data(b"v2")]);
+	});
+}
+
+#[test]
 fn an_unchanged_range_starts_no_pass() {
 	new_test_ext().execute_with(|| {
 		SpecMessaging::on_runtime_upgrade();
