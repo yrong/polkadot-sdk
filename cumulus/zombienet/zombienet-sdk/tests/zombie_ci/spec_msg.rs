@@ -529,7 +529,7 @@ async fn outage_and_follow(
 	let follow = async {
 		while let Some(block) = blocks.next().await {
 			let block = block?;
-			processed.extend(processed_ids(&block, &ids).await?);
+			processed.extend(delivered_ids(&block, &ids).await?);
 			if processed.len() == ids.len() {
 				return Ok(block.number());
 			}
@@ -576,7 +576,7 @@ async fn spec_msg_delivers_across_collator_restarts() -> Result<(), anyhow::Erro
 		let interrupted = loop {
 			let block =
 				best.next().await.ok_or_else(|| anyhow!("receiver best stream ended"))??;
-			let count = processed_ids(&block, &ids).await?.len();
+			let count = settled_watched_ids(&block, &ids).await?.len();
 			if count > 0 {
 				anyhow::ensure!(count < ids.len(), "receiver already processed the batch");
 				log::info!(
@@ -1025,12 +1025,52 @@ async fn settled_ids(
 	Ok(settled)
 }
 
-/// The ids among `ids` that `block`'s message queue settled over spec-msg, in order.
-async fn processed_ids(
+/// The ids among `ids` that `block`'s message queue settled over spec-msg, in order, whatever the
+/// outcome: queue progress, not delivery.
+async fn settled_watched_ids(
 	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
 	ids: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, anyhow::Error> {
 	Ok(settled_ids(block, ids).await?.into_iter().flatten().collect())
+}
+
+/// The ids among `ids` that `block` executed successfully from the sender's channel, in order.
+/// Any other outcome for a watched id is an error.
+async fn delivered_ids(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	ids: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+	let mut delivered = Vec::new();
+	for event in block.events().await?.iter() {
+		let event = event?;
+		if event.pallet_name() != "MessageQueue" {
+			continue;
+		}
+		// Every settling event starts with the message id.
+		let Ok(id) = <[u8; 32]>::decode(&mut event.field_bytes()) else { continue };
+		if !ids.contains(&id.to_vec()) {
+			continue;
+		}
+		anyhow::ensure!(
+			event.variant_name() == "Processed",
+			"XCM {:#x} at block #{}: {}",
+			H256::from(id),
+			block.number(),
+			event.variant_name(),
+		);
+		let (_, origin, _, success) =
+			<(H256, AggregateMessageOrigin, frame_support::weights::Weight, bool)>::decode_all(
+				&mut event.field_bytes(),
+			)?;
+		anyhow::ensure!(
+			origin == AggregateMessageOrigin::SpecMsg(in_channel()) && success,
+			"XCM {:#x} at block #{}: origin {origin:?}, success {success}",
+			H256::from(id),
+			block.number(),
+		);
+		delivered.push(id.to_vec());
+	}
+	Ok(delivered)
 }
 
 /// The leaves the receiver consumed from the sender's channel, at its best block.
@@ -1458,7 +1498,7 @@ async fn spec_msg_drains_channels_closed_by_either_peer() -> Result<(), anyhow::
 		loop {
 			let block =
 				best.next().await.ok_or_else(|| anyhow!("receiver best stream ended"))??;
-			if !processed_ids(&block, &reverse_ids).await?.is_empty() {
+			if !settled_watched_ids(&block, &reverse_ids).await?.is_empty() {
 				break;
 			}
 		}
@@ -1790,10 +1830,10 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 	let receiver: OnlineClient<PolkadotConfig> =
 		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
-	let newest = |relay: OnlineClient<PolkadotConfig>| async move {
+	let newest = |relay: OnlineClient<PolkadotConfig>, at: Option<H256>| async move {
 		call_at::<Option<H256>>(
 			&relay,
-			None,
+			at,
 			"ParachainHost_newest_included_provides",
 			&ParaId::from(SENDER).encode(),
 		)
@@ -1811,82 +1851,118 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 		// The sender's root moves only when it sends, so that root stays the newest.
 		wait_for("the sender's `Hello` root to finalize", || {
 			let relay = relay.clone();
-			async move { Ok(newest(relay).await.is_ok()) }
+			async move { Ok(newest(relay, None).await.is_ok()) }
 		})
 		.await?;
-		let baseline = newest(relay.clone()).await?;
+		let baseline = newest(relay.clone(), None).await?;
 		std::fs::write(&gate, baseline.0)?;
-		anyhow::ensure!(newest(relay.clone()).await? == baseline, "sender root moved at the gate");
+		anyhow::ensure!(
+			newest(relay.clone(), None).await? == baseline,
+			"sender root moved at the gate"
+		);
 		log::info!("Gate armed at {SENDER}'s included root {baseline:?}");
 
 		let mut relay_blocks = relay.blocks().subscribe_finalized().await?;
 		let mut receiver_blocks = receiver.blocks().subscribe_finalized().await?;
 		let mut sender_blocks = sender.blocks().subscribe_finalized().await?;
 		let before = inbound_count(&receiver).await?;
-		let receiver_at = receiver.blocks().at(best_hash(&receiver).await?).await?.number();
-		let (sent, ids) = submit_sudo(&sender, send_xcm_to(RECEIVER), false).await?;
+		// Finalized, so every fork that later carries the send descends from it.
+		let floor = finalized_number(&sender).await?;
+		let (sent, ids, extrinsic) =
+			submit_sudo_tracked(&sender, send_xcm_to(RECEIVER), false).await?;
 		let [id] = ids.as_slice() else { return Err(anyhow!("expected one send")) };
+		// The send's id on every fork it was seen on; each fork's block entropy can change it.
+		let mut fork_ids = BTreeSet::from([id.clone()]);
 		let sent_at = sender.blocks().at(sent).await?.number();
 		log::info!("Sent {id:?} at {SENDER} block #{sent_at} {sent:?} while withheld");
 
-		// Hold the gate until a backed sender candidate holding the send left the relay chain
-		// unincluded and the receiver finalized three later blocks, none of which consumed the sent
-		// leaf. A candidate leaves by timing out or, without an event, when a session change drains
-		// every candidate pending availability: on short sessions the timeout never fires.
-		let mut pending = BTreeSet::new();
-		let (mut dropped, mut receiver_finalized) = (0usize, 0u32);
+		// Hold the gate until a sender candidate that carries the send was backed at relay
+		// block B and left unincluded at D, and a receiver candidate included in (B, D] with its
+		// relay parent in [B, D) had not consumed the sent leaf. A candidate leaves by timing out
+		// or, without an event, when a session change drains every candidate pending
+		// availability: on short sessions the timeout never fires. Finalized relay blocks form one
+		// branch, so every block below lies on it.
+		let mut branch = BTreeMap::new();
+		let mut backed = BTreeMap::new();
+		let mut windows = Vec::new();
+		let mut included = Vec::new();
 		let withheld = async {
 			loop {
 				tokio::select! {
 					block = relay_blocks.next() => {
 						let block = block.ok_or_else(|| anyhow!("relay finality ended"))??;
+						let number = block.number();
+						branch.insert(block.hash(), number);
 						for event in block.events().await?.iter() {
 							let event = event?;
 							if (event.pallet_name(), event.variant_name()) == ("Session", "NewSession") {
-								dropped += pending.len();
-								pending.clear();
+								windows.extend(std::mem::take(&mut backed).into_values().map(|b| (b, number)));
 								continue;
 							}
 							if event.pallet_name() != "ParaInclusion" {
 								continue;
 							}
 							let fields = event.field_values()?;
-							let para = fields.at(0).and_then(|r| r.at("descriptor")).and_then(|d| {
+							let descriptor = fields.at(0).and_then(|r| r.at("descriptor"));
+							let para = descriptor.and_then(|d| {
 								d.at("para_id")
 									.and_then(|id| id.at(0).or(Some(id)))
 									.and_then(|v| v.as_u128())
 							});
-							if para != Some(SENDER.into()) {
-								continue;
-							}
-							// A head is the encoded header: the parent hash, then the compact number.
+							let parent = descriptor
+								.and_then(|d| d.at("relay_parent"))
+								.map(|p| H256::from_slice(&flatten(p)));
 							let head = fields.at(1).map(flatten).unwrap_or_default();
-							let number = head
-								.get(32..)
-								.and_then(|mut n| codec::Compact::<u32>::decode(&mut n).ok())
-								.map_or(0, |n| n.0);
-							log::info!(
-								"Relay #{}: {SENDER} {} up to #{number}",
-								block.number(),
-								event.variant_name(),
-							);
-							match event.variant_name() {
-								"CandidateBacked" if number >= sent_at => {
-									pending.insert(head);
+							let hash = H256::from(sp_crypto_hashing::blake2_256(&head));
+							match (para.map(|p| p as u32), event.variant_name()) {
+								(Some(SENDER), "CandidateBacked") => {
+									if let Some(fork_id) = fork_send(&sender, hash, floor, extrinsic).await? {
+										log::info!(
+											"Relay #{number}: backed {SENDER} {hash:?} with the send as {:?}",
+											H256::from_slice(&fork_id),
+										);
+										fork_ids.insert(fork_id);
+										backed.insert(hash, number);
+									}
 								},
-								"CandidateTimedOut" => {
-									dropped += usize::from(pending.remove(&head));
+								(Some(SENDER), "CandidateTimedOut") => {
+									if let Some(b) = backed.remove(&hash) {
+										windows.push((b, number));
+									}
 								},
-								"CandidateIncluded" => {
-									pending.remove(&head);
-									let root = newest(relay.clone()).await?;
+								(Some(SENDER), "CandidateIncluded") => {
+									anyhow::ensure!(
+										!backed.contains_key(&hash),
+										"withheld {SENDER} candidate {hash:?} included at relay #{number}",
+									);
+									let root = newest(relay.clone(), Some(block.hash())).await?;
 									anyhow::ensure!(
 										root == baseline,
-										"withheld root {root:?} was included at relay #{}",
-										block.number(),
+										"withheld root {root:?} was included at relay #{number}",
 									);
 								},
+								(Some(RECEIVER), "CandidateIncluded") => {
+									let parent = parent.ok_or_else(|| anyhow!("receipt without relay parent"))?;
+									included.push((number, parent, hash));
+								},
 								_ => {},
+							}
+						}
+						for &(b, d) in &windows {
+							for &(r, parent, head) in &included {
+								let Some(&p) = branch.get(&parent) else { continue };
+								if !(b < r && r <= d && b <= p && p < d) {
+									continue;
+								}
+								let states =
+									channel_map_at::<InChannelId, InChannelState>(&receiver, "InChannels", head)
+										.await?;
+								let at = states.get(&in_channel()).map(|s| s.frontier.leaf_count());
+								anyhow::ensure!(
+									at == Some(before),
+									"{RECEIVER} head {head:?} included at relay #{r} consumed up to {at:?}",
+								);
+								return Ok::<_, anyhow::Error>((b, d, r, p, head));
 							}
 						}
 					},
@@ -1908,28 +1984,39 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 							"{RECEIVER} block #{} consumed {SENDER}'s withheld leaf",
 							block.number(),
 						);
-						if block.number() > receiver_at {
-							receiver_finalized += 1;
-						}
 					},
-				}
-				if dropped > 0 && receiver_finalized >= 3 {
-					return Ok::<_, anyhow::Error>(());
 				}
 			}
 		};
-		tokio::time::timeout(Duration::from_secs(300), withheld).await.map_err(|_| {
-			anyhow!(
-				"no withheld sender candidate dropped within 5 minutes: {dropped} dropped, {} \
-				 pending, {receiver_finalized} receiver blocks finalized",
-				pending.len(),
-			)
-		})??;
-		anyhow::ensure!(inbound_count(&receiver).await? == before, "receiver frontier moved");
+		let (b, d, r, p, head) =
+			tokio::time::timeout(Duration::from_secs(300), withheld).await.map_err(|_| {
+				anyhow!(
+					"no receiver inclusion inside a withheld window within 5 minutes: windows \
+					 {windows:?}, {} still backed",
+					backed.len(),
+				)
+			})??;
 		log::info!(
-			"Withheld: {dropped} {SENDER} candidates dropped unincluded, {receiver_finalized} \
-			 {RECEIVER} blocks finalized without consuming the sent leaf"
+			"Withheld: {SENDER}'s send backed at relay #{b}, dropped unincluded at #{d}; {RECEIVER} \
+			 head {head:?} with relay parent #{p}, included at #{r}, had consumed {before} leaves"
 		);
+		// The relay drops a receiver candidate whose `Requires` it cannot match with a debug line.
+		// Count it only where the target is shown to log.
+		for name in ["alice", "bob"] {
+			let logs = network.get_node(name)?.logs().await?;
+			anyhow::ensure!(
+				logs.contains("runtime::inclusion-inherent") &&
+					logs.contains("[process_inherent_data]"),
+				"{name} does not log runtime::inclusion-inherent at debug"
+			);
+			let drops = logs
+				.lines()
+				.filter(|l| {
+					l.contains("Dropping candidate") && l.contains(&format!("for para {RECEIVER}"))
+				})
+				.count();
+			anyhow::ensure!(drops == 0, "{name} dropped {drops} {RECEIVER} candidates");
+		}
 
 		std::fs::remove_file(&gate)?;
 		log::info!("Gate removed");
@@ -1939,16 +2026,8 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 		let canonical = async {
 			while let Some(block) = sender_blocks.next().await {
 				let block = block?;
-				for event in block.events().await?.iter() {
-					let event = event?;
-					if (event.pallet_name(), event.variant_name()) != ("PolkadotXcm", "Sent") {
-						continue;
-					}
-					let fields = event.field_values()?;
-					if format!("{fields:?}").contains("UnsubscribeVersion") {
-						let id = fields.at("message_id").map(flatten);
-						return Ok((block.number(), id.ok_or_else(|| anyhow!("send without id"))?));
-					}
+				if let Some(id) = sent_by(&block, extrinsic).await? {
+					return Ok((block.number(), id));
 				}
 			}
 			Err(anyhow!("sender finality ended"))
@@ -1957,13 +2036,14 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 			.await
 			.map_err(|_| anyhow!("the send did not finalize within 5 minutes of release"))??;
 		log::info!("Send finalized at {SENDER} block #{canonical_at} with id {canonical:?}");
-		let watched = [id.clone(), canonical.clone()];
+		fork_ids.insert(canonical.clone());
+		let watched: Vec<_> = fork_ids.iter().cloned().collect();
 		let mut executed = Vec::new();
 		let mut after = 0;
 		let released = async {
 			while let Some(block) = receiver_blocks.next().await {
 				let block = block?;
-				executed.extend(processed_ids(&block, &watched).await?);
+				executed.extend(delivered_ids(&block, &watched).await?);
 				anyhow::ensure!(executed.len() <= 1, "the send executed twice: {executed:?}");
 				if !executed.is_empty() {
 					after += 1;
@@ -1980,15 +2060,60 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 			.map_err(|_| anyhow!("the send was not executed within 5 minutes of release"))??;
 		anyhow::ensure!(
 			executed == [canonical.clone()],
-			"executed {executed:?}, not the canonical send"
+			"executed {executed:?} of the send's ids {watched:?}, not the canonical one"
 		);
-		anyhow::ensure!(newest(relay.clone()).await? != baseline, "sender root never included");
+		anyhow::ensure!(
+			newest(relay.clone(), None).await? != baseline,
+			"sender root never included"
+		);
 		log::info!("Released: {canonical:?} executed once");
 		Ok(())
 	};
 	let result = tokio::time::timeout(Duration::from_secs(900), test).await;
 	network.destroy().await?;
 	result.map_err(|_| anyhow!("withheld sender test exceeded 15 minutes"))?
+}
+
+/// The send's message id on the fork from `head` down to just above block `floor`, if a block
+/// there holds `extrinsic`. A withheld send block is abandoned and the signed extrinsic re-authored
+/// on another fork, so the extrinsic hash identifies the send.
+async fn fork_send(
+	client: &OnlineClient<PolkadotConfig>,
+	mut head: H256,
+	floor: u32,
+	extrinsic: H256,
+) -> Result<Option<Vec<u8>>, anyhow::Error> {
+	loop {
+		let block = client.blocks().at(head).await?;
+		if block.number() <= floor {
+			return Ok(None);
+		}
+		if let Some(id) = sent_by(&block, extrinsic).await? {
+			return Ok(Some(id));
+		}
+		head = block.header().parent_hash;
+	}
+}
+
+/// The id of the XCM that `extrinsic` sent in `block`, if `block` holds it.
+async fn sent_by(
+	block: &Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+	extrinsic: H256,
+) -> Result<Option<Vec<u8>>, anyhow::Error> {
+	for xt in block.extrinsics().await?.iter() {
+		if xt.hash() != extrinsic {
+			continue;
+		}
+		for event in xt.events().await?.iter() {
+			let event = event?;
+			if (event.pallet_name(), event.variant_name()) == ("PolkadotXcm", "Sent") {
+				let id = event.field_values()?.at("message_id").map(flatten);
+				return Ok(Some(id.ok_or_else(|| anyhow!("send without id"))?));
+			}
+		}
+		return Err(anyhow!("send extrinsic in block {:?} sent no XCM", block.hash()));
+	}
+	Ok(None)
 }
 
 async fn wait_for_routed_messages(
@@ -2880,6 +3005,16 @@ async fn submit_sudo(
 	call: Value,
 	finalized: bool,
 ) -> Result<(H256, Vec<Vec<u8>>), anyhow::Error> {
+	let (block, sent, _) = submit_sudo_tracked(client, call, finalized).await?;
+	Ok((block, sent))
+}
+
+/// [`submit_sudo`], also returning the signed extrinsic's hash: its identity on every fork.
+async fn submit_sudo_tracked(
+	client: &OnlineClient<PolkadotConfig>,
+	call: Value,
+	finalized: bool,
+) -> Result<(H256, Vec<Vec<u8>>, H256), anyhow::Error> {
 	let alice = dev::alice();
 	// The nonce is read at the best block. subxt reads it at the finalized block, which an earlier
 	// call that is only in a best block has not reached: the next call would reuse its nonce. The
@@ -2903,6 +3038,7 @@ async fn submit_sudo(
 	let tx = subxt::dynamic::tx("Sudo", "sudo", vec![call]);
 	let mut progress =
 		client.tx().create_signed(&tx, &alice, params).await?.submit_and_watch().await?;
+	let extrinsic = progress.extrinsic_hash();
 	while let Some(status) = progress.next().await {
 		let in_block = match status? {
 			TxStatus::InBestBlock(in_block) if !finalized => in_block,
@@ -2923,7 +3059,7 @@ async fn submit_sudo(
 				if fields.contains("Err") {
 					return Err(anyhow!("sudo dispatch failed: {fields}"));
 				}
-				return Ok((in_block.block_hash(), sent));
+				return Ok((in_block.block_hash(), sent, extrinsic));
 			}
 		}
 		return Err(anyhow!("no `Sudo::Sudid` in block {:?}", in_block.block_hash()));
@@ -3223,7 +3359,7 @@ fn build_network_config(
 	// `with_args` replaces the default arguments.
 	let gate: Option<Vec<zombienet_sdk::Arg>> = match &mode {
 		NetworkMode::Withhold(gate) => Some(vec![
-			"-lparachain=debug,runtime::inclusion=debug,MALUS=info".into(),
+			"-lparachain=debug,runtime::inclusion=debug,runtime::inclusion-inherent=debug,MALUS=info".into(),
 			("--withhold-para", SENDER.to_string().as_str()).into(),
 			("--availability-gate", gate.to_string_lossy().as_ref()).into(),
 		]),
