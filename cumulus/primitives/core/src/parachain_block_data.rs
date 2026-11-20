@@ -86,14 +86,12 @@ pub enum ParachainBlockData<Block> {
 		scheduling_proof: SchedulingProof,
 	},
 	/// V3 adds the speculative-messaging lifts, from which `validate_block` synthesizes
-	/// `Requires`. Like `scheduling_proof`, they are collator-supplied and regenerable from
-	/// public data.
+	/// `Requires`.
 	V3 {
 		blocks: Vec<Block>,
 		proof: CompactProof,
-		/// Required when the runtime has V3 scheduling enabled, exactly as choosing V2 over V1
-		/// is; `validate_block` rejects a V3-scheduling candidate without one. Lifts do not
-		/// imply V3 scheduling, so it stays optional here.
+		/// Optional: lifts do not imply V3 scheduling. `validate_block` requires it when V3
+		/// scheduling is enabled.
 		scheduling_proof: Option<SchedulingProof>,
 		lifts: LiftsBySource,
 	},
@@ -155,7 +153,6 @@ impl<Block: Decode> Decode for ParachainBlockData<Block> {
 					let blocks = Vec::<Block>::decode(input)?;
 					let proof = CompactProof::decode(input)?;
 					let scheduling_proof = Option::<crate::SchedulingProof>::decode(input)?;
-					// The canonical form is enforced here, at the untrusted boundary.
 					let lifts = LiftsBySource::decode(input)?;
 
 					Ok(Self::V3 { blocks, proof, scheduling_proof, lifts })
@@ -235,14 +232,8 @@ impl<Block> ParachainBlockData<Block> {
 		}
 	}
 
-	/// Returns the blocks and storage proof.
-	pub fn into_inner(self) -> (Vec<Block>, CompactProof) {
-		let (blocks, proof, _) = self.into_parts();
-		(blocks, proof)
-	}
-
-	/// Returns the blocks, storage proof and optional speculative-messaging lifts.
-	pub fn into_parts(self) -> (Vec<Block>, CompactProof, Option<LiftsBySource>) {
+	/// Returns the blocks, storage proof and speculative-messaging lifts, if V3.
+	pub fn into_inner(self) -> (Vec<Block>, CompactProof, Option<LiftsBySource>) {
 		match self {
 			Self::V0 { block, proof } => (block.into_iter().collect(), proof, None),
 			Self::V1 { blocks, proof } | Self::V2 { blocks, proof, .. } => (blocks, proof, None),
@@ -434,7 +425,7 @@ mod tests {
 			scheduling_proof,
 		};
 
-		let (blocks, proof) = v2.into_inner();
+		let (blocks, proof, _) = v2.into_inner();
 		assert_eq!(blocks.len(), 1);
 		assert_eq!(proof.encoded_nodes.len(), 1);
 	}
@@ -476,7 +467,7 @@ mod tests {
 			assert_eq!(v3.scheduling_proof(), decoded.scheduling_proof());
 			assert_eq!(decoded.scheduling_proof().is_some(), scheduling_proof.is_some());
 			assert!(decoded.as_v0().is_none());
-			let (blocks, proof, owned_lifts) = decoded.into_parts();
+			let (blocks, proof, owned_lifts) = decoded.into_inner();
 			assert_eq!(blocks, v3.blocks());
 			assert_eq!(&proof, v3.proof());
 			assert_eq!(owned_lifts.as_ref(), Some(&lifts));
