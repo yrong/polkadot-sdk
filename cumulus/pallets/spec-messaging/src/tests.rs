@@ -1895,6 +1895,62 @@ fn a_changed_range_starts_a_pass_that_sends_the_due_hello_next_block() {
 	});
 }
 
+#[cfg(feature = "try-runtime")]
+#[test]
+fn upgrade_checks_versions_promised_to_inbound_channels() {
+	new_test_ext().execute_with(|| {
+		let ch = in_channel();
+		SupportedVersions::set(1..=3);
+		accept(ch);
+		for range in [2..=3, 1..=2] {
+			SupportedVersions::set(range);
+			assert!(SpecMessaging::pre_upgrade().is_err());
+		}
+		SupportedVersions::set(1..=4);
+		assert_ok!(SpecMessaging::pre_upgrade());
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			channel_item(ch, vec![hello(1)])
+		));
+		SupportedVersions::set(1..=1);
+		assert_ok!(SpecMessaging::pre_upgrade());
+		SupportedVersions::set(2..=3);
+		assert!(SpecMessaging::pre_upgrade().is_err());
+		assert_ok!(SpecMessaging::close_inbound_channel(
+			RuntimeOrigin::root(),
+			ch.sender,
+			ch.domain,
+			ch.num
+		));
+		assert!(SpecMessaging::pre_upgrade().is_err());
+		roll_one_block();
+		let close = ChannelMessage::CloseChannel { session: 1 }.encode();
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			channel_item(ch, vec![close])
+		));
+		assert_ok!(SpecMessaging::pre_upgrade());
+	});
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn upgrade_checks_the_outbound_version_until_close() {
+	new_test_ext().execute_with(|| {
+		let ch = out_channel();
+		opened(ch, 1, 1024);
+		SupportedVersions::set(2..=2);
+		assert!(SpecMessaging::pre_upgrade().is_err());
+		assert_ok!(SpecMessaging::close_channel(
+			RuntimeOrigin::root(),
+			ch.recipient,
+			ch.domain,
+			ch.num
+		));
+		assert_ok!(SpecMessaging::pre_upgrade());
+	});
+}
+
 #[test]
 fn dropping_the_open_version_requires_a_close_and_reopen() {
 	new_test_ext().execute_with(|| {

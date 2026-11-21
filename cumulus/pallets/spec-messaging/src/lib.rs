@@ -378,6 +378,36 @@ pub mod pallet {
 			}
 		}
 
+		#[cfg(feature = "try-runtime")]
+		fn pre_upgrade() -> Result<Vec<u8>, sp_runtime::TryRuntimeError> {
+			let supported = T::SupportedVersions::get();
+			for state in InChannels::<T>::iter_values() {
+				if let RegisterStatus::Accepting { min, max, .. } = state.status {
+					ensure!(
+						supported.contains(&min) && supported.contains(&max),
+						"spec-msg: upgrade drops an advertised inbound version"
+					);
+				}
+				if let Some(params) = state.open {
+					ensure!(
+						supported.contains(&params.version),
+						"spec-msg: upgrade drops an inbound session version"
+					);
+				}
+			}
+			for state in OutChannels::<T>::iter_values() {
+				if let Some(open) =
+					state.open.filter(|o| o.session == state.session && !state.closed(o.session))
+				{
+					ensure!(
+						supported.contains(&open.params.version),
+						"spec-msg: upgrade drops an outbound session version"
+					);
+				}
+			}
+			Ok(Vec::new())
+		}
+
 		/// Only schedules the Hello pass when [`Config::SupportedVersions`] changed: sends are
 		/// refused before initialization, so `on_initialize` does the work.
 		fn on_runtime_upgrade() -> Weight {
