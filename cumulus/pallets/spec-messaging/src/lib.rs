@@ -95,6 +95,11 @@ impl<Id> QueueFootprintQuery<Id> for () {
 
 /// Sink for consumed `Data` payloads. `()` drops them.
 pub trait OnSpecMsgData {
+	/// Whether the runtime can accept an inbound channel on this lane.
+	fn handles(_domain: u8, _num: u16) -> bool {
+		true
+	}
+
 	/// One `Data` payload, consumed in order at `position` of `(source, stream)`.
 	fn on_data(source: ParaId, stream: StreamId, position: MessagePosition, data: Vec<u8>);
 
@@ -348,6 +353,8 @@ pub mod pallet {
 		TooManyInboundMessages,
 		/// Candidate bundle exceeded `MAX_COMMITMENT_ENTRIES` distinct sources.
 		MaxCommitmentEntriesExceeded,
+		/// The data handler does not serve this inbound lane.
+		UnsupportedLane,
 	}
 
 	#[pallet::hooks]
@@ -526,6 +533,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			T::AcceptChannelOrigin::ensure_origin(origin)?;
 			ensure!(sender != T::SelfParaId::get(), Error::<T>::ChannelToSelf);
+			ensure!(T::DataHandler::handles(domain, num), Error::<T>::UnsupportedLane);
 			let channel = InChannelId { sender, domain, num };
 			let mut state = InChannels::<T>::get(channel).unwrap_or_else(|| InChannelState {
 				frontier: MmrFrontier::new(),
