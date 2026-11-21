@@ -1,0 +1,27 @@
+title: Route sibling XCM over speculative messaging
+doc:
+- audience: Runtime Dev
+  description: |-
+    To enable this transport, place `SpecMsgRouter` before `XcmpQueue`. HRMP keeps priority
+    until the runtime marks the channel as closing. With HRMP closed or marked as closing,
+    an open speculative messaging channel can carry the XCM. If that channel closes during
+    cutover, new sends fail until it reopens or the runtime clears the HRMP closing flag.
+    Wait for the sender and relay queues to drain before requesting HRMP closure.
+
+    Handle `AggregateMessageOrigin::SpecMsg(InChannelId)` in exhaustive matches on the
+    Cumulus and bridge-hub queue origins. Each inbound channel has its own queue and
+    executes XCM with the sender's sibling origin. Runtimes using the messaging pallet must
+    configure `ChannelManagementOrigin` for HRMP cutover and inbound queue pause or resume.
+
+    For sibling XCM benchmarks over spec-msg, use the messaging pallet as the
+    `ToParachainDeliveryHelper` setup type and the router's `Price` as `PriceForDelivery`.
+    Leave HRMP closed for the benchmark destination.
+crates:
+- name: cumulus-pallet-spec-messaging
+  bump: major
+- name: cumulus-primitives-core
+  bump: major
+- name: parachains-common
+  bump: major
+- name: bridge-hub-common
+  bump: major

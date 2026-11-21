@@ -149,8 +149,18 @@ fn open_inbound<T: Config>(channel: InChannelId) {
 	);
 }
 
+impl<T: Config> polkadot_runtime_parachains::EnsureForParachain for Pallet<T> {
+	fn ensure(para: ParaId) {
+		if frame_system::Pallet::<T>::execution_phase().is_none() {
+			frame_system::Pallet::<T>::note_finished_initialize();
+		}
+		mark_rolled_over::<T>();
+		open_outbound::<T>(xcm_channel(para), *T::SupportedVersions::get().start());
+	}
+}
+
 /// An outbound channel that took part in session 1 and applied its `Opened`.
-fn open_outbound<T: Config>(channel: OutChannelId) {
+fn open_outbound<T: Config>(channel: OutChannelId, version: u8) {
 	OutChannels::<T>::insert(
 		channel,
 		OutChannelState {
@@ -162,7 +172,7 @@ fn open_outbound<T: Config>(channel: OutChannelId) {
 			}),
 			open: Some(OpenSession {
 				session: 1,
-				params: SessionParams { version: 1, max_message_size: T::MaxMsgLen::get() },
+				params: SessionParams { version, max_message_size: T::MaxMsgLen::get() },
 				opened: true,
 			}),
 			closed_session: None,
@@ -217,6 +227,65 @@ mod benchmarks {
 		Ok(())
 	}
 
+	/// The XCM channel to the peer is open, so the flag is set.
+	#[benchmark]
+	fn set_hrmp_closing() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let peer = sibling::<T>(0);
+		open_outbound::<T>(xcm_channel(peer), 1);
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, peer);
+
+		assert!(HrmpClosing::<T>::contains_key(peer));
+		Ok(())
+	}
+
+	/// The flag is set, so the call removes an entry.
+	#[benchmark]
+	fn clear_hrmp_closing() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let peer = sibling::<T>(0);
+		HrmpClosing::<T>::insert(peer, ());
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, peer);
+
+		assert!(!HrmpClosing::<T>::contains_key(peer));
+		Ok(())
+	}
+
+	/// The flag is not set yet, so the call inserts an entry.
+	#[benchmark]
+	fn pause_inbound_channel() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let channel = InChannelId { sender: sibling::<T>(0), domain: 0, num: 0 };
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, channel.sender, channel.domain, channel.num);
+
+		assert!(PausedInbound::<T>::contains_key(channel));
+		Ok(())
+	}
+
+	/// The flag is set, so the call removes an entry.
+	#[benchmark]
+	fn resume_inbound_channel() -> Result<(), BenchmarkError> {
+		let origin = T::ChannelManagementOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let channel = InChannelId { sender: sibling::<T>(0), domain: 0, num: 0 };
+		PausedInbound::<T>::insert(channel, ());
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, channel.sender, channel.domain, channel.num);
+
+		assert!(!PausedInbound::<T>::contains_key(channel));
+		Ok(())
+	}
+
 	/// Reaccepting a closed channel whose frontier is wide.
 	#[benchmark]
 	fn accept_open_channel() -> Result<(), BenchmarkError> {
@@ -255,7 +324,7 @@ mod benchmarks {
 		let origin = T::OpenChannelOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		open_outbound::<T>(channel);
+		open_outbound::<T>(channel, 1);
 		mark_rolled_over::<T>();
 
 		#[extrinsic_call]
@@ -451,7 +520,7 @@ mod benchmarks {
 	#[benchmark]
 	fn send(b: Linear<0, { T::MaxMsgLen::get().saturating_sub(8) }>) {
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		open_outbound::<T>(channel);
+		open_outbound::<T>(channel, 1);
 		OutboundFrontier::<T>::insert(channel.data_stream(), wide_frontier());
 		OutChannels::<T>::mutate(channel, |state| {
 			if let Some(AppliedRegister { register, .. }) =
