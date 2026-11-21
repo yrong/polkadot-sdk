@@ -30,6 +30,7 @@
 
 use crate::{
 	fetch::Transport,
+	pool::ROOTS_KEPT,
 	protocol,
 	tests::{ack, channel, Model, TestArchive},
 	Archive, Budget, ChainView, MemoryStore, Receiver,
@@ -578,6 +579,43 @@ impl World {
 			tip.read_at,
 		);
 	}
+}
+
+#[test]
+fn a_candidate_rebuild_recovers_after_failed_rounds_evict_its_root() {
+	let mut world = World::new(SEEDS[0]);
+	for _ in 0..3 {
+		world.source_block();
+	}
+	world.included = world.blocks.len();
+	world.round();
+	world.quiet = true;
+	world.build();
+
+	let records = [world.bundle[0].record.clone()];
+	assert!(!records[0].entries.is_empty());
+	let original_root = world.blocks[world.included - 1].root;
+	assert!(world.receiver.assemble(&records).is_ok());
+
+	*world.peers.down.write() = true;
+	for _ in 1..ROOTS_KEPT {
+		world.source_block();
+		world.include();
+	}
+	let lifts = world.receiver.assemble(&records).expect("the original root is still cached");
+	let requires = build_requires(&records, &lifts).unwrap().unwrap();
+	assert_eq!(requires.get(source()), Some(&original_root));
+
+	world.source_block();
+	world.include();
+	assert!(world.receiver.assemble(&records).is_err(), "no retained root has a lift");
+	assert!(world.on_included_fork(&world.bundle[0].chain));
+
+	*world.peers.down.write() = false;
+	world.round();
+	let lifts = world.receiver.assemble(&records).expect("the live endpoint was rebound");
+	let requires = build_requires(&records, &lifts).unwrap().unwrap();
+	assert_eq!(requires.get(source()), Some(&world.blocks[world.included - 1].root));
 }
 
 #[test]
