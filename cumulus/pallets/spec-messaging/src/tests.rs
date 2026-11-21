@@ -1984,14 +1984,14 @@ fn a_pass_spans_blocks_by_the_per_block_bound() {
 	new_test_ext().execute_with(|| {
 		SpecMessaging::on_runtime_upgrade();
 		let bound = MaxHelloPassPerBlock::get() as u16;
-		let channels: Vec<_> = (0..2 * bound + 1).map(|num| awaiting_hello(num, 2, 2)).collect();
+		let channels: Vec<_> = (0..2 * bound).map(|num| awaiting_hello(num, 2, 2)).collect();
 		upgrade_to(1..=2);
 
 		let mut sent = 0;
 		for block in 0..3 {
 			roll_one_block();
 			let now = channels.iter().filter(|ch| !hellos_on(**ch).is_empty()).count();
-			assert_eq!(now, if block < 2 { bound as usize } else { 1 });
+			assert_eq!(now, if block < 2 { bound as usize } else { 0 });
 			sent += now;
 			assert_eq!(HelloPassCursor::<Test>::get().is_none(), block == 2);
 		}
@@ -2052,6 +2052,7 @@ fn a_pass_sends_nothing_for_taken_part_or_unwanted_channels() {
 		roll_one_block();
 		assert!(hellos_on(taken).is_empty());
 		assert!(hellos_on(unwanted).is_empty());
+		roll_one_block();
 		assert!(HelloPassCursor::<Test>::get().is_none());
 	});
 }

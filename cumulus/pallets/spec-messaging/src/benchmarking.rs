@@ -514,7 +514,7 @@ mod benchmarks {
 		}
 
 		assert_eq!(SendsThisBlock::<T>::get(), n);
-		assert!(!HelloPassCursor::<T>::exists());
+		assert_eq!(HelloPassCursor::<T>::exists(), n == T::MaxHelloPassPerBlock::get());
 	}
 
 	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);

@@ -1207,11 +1207,10 @@ impl<T: Config> Pallet<T> {
 		let limit = Self::send_limit();
 		let (mut visited, mut hellos) = (0u32, 0u32);
 		let mut finished = true;
-		for (channel, mut state) in OutChannels::<T>::iter_from(last.clone()) {
-			if visited >= T::MaxHelloPassPerBlock::get() {
-				finished = false;
-				break;
-			}
+		let max_channels = T::MaxHelloPassPerBlock::get();
+		for (channel, mut state) in
+			OutChannels::<T>::iter_from(last.clone()).take(max_channels as usize)
+		{
 			visited = visited.saturating_add(1);
 			match Self::evaluate_hello_rule(&channel, &mut state, limit) {
 				Ok(true) => {
@@ -1226,7 +1225,8 @@ impl<T: Config> Pallet<T> {
 			}
 			last = OutChannels::<T>::hashed_key_for(channel);
 		}
-		if finished {
+		// A full pass step defers the end-of-map check to the next block.
+		if finished && visited < max_channels {
 			HelloPassCursor::<T>::kill();
 		} else {
 			let cursor = BoundedVec::try_from(last).expect("an `OutChannels` key fits; qed");
