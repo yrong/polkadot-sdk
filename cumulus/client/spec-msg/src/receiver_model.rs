@@ -39,8 +39,8 @@ use codec::{Decode, Encode};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	build_requires, leaf_hash, ConsumedStreams, ConsumptionRecord, FetchError, FetchResponse,
-	InChannelId, Interval, MessagePosition, MessagingInherentData, MmrFrontier, OutChannelId,
-	Register, RegisterStatus, StreamsRoot,
+	InChannelId, Interval, MessagePosition, MessagesRequest, MessagingInherentData, MmrFrontier,
+	OutChannelId, Register, RegisterStatus, StreamsRoot,
 };
 use futures::executor::block_on;
 use parking_lot::RwLock;
@@ -99,6 +99,8 @@ struct Peers {
 	honest: PeerId,
 	liar: PeerId,
 	lies: AtomicU64,
+	/// Armed for one round. The value records whether a cursor-zero request was refused.
+	unknown_at_zero: RwLock<Option<bool>>,
 }
 
 #[async_trait::async_trait]
@@ -114,6 +116,13 @@ impl Transport for Peers {
 	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
 		if *self.down.read() {
 			return Err("connection closed".into());
+		}
+		if let Some(ref mut refused) = *self.unknown_at_zero.write() {
+			let request = MessagesRequest::decode(&mut &request[..]).expect("request encodes");
+			if request.stream == channel(US) && request.start == Some(MessagePosition(0)) {
+				*refused = true;
+				return Ok(FetchResponse::Err(FetchError::UnknownStream).encode());
+			}
 		}
 		if peer == self.liar {
 			let lie = match self.lies.fetch_add(1, Ordering::Relaxed) % 4 {
@@ -252,6 +261,7 @@ impl World {
 			honest: PeerId::random(),
 			liar: PeerId::random(),
 			lies: AtomicU64::new(0),
+			unknown_at_zero: RwLock::new(None),
 		});
 		let budget = Budget { max_payloads: 3, ..Budget::default() };
 		Self {
@@ -350,6 +360,32 @@ impl World {
 		let more = self.rng.range(1, 2) as usize;
 		self.included = (self.included + more).min(self.blocks.len());
 		self.round();
+	}
+
+	/// A round gets an unproved absence for an existing channel, then retries the same root.
+	fn retry_unknown_stream_at_zero(&mut self) -> bool {
+		if self.included == 0 || self.tip().frontier.leaf_count() != 0 {
+			return false;
+		}
+		*self.peers.unknown_at_zero.write() = Some(false);
+		self.include();
+		let refused = self.peers.unknown_at_zero.write().take() == Some(true);
+		let block = &self.blocks[self.included - 1];
+		if !refused || block.channel.is_empty() {
+			return false;
+		}
+
+		let root = block.root;
+		let view = self.tip().view();
+		let wants = &view.sources[&source()];
+		assert!(!self.receiver.is_settled(&source(), &root, wants));
+		self.round();
+		let offer = block_on(self.receiver.inherent_data(&view, &[]));
+		let payloads = offer.channels.get(&in_id()).expect("the same root was retried");
+		assert!(
+			!payloads.is_empty() && self.blocks[self.included - 1].channel.starts_with(payloads)
+		);
+		true
 	}
 
 	/// The relay chain reorgs back to fewer included source blocks, reverting our blocks that
@@ -620,6 +656,7 @@ fn a_candidate_rebuild_recovers_after_failed_rounds_evict_its_root() {
 
 #[test]
 fn the_receiver_matches_a_model_under_reorgs_cuts_and_failing_peers() {
+	let mut zero_cursor_retries = 0;
 	for seed in SEEDS {
 		let mut world = World::new(seed);
 		for _ in 0..STEPS {
@@ -638,6 +675,7 @@ fn the_receiver_matches_a_model_under_reorgs_cuts_and_failing_peers() {
 					world.catch_up(outage);
 				},
 				67..=68 => world.restart(),
+				69..=72 => zero_cursor_retries += usize::from(world.retry_unknown_stream_at_zero()),
 				_ => world.build(),
 			}
 			world.check();
@@ -655,4 +693,5 @@ fn the_receiver_matches_a_model_under_reorgs_cuts_and_failing_peers() {
 			world.blocks.len(),
 		);
 	}
+	assert!(zero_cursor_retries > 0, "no mid-run cursor-zero refusal was exercised");
 }
