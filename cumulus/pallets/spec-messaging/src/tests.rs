@@ -2112,3 +2112,75 @@ fn a_pass_sends_nothing_for_taken_part_or_unwanted_channels() {
 		assert!(HelloPassCursor::<Test>::get().is_none());
 	});
 }
+
+#[test]
+fn reserved_proof_bytes_cover_a_serialized_bundle_at_the_pov_limit() {
+	use cumulus_primitives_core::ParachainBlockData;
+	use cumulus_primitives_spec_messaging::{
+		mmr::{MAX_MMR_HASHES, MAX_MMR_LEAF_COUNT},
+		streams_root::TreeStep,
+		LiftsBySource, STREAM_ID_LEN,
+	};
+	use polkadot_parachain_primitives::primitives::BlockData;
+	use sp_runtime::testing::Header;
+
+	new_test_ext().execute_with(|| {
+		let limit = MockBlockWeights::get().max_block.proof_size() as usize;
+		let gap = (1, MAX_MMR_LEAF_COUNT - 1);
+		let proof = MmrExtensionProof {
+			leaf_count: gap.1,
+			connecting_nodes: vec![Default::default(); MAX_MMR_HASHES as usize].try_into().unwrap(),
+		};
+		assert_eq!(Some(proof.encoded_size()), MmrExtensionProof::encoded_len_for(gap.0, gap.1));
+		let steps = (0..(STREAM_ID_LEN * 8) as u8)
+			.rev()
+			.map(|split_bit| TreeStep { split_bit, sibling: Default::default() })
+			.collect::<Vec<_>>();
+		// Maximize the skip and endpoint extension independently to bound any valid pair.
+		let lift = RequiresLift {
+			advances: vec![proof.clone()],
+			extension: proof,
+			tree_proof: StreamProof { steps: steps.try_into().unwrap() },
+		};
+		let register = StreamId::Ack { recipient: SELF_PARA.into(), domain: 0, num: 0 };
+		let mut budget = BundleBudget::load::<Test>();
+		let mut sources = BTreeMap::new();
+		let mut blocks = Vec::new();
+		for skip in [None, Some(gap)] {
+			for i in 0..MAX_COMMITMENT_ENTRIES {
+				if i % MaxTouchedStreams::get() == 0 {
+					budget.touched = 0;
+					blocks.push(frame_system::mocking::MockBlock::<Test> {
+						header: Header::new_from_number(blocks.len() as u64 + 1),
+						extrinsics: vec![],
+					});
+				}
+				let source = ParaId::from(i);
+				let bytes =
+					SpecMessaging::lift_reservation(&budget, (source, register), skip).unwrap();
+				budget.record((source, register), bytes);
+				if skip.is_none() {
+					sources.insert(source, vec![lift.clone()]);
+				}
+			}
+		}
+
+		let lifts = LiftsBySource::try_from(sources).unwrap();
+		let reserved = budget.reserved as usize;
+		let encoded_lifts = lifts.encoded_size();
+		assert!(encoded_lifts <= reserved);
+		let wire_len = |padding: usize| {
+			let nodes = vec![vec![0u8; padding]].encode();
+			let proof = codec::Decode::decode(&mut &nodes[..]).unwrap();
+			let candidate =
+				ParachainBlockData::new_with_lifts(blocks.clone(), proof, None, lifts.clone());
+			BlockData(candidate.encode()).encode().len()
+		};
+		// Both sizes use the same compact length prefixes as the final storage proof.
+		let padding = limit / 4;
+		let fixed = wire_len(padding) - padding - encoded_lifts;
+		let room = limit - fixed - reserved;
+		assert_eq!(wire_len(room), limit - (reserved - encoded_lifts));
+		assert!(wire_len(room + reserved - encoded_lifts + 1) > limit);
+	});
+}
