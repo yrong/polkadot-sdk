@@ -1961,17 +1961,18 @@ mod xcm_layer {
 	}
 
 	#[test]
-	#[should_panic(expected = "Defensive failure")]
+	#[cfg_attr(debug_assertions, should_panic(expected = "spec-msg XCM payload exceeds"))]
 	fn an_xcm_payload_over_the_queue_bound_is_dropped_defensively() {
 		new_test_ext().execute_with(|| {
 			let ch = xcm_in();
 			accept(ch);
 			// Within the pallet's `MaxMsgLen`, over the queue's `MaxMessageLen`.
 			QueueMaxLen::set(512);
-			let _ = SpecMessaging::enact_messages(
+			assert_ok!(SpecMessaging::enact_messages(
 				RuntimeOrigin::none(),
 				channel_item(ch, vec![hello(1), data(&[0u8; 600])]),
-			);
+			));
+			assert!(Enqueued::get().is_empty());
 		});
 	}
 
