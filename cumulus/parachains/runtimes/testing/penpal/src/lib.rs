@@ -42,6 +42,8 @@
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
 mod genesis_config_presets;
+#[cfg(test)]
+mod tests;
 mod weights;
 pub mod xcm_config;
 
@@ -51,7 +53,9 @@ use alloc::{vec, vec::Vec};
 pub use assets_common::local_and_foreign_assets::ForeignAssetReserveData;
 use assets_common::{foreign_creators::ForeignCreators, local_and_foreign_assets::TargetFromLeft};
 use cumulus_pallet_parachain_system::RelayNumberMonotonicallyIncreases;
-use cumulus_primitives_core::{AggregateMessageOrigin, ParaId, VerifySchedulingSignature};
+use cumulus_primitives_core::{
+	AggregateMessageOrigin, InChannelId, ParaId, VerifySchedulingSignature,
+};
 use frame_support::{
 	construct_runtime, derive_impl,
 	dispatch::DispatchClass,
@@ -80,7 +84,10 @@ use frame_system::{
 use pallet_revive::evm::runtime::EthExtra;
 use parachains_common::{
 	impls::BlockAuthor,
-	message_queue::{NarrowOriginToSibling, ParaIdToSibling},
+	message_queue::{
+		ChannelToSpecMsg, NarrowOriginToSibling, NarrowOriginToSpecMsg, ParaIdToSibling,
+		SpecMsgToSender,
+	},
 	AccountId, Balance, BlockNumber, Hash, Header, Nonce, Signature,
 };
 use polkadot_runtime_common::{BlockHashCount, SlowAdjustingFeeUpdate};
@@ -287,7 +294,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	system_version: 1,
 };
 
-const RELAY_PARENT_OFFSET: u32 = 0;
+const RELAY_PARENT_OFFSET: u32 = 1;
+
+/// Blocks per relay block; the collator bundles them into one PoV.
+const BLOCK_PROCESSING_VELOCITY: u32 = 3;
 
 // Unit = the base number of indivisible units for balances
 pub const UNIT: Balance = 1_000_000_000_000;
@@ -590,7 +600,7 @@ type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
 	Runtime,
 	RELAY_CHAIN_SLOT_DURATION_MILLIS,
 	BLOCK_PROCESSING_VELOCITY,
-	UNINCLUDED_SEGMENT_CAPACITY,
+	{ (UNINCLUDED_SEGMENT_CAPACITY + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY },
 >;
 
 impl cumulus_pallet_parachain_system::Config for Runtime {
@@ -608,12 +618,12 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 		Runtime,
 		RELAY_CHAIN_SLOT_DURATION_MILLIS,
 		BLOCK_PROCESSING_VELOCITY,
-		UNINCLUDED_SEGMENT_CAPACITY,
+		{ (UNINCLUDED_SEGMENT_CAPACITY + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY },
 	>;
 
 	type RelayParentOffset = ConstU32<RELAY_PARENT_OFFSET>;
 	type SchedulingSignatureVerifier = ();
-	type ConsumptionRecordSource = ();
+	type ConsumptionRecordSource = SpecMessaging;
 }
 
 impl parachain_info::Config for Runtime {}
@@ -633,7 +643,11 @@ impl pallet_message_queue::Config for Runtime {
 	type Size = u32;
 	// The XCMP queue pallet is only ever able to handle the `Sibling(ParaId)` origin:
 	type QueueChangeHandler = NarrowOriginToSibling<XcmpQueue>;
-	type QueuePausedQuery = NarrowOriginToSibling<XcmpQueue>;
+	type QueuePausedQuery = (
+		NarrowOriginToSibling<XcmpQueue>,
+		NarrowOriginToSpecMsg<SpecMessaging>,
+		SpecMsgToSender<XcmpQueue>,
+	);
 	type HeapSize = sp_core::ConstU32<{ 103 * 1024 }>;
 	type MaxStale = sp_core::ConstU32<8>;
 	type ServiceWeight = MessageQueueServiceWeight;
@@ -671,6 +685,64 @@ impl cumulus_pallet_xcmp_queue::Config for Runtime {
 	type ControllerOriginConverter = XcmOriginToTransactDispatchOrigin;
 	type WeightInfo = ();
 	type PriceForSiblingDelivery = PriceForSiblingParachainDelivery;
+}
+
+parameter_types! {
+	pub const SpecMsgSupportedVersions: core::ops::RangeInclusive<u8> = 1..=1;
+}
+
+/// Account for the unbounded queue map's key, value, and trie proof.
+pub struct SpecMsgFootprintQueryWeight;
+impl frame_support::traits::Get<Weight> for SpecMsgFootprintQueryWeight {
+	fn get() -> Weight {
+		use codec::MaxEncodedLen;
+		let entry = 8 +
+			AggregateMessageOrigin::max_encoded_len() +
+			pallet_message_queue::BookState::<AggregateMessageOrigin>::max_encoded_len();
+		RocksDbWeight::get()
+			.reads(1)
+			.saturating_add(Weight::from_parts(0, 2475 + entry as u64))
+	}
+}
+
+/// Reuse the HRMP weight for the same message-queue work.
+pub struct SpecMsgEnqueueWeight;
+impl sp_runtime::traits::Convert<u32, Weight> for SpecMsgEnqueueWeight {
+	fn convert(len: u32) -> Weight {
+		use cumulus_pallet_xcmp_queue::weights::WeightInfo;
+		cumulus_pallet_xcmp_queue::weights::SubstrateWeight::<Runtime>::enqueue_n_bytes_xcmp_message(
+			len,
+		)
+	}
+}
+
+impl cumulus_pallet_spec_messaging::Config for Runtime {
+	type SelfParaId = ParachainInfo;
+	type MaxMsgLen = ConstU32<102400>;
+	type MaxMessagesPerBlock = ConstU32<256>;
+	type MaxInFlight = ConstU32<128>;
+	// Keep sends within each block's share of the bundled PoV.
+	type MaxSendsPerBlock = ConstU32<512>;
+	type MaxTouchedStreams = ConstU32<14>;
+	type MaxBundleStreams = ConstU32<3000>;
+	// Stay below `MaxInFlight` to exercise partial consumption across blocks.
+	type MaxInboundMessagesPerItem = ConstU32<8>;
+	type MaxHelloPassPerBlock = ConstU32<8>;
+	type SupportedVersions = SpecMsgSupportedVersions;
+	type MaxMessageSize = ConstU32<102400>;
+	type MaxQueueFootprint = ConstU32<48>;
+	type QueueFootprint = cumulus_pallet_spec_messaging::QueueFootprintOf<
+		TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>,
+		SpecMsgFootprintQueryWeight,
+	>;
+	type DataHandler = cumulus_pallet_spec_messaging::EnqueueToXcmQueue<
+		TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>,
+		SpecMsgEnqueueWeight,
+	>;
+	type WeightInfo = cumulus_pallet_spec_messaging::weights::SubstrateWeight<Runtime>;
+	type OpenChannelOrigin = EnsureRoot<AccountId>;
+	type AcceptChannelOrigin = EnsureRoot<AccountId>;
+	type ChannelManagementOrigin = EnsureRoot<AccountId>;
 }
 
 parameter_types! {
@@ -840,6 +912,7 @@ construct_runtime!(
 		PolkadotXcm: pallet_xcm = 31,
 		CumulusXcm: cumulus_pallet_xcm = 32,
 		MessageQueue: pallet_message_queue = 34,
+		SpecMessaging: cumulus_pallet_spec_messaging = 35,
 
 		// Handy utilities.
 		Utility: pallet_utility = 40,
@@ -1172,6 +1245,37 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 
 		fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
 			genesis_config_presets::preset_names()
+		}
+	}
+
+	impl cumulus_primitives_core::TargetBlockRate<Block> for Runtime {
+		fn target_block_rate() -> u32 {
+			BLOCK_PROCESSING_VELOCITY
+		}
+	}
+
+	impl cumulus_primitives_core::SpecMsgApi<Block> for Runtime {
+		fn outbound_messages() -> Vec<(cumulus_primitives_spec_messaging::StreamId, Vec<Vec<u8>>)> {
+			SpecMessaging::outbound_messages()
+		}
+
+		fn outbound_frontiers() -> Vec<(
+			cumulus_primitives_spec_messaging::StreamId,
+			cumulus_primitives_spec_messaging::MmrFrontier,
+		)> {
+			SpecMessaging::outbound_frontiers()
+		}
+
+		fn consumed_streams() -> cumulus_primitives_spec_messaging::ConsumedStreams {
+			SpecMessaging::consumed_streams()
+		}
+
+		fn max_touched_streams() -> u32 {
+			SpecMessaging::max_touched_streams()
+		}
+
+		fn consumption_record() -> cumulus_primitives_spec_messaging::ConsumptionRecord {
+			SpecMessaging::consumption_record()
 		}
 	}
 
