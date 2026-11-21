@@ -1,0 +1,15 @@
+title: 'spec-msg: included-root receiver and collator wiring'
+doc:
+- audience: Node Operator
+  description: Fetch and verify messages under included roots and wire receiver inherents and lifts
+    into collation. Retry unwritten streams and refresh channel coverage when the included root
+    changes. Replay unfinalized consumption after a restart and track recovery sources until their
+    consuming blocks finalize. Check cached proofs against the receiver parent's frontier before
+    authoring.
+crates:
+- name: cumulus-client-collator
+  bump: major
+- name: cumulus-client-spec-msg
+  bump: minor
+- name: polkadot-omni-node-lib
+  bump: major
