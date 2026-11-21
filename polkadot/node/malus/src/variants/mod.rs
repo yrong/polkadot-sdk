@@ -23,6 +23,7 @@ mod dispute_valid_candidates;
 mod spam_statement_requests;
 mod suggest_garbage_candidate;
 mod support_disabled;
+mod withhold_availability;
 
 pub(crate) use self::{
 	back_garbage_candidate::{BackGarbageCandidateOptions, BackGarbageCandidates},
@@ -31,5 +32,6 @@ pub(crate) use self::{
 	spam_statement_requests::{SpamStatementRequests, SpamStatementRequestsOptions},
 	suggest_garbage_candidate::{SuggestGarbageCandidateOptions, SuggestGarbageCandidates},
 	support_disabled::{SupportDisabled, SupportDisabledOptions},
+	withhold_availability::{WithholdAvailability, WithholdAvailabilityOptions},
 };
 pub(crate) use common::*;
