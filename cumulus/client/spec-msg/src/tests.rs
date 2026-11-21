@@ -183,14 +183,14 @@ fn a_backfill_must_lead_to_the_seeded_peaks() {
 	let mut forged = sent[2..].to_vec();
 	forged[0][0] ^= 0xFF;
 	let frontier = frontier_at(sent, 2);
-	assert_eq!(seeded.backfill(channel(1), &frontier, &forged), Err(ArchiveError::Diverged));
-	assert_eq!(seeded.backfill(channel(1), &frontier, &sent[2..4]), Err(ArchiveError::Diverged));
+	assert_eq!(seeded.backfill(channel(1), 2, &frontier, &forged), Err(ArchiveError::Diverged));
+	assert_eq!(seeded.backfill(channel(1), 2, &frontier, &sent[2..4]), Err(ArchiveError::Diverged));
 	assert_eq!(
 		served(&seeded, &messages(channel(1), 2, root, u32::MAX)),
 		Err(FetchError::OutsideHorizon { lowest: MessagePosition(5) })
 	);
 
-	seeded.backfill(channel(1), &frontier, &sent[2..]).unwrap();
+	seeded.backfill(channel(1), 2, &frontier, &sent[2..]).unwrap();
 	assert_eq!(served(&seeded, &messages(channel(1), 2, root, u32::MAX)), Ok(sent[2..].to_vec()));
 	assert!(!seeded.backfill_pending().contains(&channel(1)));
 }
@@ -207,9 +207,12 @@ fn a_delayed_backfill_cannot_restore_a_confirmed_prefix() {
 	archive.import_block(21, 10, 11, 0, sends, Some(root_b)).unwrap();
 	let sent = &base.0[&stream];
 	archive.retain(10, &[(stream, 3)].into(), 0).unwrap();
-	assert_eq!(archive.backfill(stream, &frontier_at(sent, 0), sent), Err(ArchiveError::Diverged));
+	assert_eq!(
+		archive.backfill(stream, 0, &frontier_at(sent, 0), sent),
+		Err(ArchiveError::Diverged)
+	);
 	assert!(archive.backfill_pending().contains(&stream));
-	archive.backfill(stream, &frontier_at(sent, 3), &sent[3..]).unwrap();
+	archive.backfill(stream, 3, &frontier_at(sent, 3), &sent[3..]).unwrap();
 	for (root, model) in [(root_a, &a), (root_b, &b), (seed_root, &base)] {
 		assert_eq!(
 			served(&archive, &messages(stream, 3, root, u32::MAX)),
@@ -277,12 +280,13 @@ fn a_round_backfills_each_seeded_stream_from_own_peers() {
 
 #[test]
 fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
-	let (seeded, _, model, root) = seeded_and_full();
+	let (seeded, full, model, root) = seeded_and_full();
 	let sent = &model.0[&channel(1)];
 	// Two peers that kept `channel(1)` from 3 and from 4 only.
 	let pruned = |from: usize| {
 		let (mut peer, ..) = seeded_and_full();
-		peer.backfill(channel(1), &frontier_at(sent, from), &sent[from..]).unwrap();
+		peer.backfill(channel(1), from as u64, &frontier_at(sent, from), &sent[from..])
+			.unwrap();
 		(PeerId::random(), TestPeer { archive: Arc::new(peer), tamper: false })
 	};
 	let transport = ArchiveTransport(vec![pruned(4), pruned(3)]);
@@ -290,13 +294,21 @@ fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
 	let watermarks = Mutex::new(BTreeMap::from([(channel(1), 1)]));
 	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
 
-	let seeded = seeded.read();
-	assert!(!seeded.backfill_pending().contains(&channel(1)));
-	assert_eq!(served(&seeded, &messages(channel(1), 3, root, u32::MAX)), Ok(sent[3..].to_vec()));
+	assert!(seeded.read().backfill_pending().contains(&channel(1)));
 	assert_eq!(
-		served(&seeded, &messages(channel(1), 1, root, u32::MAX)),
+		served(&seeded.read(), &messages(channel(1), 3, root, u32::MAX)),
+		Ok(sent[3..].to_vec())
+	);
+	assert_eq!(
+		served(&seeded.read(), &messages(channel(1), 1, root, u32::MAX)),
 		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
 	);
+
+	let transport = ArchiveTransport(vec![honest(&full)]);
+	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+	let seeded = seeded.read();
+	assert!(!seeded.backfill_pending().contains(&channel(1)));
+	assert_eq!(served(&seeded, &messages(channel(1), 1, root, u32::MAX)), Ok(sent[1..].to_vec()));
 }
 
 #[test]

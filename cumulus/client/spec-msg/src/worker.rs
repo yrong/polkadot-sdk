@@ -447,7 +447,7 @@ pub(crate) async fn backfill<H, S, T>(
 			continue;
 		}
 		let result = if let Some((frontier, payloads)) = response {
-			let result = archive.backfill(stream, &frontier, &payloads);
+			let result = archive.backfill(stream, target, &frontier, &payloads);
 			if result.is_ok() {
 				log::info!(
 					target: LOG_TARGET,

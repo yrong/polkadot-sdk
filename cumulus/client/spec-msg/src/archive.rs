@@ -587,9 +587,11 @@ where
 	/// Store a seeded stream's `payloads` from `start` up to its floor, with `frontier` the
 	/// stream's frontier at `start`, and lower both floors to `start`. The leaves must lead from
 	/// `frontier` to the peaks stored at the floor, else nothing is written.
+	/// The stream stays pending while `start` is above `target`, the lowest leaf it still owes.
 	pub(crate) fn backfill(
 		&mut self,
 		stream: StreamId,
+		target: u64,
 		frontier: &MmrFrontier,
 		payloads: &[Vec<u8>],
 	) -> Result<(), ArchiveError> {
@@ -631,7 +633,9 @@ where
 			floors_key(&stream),
 			Floors { payload: start, node: start, retained_from: floors.retained_from }.encode(),
 		));
-		self.clear_backfill(&mut batch, &stream)?;
+		if start <= target {
+			self.clear_backfill(&mut batch, &stream)?;
+		}
 		self.store.commit(batch).map_err(ArchiveError::Store)
 	}
 
