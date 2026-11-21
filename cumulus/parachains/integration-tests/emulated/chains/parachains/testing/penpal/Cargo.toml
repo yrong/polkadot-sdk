@@ -14,8 +14,8 @@ workspace = true
 # Substrate
 frame-support = { workspace = true }
 sp-core = { workspace = true }
-sp-runtime = { workspace = true, default-features = true }
 sp-keyring = { workspace = true }
+sp-runtime = { workspace = true, default-features = true }
 
 # Polkadot
 xcm = { workspace = true }
