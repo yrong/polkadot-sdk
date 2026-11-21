@@ -56,9 +56,8 @@ pub fn xcm_channel(peer: ParaId) -> OutChannelId {
 	OutChannelId { recipient: peer, domain: XCM_CHANNEL_DOMAIN, num: XCM_CHANNEL_NUM }
 }
 
-/// Whether `stream` is an XCM channel's data stream.
-fn is_xcm_channel(stream: &StreamId) -> bool {
-	matches!(stream, StreamId::Channel { domain: XCM_CHANNEL_DOMAIN, num: XCM_CHANNEL_NUM, .. })
+fn is_xcm_channel(domain: u8, num: u16) -> bool {
+	domain == XCM_CHANNEL_DOMAIN && num == XCM_CHANNEL_NUM
 }
 
 /// [`OnSpecMsgData`] that forwards the XCM channel's payloads, in order, to the channel's message
@@ -79,9 +78,13 @@ pub struct EnqueueToXcmQueue<Queue, EnqueueWeight>(PhantomData<(Queue, EnqueueWe
 impl<Queue: EnqueueMessage<InChannelId>, EnqueueWeight: Convert<u32, Weight>> OnSpecMsgData
 	for EnqueueToXcmQueue<Queue, EnqueueWeight>
 {
+	fn handles(domain: u8, num: u16) -> bool {
+		is_xcm_channel(domain, num)
+	}
+
 	fn on_data(source: ParaId, stream: StreamId, _position: MessagePosition, data: Vec<u8>) {
 		let StreamId::Channel { domain, num, .. } = stream else { return };
-		if !is_xcm_channel(&stream) {
+		if !Self::handles(domain, num) {
 			return;
 		}
 		let Ok(message) = BoundedSlice::try_from(&data[..]) else {
@@ -294,9 +297,11 @@ impl<T: Config, ChannelInfo, VersionWrapper, Price> InspectMessageQueues
 
 	fn get_messages() -> Vec<(VersionedLocation, Vec<VersionedXcm<()>>)> {
 		OutboundMessages::<T>::iter()
-			.filter(|(stream, _)| is_xcm_channel(stream))
 			.filter_map(|(stream, leaves)| {
-				let StreamId::Channel { recipient, .. } = stream else { return None };
+				let StreamId::Channel { recipient, domain, num } = stream else { return None };
+				if !is_xcm_channel(domain, num) {
+					return None;
+				}
 				let messages: Vec<_> = leaves
 					.iter()
 					.filter_map(|leaf| match ChannelMessage::decode_all(&mut &leaf[..]).ok()? {

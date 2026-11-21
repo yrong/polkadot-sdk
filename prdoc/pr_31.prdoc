@@ -13,6 +13,8 @@ doc:
     executes XCM with the sender's sibling origin. Runtimes using the messaging pallet must
     configure `ChannelManagementOrigin` for HRMP cutover and inbound queue pause or resume.
 
+    EnqueueToXcmQueue accepts only the XCM lane (domain 0, channel 0).
+
     For sibling XCM benchmarks over spec-msg, use the messaging pallet as the
     `ToParachainDeliveryHelper` setup type and the router's `Price` as `PriceForDelivery`.
     Leave HRMP closed for the benchmark destination.

@@ -1411,7 +1411,9 @@ fn register_reads_leave_a_stream_slot_for_channel_items() {
 #[test]
 fn a_ref_time_trim_does_not_always_cut_the_same_channels() {
 	new_test_ext().execute_with(|| {
-		let channels: Vec<_> = (0..3).map(|num| InChannelId { num, ..in_channel() }).collect();
+		let channels: Vec<_> = (0..3)
+			.map(|i| InChannelId { sender: ParaId::from(3000u32 + i), ..in_channel() })
+			.collect();
 		let mut offered = MessagingInherentData::default();
 		for ch in &channels {
 			accept(*ch);
@@ -1939,17 +1941,22 @@ mod xcm_layer {
 	}
 
 	#[test]
-	fn other_channels_are_never_executed_as_xcm() {
+	fn the_xcm_handler_refuses_other_lanes_at_acceptance() {
 		new_test_ext().execute_with(|| {
-			let ch = InChannelId { sender: src(), domain: 1, num: 0 };
-			accept(ch);
-			assert_ok!(SpecMessaging::enact_messages(
-				RuntimeOrigin::none(),
-				channel_item(ch, vec![hello(1), data(b"not xcm")])
-			));
-			// Consumed, but not handed to the XCM queue.
-			assert_eq!(InChannels::<Test>::get(ch).unwrap().frontier.leaf_count(), 2);
-			assert!(Enqueued::get().is_empty());
+			for (domain, num) in [(1, 0), (0, 1)] {
+				let ch = InChannelId { sender: src(), domain, num };
+				assert_err!(
+					SpecMessaging::accept_open_channel(
+						RuntimeOrigin::root(),
+						ch.sender,
+						domain,
+						num
+					),
+					Error::<Test>::UnsupportedLane
+				);
+				assert!(!InChannels::<Test>::contains_key(ch));
+				assert!(!PendingRegisterPublishes::<Test>::get().contains(&ch));
+			}
 		});
 	}
 
