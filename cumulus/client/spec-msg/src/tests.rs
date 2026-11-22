@@ -1042,6 +1042,60 @@ fn the_floor_rises_to_the_verified_register() {
 	assert_eq!(sender.read().unconfirmed_channels(&1), vec![channel(2000)]);
 }
 
+/// Serves only the position for a head request, then serves the requested leaf.
+struct PositionOnlyHead {
+	archive: Arc<TestArchive>,
+	peer: PeerId,
+	other_frontier: Option<MmrFrontier>,
+	starts: Mutex<Vec<Option<MessagePosition>>>,
+}
+
+#[async_trait::async_trait]
+impl Transport for PositionOnlyHead {
+	fn peers(&self, _: ParaId) -> Vec<PeerId> {
+		vec![self.peer]
+	}
+
+	async fn request(&self, _: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		let req = MessagesRequest::decode(&mut &request[..]).unwrap();
+		self.starts.lock().push(req.start);
+		let cap = if req.start.is_none() { 0 } else { req.max_bytes };
+		let mut response = self.archive.serve_messages(&req, cap);
+		if let (Some(_), Some(frontier), Ok(reply)) =
+			(req.start, &self.other_frontier, &mut response)
+		{
+			reply.frontier = frontier.clone();
+		}
+		Ok(response.encode())
+	}
+}
+
+#[test]
+fn watermark_follows_a_position_only_head_and_checks_its_frontier() {
+	let (sender, _, recipient, root) = register_setup(&[2, 4]);
+	let mut different = MmrFrontier::new();
+	different.append(leaf_hash(&register(1)));
+	for (other_frontier, expected) in [(None, 4), (Some(different), 2)] {
+		let peer = PositionOnlyHead {
+			archive: recipient.clone(),
+			peer: PeerId::random(),
+			other_frontier,
+			starts: Mutex::default(),
+		};
+		let marks = Mutex::new(BTreeMap::from([(channel(2000), 2)]));
+		futures::executor::block_on(read_watermarks(
+			&sender,
+			&1,
+			&marks,
+			1000.into(),
+			&peer,
+			&FakeRoots(Some(root)),
+		));
+		assert_eq!(*peer.starts.lock(), [None, Some(MessagePosition(1))]);
+		assert_eq!(marks.lock()[&channel(2000)], expected);
+	}
+}
+
 #[test]
 fn a_register_beyond_the_leaf_count_is_clamped() {
 	let (sender, sender_root, recipient, root) = register_setup(&[99]);

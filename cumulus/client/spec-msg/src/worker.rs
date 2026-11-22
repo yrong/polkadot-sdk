@@ -26,7 +26,7 @@
 
 use crate::{
 	archive::Archive,
-	fetch::{fetch, RequestError, Transport},
+	fetch::{fetch, fetch_register_head, RequestError, Transport},
 	protocol::MAX_PAYLOAD_BYTES,
 	relay::FinalizedRoots,
 	store::ArchiveStore,
@@ -36,7 +36,7 @@ use codec::{Decode, DecodeAll, Encode};
 use cumulus_primitives_core::{ParaId, SpecMsgApi};
 use cumulus_primitives_spec_messaging::{
 	streams_root::read_streams_root, FetchError, MessagePosition, MessagesRequest, MmrFrontier,
-	Register, StreamId, StreamsRoot, MAX_SPECULATIVE_MESSAGE_LEN,
+	Register, StreamId, StreamsRoot,
 };
 use futures::{select, FutureExt, StreamExt};
 use parking_lot::{Mutex, RwLock};
@@ -535,21 +535,13 @@ pub(crate) async fn read_watermarks<H, S, T, R>(
 			log::debug!(target: LOG_TARGET, "No finalized root for {recipient:?}");
 			continue;
 		};
-		let request = MessagesRequest {
-			stream: StreamId::Ack { recipient: us, domain, num },
-			under,
-			start: None,
-			max_bytes: MAX_SPECULATIVE_MESSAGE_LEN,
-		};
-		let Ok(response) = fetch(transport, recipient, &request, None).await else {
+		let ack = StreamId::Ack { recipient: us, domain, num };
+		let Ok((_, payload, _)) = fetch_register_head(transport, recipient, ack, under).await
+		else {
 			log::debug!(target: LOG_TARGET, "No register of {recipient:?} for {stream:?}");
 			continue;
 		};
-		let register = match response.payloads.as_slice() {
-			[payload] => Register::decode_all(&mut &payload[..]).ok(),
-			_ => None,
-		};
-		let Some(register) = register else {
+		let Ok(register) = Register::decode_all(&mut &payload[..]) else {
 			log::debug!(target: LOG_TARGET, "Unusable register of {recipient:?} for {stream:?}");
 			continue;
 		};
