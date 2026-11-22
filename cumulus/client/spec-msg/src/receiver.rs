@@ -24,7 +24,7 @@
 //! - [`Receiver::assemble`]: one lift per recorded stream, checked with `build_requires_entry`.
 
 use crate::{
-	fetch::{fetch, fetch_register_head, RequestError, Transport},
+	fetch::{fetch, fetch_register_head, RequestError, Rotating, Transport},
 	pool::{Binding, HeadRead, SourcePool},
 	LOG_TARGET,
 };
@@ -44,7 +44,6 @@ use mmr_lib::{
 };
 use parking_lot::Mutex;
 use polkadot_core_primitives::Hash;
-use sc_network::PeerId;
 use std::{
 	cell::RefCell,
 	collections::{BTreeMap, BTreeSet, HashMap},
@@ -127,36 +126,6 @@ impl ChainView {
 			sources.entry(id.sender).or_default().events.insert(id, cursor);
 		}
 		Self { sources, max_touched_streams }
-	}
-}
-
-/// Wraps a transport so the peer asked first changes every round: one unresponsive peer then
-/// delays only the rounds it leads.
-struct Rotating<T: ?Sized> {
-	inner: Arc<T>,
-	rounds: Mutex<BTreeMap<ParaId, usize>>,
-}
-
-impl<T: ?Sized> Rotating<T> {
-	fn next_round(&self, source: ParaId) {
-		*self.rounds.lock().entry(source).or_default() += 1;
-	}
-}
-
-#[async_trait::async_trait]
-impl<T: Transport + ?Sized> Transport for Rotating<T> {
-	fn peers(&self, source: ParaId) -> Vec<PeerId> {
-		let mut peers = self.inner.peers(source);
-		if !peers.is_empty() {
-			let round = self.rounds.lock().get(&source).copied().unwrap_or_default();
-			let by = round % peers.len();
-			peers.rotate_left(by);
-		}
-		peers
-	}
-
-	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
-		self.inner.request(peer, request).await
 	}
 }
 
@@ -251,7 +220,7 @@ where
 		Self {
 			us,
 			budget,
-			transport: Rotating { inner: transport, rounds: Mutex::new(BTreeMap::new()) },
+			transport: Rotating::new(transport),
 			state: Mutex::new(State {
 				finalized: 0,
 				sources: BTreeMap::new(),
