@@ -4,6 +4,8 @@ doc:
   description: Archive and serve outgoing messaging streams with finalized-watermark retention and
     own-chain backfill. Retry missing channel history until served or confirmed.
     Read finalized acknowledgements even when a peer first returns only the head position.
+    Rotate the first archive peer between rounds, so a peer serving only proofs cannot stall
+    pruning or backfill.
     Keep sibling payloads and proofs available until sender finality.
 crates:
 - name: cumulus-client-spec-msg

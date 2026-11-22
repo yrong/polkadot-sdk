@@ -27,6 +27,7 @@ use cumulus_primitives_spec_messaging::{
 	MessagesRequest, MessagesResponse, MmrFrontier, Register, StreamId, StreamProof, StreamsRoot,
 	MAX_SPECULATIVE_MESSAGE_LEN,
 };
+use parking_lot::Mutex;
 use sc_network::{IfDisconnected, NetworkRequest, PeerId, ProtocolName};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -41,6 +42,40 @@ pub trait Transport: Send + Sync {
 
 	/// Send one encoded request to `peer` and return the encoded response.
 	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String>;
+}
+
+/// Rotates the first peer asked each round so a peer whose verified replies lack the needed
+/// payload delays only the rounds it leads.
+pub(crate) struct Rotating<T: ?Sized> {
+	inner: Arc<T>,
+	rounds: Mutex<BTreeMap<ParaId, usize>>,
+}
+
+impl<T: ?Sized> Rotating<T> {
+	pub(crate) fn new(inner: Arc<T>) -> Self {
+		Self { inner, rounds: Mutex::default() }
+	}
+
+	pub(crate) fn next_round(&self, source: ParaId) {
+		*self.rounds.lock().entry(source).or_default() += 1;
+	}
+}
+
+#[async_trait::async_trait]
+impl<T: Transport + ?Sized> Transport for Rotating<T> {
+	fn peers(&self, source: ParaId) -> Vec<PeerId> {
+		let mut peers = self.inner.peers(source);
+		if !peers.is_empty() {
+			let round = self.rounds.lock().get(&source).copied().unwrap_or_default();
+			let by = round % peers.len();
+			peers.rotate_left(by);
+		}
+		peers
+	}
+
+	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		self.inner.request(peer, request).await
+	}
 }
 
 /// [`Transport`] over the node's network, to a static set of peers per source.

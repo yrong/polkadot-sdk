@@ -26,7 +26,7 @@
 
 use crate::{
 	archive::Archive,
-	fetch::{fetch, fetch_register_head, RequestError, Transport},
+	fetch::{fetch, fetch_register_head, RequestError, Rotating, Transport},
 	protocol::MAX_PAYLOAD_BYTES,
 	relay::FinalizedRoots,
 	store::ArchiveStore,
@@ -48,7 +48,7 @@ use sp_runtime::{
 	SaturatedConversion,
 };
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -390,13 +390,14 @@ pub async fn run_watermark_reader<Block, C, S, T, R>(
 	T: Transport + ?Sized,
 	R: FinalizedRoots + ?Sized,
 {
+	let transport = Rotating::new(transport);
 	let mut finality = client.finality_notification_stream().fuse();
 	while let Some(mut finalized) = finality.next().await {
 		while let Some(Some(newer)) = finality.next().now_or_never() {
 			finalized = newer;
 		}
-		read_watermarks(&archive, &finalized.hash, &watermarks, us, &*transport, &*roots).await;
-		backfill(&archive, &finalized.hash, &watermarks, us, &*transport).await;
+		read_watermarks(&archive, &finalized.hash, &watermarks, us, &transport, &*roots).await;
+		backfill(&archive, &finalized.hash, &watermarks, us, &transport).await;
 	}
 }
 
@@ -409,7 +410,7 @@ pub(crate) async fn backfill<H, S, T>(
 	finalized: &H,
 	watermarks: &Mutex<BTreeMap<StreamId, u64>>,
 	us: ParaId,
-	transport: &T,
+	transport: &Rotating<T>,
 ) where
 	H: Encode + Decode + Copy + Eq + std::fmt::Debug,
 	S: ArchiveStore,
@@ -463,6 +464,7 @@ pub(crate) async fn backfill<H, S, T>(
 			log::warn!(target: LOG_TARGET, "Backfilling {stream:?} failed: {e:?}");
 		}
 	}
+	transport.next_round(us);
 }
 
 /// `stream`'s leaves from `start` up to `end` under `under`, with the frontier before the first.
@@ -520,7 +522,7 @@ pub(crate) async fn read_watermarks<H, S, T, R>(
 	finalized: &H,
 	watermarks: &Mutex<BTreeMap<StreamId, u64>>,
 	us: ParaId,
-	transport: &T,
+	transport: &Rotating<T>,
 	roots: &R,
 ) where
 	H: Encode + Decode + Copy + Eq + std::fmt::Debug,
@@ -529,12 +531,14 @@ pub(crate) async fn read_watermarks<H, S, T, R>(
 	R: FinalizedRoots + ?Sized,
 {
 	let channels = archive.read().unconfirmed_channels(finalized);
+	let mut recipients = BTreeSet::new();
 	for stream in channels {
 		let StreamId::Channel { recipient, domain, num } = stream else { continue };
 		let Some(under) = roots.finalized_included_root(recipient).await else {
 			log::debug!(target: LOG_TARGET, "No finalized root for {recipient:?}");
 			continue;
 		};
+		recipients.insert(recipient);
 		let ack = StreamId::Ack { recipient: us, domain, num };
 		let Ok((_, payload, _)) = fetch_register_head(transport, recipient, ack, under).await
 		else {
@@ -548,6 +552,9 @@ pub(crate) async fn read_watermarks<H, S, T, R>(
 		let mut watermarks = watermarks.lock();
 		let mark = watermarks.entry(stream).or_default();
 		*mark = (*mark).max(register.up_to.0);
+	}
+	for recipient in recipients {
+		transport.next_round(recipient);
 	}
 }
 

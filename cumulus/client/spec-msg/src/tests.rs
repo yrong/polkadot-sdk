@@ -19,7 +19,7 @@
 //! roots computed independently of the archive.
 
 use crate::{
-	fetch::{fetch, RequestError, Transport},
+	fetch::{fetch, RequestError, Rotating, Transport},
 	protocol,
 	store::ArchiveStore,
 	worker::{backfill, read_watermarks},
@@ -157,6 +157,10 @@ fn honest(archive: &Arc<TestArchive>) -> (PeerId, TestPeer) {
 	(PeerId::random(), TestPeer { archive: archive.clone(), tamper: false })
 }
 
+fn rotating(peers: Vec<(PeerId, TestPeer)>) -> Rotating<ArchiveTransport> {
+	Rotating::new(Arc::new(ArchiveTransport(peers)))
+}
+
 /// A chain that sent 5 leaves on `channel(1)`, 3 on `ack(2)` and 2 on `channel(3)` before block
 /// 10: an archive seeded there, and one that archived the history as block 1.
 fn seeded_and_full() -> (TestArchive, Arc<TestArchive>, Model, StreamsRoot) {
@@ -234,7 +238,7 @@ fn an_unreadable_floor_keeps_a_seeded_stream_pending() {
 	let frontiers = model.0.iter().map(|(s, sent)| (*s, frontier_at(sent, sent.len()))).collect();
 	archive.seed(10, 9, 10, 0, frontiers, None).unwrap();
 	let archive = RwLock::new(archive);
-	let transport = ArchiveTransport(vec![honest(&full)]);
+	let transport = rotating(vec![honest(&full)]);
 	let marks = Mutex::new([(stream, 2)].into());
 	let mut key = b"spec-msg/archive/v2/f".to_vec();
 	key.extend(stream.encode());
@@ -260,7 +264,7 @@ fn an_unreadable_floor_keeps_a_seeded_stream_pending() {
 fn a_round_backfills_each_seeded_stream_from_own_peers() {
 	let (seeded, full, model, root) = seeded_and_full();
 	let seeded = RwLock::new(seeded);
-	let transport = ArchiveTransport(vec![honest(&full)]);
+	let transport = rotating(vec![honest(&full)]);
 	// `channel(1)` is confirmed up to 2, `channel(3)` past its floor; `channel(1)` before the
 	// watermark is read waits.
 	let watermarks = Mutex::new(BTreeMap::from([(channel(3), 2)]));
@@ -289,7 +293,7 @@ fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
 			.unwrap();
 		(PeerId::random(), TestPeer { archive: Arc::new(peer), tamper: false })
 	};
-	let transport = ArchiveTransport(vec![pruned(4), pruned(3)]);
+	let transport = rotating(vec![pruned(4), pruned(3)]);
 	let seeded = RwLock::new(seeded);
 	let watermarks = Mutex::new(BTreeMap::from([(channel(1), 1)]));
 	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
@@ -304,7 +308,7 @@ fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
 		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
 	);
 
-	let transport = ArchiveTransport(vec![honest(&full)]);
+	let transport = rotating(vec![honest(&full)]);
 	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
 	let seeded = seeded.read();
 	assert!(!seeded.backfill_pending().contains(&channel(1)));
@@ -989,6 +993,71 @@ fn register(up_to: u64) -> Vec<u8> {
 	Register { up_to: MessagePosition(up_to), status }.encode()
 }
 
+/// Two peers with the same archive. Only the second serves payloads.
+struct ArchivePeers {
+	archive: Arc<TestArchive>,
+	peers: [PeerId; 2],
+}
+
+impl ArchivePeers {
+	fn rotating(archive: Arc<TestArchive>) -> Rotating<Self> {
+		Rotating::new(Arc::new(Self { archive, peers: [PeerId::random(), PeerId::random()] }))
+	}
+}
+
+#[async_trait::async_trait]
+impl Transport for ArchivePeers {
+	fn peers(&self, _: ParaId) -> Vec<PeerId> {
+		self.peers.to_vec()
+	}
+
+	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		let request = MessagesRequest::decode(&mut &request[..]).unwrap();
+		let cap = if peer == self.peers[0] { 0 } else { request.max_bytes };
+		Ok(self.archive.serve_messages(&request, cap).encode())
+	}
+}
+
+#[test]
+fn archive_rounds_rotate_peers_for_backfill() {
+	let (seeded, full, model, root) = seeded_and_full();
+	let archive = RwLock::new(seeded);
+	let transport = ArchivePeers::rotating(full);
+	let stream = channel(1);
+	let marks = Mutex::new([(stream, 2)].into());
+	let round =
+		|| futures::executor::block_on(backfill(&archive, &10, &marks, 2000.into(), &transport));
+	round();
+	assert!(archive.read().backfill_pending().contains(&stream));
+	round();
+	assert!(!archive.read().backfill_pending().contains(&stream));
+	assert_eq!(
+		served(&archive.read(), &messages(stream, 2, root, u32::MAX)),
+		Ok(model.0[&stream][2..].to_vec())
+	);
+}
+
+#[test]
+fn archive_rounds_rotate_peers_for_watermarks() {
+	let (sender, _, recipient, root) = register_setup(&[4]);
+	let transport = ArchivePeers::rotating(recipient);
+	let marks = Mutex::new(BTreeMap::new());
+	let round = || {
+		futures::executor::block_on(read_watermarks(
+			&sender,
+			&1,
+			&marks,
+			1000.into(),
+			&transport,
+			&FakeRoots(Some(root)),
+		))
+	};
+	round();
+	assert!(marks.lock().is_empty());
+	round();
+	assert_eq!(marks.lock().get(&channel(2000)), Some(&4));
+}
+
 /// The sender (para 1000) holds 6 sends to 2000 on `channel(2000)` at block 1. The recipient's
 /// archive holds one register per entry of `ups` on `ack(1000)`. Returns both roots.
 fn register_setup(
@@ -1015,7 +1084,7 @@ fn round(
 		&1,
 		watermarks,
 		1000.into(),
-		&ArchiveTransport(peers),
+		&rotating(peers),
 		&FakeRoots(root),
 	));
 	let marks = watermarks.lock().clone();
@@ -1076,19 +1145,19 @@ fn watermark_follows_a_position_only_head_and_checks_its_frontier() {
 	let mut different = MmrFrontier::new();
 	different.append(leaf_hash(&register(1)));
 	for (other_frontier, expected) in [(None, 4), (Some(different), 2)] {
-		let peer = PositionOnlyHead {
+		let peer = Arc::new(PositionOnlyHead {
 			archive: recipient.clone(),
 			peer: PeerId::random(),
 			other_frontier,
 			starts: Mutex::default(),
-		};
+		});
 		let marks = Mutex::new(BTreeMap::from([(channel(2000), 2)]));
 		futures::executor::block_on(read_watermarks(
 			&sender,
 			&1,
 			&marks,
 			1000.into(),
-			&peer,
+			&Rotating::new(peer.clone()),
 			&FakeRoots(Some(root)),
 		));
 		assert_eq!(*peer.starts.lock(), [None, Some(MessagePosition(1))]);
