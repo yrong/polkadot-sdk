@@ -2184,3 +2184,45 @@ fn reserved_proof_bytes_cover_a_serialized_bundle_at_the_pov_limit() {
 		assert!(wire_len(room + reserved - encoded_lifts + 1) > limit);
 	});
 }
+
+#[test]
+fn offboarding_removes_only_listed_channels_and_preserves_the_outbound_frontier() {
+	new_test_ext().execute_with(|| {
+		let peer = src();
+		let other = ParaId::from(1001u32);
+		for (id, num) in [(peer, 0), (peer, 1), (other, 0)] {
+			assert_ok!(SpecMessaging::open_channel(RuntimeOrigin::root(), id, 0, num));
+			assert_ok!(SpecMessaging::accept_open_channel(RuntimeOrigin::root(), id, 0, num));
+		}
+		let stream = out_channel().data_stream();
+		let mut frontier = MmrFrontier::new();
+		frontier.append(leaf_hash_with_version(LEAF_VERSION, &[1]));
+		OutboundFrontier::<Test>::insert(stream, frontier.clone());
+
+		let lanes = BoundedVec::try_from(vec![(0, 0)]).unwrap();
+		assert_err!(
+			SpecMessaging::clean_offboarded_peer(RuntimeOrigin::none(), peer, lanes.clone()),
+			sp_runtime::DispatchError::BadOrigin
+		);
+		assert_ok!(SpecMessaging::clean_offboarded_peer(
+			RuntimeOrigin::root(),
+			peer,
+			lanes.clone()
+		));
+		System::assert_last_event(
+			Event::<Test>::PeerChannelsRemoved { peer, channels: lanes }.into(),
+		);
+		roll_one_block();
+		for (id, num, exists) in [(peer, 0, false), (peer, 1, true), (other, 0, true)] {
+			assert_eq!(
+				InChannels::<Test>::contains_key(InChannelId { sender: id, domain: 0, num }),
+				exists
+			);
+			assert_eq!(
+				OutChannels::<Test>::contains_key(OutChannelId { recipient: id, domain: 0, num }),
+				exists
+			);
+		}
+		assert_eq!(OutboundFrontier::<Test>::get(stream), frontier);
+	});
+}

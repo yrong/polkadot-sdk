@@ -62,6 +62,8 @@ pub use pallet::*;
 
 use channel_policy::{InChannelPolicy, OutChannelPolicy};
 
+pub const MAX_CLEANUP_CHANNELS: u32 = 32;
+
 const LOG_TARGET: &str = "runtime::spec-msg";
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -302,6 +304,11 @@ pub mod pallet {
 		RegisterPublished { channel: InChannelId, up_to: MessagePosition, status: RegisterStatus },
 		/// A message was consumed in order.
 		MessageConsumed { source: ParaId, stream: StreamId, position: MessagePosition },
+		/// Governance cleared the listed lanes of an offboarded peer.
+		PeerChannelsRemoved {
+			peer: ParaId,
+			channels: BoundedVec<(u8, u16), ConstU32<MAX_CLEANUP_CHANNELS>>,
+		},
 	}
 
 	#[pallet::error]
@@ -657,6 +664,23 @@ pub mod pallet {
 			InChannels::<T>::insert(channel, state);
 			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
 			Self::deposit_event(Event::InboundChannelClosed { channel });
+			Ok(())
+		}
+
+		/// Remove the listed channels after governance confirms the peer has offboarded.
+		#[pallet::call_index(9)]
+		#[pallet::weight(T::WeightInfo::clean_offboarded_peer(channels.len() as u32))]
+		pub fn clean_offboarded_peer(
+			origin: OriginFor<T>,
+			peer: ParaId,
+			channels: BoundedVec<(u8, u16), ConstU32<MAX_CLEANUP_CHANNELS>>,
+		) -> DispatchResult {
+			frame_system::ensure_root(origin)?;
+			for &(domain, num) in channels.iter() {
+				InChannels::<T>::remove(InChannelId { sender: peer, domain, num });
+				OutChannels::<T>::remove(OutChannelId { recipient: peer, domain, num });
+			}
+			Self::deposit_event(Event::PeerChannelsRemoved { peer, channels });
 			Ok(())
 		}
 	}

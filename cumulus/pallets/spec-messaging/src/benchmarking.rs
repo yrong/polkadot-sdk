@@ -517,5 +517,28 @@ mod benchmarks {
 		assert_eq!(HelloPassCursor::<T>::exists(), n == T::MaxHelloPassPerBlock::get());
 	}
 
+	#[benchmark(pov_mode = Measured)]
+	fn clean_offboarded_peer(n: Linear<0, MAX_CLEANUP_CHANNELS>) {
+		let peer = sibling::<T>(0);
+		let mut channels = BoundedVec::default();
+		for num in 0..n as u16 {
+			open_inbound::<T>(InChannelId { sender: peer, domain: 0, num });
+			open_outbound::<T>(OutChannelId { recipient: peer, domain: 0, num });
+			channels.try_push((0, num)).expect("benchmark range fits; qed");
+		}
+
+		#[extrinsic_call]
+		_(RawOrigin::Root, peer, channels);
+
+		for num in 0..n as u16 {
+			assert!(!InChannels::<T>::contains_key(InChannelId { sender: peer, domain: 0, num }));
+			assert!(!OutChannels::<T>::contains_key(OutChannelId {
+				recipient: peer,
+				domain: 0,
+				num
+			}));
+		}
+	}
+
 	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
 }

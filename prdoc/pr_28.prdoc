@@ -3,6 +3,7 @@ doc:
 - audience: Runtime Dev
   description: |-
     Parachain runtimes can use the new pallet to manage channels, consume messages and publish acknowledgements. To enable it, configure the pallet as the parachain system's ConsumptionRecordSource and implement SpecMsgApi for collators.
+    After a peer offboards, governance can remove its channels in batches.
     Data handlers can restrict which inbound lanes the runtime accepts.
     Run try-runtime before narrowing SupportedVersions to check live sessions and advertised ranges.
 crates:

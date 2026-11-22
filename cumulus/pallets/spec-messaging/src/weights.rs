@@ -62,6 +62,7 @@ pub trait WeightInfo {
 	fn send(b: u32, ) -> Weight;
 	fn idle_commit() -> Weight;
 	fn hello_pass(n: u32, ) -> Weight;
+	fn clean_offboarded_peer(n: u32, ) -> Weight;
 }
 
 /// Weights for `cumulus_pallet_spec_messaging` using the Substrate node and recommended hardware.
@@ -530,6 +531,31 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().writes((3_u64).saturating_mul(n.into())))
 			.saturating_add(Weight::from_parts(0, 2579).saturating_mul(n.into()))
 	}
+	/// Storage: `System::Number` (r:1 w:0)
+	/// Proof: `System::Number` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `Measured`)
+	/// Storage: `System::ExecutionPhase` (r:1 w:0)
+	/// Proof: `System::ExecutionPhase` (`max_values`: Some(1), `max_size`: Some(5), added: 500, mode: `Measured`)
+	/// Storage: `System::EventCount` (r:1 w:1)
+	/// Proof: `System::EventCount` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `Measured`)
+	/// Storage: `System::Events` (r:1 w:1)
+	/// Proof: `System::Events` (`max_values`: Some(1), `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::InChannels` (r:0 w:32)
+	/// Proof: `SpecMessaging::InChannels` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutChannels` (r:0 w:32)
+	/// Proof: `SpecMessaging::OutChannels` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `n` is `[0, 32]`.
+	fn clean_offboarded_peer(n: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `30`
+		//  Estimated: `1515`
+		// Minimum execution time: 5_760_000 picoseconds.
+		Weight::from_parts(6_364_412, 1515)
+			// Standard Error: 1_813
+			.saturating_add(Weight::from_parts(2_311_863, 0).saturating_mul(n.into()))
+			.saturating_add(T::DbWeight::get().reads(4_u64))
+			.saturating_add(T::DbWeight::get().writes(2_u64))
+			.saturating_add(T::DbWeight::get().writes((2_u64).saturating_mul(n.into())))
+	}
 }
 
 // For backwards compatibility and tests.
@@ -996,5 +1022,30 @@ impl WeightInfo for () {
 			.saturating_add(RocksDbWeight::get().writes(2_u64))
 			.saturating_add(RocksDbWeight::get().writes((3_u64).saturating_mul(n.into())))
 			.saturating_add(Weight::from_parts(0, 2579).saturating_mul(n.into()))
+	}
+	/// Storage: `System::Number` (r:1 w:0)
+	/// Proof: `System::Number` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `Measured`)
+	/// Storage: `System::ExecutionPhase` (r:1 w:0)
+	/// Proof: `System::ExecutionPhase` (`max_values`: Some(1), `max_size`: Some(5), added: 500, mode: `Measured`)
+	/// Storage: `System::EventCount` (r:1 w:1)
+	/// Proof: `System::EventCount` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `Measured`)
+	/// Storage: `System::Events` (r:1 w:1)
+	/// Proof: `System::Events` (`max_values`: Some(1), `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::InChannels` (r:0 w:32)
+	/// Proof: `SpecMessaging::InChannels` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// Storage: `SpecMessaging::OutChannels` (r:0 w:32)
+	/// Proof: `SpecMessaging::OutChannels` (`max_values`: None, `max_size`: None, mode: `Measured`)
+	/// The range of component `n` is `[0, 32]`.
+	fn clean_offboarded_peer(n: u32, ) -> Weight {
+		// Proof Size summary in bytes:
+		//  Measured:  `30`
+		//  Estimated: `1515`
+		// Minimum execution time: 5_760_000 picoseconds.
+		Weight::from_parts(6_364_412, 1515)
+			// Standard Error: 1_813
+			.saturating_add(Weight::from_parts(2_311_863, 0).saturating_mul(n.into()))
+			.saturating_add(RocksDbWeight::get().reads(4_u64))
+			.saturating_add(RocksDbWeight::get().writes(2_u64))
+			.saturating_add(RocksDbWeight::get().writes((2_u64).saturating_mul(n.into())))
 	}
 }
