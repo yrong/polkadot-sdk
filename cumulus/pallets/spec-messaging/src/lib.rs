@@ -725,7 +725,8 @@ pub mod pallet {
 			Ok(())
 		}
 
-		/// Remove the listed channels after governance confirms the peer has offboarded.
+		/// Remove the listed channels and the peer's XCM routing state after governance confirms
+		/// the peer has offboarded.
 		#[pallet::call_index(9)]
 		#[pallet::weight(T::WeightInfo::clean_offboarded_peer(channels.len() as u32))]
 		pub fn clean_offboarded_peer(
@@ -735,9 +736,13 @@ pub mod pallet {
 		) -> DispatchResult {
 			frame_system::ensure_root(origin)?;
 			for &(domain, num) in channels.iter() {
-				InChannels::<T>::remove(InChannelId { sender: peer, domain, num });
+				let inbound = InChannelId { sender: peer, domain, num };
+				InChannels::<T>::remove(inbound);
+				PausedInbound::<T>::remove(inbound);
 				OutChannels::<T>::remove(OutChannelId { recipient: peer, domain, num });
 			}
+			HrmpClosing::<T>::remove(peer);
+			DeliveryFeeFactor::<T>::remove(peer);
 			Self::deposit_event(Event::PeerChannelsRemoved { peer, channels });
 			Ok(())
 		}

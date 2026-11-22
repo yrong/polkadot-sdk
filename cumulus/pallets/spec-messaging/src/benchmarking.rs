@@ -589,18 +589,30 @@ mod benchmarks {
 	#[benchmark(pov_mode = Measured)]
 	fn clean_offboarded_peer(n: Linear<0, MAX_CLEANUP_CHANNELS>) {
 		let peer = sibling::<T>(0);
+		HrmpClosing::<T>::insert(peer, ());
+		DeliveryFeeFactor::<T>::insert(peer, sp_runtime::FixedU128::from_u32(2));
 		let mut channels = BoundedVec::default();
 		for num in 0..n as u16 {
-			open_inbound::<T>(InChannelId { sender: peer, domain: 0, num });
-			open_outbound::<T>(OutChannelId { recipient: peer, domain: 0, num });
+			let channel = InChannelId { sender: peer, domain: 0, num };
+			PausedInbound::<T>::insert(channel, ());
+			open_inbound::<T>(channel);
+			open_outbound::<T>(
+				OutChannelId { recipient: peer, domain: 0, num },
+				*T::SupportedVersions::get().start(),
+			);
 			channels.try_push((0, num)).expect("benchmark range fits; qed");
 		}
 
 		#[extrinsic_call]
 		_(RawOrigin::Root, peer, channels);
 
+		assert!(!HrmpClosing::<T>::contains_key(peer));
+		assert!(!DeliveryFeeFactor::<T>::contains_key(peer));
+
 		for num in 0..n as u16 {
-			assert!(!InChannels::<T>::contains_key(InChannelId { sender: peer, domain: 0, num }));
+			let channel = InChannelId { sender: peer, domain: 0, num };
+			assert!(!PausedInbound::<T>::contains_key(channel));
+			assert!(!InChannels::<T>::contains_key(channel));
 			assert!(!OutChannels::<T>::contains_key(OutChannelId {
 				recipient: peer,
 				domain: 0,

@@ -2901,10 +2901,16 @@ fn offboarding_removes_only_listed_channels_and_preserves_the_outbound_frontier(
 	new_test_ext().execute_with(|| {
 		let peer = src();
 		let other = ParaId::from(1001u32);
-		for (id, num) in [(peer, 0), (peer, 1), (other, 0)] {
-			assert_ok!(SpecMessaging::open_channel(RuntimeOrigin::root(), id, 0, num));
-			assert_ok!(SpecMessaging::accept_open_channel(RuntimeOrigin::root(), id, 0, num));
+		for id in [peer, other] {
+			accept(InChannelId { sender: id, domain: 0, num: 0 });
+			assert_ok!(SpecMessaging::open_channel(RuntimeOrigin::root(), id, 0, 0));
 		}
+		// A non-XCM lane retained from a different data handler.
+		InChannels::<Test>::insert(
+			InChannelId { num: 1, ..in_channel() },
+			InChannels::<Test>::get(in_channel()).unwrap(),
+		);
+		assert_ok!(SpecMessaging::open_channel(RuntimeOrigin::root(), peer, 0, 1));
 		let stream = out_channel().data_stream();
 		let mut frontier = MmrFrontier::new();
 		frontier.append(leaf_hash_with_version(LEAF_VERSION, &[1]));
@@ -2935,5 +2941,95 @@ fn offboarding_removes_only_listed_channels_and_preserves_the_outbound_frontier(
 			);
 		}
 		assert_eq!(OutboundFrontier::<Test>::get(stream), frontier);
+	});
+}
+
+#[test]
+fn offboarding_drains_paused_xcm_and_preserves_other_spec_msg_and_hrmp_delivery() {
+	use cumulus_primitives_core::{AggregateMessageOrigin, XcmpMessageFormat, XcmpMessageHandler};
+	use frame_support::traits::{QueueFootprintQuery as _, ServiceQueues};
+	use xcm::latest::prelude::*;
+
+	let message = |sender: ParaId, tag: u8| {
+		xcm::VersionedXcm::<()>::from(Xcm(vec![
+			ExpectOrigin(Some(Location::new(1, [Parachain(sender.into())]))),
+			SetTopic([tag; 32]),
+		]))
+		.encode()
+	};
+	let processed = || {
+		System::events()
+			.into_iter()
+			.filter_map(|record| match record.event {
+				RuntimeEvent::MessageQueue(pallet_message_queue::Event::Processed {
+					origin,
+					id,
+					success: true,
+					..
+				}) => Some((origin, id)),
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+	};
+	new_test_ext().execute_with(|| {
+		let a = in_channel();
+		let b = InChannelId { sender: ParaId::from(1001u32), ..a };
+		let origin_a = AggregateMessageOrigin::SpecMsg(a);
+		let origin_b = AggregateMessageOrigin::SpecMsg(b);
+		let hrmp = AggregateMessageOrigin::Sibling(b.sender);
+		let first = message(a.sender, 1);
+		let second = message(b.sender, 2);
+		let third = message(b.sender, 3);
+		accept(a);
+		accept(b);
+		for peer in [a.sender, b.sender] {
+			HrmpClosing::<Test>::insert(peer, ());
+			DeliveryFeeFactor::<Test>::insert(peer, sp_runtime::FixedU128::from_u32(2));
+		}
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			channel_item(a, vec![hello(1), data(&first)])
+		));
+		assert_ok!(SpecMessaging::pause_inbound_channel(
+			RuntimeOrigin::root(),
+			a.sender,
+			a.domain,
+			a.num
+		));
+		MessageQueue::service_queues(Weight::MAX);
+		assert!(processed().is_empty());
+		assert_eq!(MessageQueue::footprint(origin_a.clone()).ready_pages, 1);
+		assert_ok!(SpecMessaging::clean_offboarded_peer(
+			RuntimeOrigin::root(),
+			a.sender,
+			vec![(a.domain, a.num)].try_into().unwrap()
+		));
+		assert!(!InChannels::<Test>::contains_key(a));
+		assert!(!DeliveryFeeFactor::<Test>::contains_key(a.sender));
+		assert!(!HrmpClosing::<Test>::contains_key(a.sender));
+		assert!(HrmpClosing::<Test>::contains_key(b.sender));
+		assert!(DeliveryFeeFactor::<Test>::contains_key(b.sender));
+		assert_eq!(MessageQueue::footprint(origin_a.clone()).ready_pages, 1);
+		roll_one_block();
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			channel_item(b, vec![hello(1), data(&second)])
+		));
+		let mut page = XcmpMessageFormat::ConcatenatedVersionedXcm.encode();
+		page.extend_from_slice(&third);
+		assert_eq!(
+			XcmpQueue::handle_xcmp_messages([(b.sender, 1, &page[..])].into_iter(), Weight::MAX).0,
+			1
+		);
+		let expected = [(origin_a, first), (origin_b, second), (hrmp, third)]
+			.map(|(origin, bytes)| (origin, sp_io::hashing::blake2_256(&bytes).into()));
+		for _ in 0..2 {
+			MessageQueue::service_queues(Weight::MAX);
+			let actual = processed();
+			assert_eq!(actual.len(), expected.len());
+			for item in &expected {
+				assert!(actual.contains(item));
+			}
+		}
 	});
 }

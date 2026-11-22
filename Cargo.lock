@@ -5424,12 +5424,15 @@ dependencies = [
 name = "cumulus-pallet-spec-messaging"
 version = "0.1.0"
 dependencies = [
+ "cumulus-pallet-xcmp-queue",
  "cumulus-primitives-core",
  "cumulus-primitives-spec-messaging",
  "frame-benchmarking",
  "frame-support",
  "frame-system",
  "log",
+ "pallet-message-queue",
+ "parachains-common",
  "parity-scale-codec",
  "polkadot-ckb-merkle-mountain-range",
  "polkadot-core-primitives",
@@ -5443,6 +5446,7 @@ dependencies = [
  "sp-runtime 31.0.1",
  "staging-xcm",
  "staging-xcm-builder",
+ "staging-xcm-executor",
 ]
 
 [[package]]

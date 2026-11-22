@@ -13,6 +13,8 @@ doc:
     executes XCM with the sender's sibling origin. Runtimes using the messaging pallet must
     configure `ChannelManagementOrigin` for HRMP cutover and inbound queue pause or resume.
 
+    Offboarding cleanup clears queue pauses for the listed lanes so previously queued XCM can drain.
+
     EnqueueToXcmQueue accepts only the XCM lane (domain 0, channel 0).
 
     For sibling XCM benchmarks over spec-msg, use the messaging pallet as the

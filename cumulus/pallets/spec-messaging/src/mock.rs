@@ -15,16 +15,18 @@
 
 use crate as cumulus_pallet_spec_messaging;
 use core::ops::RangeInclusive;
+use cumulus_primitives_core::AggregateMessageOrigin;
 use cumulus_primitives_spec_messaging::InChannelId;
 use frame_support::{
 	derive_impl,
 	pallet_prelude::Weight,
 	parameter_types,
-	traits::EnqueueMessage,
+	traits::{ConstU32, EnqueueMessage, Everything, Nothing, TransformOrigin},
 	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, RuntimeDbWeight},
 	BoundedSlice,
 };
 use frame_system::EnsureRoot;
+use parachains_common::message_queue::{ChannelToSpecMsg, NarrowOriginToSpecMsg, ParaIdToSibling};
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use sp_runtime::BuildStorage;
 
@@ -34,6 +36,8 @@ frame_support::construct_runtime!(
 	pub enum Test {
 		System: frame_system,
 		SpecMessaging: cumulus_pallet_spec_messaging,
+		MessageQueue: pallet_message_queue,
+		XcmpQueue: cumulus_pallet_xcmp_queue,
 	}
 );
 
@@ -117,11 +121,18 @@ impl sp_runtime::traits::Convert<u32, Weight> for EnqueueWeight {
 /// Message queue that records what it is given, bounded by [`QueueMaxLen`].
 pub struct RecordingQueue;
 
+type SpecMsgQueue =
+	TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>;
+
 impl EnqueueMessage<InChannelId> for RecordingQueue {
 	type MaxMessageLen = QueueMaxLen;
 
 	fn enqueue_message(message: BoundedSlice<u8, Self::MaxMessageLen>, origin: InChannelId) {
 		Enqueued::mutate(|enqueued| enqueued.push((origin, message.to_vec())));
+		SpecMsgQueue::enqueue_message(
+			(&message[..]).try_into().expect("test queue fits the recorded message; qed"),
+			origin,
+		);
 	}
 
 	fn enqueue_messages<'a>(
@@ -131,7 +142,9 @@ impl EnqueueMessage<InChannelId> for RecordingQueue {
 		messages.for_each(|message| Self::enqueue_message(message, origin));
 	}
 
-	fn sweep_queue(_: InChannelId) {}
+	fn sweep_queue(origin: InChannelId) {
+		SpecMsgQueue::sweep_queue(origin);
+	}
 }
 
 /// The HRMP channel state tests can set.
@@ -205,4 +218,74 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 		System::initialize(&1, &Default::default(), &Default::default());
 	});
 	ext
+}
+
+parameter_types! {
+	pub BaseXcmWeight: Weight = Weight::from_parts(1_000, 0);
+	pub UniversalLocation: xcm::latest::InteriorLocation = xcm::latest::Junctions::Here;
+}
+
+impl cumulus_pallet_xcmp_queue::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+	type ChannelInfo = MockHrmp;
+	type VersionWrapper = ();
+	type XcmpQueue = TransformOrigin<MessageQueue, AggregateMessageOrigin, ParaId, ParaIdToSibling>;
+	type MaxInboundSuspended = ConstU32<1_000>;
+	type MaxActiveOutboundChannels = ConstU32<128>;
+	type MaxPageSize = ConstU32<{ 103 * 1024 }>;
+	type ControllerOrigin = EnsureRoot<u64>;
+	type ControllerOriginConverter = ();
+	type WeightInfo = ();
+	type PriceForSiblingDelivery =
+		polkadot_runtime_common::xcm_sender::NoPriceForMessageDelivery<ParaId>;
+}
+
+impl pallet_message_queue::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+	type MessageProcessor = xcm_builder::ProcessXcmMessage<
+		AggregateMessageOrigin,
+		xcm_executor::XcmExecutor<TestXcmConfig>,
+		RuntimeCall,
+	>;
+	type Size = u32;
+	type QueueChangeHandler = ();
+	type QueuePausedQuery = NarrowOriginToSpecMsg<SpecMessaging>;
+	type HeapSize = ConstU32<{ 103 * 1024 }>;
+	type MaxStale = ConstU32<8>;
+	type ServiceWeight = ();
+	type IdleMaxServiceWeight = ();
+	type WeightInfo = ();
+}
+
+pub struct TestXcmConfig;
+impl xcm_executor::Config for TestXcmConfig {
+	type RuntimeCall = RuntimeCall;
+	type XcmSender = ();
+	type XcmEventEmitter = ();
+	type AssetTransactor = ();
+	type OriginConverter = ();
+	type IsReserve = ();
+	type IsTeleporter = ();
+	type UniversalLocation = UniversalLocation;
+	type Barrier = xcm_builder::AllowUnpaidExecutionFrom<Everything>;
+	type Weigher = xcm_builder::FixedWeightBounds<BaseXcmWeight, RuntimeCall, ConstU32<100>>;
+	type Trader = ();
+	type ResponseHandler = ();
+	type AssetTrap = ();
+	type AssetLocker = ();
+	type AssetExchanger = ();
+	type SubscriptionService = ();
+	type PalletInstancesInfo = ();
+	type FeeManager = ();
+	type MaxAssetsIntoHolding = ConstU32<64>;
+	type MessageExporter = ();
+	type UniversalAliases = Nothing;
+	type CallDispatcher = RuntimeCall;
+	type SafeCallFilter = Nothing;
+	type Aliasers = Nothing;
+	type TransactionalProcessor = ();
+	type HrmpNewChannelOpenRequestHandler = ();
+	type HrmpChannelAcceptedHandler = ();
+	type HrmpChannelClosingHandler = ();
+	type XcmRecorder = ();
 }
