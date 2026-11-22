@@ -388,17 +388,26 @@ pub mod pallet {
 		#[cfg(feature = "try-runtime")]
 		fn pre_upgrade() -> Result<Vec<u8>, sp_runtime::TryRuntimeError> {
 			let supported = T::SupportedVersions::get();
+			let max_len = T::MaxMsgLen::get();
 			for state in InChannels::<T>::iter_values() {
-				if let RegisterStatus::Accepting { min, max, .. } = state.status {
+				if let RegisterStatus::Accepting { min, max, max_message_size, .. } = state.status {
 					ensure!(
 						supported.contains(&min) && supported.contains(&max),
 						"spec-msg: upgrade drops an advertised inbound version"
+					);
+					ensure!(
+						max_message_size <= max_len,
+						"spec-msg: MaxMsgLen is below the advertised inbound message size"
 					);
 				}
 				if let Some(params) = state.open {
 					ensure!(
 						supported.contains(&params.version),
 						"spec-msg: upgrade drops an inbound session version"
+					);
+					ensure!(
+						params.max_message_size <= max_len,
+						"spec-msg: MaxMsgLen is below the session inbound message size"
 					);
 				}
 			}
@@ -1391,7 +1400,8 @@ impl<T: Config> Pallet<T> {
 		max.saturating_sub(used).saturating_sub(others)
 	}
 
-	/// The watching rule for an inbound channel: watched, and its delivery queue has room.
+	/// Queue capacity is checked once per item, so the last admitted item can take the queue
+	/// past the page threshold.
 	fn is_consumed(channel: &InChannelId, state: &InChannelState) -> bool {
 		state.is_watched() && T::QueueFootprint::ready_pages(channel) < T::MaxQueueFootprint::get()
 	}

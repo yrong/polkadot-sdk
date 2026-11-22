@@ -50,7 +50,7 @@ parameter_types! {
 pub const SELF_PARA: u32 = 2000;
 
 parameter_types! {
-	pub const MaxMsgLen: u32 = 1024;
+	pub static MaxMsgLen: u32 = 1024;
 	pub const MaxMessagesPerBlock: u32 = 16;
 	pub const MaxInFlight: u32 = 4;
 	pub const MaxSendsPerBlock: u32 = 32;
@@ -58,7 +58,7 @@ parameter_types! {
 	pub const MaxBundleStreams: u32 = 1024;
 	pub const MaxInboundMessagesPerItem: u32 = 16;
 	pub const MaxHelloPassPerBlock: u32 = 2;
-	pub const MaxMessageSize: u32 = 1024;
+	pub static MaxMessageSize: u32 = 1024;
 	pub const MaxQueueFootprint: u32 = 4;
 	pub SelfParaId: ParaId = ParaId::from(SELF_PARA);
 }

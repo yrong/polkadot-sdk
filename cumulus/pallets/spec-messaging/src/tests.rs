@@ -1935,6 +1935,40 @@ fn upgrade_checks_versions_promised_to_inbound_channels() {
 
 #[cfg(feature = "try-runtime")]
 #[test]
+fn upgrade_preserves_the_inbound_size_until_the_session_drains() {
+	new_test_ext().execute_with(|| {
+		let ch = in_channel();
+		let promised = MaxMessageSize::get();
+		accept(ch);
+		MaxMessageSize::set(promised - 1);
+		assert_ok!(SpecMessaging::pre_upgrade());
+
+		MaxMsgLen::set(promised - 1);
+		assert!(SpecMessaging::pre_upgrade().is_err());
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			channel_item(ch, vec![hello(1)])
+		));
+		assert!(SpecMessaging::pre_upgrade().is_err());
+		assert_ok!(SpecMessaging::close_inbound_channel(
+			RuntimeOrigin::root(),
+			ch.sender,
+			ch.domain,
+			ch.num
+		));
+		assert!(SpecMessaging::pre_upgrade().is_err());
+		roll_one_block();
+		let close = ChannelMessage::CloseChannel { session: 1 }.encode();
+		assert_ok!(SpecMessaging::enact_messages(
+			RuntimeOrigin::none(),
+			channel_item(ch, vec![close])
+		));
+		assert_ok!(SpecMessaging::pre_upgrade());
+	});
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
 fn upgrade_checks_the_outbound_version_until_close() {
 	new_test_ext().execute_with(|| {
 		let ch = out_channel();
