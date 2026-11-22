@@ -880,9 +880,16 @@ async fn close_at_full_window(
 				.and_then(|v| v.as_u128())
 				.ok_or_else(|| anyhow!("missing queue book field {name}"))
 		};
-		if field("end")? - field("begin")? < MAX_QUEUE_PAGES {
+		let pages = field("end")? - field("begin")?;
+		if pages < MAX_QUEUE_PAGES {
 			return Ok(false);
 		}
+		// The last item starts below the threshold and each large XCM adds at most one page.
+		let max_pages = MAX_QUEUE_PAGES - 1 + u128::from(MAX_PER_ITEM);
+		anyhow::ensure!(
+			pages <= max_pages,
+			"paused queue has {pages} ready pages, limit {max_pages}"
+		);
 		let consumed = channel_map_at::<InChannelId, InChannelState>(receiver, "InChannels", hash)
 			.await?
 			.remove(&in_channel())
