@@ -24,11 +24,11 @@
 //! - [`Receiver::assemble`]: one lift per recorded stream, checked with `build_requires_entry`.
 
 use crate::{
-	fetch::{fetch, RequestError, Transport},
+	fetch::{fetch, fetch_register_head, RequestError, Transport},
 	pool::{Binding, HeadRead, SourcePool},
 	LOG_TARGET,
 };
-use codec::{DecodeAll, MaxEncodedLen};
+use codec::DecodeAll;
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	build_requires_entry, leaf_hash, mmr::SpecMerge, BroadcastId, ConsumedStreams,
@@ -970,24 +970,9 @@ where
 		stream: StreamId,
 		root: StreamsRoot,
 	) -> Result<(HeadRead, StreamProof), RequestError> {
-		let request = MessagesRequest {
-			stream,
-			under: root,
-			start: None,
-			max_bytes: Register::max_encoded_len() as u32,
-		};
-		let mut response = fetch(&self.transport, source, &request, None).await?;
-		if response.payloads.is_empty() {
-			let request = MessagesRequest {
-				start: Some(MessagePosition(response.frontier.leaf_count())),
-				max_bytes: MAX_SPECULATIVE_MESSAGE_LEN,
-				..request
-			};
-			response = fetch(&self.transport, source, &request, Some(&response.frontier)).await?;
-		}
-		let [payload] = <[Vec<u8>; 1]>::try_from(response.payloads.into_inner())
-			.map_err(|_| RequestError::Unserved { refusals: Vec::new() })?;
-		Ok((HeadRead { under: root, frontier: response.frontier, payload }, response.tree_proof))
+		let (frontier, payload, proof) =
+			fetch_register_head(&self.transport, source, stream, root).await?;
+		Ok((HeadRead { under: root, frontier, payload }, proof))
 	}
 }
 

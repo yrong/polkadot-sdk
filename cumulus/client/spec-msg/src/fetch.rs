@@ -20,11 +20,12 @@
 //! penalized.
 
 use crate::{protocol::PROTOCOL_NAME, LOG_TARGET};
-use codec::{DecodeLimit, Encode};
+use codec::{DecodeLimit, Encode, MaxEncodedLen};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
-	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagesRequest,
-	MessagesResponse, MmrFrontier, VerifyError,
+	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagePosition,
+	MessagesRequest, MessagesResponse, MmrFrontier, Register, StreamId, StreamProof, StreamsRoot,
+	VerifyError, MAX_SPECULATIVE_MESSAGE_LEN,
 };
 use parking_lot::Mutex;
 use sc_network::{IfDisconnected, NetworkRequest, PeerId, ProtocolName};
@@ -200,4 +201,31 @@ pub async fn fetch<T: Transport + ?Sized>(
 		}
 	}
 	Err(RequestError::Unserved { refusals })
+}
+
+/// Fetch a register under `under`, following a position-only head reply from its verified frontier.
+pub(crate) async fn fetch_register_head<T: Transport + ?Sized>(
+	transport: &T,
+	source: ParaId,
+	stream: StreamId,
+	under: StreamsRoot,
+) -> Result<(MmrFrontier, Vec<u8>, StreamProof), RequestError> {
+	let request = MessagesRequest {
+		stream,
+		under,
+		start: None,
+		max_bytes: Register::max_encoded_len() as u32,
+	};
+	let mut response = fetch(transport, source, &request, None).await?;
+	if response.payloads.is_empty() {
+		let request = MessagesRequest {
+			start: Some(MessagePosition(response.frontier.leaf_count())),
+			max_bytes: MAX_SPECULATIVE_MESSAGE_LEN,
+			..request
+		};
+		response = fetch(transport, source, &request, Some(&response.frontier)).await?;
+	}
+	let [payload] = <[Vec<u8>; 1]>::try_from(response.payloads.into_inner())
+		.map_err(|_| RequestError::Unserved { refusals: Vec::new() })?;
+	Ok((response.frontier, payload, response.tree_proof))
 }
