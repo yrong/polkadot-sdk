@@ -1713,6 +1713,8 @@ impl<T: Config> Pallet<T> {
 }
 
 impl<T: Config> ProvideConsumptionRecord for Pallet<T> {
+	const ENABLED: bool = true;
+
 	fn consumption_record() -> ConsumptionRecord {
 		Self::consumption_record()
 	}
