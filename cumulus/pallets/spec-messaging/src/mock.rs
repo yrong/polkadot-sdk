@@ -51,7 +51,7 @@ pub const SELF_PARA: u32 = 2000;
 
 parameter_types! {
 	pub static MaxMsgLen: u32 = 1024;
-	pub const MaxMessagesPerBlock: u32 = 16;
+	pub static MaxMessagesPerBlock: u32 = 16;
 	pub const MaxInFlight: u32 = 4;
 	pub const MaxSendsPerBlock: u32 = 32;
 	pub const MaxTouchedStreams: u32 = 8;

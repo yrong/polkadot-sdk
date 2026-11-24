@@ -129,8 +129,8 @@ fn longest_path<'a, T: Config>(streams: impl Iterator<Item = &'a StreamId>) -> u
 fn queue_send<T: Config>(stream: StreamId) {
 	let payload: BoundedVec<u8, T::MaxMsgLen> = vec![0u8].try_into().expect("1 byte fits; qed");
 	let hash = leaf_hash_with_version(LEAF_VERSION, &payload);
-	OutboundMessages::<T>::insert(stream, BoundedVec::truncate_from(vec![payload]));
-	OutboundLeafHashes::<T>::insert(stream, BoundedVec::truncate_from(vec![hash]));
+	OutboundMessages::<T>::set(stream, vec![payload].try_into().expect("one message fits; qed"));
+	OutboundLeafHashes::<T>::set(stream, vec![hash].try_into().expect("one hash fits; qed"));
 	SendsThisBlock::<T>::mutate(|sends| *sends = sends.saturating_add(1));
 }
 

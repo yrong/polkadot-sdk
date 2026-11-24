@@ -119,6 +119,46 @@ fn append_positions_are_stable_in_a_block_and_advance_across_blocks() {
 }
 
 #[test]
+fn lowering_the_send_cap_preserves_the_committed_frontier() {
+	new_test_ext().execute_with(|| {
+		let stream = stream(0);
+		let messages: Vec<_> = (0u8..17).map(|i| vec![i]).collect();
+		let payloads: Vec<_> = messages.iter().map(Vec::as_slice).collect();
+		for payload in &messages[..9] {
+			assert_ok!(SpecMessaging::append_to_stream(stream, payload.clone()));
+		}
+		SpecMessaging::on_finalize(1);
+		assert_eq!(
+			read_streams_root(&System::digest()),
+			Some(expected_root(&[(stream, &payloads[..9])]))
+		);
+
+		let committed = SpecMessaging::outbound_frontiers();
+		MaxMessagesPerBlock::set(8);
+		assert_eq!(sent_on(stream), messages[..9]);
+		assert_eq!(SpecMessaging::outbound_frontiers(), committed);
+		System::initialize(&2, &Default::default(), &Default::default());
+		SpecMessaging::on_runtime_upgrade();
+		SpecMessaging::on_initialize(2);
+		for (i, payload) in messages.iter().enumerate().skip(9) {
+			assert_eq!(
+				SpecMessaging::append_to_stream(stream, payload.clone()),
+				Ok(MessagePosition(i as u64))
+			);
+		}
+		assert_err!(
+			SpecMessaging::append_to_stream(stream, vec![17]),
+			Error::<Test>::TooManyMessages
+		);
+		SpecMessaging::on_finalize(2);
+		assert_eq!(
+			read_streams_root(&System::digest()),
+			Some(expected_root(&[(stream, &payloads)]))
+		);
+	});
+}
+
+#[test]
 fn a_send_before_on_initialize_belongs_to_its_own_block() {
 	new_test_ext().execute_with(|| {
 		let s = stream(0);

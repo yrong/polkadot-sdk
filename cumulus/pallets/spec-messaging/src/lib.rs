@@ -206,20 +206,26 @@ pub mod pallet {
 		StorageMap<_, Twox64Concat, StreamId, MmrFrontier, ValueQuery>;
 
 	/// Outbound sends of this block only, per stream; drained into the frontiers next block.
+	/// The batch and its leaf hashes must stay readable if an upgrade lowers the per-stream cap.
 	#[pallet::storage]
 	pub type OutboundMessages<T: Config> = StorageMap<
 		_,
 		Twox64Concat,
 		StreamId,
-		BoundedVec<BoundedVec<u8, T::MaxMsgLen>, T::MaxMessagesPerBlock>,
+		WeakBoundedVec<BoundedVec<u8, T::MaxMsgLen>, T::MaxMessagesPerBlock>,
 		ValueQuery,
 	>;
 
 	/// Leaf hashes of [`OutboundMessages`], in the same order. A payload is hashed once, at send,
 	/// so the commit and the next block's drain read only hashes.
 	#[pallet::storage]
-	pub type OutboundLeafHashes<T: Config> =
-		StorageMap<_, Twox64Concat, StreamId, BoundedVec<Hash, T::MaxMessagesPerBlock>, ValueQuery>;
+	pub type OutboundLeafHashes<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		StreamId,
+		WeakBoundedVec<Hash, T::MaxMessagesPerBlock>,
+		ValueQuery,
+	>;
 
 	/// Sends this block, across all streams.
 	#[pallet::storage]
