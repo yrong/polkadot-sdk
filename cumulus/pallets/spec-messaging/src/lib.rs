@@ -87,8 +87,8 @@ pub trait QueueFootprintQuery<Id> {
 	/// Number of ready pages in the channel's delivery queue.
 	fn ready_pages(id: &Id) -> u32;
 
-	/// Upper bound of one [`Self::ready_pages`]. `enact_messages` makes one per channel item and
-	/// charges it on top of its benchmarks, which run with `()`.
+	/// Charged once per channel item for [`Self::ready_pages`]. With [`EnqueueToXcmQueue`],
+	/// include the proof of the existing tail page read by the channel's first enqueue.
 	fn ready_pages_weight() -> Weight {
 		Weight::zero()
 	}
