@@ -164,6 +164,38 @@ fn consumed_payloads_fit_the_message_queue() {
 }
 
 #[test]
+fn enqueue_weight_covers_an_existing_tail_page() {
+	use codec::Encode;
+	use cumulus_pallet_spec_messaging::{Config, OnSpecMsgData, QueueFootprintQuery};
+
+	let mut ext = new_test_ext();
+	ext.execute_with(|| consume(&[vec![0; 100 * 1024]]));
+	ext.commit_all().expect("queued message commits; qed");
+
+	let channel = InChannelId { sender: SIBLING.into(), domain: 0, num: 0 };
+	let (_, proof) = ext.execute_and_prove(|| {
+		assert_eq!(<Runtime as Config>::QueueFootprint::ready_pages(&channel), 1);
+		consume(&[vec![1]]);
+	});
+	let per_channel = <Runtime as Config>::QueueFootprint::ready_pages_weight();
+	type QueueEntries =
+		(pallet_message_queue::BookStateFor<Runtime>, pallet_message_queue::Pages<Runtime>);
+	let entries = <QueueEntries as frame_support::traits::StorageInfoTrait>::storage_info();
+	let proof_bound: u64 = entries
+		.iter()
+		.map(|entry| 2475 + u64::from(entry.max_size.expect("queue entry size is bounded; qed")))
+		.sum();
+	assert!(per_channel.proof_size() >= proof_bound, "each queue entry needs its own proof");
+	let weight = per_channel.saturating_add(<Runtime as Config>::DataHandler::on_data_weight(1));
+	assert!(
+		weight.proof_size() >= proof.encoded_size() as u64,
+		"charged {} proof bytes for a {}-byte enqueue proof",
+		weight.proof_size(),
+		proof.encoded_size(),
+	);
+}
+
+#[test]
 fn a_full_delivery_queue_stops_consuming_its_channel() {
 	new_test_ext().execute_with(|| {
 		let channel = InChannelId { sender: SIBLING.into(), domain: 0, num: 0 };

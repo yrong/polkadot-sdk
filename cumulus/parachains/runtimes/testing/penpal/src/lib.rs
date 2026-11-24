@@ -691,17 +691,21 @@ parameter_types! {
 	pub const SpecMsgSupportedVersions: core::ops::RangeInclusive<u8> = 1..=1;
 }
 
-/// Account for the unbounded queue map's key, value, and trie proof.
-pub struct SpecMsgFootprintQueryWeight;
-impl frame_support::traits::Get<Weight> for SpecMsgFootprintQueryWeight {
+/// Reserve the existing tail page once per channel with the queue book.
+pub struct SpecMsgChannelQueueWeight;
+impl frame_support::traits::Get<Weight> for SpecMsgChannelQueueWeight {
 	fn get() -> Weight {
 		use codec::MaxEncodedLen;
-		let entry = 8 +
-			AggregateMessageOrigin::max_encoded_len() +
+		use frame_support::{StorageHasher, Twox64Concat};
+		let origin_key = Twox64Concat::max_len::<AggregateMessageOrigin>();
+		let book = origin_key +
 			pallet_message_queue::BookState::<AggregateMessageOrigin>::max_encoded_len();
+		let page = origin_key +
+			Twox64Concat::max_len::<u32>() +
+			pallet_message_queue::PageOf::<Runtime>::max_encoded_len();
 		RocksDbWeight::get()
 			.reads(1)
-			.saturating_add(Weight::from_parts(0, 2475 + entry as u64))
+			.saturating_add(Weight::from_parts(0, 2 * 2475 + (book + page) as u64))
 	}
 }
 
@@ -733,7 +737,7 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxQueueFootprint = ConstU32<48>;
 	type QueueFootprint = cumulus_pallet_spec_messaging::QueueFootprintOf<
 		TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>,
-		SpecMsgFootprintQueryWeight,
+		SpecMsgChannelQueueWeight,
 	>;
 	type DataHandler = cumulus_pallet_spec_messaging::EnqueueToXcmQueue<
 		TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>,
