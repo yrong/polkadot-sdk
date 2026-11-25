@@ -21,8 +21,7 @@
 
 use crate::{
 	channel_policy::OutChannelPolicy, BlockStreamsRoot, Config, DeliveryFeeFactor, Error,
-	HrmpClosing, OnSpecMsgData, OutChannels, OutboundLeafHashes, OutboundMessages, Pallet,
-	QueueFootprintQuery, SendsThisBlock,
+	HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages, Pallet, QueueFootprintQuery,
 };
 use alloc::vec::Vec;
 use codec::{DecodeAll, DecodeLimit, Encode};
@@ -281,10 +280,8 @@ impl<T: Config, ChannelInfo, VersionWrapper, Price> InspectMessageQueues
 	for SpecMsgRouter<T, ChannelInfo, VersionWrapper, Price>
 {
 	fn clear_messages() {
-		// These hold only this block's sends, so this isolates a dry run's output.
-		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
-		let _ = OutboundLeafHashes::<T>::clear(u32::MAX, None);
-		SendsThisBlock::<T>::kill();
+		// Earlier sends still count against channel credit after their payloads are cleared.
+		Pallet::<T>::drain_outbound_messages();
 		// The state is the last block's, whose `on_finalize` may have committed a root: a send
 		// would then fail with `RootCommitted`, though it would not in a real block.
 		BlockStreamsRoot::<T>::kill();

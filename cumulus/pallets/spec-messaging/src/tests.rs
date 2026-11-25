@@ -2270,19 +2270,38 @@ mod xcm_layer {
 	}
 
 	#[test]
-	fn a_dry_run_on_a_finalized_block_can_send() {
-		new_test_ext().execute_with(|| {
-			open_xcm_channel();
-			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
-			// Runtime APIs run on the finalized state: the root is committed and the execution
-			// phase is unset.
-			SpecMessaging::on_finalize(System::block_number());
-			let _ = System::finalize();
+	fn a_dry_run_has_the_same_channel_credit_as_the_next_block() {
+		for remaining in [0, 1] {
+			for dry_run in [false, true] {
+				new_test_ext().execute_with(|| {
+					open_xcm_channel();
+					for _ in remaining..MaxInFlight::get() {
+						assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+					}
+					let n = System::block_number();
+					SpecMessaging::on_finalize(n);
+					let _ = System::finalize();
 
-			Router::clear_messages();
-			assert_ok!(send_xcm::<Router>(sibling(), xcm()));
-			assert_eq!(Router::get_messages().len(), 1);
-		});
+					if dry_run {
+						Router::clear_messages();
+					} else {
+						System::initialize(&(n + 1), &Default::default(), &Default::default());
+						SpecMessaging::on_initialize(n + 1);
+						System::note_finished_initialize();
+					}
+					assert!(Router::get_messages().is_empty());
+					for _ in 0..remaining {
+						assert_ok!(send_xcm::<Router>(sibling(), xcm()));
+					}
+					assert_eq!(
+						send_xcm::<Router>(sibling(), xcm()),
+						Err(SendError::Transport("spec-msg XCM channel has no capacity"))
+					);
+					let messages: usize = Router::get_messages().iter().map(|(_, m)| m.len()).sum();
+					assert_eq!(messages, remaining as usize);
+				});
+			}
+		}
 	}
 
 	#[test]

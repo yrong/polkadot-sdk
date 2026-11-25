@@ -1185,7 +1185,6 @@ impl<T: Config> Pallet<T> {
 		BlockStreamsRoot::<T>::kill();
 		ConsumptionOutbox::<T>::kill();
 		Enacted::<T>::kill();
-		SendsThisBlock::<T>::kill();
 
 		let is_first =
 			CumulusDigestItem::find_block_bundle_info(&frame_system::Pallet::<T>::digest())
@@ -1194,6 +1193,13 @@ impl<T: Config> Pallet<T> {
 			BundleStreams::<T>::kill();
 		}
 
+		let drained = Self::drain_outbound_messages();
+		RolledOver::<T>::put((now, drained));
+		drained
+	}
+
+	fn drain_outbound_messages() -> u32 {
+		SendsThisBlock::<T>::kill();
 		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
 		let mut drained = 0u32;
 		for (stream, hashes) in OutboundLeafHashes::<T>::drain() {
@@ -1204,7 +1210,6 @@ impl<T: Config> Pallet<T> {
 			}
 			OutboundFrontier::<T>::insert(stream, frontier);
 		}
-		RolledOver::<T>::put((now, drained));
 		drained
 	}
 
