@@ -667,13 +667,21 @@ fn finality_preserves_a_root_with_a_surviving_writer_after_restart() {
 struct ObservedStore {
 	inner: MemoryStore,
 	reads: std::sync::atomic::AtomicUsize,
+	unreadable_key: Mutex<Option<Vec<u8>>>,
 	writes_before_failure: Mutex<Option<usize>>,
 }
 
 impl ArchiveStore for ObservedStore {
 	fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+		self.try_get(key).ok().flatten()
+	}
+
+	fn try_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
 		self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-		self.inner.get(key)
+		if self.unreadable_key.lock().as_deref() == Some(key) {
+			return Err("injected read failure".into());
+		}
+		Ok(self.inner.get(key))
 	}
 
 	fn commit(&self, batch: crate::Batch) -> Result<(), String> {
@@ -689,6 +697,34 @@ impl ArchiveStore for ObservedStore {
 		assert!(batch.insert.iter().all(|(key, _)| !deleted.contains(key)));
 		self.inner.commit(batch)
 	}
+}
+
+#[test]
+fn a_sibling_import_retries_without_losing_the_first_child() {
+	let stream = channel(2000);
+	let store = Arc::new(ObservedStore::default());
+	let mut archive = Archive::open(store.clone());
+	let mut parent = Model::default();
+	import(&mut archive, &mut parent, 1, vec![(stream, payloads(1, 1))]);
+	let first = import(&mut archive, &mut parent.clone(), 2, vec![(stream, payloads(2, 1))]);
+	let sends = vec![(stream, payloads(3, 1))];
+	let sibling = parent.send(&sends);
+
+	let mut children = b"spec-msg/archive/v2/d".to_vec();
+	children.extend(1u64.encode());
+	*store.unreadable_key.lock() = Some(children);
+	assert!(matches!(
+		archive.import_block(12, 1, 2, 0, sends.clone(), Some(sibling)),
+		Err(ArchiveError::Store(_))
+	));
+	assert!(!archive.contains(&12));
+	assert_eq!(served(&archive, &head(stream, first, u32::MAX)), Ok(payloads(2, 1)));
+
+	*store.unreadable_key.lock() = None;
+	archive.import_block(12, 1, 2, 0, sends, Some(sibling)).unwrap();
+	archive.retain(12, &BTreeMap::new(), 0).unwrap();
+	assert_eq!(served(&archive, &head(stream, first, u32::MAX)), Err(FetchError::UnknownRoot));
+	assert_eq!(served(&archive, &head(stream, sibling, u32::MAX)), Ok(payloads(3, 1)));
 }
 
 #[test]
