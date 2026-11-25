@@ -294,10 +294,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	system_version: 1,
 };
 
-const RELAY_PARENT_OFFSET: u32 = 1;
-
-/// Blocks per relay block; the collator bundles them into one PoV.
-const BLOCK_PROCESSING_VELOCITY: u32 = 3;
+const RELAY_PARENT_OFFSET: u32 = 0;
 
 // Unit = the base number of indivisible units for balances
 pub const UNIT: Balance = 1_000_000_000_000;
@@ -600,7 +597,7 @@ type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
 	Runtime,
 	RELAY_CHAIN_SLOT_DURATION_MILLIS,
 	BLOCK_PROCESSING_VELOCITY,
-	{ (UNINCLUDED_SEGMENT_CAPACITY + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY },
+	UNINCLUDED_SEGMENT_CAPACITY,
 >;
 
 impl cumulus_pallet_parachain_system::Config for Runtime {
@@ -618,7 +615,7 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 		Runtime,
 		RELAY_CHAIN_SLOT_DURATION_MILLIS,
 		BLOCK_PROCESSING_VELOCITY,
-		{ (UNINCLUDED_SEGMENT_CAPACITY + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY },
+		UNINCLUDED_SEGMENT_CAPACITY,
 	>;
 
 	type RelayParentOffset = ConstU32<RELAY_PARENT_OFFSET>;
@@ -725,7 +722,7 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxMsgLen = ConstU32<102400>;
 	type MaxMessagesPerBlock = ConstU32<256>;
 	type MaxInFlight = ConstU32<128>;
-	// Keep sends within each block's share of the bundled PoV.
+	// Bound the work from hook-driven sends, which can run without a block-room check.
 	type MaxSendsPerBlock = ConstU32<512>;
 	type MaxTouchedStreams = ConstU32<14>;
 	type MaxBundleStreams = ConstU32<3000>;
@@ -1249,12 +1246,6 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 
 		fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
 			genesis_config_presets::preset_names()
-		}
-	}
-
-	impl cumulus_primitives_core::TargetBlockRate<Block> for Runtime {
-		fn target_block_rate() -> u32 {
-			BLOCK_PROCESSING_VELOCITY
 		}
 	}
 

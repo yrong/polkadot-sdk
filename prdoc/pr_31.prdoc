@@ -1,31 +1,40 @@
-title: Route sibling XCM over speculative messaging
+title: Add the parachain messaging pallet and route sibling XCM
 doc:
 - audience: Runtime Dev
   description: |-
-    To enable this transport, place `SpecMsgRouter` before `XcmpQueue`. HRMP keeps priority
-    until the runtime marks the channel as closing. With HRMP closed or marked as closing,
-    an open speculative messaging channel can carry the XCM. If that channel closes during
-    cutover, new sends fail until it reopens or the runtime clears the HRMP closing flag.
-    Wait for the sender and relay queues to drain before requesting HRMP closure.
+    Penpal uses the new messaging pallet to send sibling XCM. To enable it in another runtime,
+    configure the pallet as the parachain system's `ConsumptionRecordSource`, implement
+    `SpecMsgApi` for collators, and use `EnqueueToXcmQueue` for the XCM lane. Run try-runtime
+    before narrowing `SupportedVersions` or reducing `MaxMsgLen` for live channels.
 
-    Handle `AggregateMessageOrigin::SpecMsg(InChannelId)` in exhaustive matches on the
-    Cumulus and bridge-hub queue origins. Each inbound channel has its own queue and
-    executes XCM with the sender's sibling origin. Runtimes using the messaging pallet must
-    configure `ChannelManagementOrigin` for HRMP cutover and inbound queue pause or resume.
+    Place `SpecMsgRouter` before `XcmpQueue`. HRMP keeps priority until marked as closing.
+    During cutover, new sends use the open spec-msg channel and fail if it closes. Drain both
+    the sender and relay HRMP queues before requesting closure.
 
-    Offboarding cleanup clears queue pauses for the listed lanes so previously queued XCM can drain.
+    Handle `AggregateMessageOrigin::SpecMsg(InChannelId)` in exhaustive matches on Cumulus and
+    bridge-hub queue origins. Each inbound channel has its own queue and executes XCM with the
+    sender's sibling origin. Configure `ChannelManagementOrigin` for cutover and queue control.
 
-    EnqueueToXcmQueue accepts only the XCM lane (domain 0, channel 0).
-
-    For sibling XCM benchmarks over spec-msg, use the messaging pallet as the
-    `ToParachainDeliveryHelper` setup type and the router's `Price` as `PriceForDelivery`.
-    Leave HRMP closed for the benchmark destination.
+    For sibling XCM benchmarks, use the pallet as the `ToParachainDeliveryHelper` setup type,
+    the router's `Price` as `PriceForDelivery`, and a destination with HRMP closed.
+    Emulated chains can inspect block writes after pallet finalization through
+    `AdditionalInherentCode::on_finalize_block`.
 crates:
 - name: cumulus-pallet-spec-messaging
-  bump: major
+  bump: minor
 - name: cumulus-primitives-core
   bump: major
+- name: cumulus-pallet-parachain-system
+  bump: none
+- name: polkadot-omni-node-lib
+  bump: none
+- name: frame-benchmarking-cli
+  bump: none
 - name: parachains-common
-  bump: major
+  bump: minor
 - name: bridge-hub-common
   bump: major
+- name: penpal-runtime
+  bump: major
+- name: xcm-emulator
+  bump: minor
