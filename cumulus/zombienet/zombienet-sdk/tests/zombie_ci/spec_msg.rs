@@ -443,22 +443,19 @@ async fn send_batch_and_follow(
 				);
 				consumed = reached;
 			}
-			for event in block.events().await?.iter() {
-				let event = event?;
-				if event.pallet_name() != "MessageQueue" || event.variant_name() != "Processed" {
-					continue;
-				}
-				let values = event.field_values()?;
-				let Some(id) = values.at("id").map(flatten).filter(|id| ids.contains(id)) else {
-					continue;
-				};
-				let fields = format!("{values:?}");
-				if !fields.contains("SpecMsg") || !fields.contains("Bool(true)") {
-					return Err(anyhow!("XCM {id:?} not executed over spec-msg: {fields}"));
-				}
-				processed.push(id);
-			}
+			processed.extend(delivered_ids(&block, &ids).await?);
+			anyhow::ensure!(
+				ids.starts_with(&processed),
+				"the batch repeated or executed out of order"
+			);
 			if processed.len() == ids.len() {
+				let next =
+					blocks.next().await.ok_or_else(|| anyhow!("receiver finality ended"))??;
+				anyhow::ensure!(
+					delivered_ids(&next, &ids).await?.is_empty(),
+					"a batch XCM executed again in finalized block #{}",
+					next.number()
+				);
 				return Ok(());
 			}
 		}
@@ -468,9 +465,6 @@ async fn send_batch_and_follow(
 		.await
 		.map_err(|_| anyhow!("the batch was not executed within 5 minutes"))??;
 
-	if processed != ids {
-		return Err(anyhow!("the batch executed out of order"));
-	}
 	// `pallet-xcm` may send a small leaf after the batch, which the last block can consume too.
 	if consumed < end || cuts < 2 {
 		return Err(anyhow!("consumed up to {consumed} of {end} with {cuts} cut blocks"));
