@@ -1249,7 +1249,7 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 		}
 	}
 
-	impl cumulus_primitives_core::SpecMsgApi<Block> for Runtime {
+	impl cumulus_primitives_spec_messaging::SpecMsgApi<Block> for Runtime {
 		fn outbound_messages() -> Vec<(cumulus_primitives_spec_messaging::StreamId, Vec<Vec<u8>>)> {
 			SpecMessaging::outbound_messages()
 		}

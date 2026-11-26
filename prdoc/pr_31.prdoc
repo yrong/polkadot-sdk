@@ -24,6 +24,8 @@ crates:
   bump: minor
 - name: cumulus-primitives-core
   bump: major
+- name: cumulus-primitives-spec-messaging
+  bump: minor
 - name: cumulus-pallet-parachain-system
   bump: none
 - name: polkadot-omni-node-lib
