@@ -33,10 +33,10 @@ use crate::{
 	LOG_TARGET,
 };
 use codec::{Decode, DecodeAll, Encode};
-use cumulus_primitives_core::{ParaId, SpecMsgApi};
+use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	streams_root::read_streams_root, FetchError, MessagePosition, MessagesRequest, MmrFrontier,
-	Register, StreamId, StreamsRoot,
+	Register, SpecMsgApi, StreamId, StreamsRoot,
 };
 use futures::{select, FutureExt, StreamExt};
 use parking_lot::{Mutex, RwLock};
