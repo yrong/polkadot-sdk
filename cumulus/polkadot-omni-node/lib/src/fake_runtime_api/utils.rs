@@ -275,7 +275,7 @@ macro_rules! impl_node_runtime_apis {
 				}
 			}
 
-			impl cumulus_primitives_core::SpecMsgApi<$block> for $runtime {
+			impl cumulus_primitives_spec_messaging::SpecMsgApi<$block> for $runtime {
 				fn outbound_messages(
 				) -> Vec<(cumulus_primitives_spec_messaging::StreamId, Vec<Vec<u8>>)> {
 					unimplemented!()

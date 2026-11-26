@@ -32,8 +32,10 @@ use crate::{
 	LOG_TARGET,
 };
 use cumulus_client_collator::service::{SpecMsgAssembler, SpecMsgInputs};
-use cumulus_primitives_core::{CumulusDigestItem, ParaId, SpecMsgApi};
-use cumulus_primitives_spec_messaging::{ConsumptionRecord, MessagingInherentData, StreamsRoot};
+use cumulus_primitives_core::{CumulusDigestItem, ParaId};
+use cumulus_primitives_spec_messaging::{
+	ConsumptionRecord, MessagingInherentData, SpecMsgApi, StreamsRoot,
+};
 use cumulus_relay_chain_interface::{PHash, RelayChainInterface};
 use futures::{select, stream::FuturesUnordered, Stream, StreamExt};
 use sc_client_api::BlockchainEvents;

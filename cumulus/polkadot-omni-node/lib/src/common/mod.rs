@@ -32,8 +32,8 @@ use crate::cli::AuthoringPolicy;
 
 use cumulus_primitives_core::{
 	CollectCollationInfo, GetParachainInfo, RelayParentOffsetApi, SchedulingV3EnabledApi,
-	SpecMsgApi,
 };
+use cumulus_primitives_spec_messaging::SpecMsgApi;
 use sc_client_db::DbHash;
 use sc_network_sync::strategy::chain_sync::{GapSyncBodyPolicy, GapSyncBodyPolicyProvider};
 use sc_offchain::OffchainWorkerApi;
