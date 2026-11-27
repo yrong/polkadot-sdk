@@ -1025,7 +1025,7 @@ impl FinalizedRoots for FakeRoots {
 }
 
 fn register(up_to: u64) -> Vec<u8> {
-	let status = RegisterStatus::Accepting { session: 0, min: 0, max: 0, max_message_size: 0 };
+	let status = RegisterStatus::Open { max_message_size: 1024 };
 	Register { up_to: MessagePosition(up_to), status }.encode()
 }
 
