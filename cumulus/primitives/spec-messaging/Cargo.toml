@@ -16,6 +16,7 @@ async-trait = { optional = true, workspace = true }
 codec = { features = ["derive"], workspace = true }
 mmr-lib = { workspace = true, default-features = false }
 scale-info = { features = ["derive"], workspace = true }
+sp-api = { workspace = true }
 sp-core = { workspace = true }
 sp-inherents = { workspace = true }
 sp-runtime = { workspace = true }
@@ -39,6 +40,7 @@ std = [
 	"polkadot-parachain-primitives/std",
 	"polkadot-primitives/std",
 	"scale-info/std",
+	"sp-api/std",
 	"sp-core/std",
 	"sp-inherents/std",
 	"sp-runtime/std",

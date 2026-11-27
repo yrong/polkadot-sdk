@@ -27,6 +27,8 @@
 
 extern crate alloc;
 
+use alloc::{collections::BTreeMap, vec::Vec};
+
 pub mod channel;
 pub mod fetch;
 pub mod inherent;
@@ -43,8 +45,8 @@ mod conformance_vectors;
 mod test_utils;
 
 pub use channel::{
-	AppliedRegister, BroadcastId, ChannelMessage, InChannelId, InChannelState, OpenSession,
-	OutChannelId, OutChannelState, Register, RegisterStatus, SessionParams,
+	AppliedRegister, BroadcastId, ChannelMessage, InChannelId, InChannelState, InboundStatus,
+	OutChannelId, OutChannelState, Register, RegisterStatus,
 };
 pub use fetch::{
 	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagesRequest,
@@ -66,6 +68,35 @@ pub use streams_root::{
 	InnerNode, NodeKey, NodeLookup, NodeStore, StreamProof, StreamsRoot, StreamsTree, TreeChild,
 	TreeError, TreeRootEntry,
 };
+
+sp_api::decl_runtime_apis! {
+	/// The speculative-messaging node/runtime boundary: everything a collator authors and serves
+	/// by. Absent on runtimes without speculative messaging; nodes stay idle then.
+	pub trait SpecMsgApi {
+		/// This block's sends, per stream, in canonical `StreamId` order with payloads in send
+		/// order. What a collator appends to its archive. Empty for an idle block.
+		fn outbound_messages() -> Vec<(StreamId, Vec<Vec<u8>>)>;
+
+		/// Every outbound stream's frontier after this block's sends, in `StreamId` order. A node
+		/// without the state of earlier blocks seeds its archive from it.
+		fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)>;
+
+		/// Last applied ACK per outbound lane, or zero until its first ACK. A closed lane keeps its
+		/// last value until cleanup. Archive nodes read this at sender finality.
+		fn outbound_up_to() -> BTreeMap<OutChannelId, MessagePosition>;
+
+		/// Everything the inherent provider should fetch, and from which position on.
+		fn consumed_streams() -> ConsumedStreams;
+
+		/// `MaxTouchedStreams`: how many streams one inherent may touch per block.
+		fn max_touched_streams() -> u32;
+
+		/// The block's consumption record. The node uses it for acknowledgement checks and lift
+		/// assembly; the `validate_block` wrapper calls the same implementation in-wasm after
+		/// each block of a bundle.
+		fn consumption_record() -> ConsumptionRecord;
+	}
+}
 
 /// How `parachain-system` reads a block's consumption record without depending on the messaging
 /// pallet. `()` records nothing and rejects V3 PoVs.

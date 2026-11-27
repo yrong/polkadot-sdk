@@ -24,10 +24,7 @@
 //! - [`Register`] is the SCALE payload of every ack-stream leaf: the receiver's complete voice in
 //! the channel, lossy and latest-wins, read out-of-band by the sender.
 //!
-//! [`ChannelMessage::Hello`] (index 0), [`ChannelMessage::CloseChannel`] (index 1) and the
-//! [`Register`] / [`RegisterStatus`] layout are the frozen core: they parse at every channel
-//! version. Variants beyond it (such as [`ChannelMessage::Data`] at index 2) are interpreted under
-//! the session's negotiated channel version. The tests pin their byte layouts.
+//! The domain identifies the channel protocol. A closed lane number cannot be reused.
 //!
 //! # Local state
 //!
@@ -50,21 +47,14 @@ use crate::{
 	stream::StreamId,
 };
 
-/// The payload of every channel-stream MMR leaf: session signalling or userspace data.
+/// The payload of every channel-stream MMR leaf: userspace data or the terminal close marker.
 #[derive(Clone, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, TypeInfo)]
 pub enum ChannelMessage {
-	/// Frozen core (index 0). Opens session `session` at `version`, chosen from the range the
-	/// receiver advertised in [`RegisterStatus::Accepting`].
+	/// Size limits apply to the whole encoded leaf payload, including the channel envelope.
 	#[codec(index = 0)]
-	Hello { session: u32, version: u8 },
-	/// Frozen core (index 1). Last leaf of a session the sender took part in; nothing further
-	/// until a new session opens.
-	#[codec(index = 1)]
-	CloseChannel { session: u32 },
-	/// Channel version 1 (index 2). Userspace payload bytes, delivered in order. Size bounds apply
-	/// to the whole encoded leaf payload, envelope included.
-	#[codec(index = 2)]
 	Data(Vec<u8>),
+	#[codec(index = 1)]
+	Close,
 }
 
 /// The receiver's complete voice in a channel, published as a leaf on its `Ack` stream.
@@ -85,11 +75,11 @@ pub struct Register {
 	/// Cumulative watermark: all positions `< up_to` of the channel's data stream (data and
 	/// signals alike) have been consumed.
 	pub up_to: MessagePosition,
-	/// Current session status.
+	/// Current lane status.
 	pub status: RegisterStatus,
 }
 
-/// Receiver-side session status carried in a [`Register`].
+/// Receiver-side lane status carried in a [`Register`].
 #[derive(
 	Clone,
 	Copy,
@@ -103,16 +93,15 @@ pub struct Register {
 	TypeInfo,
 )]
 pub enum RegisterStatus {
-	/// Session `session` accepted; the sender may open it with a [`ChannelMessage::Hello`] at a
-	/// version in `min..=max` and encoded leaf size at most `max_message_size`.
+	/// The receiver accepts data up to the advertised size limit.
 	#[codec(index = 0)]
-	Accepting { session: u32, min: u8, max: u8, max_message_size: u32 },
-	/// The receiver consumed the session's `Hello`; data may flow.
+	Open { max_message_size: u32 },
+	/// The receiver is draining the lane and requests a [`ChannelMessage::Close`] marker.
 	#[codec(index = 1)]
-	Opened,
-	/// Session `session` is closing or closed; `up_to` reports the drain's progress.
+	Closing,
+	/// The receiver has stopped consuming this lane.
 	#[codec(index = 2)]
-	Closed { session: u32 },
+	Closed,
 }
 
 /// A channel this chain sends on, named by its recipient.
@@ -217,24 +206,6 @@ impl BroadcastId {
 	}
 }
 
-/// A session's negotiated parameters, fixed from `Accepting` to `Closed`.
-#[derive(
-	Clone,
-	Copy,
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	PartialEq,
-	Eq,
-	Debug,
-	TypeInfo,
-)]
-pub struct SessionParams {
-	pub version: u8,
-	pub max_message_size: u32,
-}
-
 /// A register applied by the sender, with its position on the recipient's `Ack` stream (the ack
 /// highwater).
 #[derive(
@@ -254,26 +225,6 @@ pub struct AppliedRegister {
 	pub register: Register,
 }
 
-/// The session the sender took part in (sent `Hello` for), its parameters, and whether the sender
-/// has applied its `Opened` register.
-#[derive(
-	Clone,
-	Copy,
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	PartialEq,
-	Eq,
-	Debug,
-	TypeInfo,
-)]
-pub struct OpenSession {
-	pub session: u32,
-	pub params: SessionParams,
-	pub opened: bool,
-}
-
 /// Sender side, per outbound channel.
 #[derive(
 	Clone,
@@ -289,19 +240,28 @@ pub struct OpenSession {
 	TypeInfo,
 )]
 pub struct OutChannelState {
-	/// Own intent: set by `open()`, cleared by `close()`. Survives receiver-initiated closes so
-	/// the sender reopens on the next `Accepting`.
 	pub want_open: bool,
-	/// Latest session number seen in `Accepting` or `Closed` (register validation).
-	pub session: u32,
-	/// Latest register applied, with its position on the recipient's `Ack` stream.
 	pub register: Option<AppliedRegister>,
-	/// The session we took part in (sent `Hello` for), its parameters, and whether we applied its
-	/// `Opened`.
-	pub open: Option<OpenSession>,
-	/// The session we sent `CloseChannel` for: no `Data` in it any more, and no second
-	/// `CloseChannel`.
-	pub closed_session: Option<u32>,
+}
+
+/// Local close state distinguishes an orderly drain from governance abandoning the tail.
+#[derive(
+	Clone,
+	Copy,
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	PartialEq,
+	Eq,
+	Debug,
+	TypeInfo,
+)]
+pub enum InboundStatus {
+	Open,
+	Closing,
+	Closed,
+	ForceClosed,
 }
 
 /// Receiver side, per inbound channel.
@@ -312,17 +272,10 @@ pub struct InChannelState {
 	/// Our copy of the sender's channel stream: incoming messages are appended to it; its leaf
 	/// count is the position of the next message to consume.
 	pub frontier: MmrFrontier,
-	/// Current session.
-	pub session: u32,
-	/// Current status.
-	pub status: RegisterStatus,
-	/// The register last published, verbatim (`None` before the first).
+	pub status: InboundStatus,
+	/// The advertised limit remains in force while closing.
+	pub max_message_size: u32,
 	pub published: Option<Register>,
-	/// The session's parameters, set by the session's `Hello` and cleared when it closes (`Some`
-	/// while `Opened` or `Draining`).
-	pub open: Option<SessionParams>,
-	/// Draining: `Closed` but still consuming toward `CloseChannel { session }`.
-	pub draining: bool,
 }
 
 #[cfg(test)]
@@ -364,13 +317,9 @@ mod tests {
 	}
 
 	#[test]
-	fn channel_message_frozen_core_variant_indices() {
-		assert_eq!(
-			ChannelMessage::Hello { session: 3, version: 7 }.encode(),
-			vec![0x00, 0x03, 0, 0, 0, 0x07],
-		);
-		assert_eq!(ChannelMessage::CloseChannel { session: 5 }.encode(), vec![0x01, 0x05, 0, 0, 0]);
-		assert_eq!(ChannelMessage::Data(vec![0xAA]).encode(), vec![0x02, 0x04, 0xAA]);
+	fn channel_message_encoding() {
+		assert_eq!(ChannelMessage::Close.encode(), vec![1]);
+		assert_eq!(ChannelMessage::Data(vec![0xaa]).encode(), vec![0, 4, 0xaa]);
 	}
 
 	#[test]
@@ -383,36 +332,17 @@ mod tests {
 	}
 
 	#[test]
-	fn register_frozen_layout() {
-		let accepting = Register {
-			up_to: MessagePosition(5),
-			status: RegisterStatus::Accepting {
-				session: 1,
-				min: 1,
-				max: 3,
-				max_message_size: 1024,
-			},
-		};
-		assert_eq!(
-			accepting.encode(),
-			vec![
-				0x05, 0, 0, 0, 0, 0, 0, 0,    // up_to: u64 LE = 5
-				0x00, // status: Accepting (index 0)
-				0x01, 0, 0, 0,    // session: u32 LE = 1
-				0x01, // min: u8 = 1
-				0x03, // max: u8 = 3
-				0x00, 0x04, 0, 0, // max_message_size: u32 LE = 1024
-			],
-		);
-		assert_eq!(Register::decode(&mut &accepting.encode()[..]).unwrap(), accepting);
-
-		let opened = Register { up_to: MessagePosition(9), status: RegisterStatus::Opened };
-		assert_eq!(opened.encode(), vec![0x09, 0, 0, 0, 0, 0, 0, 0, 0x01]);
-		assert_eq!(Register::decode(&mut &opened.encode()[..]).unwrap(), opened);
-
-		let closed =
-			Register { up_to: MessagePosition(12), status: RegisterStatus::Closed { session: 2 } };
-		assert_eq!(closed.encode(), vec![0x0c, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0]);
-		assert_eq!(Register::decode(&mut &closed.encode()[..]).unwrap(), closed);
+	fn register_encoding() {
+		for (status, tail) in [
+			(RegisterStatus::Open { max_message_size: 1024 }, vec![0, 0, 4, 0, 0]),
+			(RegisterStatus::Closing, vec![1]),
+			(RegisterStatus::Closed, vec![2]),
+		] {
+			let register = Register { up_to: MessagePosition(5), status };
+			let mut expected = 5u64.to_le_bytes().to_vec();
+			expected.extend(tail);
+			assert_eq!(register.encode(), expected);
+			assert_eq!(Register::decode(&mut &expected[..]).unwrap(), register);
+		}
 	}
 }

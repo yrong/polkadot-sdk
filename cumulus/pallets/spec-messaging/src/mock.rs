@@ -1,0 +1,289 @@
+// Copyright (C) Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate as cumulus_pallet_spec_messaging;
+use cumulus_primitives_core::AggregateMessageOrigin;
+use cumulus_primitives_spec_messaging::InChannelId;
+use frame_support::{
+	derive_impl,
+	pallet_prelude::Weight,
+	parameter_types,
+	traits::{ConstU32, EnqueueMessage, Everything, Nothing, TransformOrigin},
+	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, RuntimeDbWeight},
+	BoundedSlice,
+};
+use frame_system::EnsureRoot;
+use parachains_common::message_queue::{ChannelToSpecMsg, NarrowOriginToSpecMsg, ParaIdToSibling};
+use polkadot_parachain_primitives::primitives::Id as ParaId;
+use sp_runtime::BuildStorage;
+
+type Block = frame_system::mocking::MockBlock<Test>;
+
+frame_support::construct_runtime!(
+	pub enum Test {
+		System: frame_system,
+		SpecMessaging: cumulus_pallet_spec_messaging,
+		MessageQueue: pallet_message_queue,
+		XcmpQueue: cumulus_pallet_xcmp_queue,
+	}
+);
+
+#[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+impl frame_system::Config for Test {
+	type Block = Block;
+	type BlockWeights = MockBlockWeights;
+	type DbWeight = MockDbWeight;
+}
+
+parameter_types! {
+	pub const MockDbWeight: RuntimeDbWeight = RuntimeDbWeight { read: 1_000, write: 2_000 };
+	// A finite proof limit, which `MaxBundleStreams` must cover.
+	pub MockBlockWeights: frame_system::limits::BlockWeights =
+		frame_system::limits::BlockWeights::with_sensible_defaults(
+			Weight::from_parts(2 * WEIGHT_REF_TIME_PER_SECOND, 2 << 20),
+			sp_runtime::Perbill::from_percent(75),
+		);
+}
+
+pub const SELF_PARA: u32 = 2000;
+
+parameter_types! {
+	pub static MaxMsgLen: u32 = 1024;
+	pub static MaxMessagesPerBlock: u32 = 16;
+	pub const MaxInFlight: u32 = 4;
+	pub const MaxSendsPerBlock: u32 = 32;
+	pub const MaxTouchedStreams: u32 = 8;
+	pub const MaxBundleStreams: u32 = 1024;
+	pub const MaxInboundMessagesPerItem: u32 = 16;
+	pub static MaxMessageSize: u32 = 1024;
+	pub const MaxQueueFootprint: u32 = 4;
+	pub SelfParaId: ParaId = ParaId::from(SELF_PARA);
+}
+
+impl cumulus_pallet_spec_messaging::Config for Test {
+	type SelfParaId = SelfParaId;
+	type MaxMsgLen = MaxMsgLen;
+	type MaxMessagesPerBlock = MaxMessagesPerBlock;
+	type MaxInFlight = MaxInFlight;
+	type MaxSendsPerBlock = MaxSendsPerBlock;
+	type MaxTouchedStreams = MaxTouchedStreams;
+	type MaxBundleStreams = MaxBundleStreams;
+	type MaxInboundMessagesPerItem = MaxInboundMessagesPerItem;
+	type MaxMessageSize = MaxMessageSize;
+	type MaxQueueFootprint = MaxQueueFootprint;
+	type QueueFootprint = MockQueueFootprint;
+	type DataHandler = crate::EnqueueToXcmQueue<RecordingQueue, EnqueueWeight>;
+	type WeightInfo = ();
+	type OpenChannelOrigin = EnsureRoot<u64>;
+	type AcceptChannelOrigin = EnsureRoot<u64>;
+	type ChannelManagementOrigin = EnsureRoot<u64>;
+}
+
+parameter_types! {
+	/// Messages [`RecordingQueue`] received: `(channel, message)`.
+	pub static Enqueued: Vec<(InChannelId, Vec<u8>)> = Vec::new();
+	/// [`RecordingQueue`]'s `MaxMessageLen`: above the pallet's `MaxMsgLen` by default, so every
+	/// consumed payload fits. The oversize test lowers it.
+	pub static QueueMaxLen: u32 = 2048;
+	/// HRMP channel state [`MockHrmp`] reports for every sibling.
+	pub static HrmpState: HrmpChannel = HrmpChannel::Closed;
+	/// Proof size [`EnqueueWeight`] charges per payload; the block-weight integrity test raises it.
+	pub static EnqueueProof: u64 = 0;
+}
+
+/// Weight of enqueueing a payload: one picosecond per byte, so tests can see it charged.
+pub struct EnqueueWeight;
+
+impl sp_runtime::traits::Convert<u32, Weight> for EnqueueWeight {
+	fn convert(len: u32) -> Weight {
+		Weight::from_parts(u64::from(len), EnqueueProof::get())
+	}
+}
+
+/// Message queue that records what it is given, bounded by [`QueueMaxLen`].
+pub struct RecordingQueue;
+
+type SpecMsgQueue =
+	TransformOrigin<MessageQueue, AggregateMessageOrigin, InChannelId, ChannelToSpecMsg>;
+
+impl EnqueueMessage<InChannelId> for RecordingQueue {
+	type MaxMessageLen = QueueMaxLen;
+
+	fn enqueue_message(message: BoundedSlice<u8, Self::MaxMessageLen>, origin: InChannelId) {
+		Enqueued::mutate(|enqueued| enqueued.push((origin, message.to_vec())));
+		SpecMsgQueue::enqueue_message(
+			(&message[..]).try_into().expect("test queue fits the recorded message; qed"),
+			origin,
+		);
+	}
+
+	fn enqueue_messages<'a>(
+		messages: impl Iterator<Item = BoundedSlice<'a, u8, Self::MaxMessageLen>>,
+		origin: InChannelId,
+	) {
+		messages.for_each(|message| Self::enqueue_message(message, origin));
+	}
+
+	fn sweep_queue(origin: InChannelId) {
+		SpecMsgQueue::sweep_queue(origin);
+	}
+}
+
+/// The HRMP channel state tests can set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HrmpChannel {
+	Closed,
+	Ready,
+	Full,
+}
+
+/// HRMP channel info for the XCM router tests: every sibling is in [`HrmpState`].
+pub struct MockHrmp;
+
+impl cumulus_primitives_core::GetChannelInfo for MockHrmp {
+	fn get_channel_status(_: ParaId) -> cumulus_primitives_core::ChannelStatus {
+		use cumulus_primitives_core::ChannelStatus;
+		match HrmpState::get() {
+			HrmpChannel::Closed => ChannelStatus::Closed,
+			HrmpChannel::Ready => ChannelStatus::Ready(1024, 1024),
+			HrmpChannel::Full => ChannelStatus::Full,
+		}
+	}
+
+	fn get_channel_info(_: ParaId) -> Option<cumulus_primitives_core::ChannelInfo> {
+		None
+	}
+}
+
+parameter_types! {
+	pub FeeAssetId: xcm::latest::AssetId = xcm::latest::AssetId(xcm::latest::Location::here());
+	pub const BaseDeliveryFee: u128 = 1_000;
+	pub const ByteFee: u128 = 1;
+}
+
+/// The router as a runtime would wire it, with no version negotiation.
+pub type Router = crate::SpecMsgRouter<
+	Test,
+	MockHrmp,
+	(),
+	polkadot_runtime_common::xcm_sender::ExponentialPrice<
+		FeeAssetId,
+		BaseDeliveryFee,
+		ByteFee,
+		SpecMessaging,
+	>,
+>;
+
+std::thread_local! {
+	/// Ready pages every delivery queue reports.
+	pub static READY_PAGES: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+pub struct MockQueueFootprint;
+
+impl crate::QueueFootprintQuery<cumulus_primitives_spec_messaging::InChannelId>
+	for MockQueueFootprint
+{
+	fn is_empty(id: &cumulus_primitives_spec_messaging::InChannelId) -> bool {
+		Self::ready_pages(id) == 0
+	}
+
+	fn ready_pages(_: &cumulus_primitives_spec_messaging::InChannelId) -> u32 {
+		READY_PAGES.with(|p| p.get())
+	}
+
+	fn ready_pages_weight() -> Weight {
+		Weight::from_parts(25_000_000, 2536)
+	}
+}
+
+pub fn new_test_ext() -> sp_io::TestExternalities {
+	let mut ext: sp_io::TestExternalities =
+		frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into();
+	ext.execute_with(|| {
+		System::initialize(&1, &Default::default(), &Default::default());
+	});
+	ext
+}
+
+parameter_types! {
+	pub BaseXcmWeight: Weight = Weight::from_parts(1_000, 0);
+	pub UniversalLocation: xcm::latest::InteriorLocation = xcm::latest::Junctions::Here;
+}
+
+impl cumulus_pallet_xcmp_queue::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+	type ChannelInfo = MockHrmp;
+	type VersionWrapper = ();
+	type XcmpQueue = TransformOrigin<MessageQueue, AggregateMessageOrigin, ParaId, ParaIdToSibling>;
+	type MaxInboundSuspended = ConstU32<1_000>;
+	type MaxActiveOutboundChannels = ConstU32<128>;
+	type MaxPageSize = ConstU32<{ 103 * 1024 }>;
+	type ControllerOrigin = EnsureRoot<u64>;
+	type ControllerOriginConverter = ();
+	type WeightInfo = ();
+	type PriceForSiblingDelivery =
+		polkadot_runtime_common::xcm_sender::NoPriceForMessageDelivery<ParaId>;
+}
+
+impl pallet_message_queue::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+	type MessageProcessor = xcm_builder::ProcessXcmMessage<
+		AggregateMessageOrigin,
+		xcm_executor::XcmExecutor<TestXcmConfig>,
+		RuntimeCall,
+	>;
+	type Size = u32;
+	type QueueChangeHandler = ();
+	type QueuePausedQuery = NarrowOriginToSpecMsg<SpecMessaging>;
+	type HeapSize = ConstU32<{ 103 * 1024 }>;
+	type MaxStale = ConstU32<8>;
+	type ServiceWeight = ();
+	type IdleMaxServiceWeight = ();
+	type WeightInfo = ();
+}
+
+pub struct TestXcmConfig;
+impl xcm_executor::Config for TestXcmConfig {
+	type RuntimeCall = RuntimeCall;
+	type XcmSender = ();
+	type XcmEventEmitter = ();
+	type AssetTransactor = ();
+	type OriginConverter = ();
+	type IsReserve = ();
+	type IsTeleporter = ();
+	type UniversalLocation = UniversalLocation;
+	type Barrier = xcm_builder::AllowUnpaidExecutionFrom<Everything>;
+	type Weigher = xcm_builder::FixedWeightBounds<BaseXcmWeight, RuntimeCall, ConstU32<100>>;
+	type Trader = ();
+	type ResponseHandler = ();
+	type AssetTrap = ();
+	type AssetLocker = ();
+	type AssetExchanger = ();
+	type SubscriptionService = ();
+	type PalletInstancesInfo = ();
+	type FeeManager = ();
+	type MaxAssetsIntoHolding = ConstU32<64>;
+	type MessageExporter = ();
+	type UniversalAliases = Nothing;
+	type CallDispatcher = RuntimeCall;
+	type SafeCallFilter = Nothing;
+	type Aliasers = Nothing;
+	type TransactionalProcessor = ();
+	type HrmpNewChannelOpenRequestHandler = ();
+	type HrmpChannelAcceptedHandler = ();
+	type HrmpChannelClosingHandler = ();
+	type XcmRecorder = ();
+}

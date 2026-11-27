@@ -1,0 +1,1684 @@
+// Copyright (C) Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! # Speculative Messaging pallet
+//!
+//! Sender: accumulates outbound streams (per-stream MMR frontiers) and commits one [`StreamsRoot`]
+//! per block as an [`SPMS_ENGINE_ID`] digest; `validate_block` emits the bundle's last one as the
+//! `Provides` UMP signal. Receiver: consumes fetched inbound payloads through
+//! [`Call::enact_messages`] by recomputation into channel frontiers, writing the block's
+//! [`ConsumptionRecord`]. The inherent carries no proofs; the PoV lift binds the endpoint.
+//!
+//! Lifecycle: block `N` stages its sends and consumption; at block end
+//! [`Pallet::commit_streams_root`] publishes pending ack registers and folds the [`StreamsRoot`];
+//! the first spec-msg action of `N+1`
+//! ([`Pallet::roll_over`]) drains the sends and clears transient state.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::{
+	collections::{BTreeMap, BTreeSet},
+	vec::Vec,
+};
+use codec::{Compact, DecodeAll, Encode, MaxEncodedLen};
+use core::marker::PhantomData;
+use cumulus_primitives_core::CumulusDigestItem;
+use cumulus_primitives_spec_messaging::{
+	leaf_hash_with_version, streams_root::update_tree_leaf, AppliedRegister, ChannelMessage,
+	ConsumedStreams, ConsumptionRecord, InChannelId, InChannelState, InboundStatus, InnerNode,
+	Interval, LossyRead, MessagePosition, MessagingInherentData, MmrExtensionProof, MmrFrontier,
+	MmrRoot, NodeKey, NodeLookup, NodeStore, OutChannelId, OutChannelState, Payload,
+	ProvideConsumptionRecord, Register, RegisterStatus, StreamId, StreamProof, StreamsRoot,
+	TreeError, TreeRootEntry, INHERENT_IDENTIFIER, LEAF_VERSION, MAX_SPECULATIVE_MESSAGE_LEN,
+	SPMS_ENGINE_ID,
+};
+use frame_support::{
+	ensure,
+	inherent::InherentData,
+	pallet_prelude::Weight,
+	traits::{EnsureOrigin, Get},
+	BoundedBTreeSet, BoundedVec,
+};
+use polkadot_core_primitives::Hash;
+use polkadot_parachain_primitives::primitives::Id as ParaId;
+use polkadot_primitives::v9::MAX_COMMITMENT_ENTRIES;
+use sp_runtime::{generic::DigestItem, SaturatedConversion};
+
+pub use pallet::*;
+
+use channel_policy::{InChannelPolicy, OutChannelPolicy};
+
+pub const MAX_CLEANUP_CHANNELS: u32 = 32;
+
+const LOG_TARGET: &str = "runtime::spec-msg";
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+mod channel_policy;
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+pub mod weights;
+pub mod xcm_transport;
+
+pub use weights::WeightInfo;
+pub use xcm_transport::{EnqueueToXcmQueue, QueueFootprintOf, SpecMsgRouter, XCM_CHANNEL_DOMAIN};
+
+/// Query the memory footprint of a channel's delivery queue.
+pub trait QueueFootprintQuery<Id> {
+	/// Number of ready pages in the channel's delivery queue.
+	fn ready_pages(id: &Id) -> u32;
+
+	/// Includes overweight messages that can still be executed manually.
+	fn is_empty(id: &Id) -> bool;
+
+	/// Weight of a footprint query. With [`EnqueueToXcmQueue`],
+	/// include the proof of the existing tail page read by the channel's first enqueue.
+	fn ready_pages_weight() -> Weight {
+		Weight::zero()
+	}
+}
+
+impl<Id> QueueFootprintQuery<Id> for () {
+	fn is_empty(_: &Id) -> bool {
+		true
+	}
+	fn ready_pages(_: &Id) -> u32 {
+		0
+	}
+}
+
+/// Sink for consumed `Data` payloads. `()` drops them; [`EnqueueToXcmQueue`] executes the XCM
+/// channel's payloads as XCM.
+pub trait OnSpecMsgData {
+	/// Whether the runtime can accept an inbound channel on this lane.
+	fn handles(_domain: u8, _num: u16) -> bool {
+		true
+	}
+
+	/// One `Data` payload, consumed in order at `position` of `(source, stream)`.
+	fn on_data(source: ParaId, stream: StreamId, position: MessagePosition, data: Vec<u8>);
+
+	/// Upper bound of [`Self::on_data`] for a payload of `len` bytes.
+	fn on_data_weight(len: u32) -> Weight;
+
+	/// The longest `data` this handler accepts; `integrity_test` keeps [`Config::MaxMsgLen`] within
+	/// it, so no consumed payload is dropped for its size.
+	fn max_len() -> u32 {
+		u32::MAX
+	}
+}
+
+impl OnSpecMsgData for () {
+	fn on_data(_: ParaId, _: StreamId, _: MessagePosition, _: Vec<u8>) {}
+
+	fn on_data_weight(_: u32) -> Weight {
+		Weight::zero()
+	}
+}
+
+#[frame_support::pallet]
+pub mod pallet {
+	use super::*;
+	use frame_support::{
+		inherent::{InherentData, InherentIdentifier, MakeFatalError, ProvideInherent},
+		pallet_prelude::*,
+	};
+	use frame_system::pallet_prelude::*;
+
+	#[pallet::pallet]
+	#[pallet::without_storage_info]
+	pub struct Pallet<T>(_);
+
+	#[pallet::config]
+	pub trait Config: frame_system::Config<RuntimeEvent: From<Event<Self>>> {
+		/// This parachain's own id; consumed streams are addressed to it.
+		type SelfParaId: Get<ParaId>;
+
+		/// Hard per-message payload size bound.
+		#[pallet::constant]
+		type MaxMsgLen: Get<u32>;
+
+		/// Per-stream, per-block cap on outbound sends.
+		#[pallet::constant]
+		type MaxMessagesPerBlock: Get<u32>;
+
+		/// The in-flight gate: at most `MaxInFlight` leaves sent and unconfirmed by the peer's
+		/// watermark.
+		#[pallet::constant]
+		type MaxInFlight: Get<u32>;
+
+		/// Per-block cap on sends across all streams, so the end-of-block fold and the next
+		/// block's drain are bounded. [`Config::MaxTouchedStreams`] of it is kept for the sends the
+		/// inherent causes, so earlier sends in the block cannot make the inherent fail.
+		#[pallet::constant]
+		type MaxSendsPerBlock: Get<u32>;
+
+		/// Per-block cap on streams the inherent may touch; `<= MAX_COMMITMENT_ENTRIES`.
+		#[pallet::constant]
+		type MaxTouchedStreams: Get<u32>;
+
+		/// Cap on distinct streams the candidate bundle may touch. It must cover the block proof
+		/// size divided by a lift's reservation, so the proof size always binds first.
+		#[pallet::constant]
+		type MaxBundleStreams: Get<u32>;
+
+		/// Per-item cap on inbound messages consumed.
+		#[pallet::constant]
+		type MaxInboundMessagesPerItem: Get<u32>;
+
+		/// Advertised maximum message size when accepting an inbound channel.
+		#[pallet::constant]
+		type MaxMessageSize: Get<u32>;
+
+		/// Maximum allowed footprint (ready pages) for an inbound channel's delivery queue.
+		#[pallet::constant]
+		type MaxQueueFootprint: Get<u32>;
+
+		/// Query the footprint of an inbound channel's delivery queue.
+		type QueueFootprint: QueueFootprintQuery<InChannelId>;
+
+		/// Sink for consumed `Data` payloads.
+		type DataHandler: OnSpecMsgData;
+
+		/// Weight information for the calls and hooks.
+		type WeightInfo: WeightInfo;
+
+		/// Origin allowed to open an outbound channel.
+		type OpenChannelOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+
+		/// Origin allowed to accept and close an inbound channel.
+		type AcceptChannelOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+
+		/// Origin allowed to flag a sibling's HRMP channel as closing in favour of spec-msg.
+		type ChannelManagementOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+	}
+
+	/// Per-stream outbound MMR frontiers; reflects state as of the previous block.
+	#[pallet::storage]
+	pub type OutboundFrontier<T: Config> =
+		StorageMap<_, Twox64Concat, StreamId, MmrFrontier, ValueQuery>;
+
+	/// Outbound sends of this block only, per stream; drained into the frontiers next block.
+	/// The batch and its leaf hashes must stay readable if an upgrade lowers the per-stream cap.
+	#[pallet::storage]
+	pub type OutboundMessages<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		StreamId,
+		WeakBoundedVec<BoundedVec<u8, T::MaxMsgLen>, T::MaxMessagesPerBlock>,
+		ValueQuery,
+	>;
+
+	/// Leaf hashes of [`OutboundMessages`], in the same order. A payload is hashed once, at send,
+	/// so the commit and the next block's drain read only hashes.
+	#[pallet::storage]
+	pub type OutboundLeafHashes<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		StreamId,
+		WeakBoundedVec<Hash, T::MaxMessagesPerBlock>,
+		ValueQuery,
+	>;
+
+	/// Sends this block, across all streams.
+	#[pallet::storage]
+	pub type SendsThisBlock<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+	/// This block's committed [`StreamsRoot`] (the `Provides` source); transient. `Some(None)` once
+	/// an idle block has committed, so a later send is rejected there too.
+	#[pallet::storage]
+	pub type BlockStreamsRoot<T: Config> = StorageValue<_, Option<StreamsRoot>, OptionQuery>;
+
+	/// Root of the commitment-tree node cache over every outbound stream. Each commit folds the
+	/// block's touched streams into it, so it must hold every stream from the first send on.
+	#[pallet::storage]
+	pub type TreeRoot<T: Config> = StorageValue<_, TreeRootEntry, OptionQuery>;
+
+	/// Inner nodes of the [`TreeRoot`] trie.
+	#[pallet::storage]
+	pub type TreeNodes<T: Config> = StorageMap<_, Twox64Concat, NodeKey, InnerNode, OptionQuery>;
+
+	/// The block whose roll-over has run, with the number of sends it drained. See
+	/// [`Pallet::roll_over`].
+	#[pallet::storage]
+	pub type RolledOver<T: Config> = StorageValue<_, (BlockNumberFor<T>, u32), OptionQuery>;
+
+	/// Sender side, per outbound channel.
+	#[pallet::storage]
+	pub type OutChannels<T: Config> =
+		StorageMap<_, Twox64Concat, OutChannelId, OutChannelState, OptionQuery>;
+
+	/// Highest outbound lane number allocated per peer and domain, retained after cleanup.
+	#[pallet::storage]
+	pub type LastOutboundLane<T: Config> = StorageMap<_, Twox64Concat, (ParaId, u8), u16>;
+	/// Highest inbound lane number allocated per peer and domain, retained after cleanup.
+	#[pallet::storage]
+	pub type LastInboundLane<T: Config> = StorageMap<_, Twox64Concat, (ParaId, u8), u16>;
+
+	/// Receiver side, per inbound channel.
+	#[pallet::storage]
+	pub type InChannels<T: Config> =
+		StorageMap<_, Twox64Concat, InChannelId, InChannelState, OptionQuery>;
+
+	/// Siblings whose HRMP channel is being closed in favour of spec-msg. While a sibling is
+	/// flagged, [`SpecMsgRouter`] treats its HRMP channel as closed: new XCM goes over spec-msg,
+	/// while `XcmpQueue` keeps draining what HRMP already queued. See
+	/// [`Pallet::set_hrmp_closing`].
+	#[pallet::storage]
+	pub type HrmpClosing<T: Config> = StorageMap<_, Twox64Concat, ParaId, (), OptionQuery>;
+
+	/// Inbound channels whose delivery queue is paused through [`QueuePausedQuery`]. See
+	/// [`Pallet::pause_inbound_channel`].
+	#[pallet::storage]
+	pub type PausedInbound<T: Config> = StorageMap<_, Twox64Concat, InChannelId, (), OptionQuery>;
+
+	/// The factor that multiplies the base delivery fee of [`SpecMsgRouter`]'s XCM to a sibling.
+	/// It rises while that sibling's XCM channel is congested.
+	#[pallet::storage]
+	pub type DeliveryFeeFactor<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		ParaId,
+		sp_runtime::FixedU128,
+		ValueQuery,
+		polkadot_runtime_parachains::GetMinFeeFactor<Pallet<T>>,
+	>;
+
+	/// Whether `enact_messages` ran this block; cleared next block.
+	#[pallet::storage]
+	pub type Enacted<T: Config> = StorageValue<_, (), OptionQuery>;
+
+	/// This block's consumption intervals; grouped/sorted by [`Pallet::consumption_record`],
+	/// cleared next block. Bounded by [`Config::MaxTouchedStreams`].
+	#[pallet::storage]
+	#[pallet::unbounded]
+	pub type ConsumptionOutbox<T: Config> =
+		StorageValue<_, Vec<(ParaId, StreamId, Interval)>, ValueQuery>;
+
+	/// Streams touched across blocks in the candidate bundle: a stream's first touch reserves its
+	/// lift, and the touched sources are their parachains. Cleared on index 0. `create_inherent`
+	/// reads no register whose stream is here, so its bundles need no `advances`.
+	#[pallet::storage]
+	pub type BundleStreams<T: Config> =
+		StorageValue<_, BoundedBTreeSet<(ParaId, StreamId), T::MaxBundleStreams>, ValueQuery>;
+
+	/// Inbound channels whose register may have changed; published at block end, and kept for the
+	/// next block if the publish fails.
+	#[pallet::storage]
+	#[pallet::unbounded]
+	pub type PendingRegisterPublishes<T: Config> =
+		StorageValue<_, BTreeSet<InChannelId>, ValueQuery>;
+
+	#[pallet::event]
+	#[pallet::generate_deposit(pub(super) fn deposit_event)]
+	pub enum Event<T: Config> {
+		/// An outbound lane was opened.
+		ChannelOpened { channel: OutChannelId },
+		/// An inbound lane was accepted.
+		ChannelAccepted { channel: InChannelId },
+		/// An outbound channel was closed from our side.
+		ChannelClosed { channel: OutChannelId },
+		/// An inbound channel was closed from our side.
+		InboundChannelClosed { channel: InChannelId },
+		/// An ack register was published at block end.
+		RegisterPublished { channel: InChannelId, up_to: MessagePosition, status: RegisterStatus },
+		/// A message was consumed in order.
+		MessageConsumed { source: ParaId, stream: StreamId, position: MessagePosition },
+		/// Governance cleared the listed lanes of an offboarded peer.
+		PeerChannelsRemoved {
+			peer: ParaId,
+			channels: BoundedVec<(u8, u16), ConstU32<MAX_CLEANUP_CHANNELS>>,
+		},
+		/// The receiver released the handover without waiting for the old queue to drain.
+		InboundChannelForceClosed { channel: InChannelId },
+	}
+
+	#[pallet::error]
+	#[derive(PartialEq, Eq)]
+	pub enum Error<T> {
+		/// Payload over [`Config::MaxMsgLen`] or the advertised `max_message_size`.
+		MessageTooBig,
+		/// Stream over [`Config::MaxMessagesPerBlock`] this block.
+		TooManyMessages,
+		/// The block's sends reached [`Pallet::send_limit`], or [`Config::MaxSendsPerBlock`].
+		TooManySends,
+		/// Wrong stream kind for the item, or addressed to another chain.
+		UnknownStream,
+		/// A second item for the same stream.
+		DuplicateStream,
+		/// A consume item with no payloads.
+		EmptyItem,
+		/// [`Config::MaxTouchedStreams`] exhausted.
+		TooManyStreams,
+		/// An item's payloads or frontier would violate MMR rules or exceed bounds.
+		BadFrontier,
+		/// This block's `StreamsRoot` is already committed; a later send could not be served.
+		RootCommitted,
+		/// `enact_messages` already ran this block.
+		AlreadyEnacted,
+		/// A channel to this chain itself.
+		ChannelToSelf,
+		/// The inbound channel is already accepted.
+		AlreadyAccepted,
+		/// The channel is not open for sending.
+		NotOpen,
+		/// The send would exceed the `MaxInFlight` credit gate.
+		NoCredit,
+		/// A register read is not exactly one leaf, or does not decode as a [`Register`].
+		BadRegister,
+		/// No such channel exists.
+		UnknownChannel,
+		/// The channel is already closed from this side.
+		AlreadyClosed,
+		/// Send attempted before pallet initialization (e.g. during runtime upgrade).
+		NotInitialized,
+		/// Only the next unused lane number can be allocated.
+		UnexpectedLaneNumber,
+		/// The previous XCM lane is still open or its execution queue has messages.
+		LaneBusy,
+		/// An inherent item violated protocol admission rules.
+		NotAdmitted,
+		/// Inbound messages in one item exceed [`Config::MaxInboundMessagesPerItem`].
+		TooManyInboundMessages,
+		/// Candidate bundle exceeded `MAX_COMMITMENT_ENTRIES` distinct sources.
+		MaxCommitmentEntriesExceeded,
+		/// The data handler does not serve this inbound lane.
+		UnsupportedLane,
+	}
+
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
+			let drained = Self::roll_over();
+			// The calls and the inherent charge the end-of-block commit; this charges the idle one,
+			// and the publishes the last block could not make, which no call of this block charges.
+			let mut weight = T::WeightInfo::on_initialize(drained)
+				.saturating_add(T::WeightInfo::idle_commit())
+				.saturating_add(T::DbWeight::get().reads(1));
+			let carried = PendingRegisterPublishes::<T>::get().len() as u32;
+			if carried > 0 {
+				weight = weight.saturating_add(commit_weight::<T>(0, carried));
+			}
+			weight
+		}
+
+		#[cfg(feature = "try-runtime")]
+		fn pre_upgrade() -> Result<Vec<u8>, sp_runtime::TryRuntimeError> {
+			for state in InChannels::<T>::iter_values() {
+				if state.is_watched() {
+					ensure!(
+						state.max_message_size <= T::MaxMsgLen::get(),
+						"spec-msg: MaxMsgLen is below the advertised inbound message size"
+					);
+				}
+			}
+			Ok(Vec::new())
+		}
+
+		fn on_finalize(_n: BlockNumberFor<T>) {
+			let _ = Self::commit_streams_root();
+		}
+
+		fn integrity_test() {
+			assert!(
+				1 <= T::MaxInFlight::get() && T::MaxInFlight::get() < T::MaxMessagesPerBlock::get(),
+				"1 <= MaxInFlight < MaxMessagesPerBlock required",
+			);
+			assert!(
+				T::MaxTouchedStreams::get() <= MAX_COMMITMENT_ENTRIES,
+				"`MaxTouchedStreams` must not exceed `MAX_COMMITMENT_ENTRIES`",
+			);
+			assert!(
+				T::MaxTouchedStreams::get() < T::MaxSendsPerBlock::get(),
+				"`MaxTouchedStreams` must be below `MaxSendsPerBlock`",
+			);
+			assert!(
+				T::MaxBundleStreams::get() as u64 * lift_len() as u64 >=
+					T::BlockWeights::get().max_block.proof_size(),
+				"`MaxBundleStreams` lifts must cover the block proof size",
+			);
+			// Dispatch never refuses the mandatory inherent for weight, and a block author need
+			// not use `create_inherent`: what the caps allow must fit the block.
+			let (inherent, block) = (max_inherent_weight::<T>(), T::BlockWeights::get().max_block);
+			assert!(
+				inherent.all_lte(block),
+				"the messaging inherent the caps allow ({inherent:?}) must fit the block ({block:?})",
+			);
+			assert!(
+				T::MaxMessageSize::get() <= T::MaxMsgLen::get(),
+				"`MaxMessageSize` must not exceed `MaxMsgLen`",
+			);
+			assert!(
+				Register::max_encoded_len() <= T::MaxMsgLen::get() as usize,
+				"`MaxMsgLen` must fit a channel register",
+			);
+			assert!(
+				T::MaxMsgLen::get() <= T::DataHandler::max_len(),
+				"`MaxMsgLen` must not exceed the data handler's `max_len`",
+			);
+			// Receivers refuse to fetch a longer leaf, which would stall its channel for good.
+			assert!(
+				T::MaxMsgLen::get() <= MAX_SPECULATIVE_MESSAGE_LEN,
+				"`MaxMsgLen` must not exceed `MAX_SPECULATIVE_MESSAGE_LEN`",
+			);
+		}
+	}
+
+	#[pallet::call]
+	impl<T: Config> Pallet<T> {
+		/// Consume this block's fetched payloads by recomputation and record them.
+		/// Strict-on-import: any invalid item invalidates the block.
+		#[pallet::call_index(0)]
+		#[pallet::weight((enact_weight::<T>(data), DispatchClass::Mandatory))]
+		pub fn enact_messages(origin: OriginFor<T>, data: MessagingInherentData) -> DispatchResult {
+			ensure_none(origin)?;
+			Self::roll_over();
+			ensure!(!Enacted::<T>::exists(), Error::<T>::AlreadyEnacted);
+			Enacted::<T>::put(());
+
+			let us = T::SelfParaId::get();
+			let mut budget = BundleBudget::load::<T>();
+
+			for (channel_id, payloads) in data.channels {
+				ensure!(!payloads.is_empty(), Error::<T>::EmptyItem);
+				ensure!(
+					payloads.len() as u32 <= T::MaxInboundMessagesPerItem::get(),
+					Error::<T>::TooManyInboundMessages
+				);
+				let stream = channel_id.sender_data_stream(us);
+				let bytes = Self::lift_reservation(&budget, stream, None)?;
+				Self::consume_channel_item(channel_id, payloads)?;
+				budget.record(stream, bytes);
+			}
+
+			for (channel_id, lossy) in data.registers {
+				let stream = channel_id.peer_ack_stream(us);
+				let skip = Self::consume_register_item(channel_id, lossy)?;
+				let bytes = Self::lift_reservation(&budget, stream, skip)?;
+				budget.record(stream, bytes);
+			}
+
+			// Broadcast subscriptions are not supported yet.
+			ensure!(data.events.is_empty(), Error::<T>::NotAdmitted);
+
+			BundleStreams::<T>::put(
+				BoundedBTreeSet::try_from(budget.streams)
+					.map_err(|_| Error::<T>::TooManyStreams)?,
+			);
+			// Lifts are attached after the block is built, so their proof size is charged here.
+			// Extra weight is outside the call's declared weight, so weight reclaim cannot refund
+			// it.
+			frame_system::Pallet::<T>::register_extra_weight_unchecked(
+				Weight::from_parts(0, budget.reserved),
+				DispatchClass::Mandatory,
+			);
+			Ok(())
+		}
+
+		/// Open a fresh outbound lane to `recipient`.
+		#[pallet::call_index(1)]
+		#[pallet::weight(T::WeightInfo::open_channel())]
+		pub fn open_channel(
+			origin: OriginFor<T>,
+			recipient: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::OpenChannelOrigin::ensure_origin(origin)?;
+			ensure!(recipient != T::SelfParaId::get(), Error::<T>::ChannelToSelf);
+			let channel = OutChannelId { recipient, domain, num };
+			let last = LastOutboundLane::<T>::get((recipient, domain));
+			ensure!(
+				Some(num) == last.map_or(Some(0), |n| n.checked_add(1)),
+				Error::<T>::UnexpectedLaneNumber
+			);
+			if let Some(last) = last.filter(|_| domain == XCM_CHANNEL_DOMAIN) {
+				ensure!(
+					!OutChannels::<T>::get(OutChannelId { num: last, ..channel })
+						.is_some_and(|lane| lane.want_open),
+					Error::<T>::LaneBusy
+				);
+			}
+			LastOutboundLane::<T>::insert((recipient, domain), num);
+			OutChannels::<T>::insert(channel, OutChannelState { want_open: true, register: None });
+			Self::deposit_event(Event::ChannelOpened { channel });
+			Ok(())
+		}
+
+		/// Accept a fresh inbound lane from `sender`.
+		#[pallet::call_index(2)]
+		#[pallet::weight(
+			T::WeightInfo::accept_open_channel()
+				.saturating_add(T::QueueFootprint::ready_pages_weight())
+				.saturating_add(commit_weight::<T>(0, 1))
+		)]
+		pub fn accept_open_channel(
+			origin: OriginFor<T>,
+			sender: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::AcceptChannelOrigin::ensure_origin(origin)?;
+			ensure!(sender != T::SelfParaId::get(), Error::<T>::ChannelToSelf);
+			ensure!(T::DataHandler::handles(domain, num), Error::<T>::UnsupportedLane);
+			let channel = InChannelId { sender, domain, num };
+			let last = LastInboundLane::<T>::get((sender, domain));
+			ensure!(
+				Some(num) == last.map_or(Some(0), |n| n.checked_add(1)),
+				Error::<T>::UnexpectedLaneNumber
+			);
+			if let Some(last) = last.filter(|_| domain == XCM_CHANNEL_DOMAIN) {
+				let previous = InChannelId { num: last, ..channel };
+				let previous_status = InChannels::<T>::get(previous).map(|lane| lane.status);
+				let ready = match previous_status {
+					Some(InboundStatus::ForceClosed) => true,
+					None | Some(InboundStatus::Closed) => T::QueueFootprint::is_empty(&previous),
+					Some(InboundStatus::Open | InboundStatus::Closing) => false,
+				};
+				ensure!(ready, Error::<T>::LaneBusy);
+			}
+			let max_message_size = T::MaxMessageSize::get();
+			LastInboundLane::<T>::insert((sender, domain), num);
+			InChannels::<T>::insert(
+				channel,
+				InChannelState {
+					frontier: MmrFrontier::new(),
+					status: InboundStatus::Open,
+					max_message_size,
+					published: None,
+				},
+			);
+			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
+			Self::deposit_event(Event::ChannelAccepted { channel });
+			Ok(())
+		}
+
+		/// Close an outbound channel from our side.
+		#[pallet::call_index(3)]
+		#[pallet::weight(
+			T::WeightInfo::close_channel().saturating_add(commit_weight::<T>(1, 0))
+		)]
+		pub fn close_channel(
+			origin: OriginFor<T>,
+			recipient: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::OpenChannelOrigin::ensure_origin(origin)?;
+			let channel = OutChannelId { recipient, domain, num };
+			let mut state = OutChannels::<T>::get(channel).ok_or(Error::<T>::UnknownChannel)?;
+			ensure!(state.want_open, Error::<T>::AlreadyClosed);
+			state.want_open = false;
+
+			Self::append_to_stream(channel.data_stream(), ChannelMessage::Close.encode())?;
+			OutChannels::<T>::insert(channel, state);
+			Self::deposit_event(Event::ChannelClosed { channel });
+			Ok(())
+		}
+
+		/// Close an inbound channel from our side.
+		#[pallet::call_index(4)]
+		#[pallet::weight(
+			T::WeightInfo::close_inbound_channel()
+				.saturating_add(commit_weight::<T>(0, 1))
+		)]
+		pub fn close_inbound_channel(
+			origin: OriginFor<T>,
+			sender: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::AcceptChannelOrigin::ensure_origin(origin)?;
+			let channel = InChannelId { sender, domain, num };
+			let mut state = InChannels::<T>::get(channel).ok_or(Error::<T>::UnknownChannel)?;
+			ensure!(state.status == InboundStatus::Open, Error::<T>::AlreadyClosed);
+			state.status = InboundStatus::Closing;
+			InChannels::<T>::insert(channel, state);
+			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
+			Self::deposit_event(Event::InboundChannelClosed { channel });
+			Ok(())
+		}
+
+		/// Abandon the unconsumed tail and allow a replacement before queued XCM finishes.
+		#[pallet::call_index(10)]
+		#[pallet::weight(
+			T::WeightInfo::force_close_inbound().saturating_add(commit_weight::<T>(0, 1))
+		)]
+		pub fn force_close_inbound(
+			origin: OriginFor<T>,
+			sender: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::AcceptChannelOrigin::ensure_origin(origin)?;
+			let channel = InChannelId { sender, domain, num };
+			InChannels::<T>::try_mutate(channel, |lane| -> DispatchResult {
+				let state = lane.as_mut().ok_or(Error::<T>::UnknownChannel)?;
+				ensure!(state.status != InboundStatus::ForceClosed, Error::<T>::AlreadyClosed);
+				state.status = InboundStatus::ForceClosed;
+				Ok(())
+			})?;
+			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
+			Self::deposit_event(Event::InboundChannelForceClosed { channel });
+			Ok(())
+		}
+
+		/// Remove the listed channels and the peer's XCM routing state after governance confirms
+		/// the peer has offboarded.
+		#[pallet::call_index(9)]
+		#[pallet::weight(T::WeightInfo::clean_offboarded_peer(channels.len() as u32))]
+		pub fn clean_offboarded_peer(
+			origin: OriginFor<T>,
+			peer: ParaId,
+			channels: BoundedVec<(u8, u16), ConstU32<MAX_CLEANUP_CHANNELS>>,
+		) -> DispatchResult {
+			frame_system::ensure_root(origin)?;
+			for &(domain, num) in channels.iter() {
+				let inbound = InChannelId { sender: peer, domain, num };
+				InChannels::<T>::remove(inbound);
+				PausedInbound::<T>::remove(inbound);
+				OutChannels::<T>::remove(OutChannelId { recipient: peer, domain, num });
+			}
+			HrmpClosing::<T>::remove(peer);
+			DeliveryFeeFactor::<T>::remove(peer);
+			Self::deposit_event(Event::PeerChannelsRemoved { peer, channels });
+			Ok(())
+		}
+
+		/// Route new XCM to the open spec-msg channel while HRMP drains. Wait for the sender's
+		/// XCMP queue and the relay HRMP channel to drain before requesting relay closure.
+		/// Closure drops what the relay channel still holds.
+		/// The receiver uses separate queues, so messages can execute out of order.
+		/// Clear the flag with [`Pallet::clear_hrmp_closing`] before reopening HRMP.
+		#[pallet::call_index(5)]
+		#[pallet::weight((T::WeightInfo::set_hrmp_closing(), DispatchClass::Operational))]
+		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
+			T::ChannelManagementOrigin::ensure_origin(origin)?;
+			let open = OutChannels::<T>::get(Self::outbound_xcm_lane(peer))
+				.is_some_and(|state| state.send_size_limit().is_some());
+			ensure!(open, Error::<T>::NotOpen);
+			HrmpClosing::<T>::insert(peer, ());
+			Ok(())
+		}
+
+		/// Clear the [`HrmpClosing`] flag for `peer`: the router prefers HRMP again whenever an
+		/// HRMP channel is open. XCM already sent over spec-msg is still delivered. Idempotent.
+		#[pallet::call_index(6)]
+		#[pallet::weight((T::WeightInfo::clear_hrmp_closing(), DispatchClass::Operational))]
+		pub fn clear_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
+			T::ChannelManagementOrigin::ensure_origin(origin)?;
+			HrmpClosing::<T>::remove(peer);
+			Ok(())
+		}
+
+		/// Pause the delivery queue of an inbound channel: execution stops at once, and
+		/// consumption stops when the queue reaches `MaxQueueFootprint`. Idempotent.
+		#[pallet::call_index(7)]
+		#[pallet::weight((T::WeightInfo::pause_inbound_channel(), DispatchClass::Operational))]
+		pub fn pause_inbound_channel(
+			origin: OriginFor<T>,
+			sender: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::ChannelManagementOrigin::ensure_origin(origin)?;
+			PausedInbound::<T>::insert(InChannelId { sender, domain, num }, ());
+			Ok(())
+		}
+
+		/// Resume the delivery queue paused by [`Pallet::pause_inbound_channel`]. Idempotent.
+		#[pallet::call_index(8)]
+		#[pallet::weight((T::WeightInfo::resume_inbound_channel(), DispatchClass::Operational))]
+		pub fn resume_inbound_channel(
+			origin: OriginFor<T>,
+			sender: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::ChannelManagementOrigin::ensure_origin(origin)?;
+			PausedInbound::<T>::remove(InChannelId { sender, domain, num });
+			Ok(())
+		}
+	}
+
+	#[pallet::inherent]
+	impl<T: Config> ProvideInherent for Pallet<T> {
+		type Call = Call<T>;
+		type Error = MakeFatalError<()>;
+		const INHERENT_IDENTIFIER: InherentIdentifier =
+			cumulus_primitives_spec_messaging::INHERENT_IDENTIFIER;
+
+		fn create_inherent(inherent_data: &InherentData) -> Option<Self::Call> {
+			let data = inherent_data
+				.get_data::<MessagingInherentData>(&INHERENT_IDENTIFIER)
+				.ok()
+				.flatten()?;
+			if data.is_empty() {
+				return None;
+			}
+
+			let us = T::SelfParaId::get();
+			let mut budget = BundleBudget::load::<T>();
+			let overhead = inherent_overhead::<T>();
+			let mut remaining =
+				Self::proof_budget(inherent_data).saturating_sub(overhead.proof_size());
+			// The call is mandatory, so nothing refuses it past the block's ref time or proof size:
+			// keep within both, counting the storage proof the call is charged for.
+			let ref_time = T::BlockWeights::get()
+				.max_block
+				.ref_time()
+				.saturating_sub(frame_system::Pallet::<T>::block_weight().total().ref_time())
+				.saturating_sub(overhead.ref_time());
+			let mut tally = EnactTally::default();
+			// Register reads go first: they carry our flow-control grants, and a channel backlog
+			// that fills the block's ref time would otherwise drop them in every block. They leave
+			// one stream slot for channel items, or as many fresh registers as the cap would keep
+			// every inbound message out.
+			let register_slots = if data.channels.is_empty() {
+				T::MaxTouchedStreams::get()
+			} else {
+				T::MaxTouchedStreams::get().saturating_sub(1)
+			};
+			let mut filtered_registers = BTreeMap::new();
+			for (channel_id, lossy) in data.registers {
+				if budget.touched >= register_slots {
+					break;
+				}
+				let stream = channel_id.peer_ack_stream(us);
+				// One read per register per bundle; a newer register waits for the next bundle.
+				// A second read can skip leaves, and the PoV then needs an advance over them,
+				// which the node fetches only after importing the block: usually after the
+				// collation is built. A read that skips none waits too, so no two reads of a
+				// register are ever stitched.
+				if budget.streams.contains(&stream) {
+					continue;
+				}
+				let Ok(AdmittedRegisterRead { skip, .. }) =
+					Self::admit_register_read(channel_id, &lossy)
+				else {
+					continue;
+				};
+				let Ok(bytes) = Self::lift_reservation(&budget, stream, skip) else {
+					continue;
+				};
+				let cost = bytes.saturating_add((channel_id, &lossy).encoded_size() as u64);
+				let item = EnactTally { registers: tally.registers.saturating_add(1), ..tally };
+				let weight = item.weight::<T>();
+				if cost.saturating_add(weight.proof_size()) > remaining ||
+					weight.ref_time() > ref_time
+				{
+					continue;
+				}
+				remaining -= cost;
+				tally = item;
+				budget.record(stream, bytes);
+				filtered_registers.insert(channel_id, lossy);
+			}
+
+			let mut filtered_channels = BTreeMap::new();
+			// Channel items follow from a start that moves every block: when the block cannot hold
+			// them all, the cut does not always fall on the channels last in key order.
+			let mut channels: Vec<_> = data.channels.into_iter().collect();
+			let number = frame_system::Pallet::<T>::block_number().saturated_into::<u64>();
+			let start = trim_start(number, channels.len());
+			channels.rotate_left(start);
+
+			for (channel_id, payloads) in channels {
+				let Some(mut admitted) = Self::admit_channel_item(channel_id, &payloads) else {
+					continue;
+				};
+				let stream = channel_id.sender_data_stream(us);
+				let Ok(bytes) = Self::lift_reservation(&budget, stream, None) else {
+					continue;
+				};
+				// Any prefix of an admitted prefix is admitted, so trimming to the budget is safe.
+				let mut cost = bytes
+					.saturating_add(channel_id.encoded_size() as u64)
+					.saturating_add(Compact::<u32>::max_encoded_len() as u64);
+				let mut item = EnactTally { channels: tally.channels.saturating_add(1), ..tally };
+				let mut keep = 0;
+				for payload in &admitted.payloads {
+					let next = cost.saturating_add(payload.encoded_size() as u64);
+					let mut next_item = item;
+					next_item.add_payload::<T>(payload);
+					let weight = next_item.weight::<T>();
+					if next.saturating_add(weight.proof_size()) > remaining ||
+						weight.ref_time() > ref_time
+					{
+						break;
+					}
+					cost = next;
+					item = next_item;
+					keep += 1;
+				}
+				if keep == 0 {
+					continue;
+				}
+				admitted.payloads.truncate(keep);
+				remaining -= cost;
+				tally = item;
+				budget.record(stream, bytes);
+				filtered_channels.insert(channel_id, admitted.payloads);
+			}
+
+			let filtered = MessagingInherentData {
+				channels: filtered_channels,
+				registers: filtered_registers,
+				events: BTreeMap::new(),
+			};
+
+			if filtered.is_empty() {
+				None
+			} else {
+				Some(Call::enact_messages { data: filtered })
+			}
+		}
+
+		fn is_inherent(call: &Self::Call) -> bool {
+			matches!(call, Call::enact_messages { .. })
+		}
+	}
+}
+
+/// Where `create_inherent` starts trimming `len` channel items in block `number`. Scrambled, so
+/// it never runs in step with the node's own rotation and skips the same channels every time.
+fn trim_start(number: u64, len: usize) -> usize {
+	if len == 0 {
+		return 0;
+	}
+	let mixed = number.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+	((mixed ^ (mixed >> 29)) % len as u64) as usize
+}
+
+/// The end-of-block work for `sends` sends and `publishes` register publishes. Both benchmarks'
+/// bases hold the commit's fixed cost, so `commit_publishes` adds only its slope.
+fn commit_weight<T: Config>(sends: u32, publishes: u32) -> Weight {
+	let publishes = T::WeightInfo::commit_publishes(publishes)
+		.saturating_sub(T::WeightInfo::commit_publishes(0));
+	T::WeightInfo::commit_sends(sends).saturating_add(publishes)
+}
+
+/// Weight of one `enact_messages`, with the end-of-block work it causes: one register publish per
+/// channel item and at most one send per register read.
+fn enact_weight<T: Config>(data: &MessagingInherentData) -> Weight {
+	let mut tally = EnactTally {
+		channels: data.channels.len() as u32,
+		registers: data.registers.len() as u32,
+		..Default::default()
+	};
+	for payload in data.channels.values().flatten() {
+		tally.add_payload::<T>(payload);
+	}
+	tally.weight::<T>()
+}
+
+/// The mandatory base weight plus the bare extrinsic framing outside the encoded items.
+fn inherent_overhead<T: Config>() -> Weight {
+	// Length prefixes for the extrinsic and three maps, the version byte and the call indices.
+	let framing = 4 * Compact::<u32>::max_encoded_len() + 3;
+	T::BlockWeights::get()
+		.get(frame_support::dispatch::DispatchClass::Mandatory)
+		.base_extrinsic
+		.saturating_add_proof_size(framing as u64)
+}
+
+/// Maximum encoded size of the items for a given split between channels and registers.
+fn max_inherent_item_bytes<T: Config>(channels: u32, registers: u32) -> u64 {
+	let channel = <(
+		InChannelId,
+		BoundedVec<BoundedVec<u8, T::MaxMsgLen>, T::MaxInboundMessagesPerItem>,
+	)>::max_encoded_len();
+	// An admitted LossyRead carries a frontier and exactly one encoded register payload.
+	let register = Register::max_encoded_len();
+	let read = OutChannelId::max_encoded_len() +
+		MmrFrontier::max_encoded_len() +
+		Compact(1u32).encoded_size() +
+		Compact(register as u32).encoded_size() +
+		register;
+	u64::from(channels)
+		.saturating_mul(channel as u64)
+		.saturating_add(u64::from(registers) * read as u64)
+}
+
+/// The most an `enact_messages` within the caps can weigh, with its extrinsic bytes, which the
+/// block length limit bounds too, and its lift reservation.
+fn max_inherent_weight<T: Config>() -> Weight {
+	let streams = T::MaxTouchedStreams::get();
+	let per_item = T::MaxInboundMessagesPerItem::get();
+	let length = *<T as frame_system::Config>::BlockLength::get()
+		.max
+		.get(frame_support::dispatch::DispatchClass::Mandatory);
+	let reservation = Compact(MAX_COMMITMENT_ENTRIES).encoded_size() as u64 +
+		u64::from(streams) *
+			(lift_len() + ParaId::max_encoded_len() + Compact::<u32>::max_encoded_len()) as u64;
+	let mut worst = Weight::zero();
+	// Registers and channels are charged differently: take the worst split of the streams.
+	for registers in 0..=streams {
+		let channels = streams - registers;
+		let payloads = channels.saturating_mul(per_item);
+		let tally = EnactTally {
+			channels,
+			payloads,
+			bytes: payloads.saturating_mul(T::MaxMsgLen::get()).min(length),
+			handler: T::DataHandler::on_data_weight(T::MaxMsgLen::get())
+				.saturating_mul(payloads.into()),
+			registers,
+		};
+		let item_bytes = max_inherent_item_bytes::<T>(channels, registers).min(u64::from(length));
+		worst = worst.max(tally.weight::<T>().saturating_add_proof_size(item_bytes));
+	}
+	worst
+		.saturating_add(inherent_overhead::<T>())
+		.saturating_add_proof_size(reservation)
+}
+
+/// What [`enact_weight`] charges for, so `create_inherent` can grow an inherent payload by payload.
+#[derive(Clone, Copy, Default)]
+struct EnactTally {
+	channels: u32,
+	payloads: u32,
+	bytes: u32,
+	handler: Weight,
+	registers: u32,
+}
+
+impl EnactTally {
+	fn add_payload<T: Config>(&mut self, payload: &Payload) {
+		let len = payload.len() as u32;
+		self.payloads = self.payloads.saturating_add(1);
+		self.bytes = self.bytes.saturating_add(len);
+		self.handler = self.handler.saturating_add(T::DataHandler::on_data_weight(len));
+	}
+
+	fn weight<T: Config>(&self) -> Weight {
+		let Self { channels, payloads, bytes, handler, registers } = *self;
+		// Every benchmark's base holds the inherent's fixed cost, and the payload and byte bases
+		// one channel's too: `enact_channels`, or `enact_registers` without channels, charges them
+		// once.
+		let registers_weight = T::WeightInfo::enact_registers(registers);
+		let enact = if channels == 0 {
+			registers_weight
+		} else {
+			// The payload benchmark counts the messages beyond the first of each channel.
+			let payloads = T::WeightInfo::enact_payloads(payloads.saturating_sub(channels))
+				.saturating_sub(T::WeightInfo::enact_payloads(0));
+			let bytes =
+				T::WeightInfo::enact_bytes(bytes).saturating_sub(T::WeightInfo::enact_bytes(0));
+			T::WeightInfo::enact_channels(channels)
+				.saturating_add(payloads)
+				.saturating_add(bytes)
+				.saturating_add(registers_weight.saturating_sub(T::WeightInfo::enact_registers(0)))
+		};
+		let footprints = T::QueueFootprint::ready_pages_weight().saturating_mul(channels.into());
+		enact
+			.saturating_add(handler)
+			.saturating_add(footprints)
+			.saturating_add(commit_weight::<T>(registers, channels))
+	}
+}
+
+/// The proof bytes one lift without advances reserves; a bundle has at most 256 blocks, so the
+/// `advances` length prefix takes 2 bytes.
+fn lift_len() -> usize {
+	2 + MmrExtensionProof::max_encoded_len() + StreamProof::max_encoded_len()
+}
+
+/// The candidate bundle's touched sources and streams, plus this inherent's touches and the proof
+/// bytes it reserved for lifts.
+struct BundleBudget {
+	touched: u32,
+	sources: BTreeSet<ParaId>,
+	streams: BTreeSet<(ParaId, StreamId)>,
+	reserved: u64,
+}
+
+impl BundleBudget {
+	fn load<T: Config>() -> Self {
+		let streams = BundleStreams::<T>::get().into_inner();
+		let sources = streams.iter().map(|(source, _)| *source).collect();
+		Self { touched: 0, sources, streams, reserved: 0 }
+	}
+
+	fn record(&mut self, stream: (ParaId, StreamId), bytes: u64) {
+		self.touched += 1;
+		self.sources.insert(stream.0);
+		self.streams.insert(stream);
+		self.reserved = self.reserved.saturating_add(bytes);
+	}
+}
+
+/// [`TreeNodes`] with writes buffered until [`Self::flush`], so a failed fold writes nothing and a
+/// node on several touched paths is written once.
+struct TreeNodeOverlay<T>(BTreeMap<NodeKey, InnerNode>, PhantomData<T>);
+
+impl<T> Default for TreeNodeOverlay<T> {
+	fn default() -> Self {
+		Self(BTreeMap::new(), PhantomData)
+	}
+}
+
+impl<T: Config> TreeNodeOverlay<T> {
+	fn flush(self) {
+		for (key, node) in self.0 {
+			TreeNodes::<T>::insert(key, node);
+		}
+	}
+}
+
+impl<T: Config> NodeLookup for TreeNodeOverlay<T> {
+	fn get_node(&self, key: &NodeKey) -> Option<InnerNode> {
+		self.0.get(key).copied().or_else(|| TreeNodes::<T>::get(key))
+	}
+}
+
+impl<T: Config> NodeStore for TreeNodeOverlay<T> {
+	fn set_node(&mut self, key: NodeKey, node: InnerNode) {
+		self.0.insert(key, node);
+	}
+}
+
+/// Decodes to the length of an inherent's raw data, so other inherents can be sized without
+/// knowing their types.
+struct EncodedLen(usize);
+
+impl codec::Decode for EncodedLen {
+	fn decode<I: codec::Input>(input: &mut I) -> Result<Self, codec::Error> {
+		Ok(Self(input.remaining_len()?.unwrap_or(0)))
+	}
+}
+
+/// Result of evaluating an inbound channel item against admission rules.
+struct AdmittedChannelItem {
+	/// The frontier before the item: its root and leaf count.
+	start: MmrRoot,
+	start_leaf_count: u64,
+	/// The channel state after the admitted prefix.
+	state: InChannelState,
+	payloads: Vec<Payload>,
+	data_messages: Vec<(MessagePosition, Vec<u8>)>,
+}
+
+/// A register read that passed admission.
+struct AdmittedRegisterRead {
+	/// The read's gap from where the previous read ended, if there was one.
+	skip: Option<(u64, u64)>,
+	state: OutChannelState,
+	register: Register,
+	read_pos: MessagePosition,
+	/// The frontier after the read.
+	end: MmrFrontier,
+}
+
+impl<T: Config> Pallet<T> {
+	/// Start this block's messaging state once: forget the previous block's root and consumption,
+	/// and drain its sends. Returns the number drained.
+	pub fn roll_over() -> u32 {
+		let now = frame_system::Pallet::<T>::block_number();
+		if let Some((at, drained)) = RolledOver::<T>::get() {
+			if at == now {
+				return drained;
+			}
+		}
+
+		BlockStreamsRoot::<T>::kill();
+		ConsumptionOutbox::<T>::kill();
+		Enacted::<T>::kill();
+
+		let is_first =
+			CumulusDigestItem::find_block_bundle_info(&frame_system::Pallet::<T>::digest())
+				.map_or(true, |info| info.index == 0);
+		if is_first {
+			BundleStreams::<T>::kill();
+		}
+
+		let drained = Self::drain_outbound_messages();
+		RolledOver::<T>::put((now, drained));
+		drained
+	}
+
+	fn drain_outbound_messages() -> u32 {
+		SendsThisBlock::<T>::kill();
+		let _ = OutboundMessages::<T>::clear(u32::MAX, None);
+		let mut drained = 0u32;
+		for (stream, hashes) in OutboundLeafHashes::<T>::drain() {
+			let mut frontier = OutboundFrontier::<T>::get(stream);
+			for hash in hashes {
+				frontier.append(hash);
+				drained = drained.saturating_add(1);
+			}
+			OutboundFrontier::<T>::insert(stream, frontier);
+		}
+		drained
+	}
+
+	/// The block's send cap outside the inherent's room.
+	pub fn send_limit() -> u32 {
+		T::MaxSendsPerBlock::get().saturating_sub(T::MaxTouchedStreams::get())
+	}
+
+	/// Append `payload` to `stream`'s outbound MMR within [`Self::send_limit`], returning its
+	/// position.
+	pub(crate) fn append_to_stream(
+		stream: StreamId,
+		payload: Vec<u8>,
+	) -> Result<MessagePosition, Error<T>> {
+		Self::append_within(stream, payload, Self::send_limit())
+	}
+
+	/// [`Self::append_to_stream`] with the block's sends capped at `limit`.
+	fn append_within(
+		stream: StreamId,
+		payload: Vec<u8>,
+		limit: u32,
+	) -> Result<MessagePosition, Error<T>> {
+		let payload: BoundedVec<u8, T::MaxMsgLen> =
+			payload.try_into().map_err(|_| Error::<T>::MessageTooBig)?;
+
+		Self::roll_over();
+		ensure!(!BlockStreamsRoot::<T>::exists(), Error::<T>::RootCommitted);
+		let sends = SendsThisBlock::<T>::get();
+		ensure!(sends < limit, Error::<T>::TooManySends);
+		let hash = leaf_hash_with_version(LEAF_VERSION, &payload);
+		let index = OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
+		OutboundMessages::<T>::try_append(stream, payload)
+			.map_err(|()| Error::<T>::TooManyMessages)?;
+		OutboundLeafHashes::<T>::try_append(stream, hash)
+			.map_err(|()| Error::<T>::TooManyMessages)?;
+		SendsThisBlock::<T>::put(sends + 1);
+
+		Ok(MessagePosition(OutboundFrontier::<T>::get(stream).leaf_count() + index))
+	}
+
+	/// Fold this block's sends into the [`StreamsRoot`], memoize it, and deposit the digest.
+	pub fn commit_streams_root() -> Option<StreamsRoot> {
+		Self::roll_over();
+		if let Some(committed) = BlockStreamsRoot::<T>::get() {
+			return committed;
+		}
+
+		Self::publish_pending_registers();
+
+		let mut touched: BTreeMap<StreamId, Hash> = BTreeMap::new();
+		for (stream, hashes) in OutboundLeafHashes::<T>::iter() {
+			let mut frontier = OutboundFrontier::<T>::get(stream);
+			for hash in hashes {
+				frontier.append(hash);
+			}
+			touched.insert(stream, frontier.root().0);
+		}
+		if touched.is_empty() {
+			BlockStreamsRoot::<T>::put(None::<StreamsRoot>);
+			return None;
+		}
+
+		let root = match Self::fold_into_tree(&touched) {
+			Ok(root) => root,
+			Err(error) => {
+				// Fail closed: a root from a corrupt cache would not commit the real stream roots.
+				log::error!(
+					target: LOG_TARGET,
+					"Block {:?}: streams root not committed: {error:?}",
+					frame_system::Pallet::<T>::block_number(),
+				);
+				BlockStreamsRoot::<T>::put(None::<StreamsRoot>);
+				return None;
+			},
+		};
+		BlockStreamsRoot::<T>::put(Some(root));
+		frame_system::Pallet::<T>::deposit_log(DigestItem::Consensus(
+			SPMS_ENGINE_ID,
+			root.encode(),
+		));
+		log::debug!(
+			target: LOG_TARGET,
+			"Block {:?}: committed streams root {root:?} over {} touched streams",
+			frame_system::Pallet::<T>::block_number(),
+			touched.len(),
+		);
+
+		Some(root)
+	}
+
+	/// Fold the touched streams' roots into the node cache and return the new [`StreamsRoot`].
+	/// On error, nothing is written.
+	fn fold_into_tree(touched: &BTreeMap<StreamId, Hash>) -> Result<StreamsRoot, TreeError> {
+		let mut entry = TreeRoot::<T>::get();
+		let mut nodes = TreeNodeOverlay::<T>::default();
+		let mut root = None;
+		for (stream, stream_root) in touched {
+			root = Some(update_tree_leaf(&mut entry, *stream, *stream_root, &mut nodes)?);
+		}
+		nodes.flush();
+		TreeRoot::<T>::set(entry);
+		Ok(root.expect("callers pass at least one touched stream; qed"))
+	}
+
+	/// This block's committed [`StreamsRoot`], if any.
+	pub fn current_streams_root() -> Option<StreamsRoot> {
+		BlockStreamsRoot::<T>::get().flatten()
+	}
+
+	/// Publish any pending ack registers for channels modified this block.
+	fn publish_pending_registers() {
+		let pending = PendingRegisterPublishes::<T>::take();
+		for channel in pending {
+			if let Some(mut state) = InChannels::<T>::get(channel) {
+				let current = Register {
+					up_to: MessagePosition(state.frontier.leaf_count()),
+					status: state.register_status(),
+				};
+				if state.published.as_ref() != Some(&current) {
+					let stream = channel.ack_stream();
+					if Self::append_within(stream, current.encode(), T::MaxSendsPerBlock::get())
+						.is_ok()
+					{
+						state.published = Some(current);
+						InChannels::<T>::insert(channel, state);
+						Self::deposit_event(Event::RegisterPublished {
+							channel,
+							up_to: current.up_to,
+							status: current.status,
+						});
+					} else {
+						PendingRegisterPublishes::<T>::mutate(|p| {
+							p.insert(channel);
+						});
+					}
+				}
+			}
+		}
+	}
+
+	/// Weight of [`Self::send`] for `data_len` bytes on `channel`, with the end-of-block work it
+	/// causes. Callers charge it before the send: `send` is not a call. The commit folds a stream
+	/// once per block, so only the stream's first send of the block pays for the fold.
+	pub fn send_weight(channel: OutChannelId, data_len: u32) -> Weight {
+		let now = frame_system::Pallet::<T>::block_number();
+		// Before this block's roll-over, the stored hashes are the last block's.
+		let touched = RolledOver::<T>::get().is_some_and(|(at, _)| at == now) &&
+			OutboundLeafHashes::<T>::decode_len(channel.data_stream()).unwrap_or(0) > 0;
+		let commit = if touched {
+			// One more leaf appended to the stream's frontier, which the drain's slope covers: it
+			// makes the same append and reads and writes the frontier too.
+			T::WeightInfo::on_initialize(1).saturating_sub(T::WeightInfo::on_initialize(0))
+		} else {
+			commit_weight::<T>(1, 0)
+		};
+		T::WeightInfo::send(data_len).saturating_add(commit)
+	}
+
+	/// Whether [`Self::send`] would accept `data_len` bytes on `channel` now: the block is
+	/// initialized and its root not committed, the encoded `Data` leaf fits [`Config::MaxMsgLen`]
+	/// and the lane's `max_message_size`, the channel is open with credit left, and the stream
+	/// and the block have room. No side effects: before this block's [`Self::roll_over`], the
+	/// stored root and sends are the last block's, so it reads them as the roll-over would leave
+	/// them.
+	pub fn can_send(channel: OutChannelId, data_len: usize) -> Result<(), Error<T>> {
+		ensure!(frame_system::Pallet::<T>::execution_phase().is_some(), Error::<T>::NotInitialized);
+		let now = frame_system::Pallet::<T>::block_number();
+		let rolled_over = RolledOver::<T>::get().is_some_and(|(at, _)| at == now);
+		ensure!(!rolled_over || !BlockStreamsRoot::<T>::exists(), Error::<T>::RootCommitted);
+
+		// The `Data` leaf is a variant byte, the compact length and the bytes.
+		let len = u32::try_from(data_len).map_err(|_| Error::<T>::MessageTooBig)?;
+		let leaf_len = (data_len as u64)
+			.saturating_add(1)
+			.saturating_add(Compact(len).encoded_size() as u64);
+		ensure!(leaf_len <= u64::from(T::MaxMsgLen::get()), Error::<T>::MessageTooBig);
+
+		let state = OutChannels::<T>::get(channel).ok_or(Error::<T>::NotOpen)?;
+		let max_size = state.send_size_limit().ok_or(Error::<T>::NotOpen)?;
+		ensure!(leaf_len <= u64::from(max_size), Error::<T>::MessageTooBig);
+
+		let stream = channel.data_stream();
+		let sent = Self::sent_count(stream);
+		let up_to = state.register.map(|r| r.register.up_to.0).unwrap_or(0);
+		ensure!(sent.saturating_sub(up_to) < T::MaxInFlight::get() as u64, Error::<T>::NoCredit);
+
+		if rolled_over {
+			let queued = OutboundMessages::<T>::decode_len(stream).unwrap_or(0);
+			ensure!(queued < T::MaxMessagesPerBlock::get() as usize, Error::<T>::TooManyMessages);
+			ensure!(SendsThisBlock::<T>::get() < Self::send_limit(), Error::<T>::TooManySends);
+		}
+		Ok(())
+	}
+
+	/// Send `data` on an outbound channel.
+	pub fn send(channel: OutChannelId, data: Vec<u8>) -> Result<MessagePosition, Error<T>> {
+		Self::can_send(channel, data.len())?;
+		Self::append_to_stream(channel.data_stream(), ChannelMessage::Data(data).encode())
+	}
+
+	pub fn outbound_xcm_lane(peer: ParaId) -> OutChannelId {
+		OutChannelId {
+			recipient: peer,
+			domain: XCM_CHANNEL_DOMAIN,
+			num: LastOutboundLane::<T>::get((peer, XCM_CHANNEL_DOMAIN)).unwrap_or_default(),
+		}
+	}
+
+	/// Checks the stream and source caps for touching `stream`, and returns the proof bytes the
+	/// candidate attaches for it after the block is built. `skip` is a lossy read's gap from where
+	/// the previous read ended. It costs bytes only when the bundle already read the stream, which
+	/// only a block authored elsewhere does: `create_inherent` reads a register once per bundle.
+	fn lift_reservation(
+		budget: &BundleBudget,
+		stream: (ParaId, StreamId),
+		skip: Option<(u64, u64)>,
+	) -> Result<u64, Error<T>> {
+		ensure!(budget.touched < T::MaxTouchedStreams::get(), Error::<T>::TooManyStreams);
+		ensure!(
+			budget.streams.contains(&stream) ||
+				budget.streams.len() < T::MaxBundleStreams::get() as usize,
+			Error::<T>::TooManyStreams
+		);
+		let new_source = !budget.sources.contains(&stream.0);
+		ensure!(
+			!new_source || budget.sources.len() < MAX_COMMITMENT_ENTRIES as usize,
+			Error::<T>::MaxCommitmentEntriesExceeded
+		);
+
+		let mut bytes = 0usize;
+		if budget.sources.is_empty() {
+			bytes += Compact(MAX_COMMITMENT_ENTRIES).encoded_size();
+		}
+		if new_source {
+			bytes += ParaId::max_encoded_len() + Compact::<u32>::max_encoded_len();
+		}
+		if !budget.streams.contains(&stream) {
+			bytes += lift_len();
+		} else if let Some((n1, n2)) = skip {
+			bytes += MmrExtensionProof::encoded_len_for(n1, n2)
+				.unwrap_or_else(MmrExtensionProof::max_encoded_len);
+		}
+		Ok(bytes as u64)
+	}
+
+	/// Proof size left for the messaging inherent: the block's remaining proof budget, less the
+	/// raw data of the other inherents, which are applied after this one is created.
+	fn proof_budget(inherent_data: &InherentData) -> u64 {
+		let max = T::BlockWeights::get().max_block.proof_size();
+		let used = frame_system::Pallet::<T>::block_weight().total().proof_size();
+		let others: u64 = inherent_data
+			.identifiers()
+			.filter(|id| **id != INHERENT_IDENTIFIER)
+			.filter_map(|id| inherent_data.get_data::<EncodedLen>(id).ok().flatten())
+			.map(|len| len.0 as u64)
+			.fold(0, u64::saturating_add);
+		max.saturating_sub(used).saturating_sub(others)
+	}
+
+	/// Queue capacity is checked once per item, so the last admitted item can take the queue
+	/// past the page threshold.
+	fn is_consumed(channel: &InChannelId, state: &InChannelState) -> bool {
+		state.is_watched() && T::QueueFootprint::ready_pages(channel) < T::MaxQueueFootprint::get()
+	}
+
+	/// Admit a prefix of payloads for an inbound channel.
+	///
+	/// Shared between `create_inherent` (which cuts before the first non-admitted payload)
+	/// and `consume_channel_item` / dispatch (which requires the admitted prefix to be the
+	/// whole item).
+	fn admit_channel_item(
+		channel_id: InChannelId,
+		payloads: &[Payload],
+	) -> Option<AdmittedChannelItem> {
+		let mut state = InChannels::<T>::get(channel_id)?;
+		if !Self::is_consumed(&channel_id, &state) {
+			return None;
+		}
+		let start = state.frontier.root();
+		let start_leaf_count = state.frontier.leaf_count();
+		let max_item_msgs = T::MaxInboundMessagesPerItem::get() as usize;
+
+		let mut admitted_payloads = Vec::new();
+		let mut data_messages = Vec::new();
+
+		for payload in payloads.iter().take(max_item_msgs) {
+			if payload.len() > T::MaxMsgLen::get() as usize {
+				break;
+			}
+			let Ok(msg) = ChannelMessage::decode_all(&mut &payload[..]) else {
+				break;
+			};
+
+			let pending_data = match msg {
+				ChannelMessage::Data(data) => {
+					if payload.len() > state.max_message_size as usize {
+						break;
+					}
+					Some(data)
+				},
+				ChannelMessage::Close => {
+					state.status = InboundStatus::Closed;
+					None
+				},
+			};
+
+			let pos = MessagePosition(state.frontier.leaf_count());
+			if state
+				.frontier
+				.try_append(leaf_hash_with_version(LEAF_VERSION, payload))
+				.is_err()
+			{
+				break;
+			}
+
+			if let Some(data) = pending_data {
+				data_messages.push((pos, data));
+			}
+			admitted_payloads.push(payload.clone());
+
+			if state.status == InboundStatus::Closed {
+				// A close is the final leaf on this lane.
+				break;
+			}
+		}
+
+		Some(AdmittedChannelItem {
+			start,
+			start_leaf_count,
+			state,
+			payloads: admitted_payloads,
+			data_messages,
+		})
+	}
+
+	fn sent_count(stream: StreamId) -> u64 {
+		OutboundFrontier::<T>::get(stream).leaf_count() +
+			OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64
+	}
+
+	/// Validate a register read for admission.
+	fn admit_register_read(
+		channel_id: OutChannelId,
+		lossy: &LossyRead,
+	) -> Result<AdmittedRegisterRead, Error<T>> {
+		let Some(state) = OutChannels::<T>::get(channel_id) else {
+			return Err(Error::<T>::UnknownChannel);
+		};
+		let sent = Self::sent_count(channel_id.data_stream());
+		let cursor = state.register_cursor(|| sent).ok_or(Error::<T>::NotAdmitted)?;
+		let [payload] = lossy.payloads.as_slice() else {
+			return Err(Error::<T>::BadRegister);
+		};
+		let register =
+			Register::decode_all(&mut &payload[..]).map_err(|_| Error::<T>::BadRegister)?;
+
+		let mut frontier = lossy.frontier.clone();
+		let read_pos = MessagePosition(frontier.leaf_count());
+		frontier
+			.try_append(leaf_hash_with_version(LEAF_VERSION, payload))
+			.map_err(|_| Error::<T>::BadFrontier)?;
+
+		ensure!(read_pos >= cursor, Error::<T>::NotAdmitted);
+		let prev_up_to = state.register.map(|r| r.register.up_to.0).unwrap_or(0);
+		ensure!(register.up_to.0 >= prev_up_to, Error::<T>::NotAdmitted);
+		ensure!(register.up_to.0 <= sent, Error::<T>::NotAdmitted);
+
+		if let (Some(previous), RegisterStatus::Open { .. }) = (state.register, register.status) {
+			ensure!(previous.register.status == register.status, Error::<T>::BadRegister);
+		}
+		let skip = state.register.map(|r| (r.position.0 + 1, read_pos.0));
+		Ok(AdmittedRegisterRead { skip, state, register, read_pos, end: frontier })
+	}
+
+	/// Consume an inbound channel item in `enact_messages`.
+	fn consume_channel_item(
+		channel_id: InChannelId,
+		payloads: Vec<Payload>,
+	) -> Result<(), Error<T>> {
+		let admitted =
+			Self::admit_channel_item(channel_id, &payloads).ok_or(Error::<T>::NotAdmitted)?;
+		ensure!(admitted.payloads.len() == payloads.len(), Error::<T>::NotAdmitted);
+
+		let foreign_stream = channel_id.sender_data_stream(T::SelfParaId::get());
+
+		for (pos, data) in admitted.data_messages {
+			T::DataHandler::on_data(channel_id.sender, foreign_stream.1, pos, data);
+		}
+
+		let start_pos = MessagePosition(admitted.start_leaf_count);
+		for idx in 0..admitted.payloads.len() {
+			Self::deposit_event(Event::MessageConsumed {
+				source: channel_id.sender,
+				stream: foreign_stream.1,
+				position: MessagePosition(start_pos.0 + idx as u64),
+			});
+		}
+
+		InChannels::<T>::insert(channel_id, &admitted.state);
+		ConsumptionOutbox::<T>::append((
+			channel_id.sender,
+			foreign_stream.1,
+			Interval { start: admitted.start, end: admitted.state.frontier },
+		));
+		PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel_id));
+		Ok(())
+	}
+
+	/// Consume a register read item in `enact_messages`. Returns the read's gap
+	/// ([`AdmittedRegisterRead::skip`]).
+	fn consume_register_item(
+		channel_id: OutChannelId,
+		lossy: LossyRead,
+	) -> Result<Option<(u64, u64)>, Error<T>> {
+		let AdmittedRegisterRead { skip, mut state, register, read_pos, end } =
+			Self::admit_register_read(channel_id, &lossy)?;
+		let start = lossy.frontier.root();
+
+		state.register = Some(AppliedRegister { position: read_pos, register });
+		match register.status {
+			RegisterStatus::Closing if state.want_open => {
+				// The credit gate leaves a stream slot, and the inherent has reserved block slots.
+				Self::append_within(
+					channel_id.data_stream(),
+					ChannelMessage::Close.encode(),
+					T::MaxSendsPerBlock::get(),
+				)?;
+				state.want_open = false;
+			},
+			RegisterStatus::Closed => state.want_open = false,
+			RegisterStatus::Open { .. } | RegisterStatus::Closing => {},
+		}
+
+		OutChannels::<T>::insert(channel_id, state);
+		let foreign_ack = channel_id.peer_ack_stream(T::SelfParaId::get());
+		ConsumptionOutbox::<T>::append((foreign_ack.0, foreign_ack.1, Interval { start, end }));
+		Ok(skip)
+	}
+
+	/// This block's outbound sends per stream, in [`StreamId`] order.
+	pub fn outbound_messages() -> Vec<(StreamId, Vec<Vec<u8>>)> {
+		let mut messages: Vec<(StreamId, Vec<Vec<u8>>)> = OutboundMessages::<T>::iter()
+			.map(|(stream, payloads)| {
+				(stream, payloads.into_iter().map(BoundedVec::into_inner).collect())
+			})
+			.collect();
+		messages.sort_by_key(|(stream, _)| *stream);
+		messages
+	}
+
+	/// Every outbound stream's frontier after this block's sends, in [`StreamId`] order. A stream
+	/// first sent in this block has no [`OutboundFrontier`] entry until the next roll-over.
+	pub fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)> {
+		let mut frontiers: BTreeMap<StreamId, MmrFrontier> =
+			OutboundFrontier::<T>::iter().collect();
+		for (stream, hashes) in OutboundLeafHashes::<T>::iter() {
+			let frontier = frontiers.entry(stream).or_default();
+			for hash in hashes {
+				frontier.append(hash);
+			}
+		}
+		frontiers.into_iter().collect()
+	}
+
+	/// Last applied ACK for each outbound lane.
+	pub fn outbound_up_to() -> BTreeMap<OutChannelId, MessagePosition> {
+		OutChannels::<T>::iter()
+			.map(|(lane, state)| {
+				(lane, state.register.map(|r| r.register.up_to).unwrap_or_default())
+			})
+			.collect()
+	}
+
+	/// The inbound streams and registers the node should fetch.
+	pub fn consumed_streams() -> ConsumedStreams {
+		let mut consumed = ConsumedStreams::default();
+		for (channel, state) in InChannels::<T>::iter() {
+			if Self::is_consumed(&channel, &state) {
+				consumed.channels.insert(channel, state.frontier);
+			}
+		}
+		for (channel, state) in OutChannels::<T>::iter() {
+			if let Some(cursor) = state.register_cursor(|| Self::sent_count(channel.data_stream()))
+			{
+				consumed.registers.insert(channel, cursor);
+			}
+		}
+		consumed
+	}
+
+	/// Cap on streams touched per block.
+	pub fn max_touched_streams() -> u32 {
+		T::MaxTouchedStreams::get()
+	}
+
+	/// This block's consumption record.
+	pub fn consumption_record() -> ConsumptionRecord {
+		let outbox = ConsumptionOutbox::<T>::get();
+		let mut record = ConsumptionRecord::default();
+		for (source, stream, interval) in outbox {
+			record.entries.entry(source).or_default().push((stream, interval));
+		}
+		// No dedup: a duplicate must reach requires synthesis and fail there.
+		for streams in record.entries.values_mut() {
+			streams.sort_by_key(|(stream, _)| *stream);
+		}
+		record
+	}
+}
+
+impl<T: Config> ProvideConsumptionRecord for Pallet<T> {
+	const ENABLED: bool = true;
+
+	fn consumption_record() -> ConsumptionRecord {
+		Self::consumption_record()
+	}
+}

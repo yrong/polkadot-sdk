@@ -22,6 +22,10 @@ use cumulus_primitives_core::{
 	BlockBundleInfo, ClaimQueueOffset, CollectCollationInfo, CoreInfo, CoreSelector,
 	CumulusDigestItem, ParaId, ParachainBlockData, PersistedValidationData,
 };
+use cumulus_primitives_spec_messaging::{
+	leaf_hash, streams_root::gen_stream_proof, ChannelMessage, InChannelId, LiftsBySource,
+	MessagingInherentData, MmrExtensionProof, MmrFrontier, RequiresLift, StreamId, StreamsRoot,
+};
 use cumulus_test_client::{
 	generate_extrinsic, generate_extrinsic_with_pair,
 	runtime::{
@@ -35,6 +39,7 @@ use cumulus_test_client::{
 };
 use cumulus_test_relay_sproof_builder::RelayStateSproofBuilder;
 use polkadot_parachain_primitives::primitives::ValidationResult;
+use relay_chain::RequiresSet;
 use sc_consensus::{BlockImport, BlockImportParams, ForkChoiceStrategy};
 use sp_api::{ApiExt, Core, ProofRecorder, ProvideRuntimeApi, StorageProof};
 use sp_consensus_babe::SlotDuration;
@@ -45,7 +50,7 @@ use sp_runtime::{
 };
 use sp_tracing::capture_test_logs;
 use sp_trie::{proof_size_extension::ProofSizeExt, recorder::IgnoredNodes};
-use std::{env, process::Command};
+use std::{collections::BTreeMap, env, process::Command};
 
 fn call_validate_block_validation_result(
 	validation_code: &[u8],
@@ -173,11 +178,31 @@ fn build_block_with_witness(
 
 fn build_multiple_blocks_with_witness(
 	client: &Client,
+	parent_head: Header,
+	sproof_builder: RelayStateSproofBuilder,
+	num_blocks: u32,
+	extra_extrinsics: impl Fn(u32) -> Vec<UncheckedExtrinsic>,
+	pre_digests: impl Fn(u32) -> Vec<DigestItem>,
+) -> TestBlockData {
+	build_bundle_with_pov_limit(
+		client,
+		parent_head,
+		sproof_builder,
+		num_blocks,
+		extra_extrinsics,
+		pre_digests,
+		0,
+	)
+}
+
+fn build_bundle_with_pov_limit(
+	client: &Client,
 	mut parent_head: Header,
 	mut sproof_builder: RelayStateSproofBuilder,
 	num_blocks: u32,
 	extra_extrinsics: impl Fn(u32) -> Vec<UncheckedExtrinsic>,
 	pre_digests: impl Fn(u32) -> Vec<DigestItem>,
+	max_pov_size: u32,
 ) -> TestBlockData {
 	let parent_head_root = *parent_head.state_root();
 	sproof_builder.para_id = test_runtime::PARACHAIN_ID.into();
@@ -200,6 +225,7 @@ fn build_multiple_blocks_with_witness(
 	};
 
 	let validation_data = PersistedValidationData {
+		max_pov_size,
 		relay_parent_number: 1,
 		parent_head: parent_head.encode().into(),
 		..Default::default()
@@ -298,7 +324,12 @@ fn validate_block_works() {
 }
 
 #[test]
-fn validate_block_rejects_v3_without_spec_messaging() {
+fn validate_block_rejects_lifts_for_unconsumed_sources() {
+	use cumulus_primitives_spec_messaging::{
+		LiftsBySource, MmrExtensionProof, RequiresLift, StreamProof,
+	};
+	use std::collections::BTreeMap;
+
 	sp_tracing::try_init_simple();
 	let (client, parent_head) = create_test_client();
 	let TestBlockData { block, validation_data } = build_block_with_witness(
@@ -309,16 +340,24 @@ fn validate_block_rejects_v3_without_spec_messaging() {
 		Default::default(),
 	);
 	let (blocks, proof, _) = block.into_inner();
-	let pov = ParachainBlockData::new_with_lifts(blocks, proof, None, Default::default());
+	let validate = |lifts| {
+		let pov = ParachainBlockData::new_with_lifts(blocks.clone(), proof.clone(), None, lifts);
+		call_validate_block(parent_head.clone(), pov, validation_data.relay_parent_storage_root)
+	};
+
+	assert_eq!(validate(LiftsBySource::default()).expect("valid V3 PoV"), *blocks[0].header());
+
+	let lift = RequiresLift {
+		advances: Vec::new(),
+		extension: MmrExtensionProof::identity(&Default::default()),
+		tree_proof: StreamProof { steps: Default::default() },
+	};
+	let lifts = LiftsBySource::try_from(BTreeMap::from([(ParaId::from(2000), vec![lift])]))
+		.expect("one source fits the bound; qed");
 	let logs = capture_test_logs!({
-		call_validate_block(parent_head, pov, validation_data.relay_parent_storage_root)
-			.expect_err("V3 requires opt-in even with empty lifts");
+		validate(lifts).expect_err("the block consumed nothing from this source");
 	});
-	assert!(
-		logs.contains("V3 requires speculative messaging to be enabled"),
-		"{}",
-		logs.get_logs()
-	);
+	assert!(logs.contains("LiftSourceMismatch"), "{}", logs.get_logs());
 }
 
 #[test]
@@ -694,6 +733,361 @@ fn validate_block_handles_ump_signal() {
 		upward_messages,
 		vec![UMP_SEPARATOR, UMPSignal::SelectCore(CoreSelector(0), ClaimQueueOffset(0)).encode()]
 	);
+}
+
+fn accept_channels(client: &Client, parent_head: Header, sources: &[ParaId]) -> Header {
+	configure_channels(
+		client,
+		parent_head,
+		vec![],
+		sources
+			.iter()
+			.map(|&sender| test_runtime::SpecMessagingCall::accept_open_channel {
+				sender,
+				domain: 0,
+				num: 0,
+			}),
+	)
+}
+
+fn configure_channels(
+	client: &Client,
+	parent_head: Header,
+	pre_digests: Vec<DigestItem>,
+	calls: impl IntoIterator<Item = test_runtime::SpecMessagingCall<test_runtime::Runtime>>,
+) -> Header {
+	let extrinsics = calls
+		.into_iter()
+		.enumerate()
+		.map(|(nonce, call)| {
+			generate_extrinsic_with_pair(
+				client,
+				Alice.into(),
+				SudoCall::sudo { call: Box::new(call.into()) },
+				Some(nonce as u32),
+			)
+		})
+		.collect();
+	let TestBlockData { block, .. } =
+		build_block_with_witness(client, extrinsics, parent_head, Default::default(), pre_digests);
+
+	let (mut header, extrinsics) = block.blocks()[0].clone().deconstruct();
+	let seal = header.digest.pop().unwrap();
+
+	let mut import = BlockImportParams::new(BlockOrigin::Own, header);
+	import.body = Some(extrinsics);
+	import.post_digests.push(seal);
+	import.fork_choice = Some(ForkChoiceStrategy::Custom(true));
+
+	futures::executor::block_on(BlockImport::import_block(client, import)).unwrap();
+	block.blocks()[0].header.clone()
+}
+
+/// A block that consumes four payloads from `source` on a channel to this para, the lift
+/// binding them to a `StreamsRoot` that commits exactly those payloads, and that root.
+fn consuming_block(
+	client: &Client,
+	parent_head: Header,
+	source: ParaId,
+) -> (TestBlockData, LiftsBySource, StreamsRoot) {
+	let channel = InChannelId { sender: source, domain: 0, num: 0 };
+	let stream =
+		StreamId::Channel { recipient: test_runtime::PARACHAIN_ID.into(), domain: 0, num: 0 };
+	let payloads: Vec<Vec<u8>> = vec![
+		ChannelMessage::Data(vec![0]).encode(),
+		ChannelMessage::Data(vec![1; 8]).encode(),
+		ChannelMessage::Data(vec![2; 8]).encode(),
+		ChannelMessage::Data(vec![3; 8]).encode(),
+	];
+
+	let mut frontier = MmrFrontier::new();
+	payloads.iter().for_each(|p| frontier.append(leaf_hash(p)));
+	let entries = BTreeMap::from([(stream, frontier.root().0)]);
+	let (committed, tree_proof) = gen_stream_proof(&entries, stream).unwrap();
+	let lift = RequiresLift {
+		advances: Vec::new(),
+		extension: MmrExtensionProof::identity(&frontier),
+		tree_proof,
+	};
+	let lifts = LiftsBySource::try_from(BTreeMap::from([(source, vec![lift])])).unwrap();
+
+	let data = MessagingInherentData {
+		channels: BTreeMap::from([(channel, payloads)]),
+		registers: BTreeMap::new(),
+		events: BTreeMap::new(),
+	};
+	let inherent = UncheckedExtrinsic::new_bare(
+		test_runtime::SpecMessagingCall::enact_messages { data }.into(),
+	);
+	let block =
+		build_block_with_witness(client, vec![inherent], parent_head, Default::default(), vec![]);
+	(block, lifts, committed)
+}
+
+fn with_lifts(block: ParachainBlockData<Block>, lifts: LiftsBySource) -> ParachainBlockData<Block> {
+	let (blocks, proof, _) = block.into_inner();
+	ParachainBlockData::new_with_lifts(blocks, proof, None, lifts)
+}
+
+#[test]
+fn validate_block_synthesizes_requires_from_the_lifts() {
+	sp_tracing::try_init_simple();
+
+	let (client, genesis_head) = create_test_client();
+	let source = ParaId::from(2000);
+	let parent_head = accept_channels(&client, genesis_head, &[source]);
+	let (TestBlockData { block, validation_data }, lifts, committed) =
+		consuming_block(&client, parent_head.clone(), source);
+	// Consuming publishes the ack register at block end, so the block also provides its root.
+	let provides = cumulus_primitives_core::bundle_provides(
+		block.blocks().iter().map(|block| block.header().digest()),
+	)
+	.expect("the consuming block has a valid SPMS digest")
+	.expect("the ack register publish commits a `StreamsRoot`");
+
+	let upward_messages = call_validate_block_validation_result(
+		WASM_BINARY.expect("You need to build the WASM binaries to run the tests!"),
+		parent_head,
+		with_lifts(block, lifts),
+		validation_data.relay_parent_storage_root,
+	)
+	.expect("Calls `validate_block`")
+	.upward_messages;
+
+	let requires = RequiresSet::try_from_iter([(source, committed)]).unwrap();
+	assert_eq!(
+		upward_messages,
+		vec![
+			UMP_SEPARATOR,
+			UMPSignal::Provides(provides).encode(),
+			UMPSignal::Requires(requires).encode(),
+		]
+	);
+}
+
+// Identical leaves let us construct the peaks of a maximum-width MMR proof.
+fn longest_extension(leaf: Hash) -> (MmrFrontier, MmrExtensionProof) {
+	use cumulus_primitives_spec_messaging::mmr::{bag_peaks, MAX_MMR_HASHES, MAX_MMR_LEAF_COUNT};
+
+	let mut subtrees = vec![leaf];
+	for _ in 1..MAX_MMR_HASHES {
+		let root = *subtrees.last().unwrap();
+		let mut pair = MmrFrontier::from_parts(vec![root], 1).unwrap();
+		pair.append(root);
+		subtrees.push(pair.peaks()[0]);
+	}
+	let count = MAX_MMR_LEAF_COUNT - 1;
+	let peaks: Vec<_> = subtrees.iter().copied().rev().collect();
+	let frontier = MmrFrontier::from_parts(peaks.clone(), count).unwrap();
+	subtrees.pop();
+	subtrees.push(bag_peaks(&peaks[1..]));
+	let extension =
+		MmrExtensionProof { leaf_count: count, connecting_nodes: subtrees.try_into().unwrap() };
+	assert_eq!(
+		extension
+			.calculate_root(&MmrFrontier::from_parts(vec![leaf], 1).unwrap())
+			.unwrap(),
+		frontier.root()
+	);
+	(frontier, extension)
+}
+
+#[test]
+fn a_near_limit_bundle_validates_with_maximum_mmr_proofs() {
+	use cumulus_primitives_spec_messaging::{
+		LossyRead, MessagePosition, OutChannelId, Register, RegisterStatus,
+	};
+	use rand::{rngs::StdRng, RngCore, SeedableRng};
+	use test_runtime::GetLastTimestamp;
+
+	sp_tracing::try_init_simple();
+
+	let (client, genesis) = create_elastic_scaling_test_client();
+	let channels: Vec<_> = (2000u32..2014)
+		.map(|i| InChannelId { sender: ParaId::from(i), domain: 0, num: 0 })
+		.collect();
+	let outbound = OutChannelId { recipient: 3000.into(), domain: 0, num: 0 };
+	let calls = channels
+		.iter()
+		.map(|c| test_runtime::SpecMessagingCall::accept_open_channel {
+			sender: c.sender,
+			domain: c.domain,
+			num: c.num,
+		})
+		.chain([test_runtime::SpecMessagingCall::open_channel {
+			recipient: outbound.recipient,
+			domain: 0,
+			num: 0,
+		}]);
+	let core_info = |cores: u16| {
+		CumulusDigestItem::CoreInfo(CoreInfo {
+			selector: CoreSelector(0),
+			claim_queue_offset: ClaimQueueOffset(0),
+			number_of_cores: cores.into(),
+		})
+		.to_digest_item()
+	};
+	let parent = configure_channels(&client, genesis, vec![core_info(12)], calls);
+
+	let us = test_runtime::PARACHAIN_ID.into();
+	let first_leaf = ChannelMessage::Data(vec![0]).encode();
+	let register = Register {
+		up_to: MessagePosition(0),
+		status: RegisterStatus::Open { max_message_size: 102400 },
+	}
+	.encode();
+	let (far, skip) = longest_extension(leaf_hash(&register));
+	let mut reads = vec![MessagingInherentData::default(); 2];
+	for (i, frontier) in [(0, MmrFrontier::new()), (1, far.clone())] {
+		reads[i]
+			.registers
+			.insert(outbound, LossyRead { frontier, payloads: vec![register.clone()] });
+	}
+	let mut committed = BTreeMap::new();
+	let mut lifts = BTreeMap::new();
+	let mut bind = |(source, stream): (ParaId, StreamId), root: Hash, extension, advances| {
+		let mut entries = BTreeMap::from([(stream, root)]);
+		let key = stream.to_bytes();
+		for bit in 0..key.len() * 8 {
+			let mut neighbour = key;
+			neighbour[bit / 8] ^= 0x80 >> (bit % 8);
+			if let Ok(other) = StreamId::from_bytes(neighbour) {
+				entries.insert(other, Hash::repeat_byte(bit as u8));
+			}
+		}
+		let (root, tree_proof) = gen_stream_proof(&entries, stream).unwrap();
+		committed.insert(source, root);
+		lifts.insert(source, vec![RequiresLift { advances, extension, tree_proof }]);
+	};
+	let mut end = far;
+	end.append(leaf_hash(&register));
+	bind(outbound.peer_ack_stream(us), end.root().0, MmrExtensionProof::identity(&end), vec![skip]);
+
+	let limit = 5 * 1024 * 1024usize;
+	// Leave room for the two headers, storage witness and lifts.
+	let body_len = (limit - 128 * 1024) / (reads.len() * 12 * 3);
+	let mut rng = StdRng::seed_from_u64(3);
+	for channel in &channels[..12] {
+		let mut frontier = MmrFrontier::new();
+		for (i, data) in reads.iter_mut().enumerate() {
+			let payloads = data.channels.entry(*channel).or_default();
+			if i == 0 {
+				payloads.push(first_leaf.clone());
+			}
+			for _ in 0..3 {
+				let mut body = vec![0; body_len];
+				rng.fill_bytes(&mut body);
+				payloads.push(ChannelMessage::Data(body).encode());
+			}
+			for payload in payloads {
+				frontier.append(leaf_hash(payload));
+			}
+		}
+		bind(
+			channel.sender_data_stream(us),
+			frontier.root().0,
+			MmrExtensionProof::identity(&frontier),
+			vec![],
+		);
+	}
+	for (data, extra) in reads.iter_mut().zip(&channels[12..]) {
+		data.channels.insert(*extra, vec![first_leaf.clone()]);
+		let (head, extension) = longest_extension(leaf_hash(&first_leaf));
+		bind(extra.sender_data_stream(us), head.root().0, extension, vec![]);
+	}
+	let next_slot = client.runtime_api().get_last_timestamp(parent.hash()).unwrap() / 6000 + 1;
+	let TestBlockData { block, validation_data } = build_bundle_with_pov_limit(
+		&client,
+		parent.clone(),
+		RelayStateSproofBuilder { current_slot: next_slot.into(), ..Default::default() },
+		2,
+		|i| {
+			vec![UncheckedExtrinsic::new_bare(
+				test_runtime::SpecMessagingCall::enact_messages { data: reads[i as usize].clone() }
+					.into(),
+			)]
+		},
+		|i| {
+			vec![BlockBundleInfo { index: i as u8, is_last: i == 1 }.to_digest_item(), core_info(6)]
+		},
+		limit as u32,
+	);
+	let candidate = with_lifts(block, LiftsBySource::try_from(lifts).unwrap());
+	let bytes = BlockData(candidate.encode()).encoded_size();
+	let limit = validation_data.max_pov_size as usize;
+	assert!((limit * 95 / 100..=limit).contains(&bytes), "{bytes} bytes at limit {limit}");
+	let head = candidate.blocks().last().unwrap().header.clone();
+	let result = call_validate_block_validation_result(
+		test_runtime::elastic_scaling_500ms::WASM_BINARY.unwrap(),
+		parent,
+		candidate,
+		validation_data.relay_parent_storage_root,
+	)
+	.unwrap();
+	assert_eq!(result.head_data, HeadData(head.encode()));
+	let expected = UMPSignal::Requires(RequiresSet::try_from_iter(committed).unwrap()).encode();
+	assert!(result.upward_messages.contains(&expected));
+}
+
+/// Rerun the test `name` in a subprocess: the wasm trap drops the panic message, which only the
+/// runtime's log on stderr keeps.
+fn assert_rerun_fails_with(name: &str, message: &str) {
+	let output = Command::new(env::current_exe().unwrap())
+		.args([name, "--", "--nocapture"])
+		.env("RUN_TEST", "1")
+		.output()
+		.expect("Runs the test");
+	assert!(output.status.success());
+	assert!(dbg!(String::from_utf8(output.stderr).unwrap()).contains(message));
+}
+
+#[test]
+fn validate_block_rejects_consumption_without_lifts() {
+	sp_tracing::try_init_simple();
+
+	if env::var("RUN_TEST").is_ok() {
+		let (client, genesis_head) = create_test_client();
+		let source = ParaId::from(2000);
+		let parent_head = accept_channels(&client, genesis_head, &[source]);
+		let (TestBlockData { block, validation_data }, ..) =
+			consuming_block(&client, parent_head.clone(), source);
+
+		call_validate_block(parent_head, block, validation_data.relay_parent_storage_root)
+			.unwrap_err();
+	} else {
+		assert_rerun_fails_with(
+			"validate_block_rejects_consumption_without_lifts",
+			"LiftSourceMismatch",
+		);
+	}
+}
+
+#[test]
+fn validate_block_rejects_a_lift_for_another_source() {
+	sp_tracing::try_init_simple();
+
+	if env::var("RUN_TEST").is_ok() {
+		let (client, genesis_head) = create_test_client();
+		let source = ParaId::from(2000);
+		let other_source = ParaId::from(3000);
+		let parent_head = accept_channels(&client, genesis_head, &[source, other_source]);
+		let (TestBlockData { block, validation_data }, ..) =
+			consuming_block(&client, parent_head.clone(), source);
+		// A lift that verifies on its own, but for a source the block did not consume.
+		let (_, other_lifts, _) = consuming_block(&client, parent_head.clone(), other_source);
+
+		call_validate_block(
+			parent_head,
+			with_lifts(block, other_lifts),
+			validation_data.relay_parent_storage_root,
+		)
+		.unwrap_err();
+	} else {
+		assert_rerun_fails_with(
+			"validate_block_rejects_a_lift_for_another_source",
+			"LiftSourceMismatch",
+		);
+	}
 }
 
 #[test]
