@@ -689,7 +689,11 @@ mod tests {
 	}
 
 	fn register(up_to: u64) -> Vec<u8> {
-		Register { up_to: MessagePosition(up_to), status: RegisterStatus::Opened }.encode()
+		Register {
+			up_to: MessagePosition(up_to),
+			status: RegisterStatus::Open { max_message_size: 1024 },
+		}
+		.encode()
 	}
 
 	fn recovery_record(h: &Harness) -> ConsumptionRecord {

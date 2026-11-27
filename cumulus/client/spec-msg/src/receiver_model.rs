@@ -307,7 +307,7 @@ impl World {
 		if count == 0 || self.rng.chance(25) {
 			let register = Register {
 				up_to: MessagePosition(self.rng.range(0, 8)),
-				status: RegisterStatus::Opened,
+				status: RegisterStatus::Open { max_message_size: 1024 },
 			};
 			sends.push((ack(US), vec![register.encode()]));
 		}

@@ -157,7 +157,10 @@ impl Transport for Sender {
 }
 
 fn register(up_to: u64) -> Register {
-	Register { up_to: MessagePosition(up_to), status: RegisterStatus::Opened }
+	Register {
+		up_to: MessagePosition(up_to),
+		status: RegisterStatus::Open { max_message_size: 1024 },
+	}
 }
 
 /// The receiving chain, as the pallet consumes: the channel's stored frontier, and the position of
@@ -444,10 +447,7 @@ fn a_returning_channel_fetches_past_its_previous_roots_reach() {
 #[test]
 fn a_new_register_watch_fetches_under_an_already_settled_root() {
 	let sender = Sender::new();
-	let accepted = Register {
-		up_to: MessagePosition(0),
-		status: RegisterStatus::Accepting { session: 1, min: 1, max: 1, max_message_size: 1024 },
-	};
+	let accepted = register(0);
 	let root =
 		sender.author(vec![(channel(US), payloads(1, 1)), (ack(US), vec![accepted.encode()])]);
 	let receiver = receiver(&sender, Budget::default());
