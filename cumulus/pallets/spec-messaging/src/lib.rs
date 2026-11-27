@@ -519,6 +519,10 @@ pub mod pallet {
 				"`MaxMessageSize` must not exceed `MaxMsgLen`",
 			);
 			assert!(
+				Register::max_encoded_len() <= T::MaxMsgLen::get() as usize,
+				"`MaxMsgLen` must fit a channel register",
+			);
+			assert!(
 				T::MaxMsgLen::get() <= T::DataHandler::max_len(),
 				"`MaxMsgLen` must not exceed the data handler's `max_len`",
 			);
