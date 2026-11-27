@@ -60,7 +60,7 @@ The test prints six checkpoints. Each one is read from chain state:
 
 | # | Checkpoint | What it shows |
 |---|---|---|
-| 1 | channel | 2001 consumed 2000's stream, which carries the open signal. 2000 read 2001's `Ack` register: the channel is open. The log shows both watermarks, the register's position and the session. |
+| 1 | channel | 2000 read 2001's `Open` register. The new lane starts at leaf 0. |
 | 2 | send | A 2000 block holds `PolkadotXcm::Sent` with a message id. Its digest commits a `StreamsRoot`. |
 | 3 | relay | `newest_included_provides(2000)` is that root. The relay recorded it. |
 | 4 | consume | A 2001 block consumed up to the stream root the sent `StreamsRoot` commits: its `Requires`. |
@@ -86,8 +86,7 @@ shortened. Part A is the channel open (checkpoint 1). Part B is the message of c
 
 **A. Open**
 
-The open takes two register reads: 2001 publishes `Accepting`, 2000 reads it and sends `Hello`, 2001 consumes
-`Hello` and publishes `Opened`, and 2000's read of `Opened` opens the channel. `open_channel` sends nothing.
+The following trace predates single-use lanes. Today 2001 publishes one `Open` register and 2000 can send once it reads that register.
 
 | Time | Node | Log | Step |
 |---|---|---|---|
