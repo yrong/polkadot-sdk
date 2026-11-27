@@ -27,7 +27,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 pub mod channel;
 pub mod fetch;
@@ -80,6 +80,10 @@ sp_api::decl_runtime_apis! {
 		/// Every outbound stream's frontier after this block's sends, in `StreamId` order. A node
 		/// without the state of earlier blocks seeds its archive from it.
 		fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)>;
+
+		/// Last applied ACK per outbound lane, or zero until its first ACK. A closed lane keeps its
+		/// last value until cleanup. Archive nodes read this at sender finality.
+		fn outbound_up_to() -> BTreeMap<OutChannelId, MessagePosition>;
 
 		/// Everything the inherent provider should fetch, and from which position on.
 		fn consumed_streams() -> ConsumedStreams;

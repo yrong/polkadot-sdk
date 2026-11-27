@@ -1630,6 +1630,15 @@ impl<T: Config> Pallet<T> {
 		frontiers.into_iter().collect()
 	}
 
+	/// Last applied ACK for each outbound lane.
+	pub fn outbound_up_to() -> BTreeMap<OutChannelId, MessagePosition> {
+		OutChannels::<T>::iter()
+			.map(|(lane, state)| {
+				(lane, state.register.map(|r| r.register.up_to).unwrap_or_default())
+			})
+			.collect()
+	}
+
 	/// The inbound streams and registers the node should fetch.
 	pub fn consumed_streams() -> ConsumedStreams {
 		let mut consumed = ConsumedStreams::default();

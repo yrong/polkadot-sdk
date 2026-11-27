@@ -1255,6 +1255,13 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 			SpecMessaging::outbound_frontiers()
 		}
 
+		fn outbound_up_to() -> alloc::collections::BTreeMap<
+			cumulus_primitives_spec_messaging::OutChannelId,
+			cumulus_primitives_spec_messaging::MessagePosition,
+		> {
+			SpecMessaging::outbound_up_to()
+		}
+
 		fn consumed_streams() -> cumulus_primitives_spec_messaging::ConsumedStreams {
 			SpecMessaging::consumed_streams()
 		}

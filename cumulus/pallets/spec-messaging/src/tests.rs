@@ -428,6 +428,34 @@ fn max_in_flight_gate_blocks_data_but_exempts_close() {
 }
 
 #[test]
+fn outbound_up_to_keeps_the_last_applied_ack_after_close() {
+	new_test_ext().execute_with(|| {
+		let ch = out_channel();
+		want_open(ch);
+		assert_eq!(SpecMessaging::outbound_up_to()[&ch], MessagePosition(0));
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), register_read(0)));
+		assert_ok!(SpecMessaging::send(ch, vec![1]));
+		roll_one_block();
+		let mut frontier = MmrFrontier::new();
+		for register in &peer_registers()[..2] {
+			frontier.append(leaf_hash_with_version(LEAF_VERSION, &register.encode()));
+		}
+		let read = LossyRead {
+			frontier,
+			payloads: vec![Register { up_to: MessagePosition(1), ..open_register() }.encode()],
+		};
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), registers(ch, read)));
+		assert_ok!(SpecMessaging::close_channel(
+			RuntimeOrigin::root(),
+			ch.recipient,
+			ch.domain,
+			ch.num
+		));
+		assert_eq!(SpecMessaging::outbound_up_to()[&ch], MessagePosition(1));
+	});
+}
+
+#[test]
 fn register_validation_rejects_up_to_greater_than_sent() {
 	new_test_ext().execute_with(|| {
 		let ch = out_channel();
