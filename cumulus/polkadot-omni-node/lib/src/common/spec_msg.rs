@@ -26,8 +26,8 @@ use crate::common::{
 	ConstructNodeRuntimeApi, NodeBlock,
 };
 use cumulus_client_spec_msg::{
-	fetch_protocol_config, run_archiver, run_receiver, run_request_handler, run_watermark_reader,
-	Archive, AuxArchiveStore, Budget, NetworkTransport, Receiver, RelayFinalizedRoots, Transport,
+	fetch_protocol_config, run_archiver, run_backfill, run_receiver, run_request_handler, Archive,
+	AuxArchiveStore, Budget, NetworkTransport, Receiver, Transport,
 };
 use cumulus_primitives_core::ParaId;
 use cumulus_relay_chain_interface::RelayChainInterface;
@@ -78,7 +78,6 @@ where
 {
 	let archive =
 		Arc::new(parking_lot::RwLock::new(Archive::open(AuxArchiveStore::new(client.clone()))));
-	let watermarks = Arc::new(parking_lot::Mutex::new(BTreeMap::new()));
 
 	let mut peers = BTreeMap::<ParaId, Vec<_>>::new();
 	for (source, addresses) in &config.peers {
@@ -94,24 +93,12 @@ where
 	spawner.spawn_blocking(
 		"spec-msg-archiver",
 		Some("spec-msg"),
-		run_archiver::<Block, _, _>(
-			client.clone(),
-			backend.clone(),
-			archive.clone(),
-			watermarks.clone(),
-		),
+		run_archiver::<Block, _, _>(client.clone(), backend.clone(), archive.clone()),
 	);
 	spawner.spawn(
-		"spec-msg-watermark-reader",
+		"spec-msg-backfill",
 		Some("spec-msg"),
-		run_watermark_reader::<Block, _, _, _, _>(
-			client.clone(),
-			archive.clone(),
-			watermarks,
-			para_id,
-			transport.clone(),
-			Arc::new(RelayFinalizedRoots(relay_chain_interface.clone())),
-		),
+		run_backfill::<Block, _, _, _>(client.clone(), archive.clone(), para_id, transport.clone()),
 	);
 	spawner.spawn_blocking(
 		"spec-msg-request-handler",

@@ -288,6 +288,13 @@ macro_rules! impl_node_runtime_apis {
 					unimplemented!()
 				}
 
+				fn outbound_up_to() -> std::collections::BTreeMap<
+					cumulus_primitives_spec_messaging::OutChannelId,
+					cumulus_primitives_spec_messaging::MessagePosition,
+				> {
+					unimplemented!()
+				}
+
 				fn consumed_streams() -> cumulus_primitives_spec_messaging::ConsumedStreams {
 					unimplemented!()
 				}
