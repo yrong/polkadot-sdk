@@ -428,30 +428,69 @@ fn max_in_flight_gate_blocks_data_but_exempts_close() {
 }
 
 #[test]
-fn outbound_up_to_keeps_the_last_applied_ack_after_close() {
+fn outbound_up_to_tracks_a_closed_lane_until_its_final_ack() {
 	new_test_ext().execute_with(|| {
 		let ch = out_channel();
-		want_open(ch);
+		assert_ok!(SpecMessaging::open_channel(RuntimeOrigin::root(), ch.recipient, ch.domain, 0));
 		assert_eq!(SpecMessaging::outbound_up_to()[&ch], MessagePosition(0));
-		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), register_read(0)));
-		assert_ok!(SpecMessaging::send(ch, vec![1]));
-		roll_one_block();
 		let mut frontier = MmrFrontier::new();
-		for register in &peer_registers()[..2] {
-			frontier.append(leaf_hash_with_version(LEAF_VERSION, &register.encode()));
-		}
-		let read = LossyRead {
-			frontier,
-			payloads: vec![Register { up_to: MessagePosition(1), ..open_register() }.encode()],
-		};
-		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), registers(ch, read)));
+		let open = next_register(ch, &mut frontier, open_register());
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), open));
+		assert_ok!(SpecMessaging::send(ch, vec![1]));
 		assert_ok!(SpecMessaging::close_channel(
 			RuntimeOrigin::root(),
 			ch.recipient,
 			ch.domain,
 			ch.num
 		));
+		assert_eq!(sent_on(ch.data_stream()), vec![data(&[1]), ChannelMessage::Close.encode()]);
+		assert_ok!(SpecMessaging::open_channel(RuntimeOrigin::root(), ch.recipient, ch.domain, 1));
+		let watches = SpecMessaging::consumed_streams().registers;
+		assert_eq!(watches[&ch], MessagePosition(1));
+		assert_eq!(watches[&OutChannelId { num: 1, ..ch }], MessagePosition(0));
+
+		roll_one_block();
+		let closing = Register { status: RegisterStatus::Closing, up_to: MessagePosition(1) };
+		let read = next_register(ch, &mut frontier, closing);
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), read));
 		assert_eq!(SpecMessaging::outbound_up_to()[&ch], MessagePosition(1));
+		assert!(sent_on(ch.data_stream()).is_empty());
+		assert_eq!(SpecMessaging::consumed_streams().registers[&ch], MessagePosition(2));
+
+		roll_one_block();
+		let closed = Register { status: RegisterStatus::Closed, up_to: MessagePosition(2) };
+		let read = next_register(ch, &mut frontier, closed);
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), read));
+		assert_eq!(SpecMessaging::outbound_up_to()[&ch], MessagePosition(2));
+		assert!(!SpecMessaging::consumed_streams().registers.contains_key(&ch));
+	});
+}
+
+#[test]
+fn outbound_up_to_stops_at_the_force_closed_lanes_partial_ack() {
+	new_test_ext().execute_with(|| {
+		let ch = out_channel();
+		want_open(ch);
+		let mut frontier = MmrFrontier::new();
+		let open = next_register(ch, &mut frontier, open_register());
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), open));
+		assert_ok!(SpecMessaging::send(ch, vec![1]));
+		assert_ok!(SpecMessaging::close_channel(RuntimeOrigin::root(), ch.recipient, ch.domain, 0));
+
+		roll_one_block();
+		let closed = Register { status: RegisterStatus::Closed, up_to: MessagePosition(1) };
+		let read = next_register(ch, &mut frontier, closed);
+		assert_ok!(SpecMessaging::enact_messages(RuntimeOrigin::none(), read));
+		assert_eq!(SpecMessaging::outbound_up_to()[&ch], MessagePosition(1));
+		assert!(!SpecMessaging::consumed_streams().registers.contains_key(&ch));
+
+		roll_one_block();
+		let read =
+			next_register(ch, &mut frontier, Register { up_to: MessagePosition(2), ..closed });
+		assert_err!(
+			SpecMessaging::enact_messages(RuntimeOrigin::none(), read),
+			Error::<Test>::NotAdmitted
+		);
 	});
 }
 
@@ -918,6 +957,17 @@ fn open_register() -> Register {
 
 fn registers(ch: OutChannelId, read: LossyRead) -> MessagingInherentData {
 	MessagingInherentData { registers: BTreeMap::from([(ch, read)]), ..Default::default() }
+}
+
+fn next_register(
+	ch: OutChannelId,
+	frontier: &mut MmrFrontier,
+	register: Register,
+) -> MessagingInherentData {
+	let payload = register.encode();
+	let before = frontier.clone();
+	frontier.append(leaf_hash_with_version(LEAF_VERSION, &payload));
+	registers(ch, LossyRead { frontier: before, payloads: vec![payload] })
 }
 
 fn want_open(ch: OutChannelId) {

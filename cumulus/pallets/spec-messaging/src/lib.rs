@@ -1347,8 +1347,7 @@ impl<T: Config> Pallet<T> {
 		ensure!(leaf_len <= u64::from(max_size), Error::<T>::MessageTooBig);
 
 		let stream = channel.data_stream();
-		let sent = OutboundFrontier::<T>::get(stream).leaf_count() +
-			OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
+		let sent = Self::sent_count(stream);
 		let up_to = state.register.map(|r| r.register.up_to.0).unwrap_or(0);
 		ensure!(sent.saturating_sub(up_to) < T::MaxInFlight::get() as u64, Error::<T>::NoCredit);
 
@@ -1501,6 +1500,11 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
+	fn sent_count(stream: StreamId) -> u64 {
+		OutboundFrontier::<T>::get(stream).leaf_count() +
+			OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64
+	}
+
 	/// Validate a register read for admission.
 	fn admit_register_read(
 		channel_id: OutChannelId,
@@ -1509,7 +1513,8 @@ impl<T: Config> Pallet<T> {
 		let Some(state) = OutChannels::<T>::get(channel_id) else {
 			return Err(Error::<T>::UnknownChannel);
 		};
-		ensure!(state.want_open, Error::<T>::NotAdmitted);
+		let sent = Self::sent_count(channel_id.data_stream());
+		let cursor = state.register_cursor(|| sent).ok_or(Error::<T>::NotAdmitted)?;
 		let [payload] = lossy.payloads.as_slice() else {
 			return Err(Error::<T>::BadRegister);
 		};
@@ -1522,14 +1527,8 @@ impl<T: Config> Pallet<T> {
 			.try_append(leaf_hash_with_version(LEAF_VERSION, payload))
 			.map_err(|_| Error::<T>::BadFrontier)?;
 
-		if let Some(hw) = state.register.map(|r| r.position.0) {
-			ensure!(read_pos.0 > hw, Error::<T>::NotAdmitted);
-		}
-
+		ensure!(read_pos >= cursor, Error::<T>::NotAdmitted);
 		let prev_up_to = state.register.map(|r| r.register.up_to.0).unwrap_or(0);
-		let stream = channel_id.data_stream();
-		let sent = OutboundFrontier::<T>::get(stream).leaf_count() +
-			OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
 		ensure!(register.up_to.0 >= prev_up_to, Error::<T>::NotAdmitted);
 		ensure!(register.up_to.0 <= sent, Error::<T>::NotAdmitted);
 
@@ -1586,8 +1585,7 @@ impl<T: Config> Pallet<T> {
 
 		state.register = Some(AppliedRegister { position: read_pos, register });
 		match register.status {
-			RegisterStatus::Open { .. } => {},
-			RegisterStatus::Closing => {
+			RegisterStatus::Closing if state.want_open => {
 				// The credit gate leaves a stream slot, and the inherent has reserved block slots.
 				Self::append_within(
 					channel_id.data_stream(),
@@ -1597,6 +1595,7 @@ impl<T: Config> Pallet<T> {
 				state.want_open = false;
 			},
 			RegisterStatus::Closed => state.want_open = false,
+			RegisterStatus::Open { .. } | RegisterStatus::Closing => {},
 		}
 
 		OutChannels::<T>::insert(channel_id, state);
@@ -1648,7 +1647,8 @@ impl<T: Config> Pallet<T> {
 			}
 		}
 		for (channel, state) in OutChannels::<T>::iter() {
-			if let Some(cursor) = state.register_cursor() {
+			if let Some(cursor) = state.register_cursor(|| Self::sent_count(channel.data_stream()))
+			{
 				consumed.registers.insert(channel, cursor);
 			}
 		}

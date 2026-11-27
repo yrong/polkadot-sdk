@@ -21,7 +21,7 @@ use cumulus_primitives_spec_messaging::{
 
 pub(crate) trait OutChannelPolicy {
 	fn send_size_limit(&self) -> Option<u32>;
-	fn register_cursor(&self) -> Option<MessagePosition>;
+	fn register_cursor(&self, sent: impl FnOnce() -> u64) -> Option<MessagePosition>;
 }
 
 impl OutChannelPolicy for OutChannelState {
@@ -31,9 +31,14 @@ impl OutChannelPolicy for OutChannelState {
 			_ => None,
 		}
 	}
-	fn register_cursor(&self) -> Option<MessagePosition> {
+	fn register_cursor(&self, sent: impl FnOnce() -> u64) -> Option<MessagePosition> {
 		if !self.want_open {
-			return None;
+			let register = self.register.map(|r| r.register);
+			if register.is_some_and(|r| r.status == RegisterStatus::Closed) ||
+				register.map_or(0, |r| r.up_to.0) >= sent()
+			{
+				return None;
+			}
 		}
 		match self.register {
 			None => Some(MessagePosition(0)),
