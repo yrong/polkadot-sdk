@@ -20,11 +20,12 @@
 //! penalized.
 
 use crate::{protocol::PROTOCOL_NAME, LOG_TARGET};
-use codec::{DecodeLimit, Encode};
+use codec::{DecodeLimit, Encode, MaxEncodedLen};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
-	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagesRequest,
-	MessagesResponse, MmrFrontier,
+	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagePosition,
+	MessagesRequest, MessagesResponse, MmrFrontier, Register, StreamId, StreamProof, StreamsRoot,
+	VerifyError, MAX_SPECULATIVE_MESSAGE_LEN,
 };
 use parking_lot::Mutex;
 use sc_network::{IfDisconnected, NetworkRequest, PeerId, ProtocolName};
@@ -126,10 +127,15 @@ pub enum RequestError {
 		/// The peers that answered with a [`FetchError`].
 		refusals: Vec<(PeerId, FetchError)>,
 	},
+	/// A response verified under the named root, but from another frontier than the stored one
+	/// at the same leaf count: the stream under that root does not run through the stored
+	/// frontier. No peer can serve one that does.
+	Diverged,
 }
 
 /// Send `request` to `source`'s peers until one response verifies. With `stored` (an inbound
-/// channel's local frontier) the response must also start from it.
+/// channel's local frontier) the response must also start from it; one that verifies on its own
+/// from another frontier at that leaf count ends the search with [`RequestError::Diverged`].
 pub async fn fetch<T: Transport + ?Sized>(
 	transport: &T,
 	source: ParaId,
@@ -172,6 +178,20 @@ pub async fn fetch<T: Transport + ?Sized>(
 		};
 		match verified {
 			Ok(()) => return Ok(response),
+			Err(VerifyError::FrontierMismatch)
+				if stored.is_some_and(|stored| {
+					response.frontier.leaf_count() == stored.leaf_count()
+				}) && verify_messages(request, &response).is_ok() =>
+			{
+				log::debug!(
+					target: LOG_TARGET,
+					"Peer {peer} of {source:?} proved {:?} under {:?} does not run through the \
+					 stored frontier",
+					request.stream,
+					request.under,
+				);
+				return Err(RequestError::Diverged);
+			},
 			Err(e) => {
 				log::debug!(
 					target: LOG_TARGET,
@@ -181,4 +201,31 @@ pub async fn fetch<T: Transport + ?Sized>(
 		}
 	}
 	Err(RequestError::Unserved { refusals })
+}
+
+/// Fetch a register under `under`, following a position-only head reply from its verified frontier.
+pub(crate) async fn fetch_register_head<T: Transport + ?Sized>(
+	transport: &T,
+	source: ParaId,
+	stream: StreamId,
+	under: StreamsRoot,
+) -> Result<(MmrFrontier, Vec<u8>, StreamProof), RequestError> {
+	let request = MessagesRequest {
+		stream,
+		under,
+		start: None,
+		max_bytes: Register::max_encoded_len() as u32,
+	};
+	let mut response = fetch(transport, source, &request, None).await?;
+	if response.payloads.is_empty() {
+		let request = MessagesRequest {
+			start: Some(MessagePosition(response.frontier.leaf_count())),
+			max_bytes: MAX_SPECULATIVE_MESSAGE_LEN,
+			..request
+		};
+		response = fetch(transport, source, &request, Some(&response.frontier)).await?;
+	}
+	let [payload] = <[Vec<u8>; 1]>::try_from(response.payloads.into_inner())
+		.map_err(|_| RequestError::Unserved { refusals: Vec::new() })?;
+	Ok((response.frontier, payload, response.tree_proof))
 }

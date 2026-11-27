@@ -24,6 +24,7 @@ use cumulus_primitives_core::{
 	CollationInfo, CollectCollationInfo, ParachainBlockData, SchedulingProof,
 };
 
+use cumulus_primitives_spec_messaging::{ConsumptionRecord, LiftsBySource};
 use sc_client_api::BlockBackend;
 use sp_api::{ApiExt, ProvideRuntimeApi, StorageProof};
 use sp_consensus::BlockStatus;
@@ -36,6 +37,22 @@ use codec::Encode;
 use std::sync::Arc;
 /// The logging target.
 const LOG_TARGET: &str = "cumulus-collator";
+
+/// What the speculative-messaging node side supplies for a collation: the blocks' consumption
+/// records, in bundle order, and the lifts binding them to committed source roots.
+#[derive(Debug, Default)]
+pub struct SpecMsgInputs {
+	/// One record per block, in bundle order.
+	pub records: Vec<ConsumptionRecord>,
+	/// The lifts the PoV carries; empty when the blocks consumed nothing.
+	pub lifts: LiftsBySource,
+}
+
+/// Supplies [`SpecMsgInputs`] for a collation's blocks. Nodes that run speculative messaging set
+/// one with [`CollatorService::with_spec_msg_assembler`]; without one, a collation carries no
+/// records and no lifts, which is correct for blocks that consumed nothing.
+pub type SpecMsgAssembler<Block> =
+	Arc<dyn Fn(&[Block]) -> Result<SpecMsgInputs, String> + Send + Sync>;
 
 /// Utility functions generally applicable to writing collators for Cumulus.
 pub trait ServiceInterface<Block: BlockT> {
@@ -88,6 +105,7 @@ pub struct CollatorService<Block: BlockT, BS, RA> {
 	block_status: Arc<BS>,
 	announce_block: Arc<dyn Fn(Block::Hash, Option<Vec<u8>>) + Send + Sync>,
 	runtime_api: Arc<RA>,
+	spec_msg_assembler: Option<SpecMsgAssembler<Block>>,
 }
 
 impl<Block: BlockT, BS, RA> Clone for CollatorService<Block, BS, RA> {
@@ -96,6 +114,7 @@ impl<Block: BlockT, BS, RA> Clone for CollatorService<Block, BS, RA> {
 			block_status: self.block_status.clone(),
 			announce_block: self.announce_block.clone(),
 			runtime_api: self.runtime_api.clone(),
+			spec_msg_assembler: self.spec_msg_assembler.clone(),
 		}
 	}
 }
@@ -113,7 +132,14 @@ where
 		announce_block: Arc<dyn Fn(Block::Hash, Option<Vec<u8>>) + Send + Sync>,
 		runtime_api: Arc<RA>,
 	) -> Self {
-		Self { block_status, announce_block, runtime_api }
+		Self { block_status, announce_block, runtime_api, spec_msg_assembler: None }
+	}
+
+	/// Supply speculative-messaging records and lifts to every collation. Only nodes that run
+	/// speculative messaging need this.
+	pub fn with_spec_msg_assembler(mut self, assembler: SpecMsgAssembler<Block>) -> Self {
+		self.spec_msg_assembler = Some(assembler);
+		self
 	}
 
 	/// Checks the status of the given block hash in the Parachain.
@@ -290,19 +316,58 @@ where
 		let signed = scheduling_proof
 			.as_ref()
 			.and_then(|proof| proof.signed_scheduling_info.as_ref());
-		let tail = bundle_provides(blocks.iter().map(|block| block.header().digest()))
-			.and_then(|provides| {
-				// TODO(https://github.com/paritytech/polkadot-sdk/issues/12707): Pass the bundle's
-				// records and lifts. Until then, the PVF rejects candidates that consume messages.
-				ump_signal_tail(&upward_message_signals, signed, provides, &[], None)
-			})
-			.map_err(
-				|error| tracing::error!(target: LOG_TARGET, %error, "Invalid candidate signals."),
-			)
+		let provides = bundle_provides(blocks.iter().map(|block| block.header().digest()))
+			.map_err(|error| tracing::error!(target: LOG_TARGET, %error, "Invalid SPMS digest."))
 			.ok()?;
+
+		// The speculative-messaging inputs for these blocks. A collation `validate_block` would
+		// reject is not worth submitting, so a failure skips it.
+		let spec_msg_inputs = match &self.spec_msg_assembler {
+			Some(assemble) => match assemble(&blocks) {
+				Ok(inputs) => inputs,
+				Err(error) => {
+					tracing::error!(
+						target: LOG_TARGET,
+						%error,
+						"Failed to assemble speculative-messaging lifts; not submitting the collation.",
+					);
+					return None;
+				},
+			},
+			None => SpecMsgInputs::default(),
+		};
+
+		let tail = ump_signal_tail(
+			&upward_message_signals,
+			signed,
+			provides,
+			&spec_msg_inputs.records,
+			Some(&spec_msg_inputs.lifts),
+		)
+		.map_err(|error| tracing::error!(target: LOG_TARGET, %error, "Invalid UMP signals."))
+		.ok()?;
+		let consuming = spec_msg_inputs.records.iter().filter(|r| !r.entries.is_empty()).count();
+		if consuming > 0 {
+			tracing::debug!(
+				target: LOG_TARGET,
+				consuming,
+				signals = tail.len(),
+				"Collation carries a `Requires` over the consumption of {consuming} blocks.",
+			);
+		}
 		upward_messages.extend(tail);
 
-		let block_data = ParachainBlockData::<Block>::new(blocks, compact_proof, scheduling_proof);
+		// Lifts ride in the PoV, which needs the V3 format; without them, keep the older ones.
+		let block_data = if spec_msg_inputs.lifts.is_empty() {
+			ParachainBlockData::<Block>::new(blocks, compact_proof, scheduling_proof)
+		} else {
+			ParachainBlockData::<Block>::new_with_lifts(
+				blocks,
+				compact_proof,
+				scheduling_proof,
+				spec_msg_inputs.lifts,
+			)
+		};
 
 		let pov = polkadot_node_primitives::maybe_compress_pov(PoV {
 			block_data: BlockData(if api_version >= 3 {
@@ -402,5 +467,62 @@ where
 			proof,
 			scheduling_proof,
 		)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cumulus_primitives_core::signals::SignalError;
+	use polkadot_primitives::{Hash, Id as ParaId, RequiresSet, StreamsRoot, UMPSignal};
+
+	/// A block that consumed `n` messages of one channel stream from source 2000, and the identity
+	/// lift binding them to the source's committed `StreamsRoot`.
+	fn consumed(n: u64) -> (SpecMsgInputs, StreamsRoot) {
+		use cumulus_primitives_spec_messaging::{
+			streams_root::{gen_stream_proof, streams_root},
+			Interval, MmrExtensionProof, MmrFrontier, MmrRoot, RequiresLift, StreamId,
+		};
+		use std::collections::BTreeMap;
+
+		let source = ParaId::from(2000u32);
+		let stream = StreamId::Channel { recipient: ParaId::from(1000u32), domain: 0, num: 0 };
+		let mut frontier = MmrFrontier::new();
+		for i in 0..n {
+			frontier.append(Hash::from_low_u64_be(i + 1));
+		}
+		let entries = BTreeMap::from([(stream, frontier.root().0)]);
+		let committed = streams_root(&entries).unwrap();
+		let (_, tree_proof) = gen_stream_proof(&entries, stream).unwrap();
+		let record = ConsumptionRecord {
+			entries: BTreeMap::from([(
+				source,
+				vec![(stream, Interval { start: MmrRoot(Hash::zero()), end: frontier.clone() })],
+			)]),
+		};
+		let lift = RequiresLift {
+			advances: Vec::new(),
+			extension: MmrExtensionProof::identity(&frontier),
+			tree_proof,
+		};
+		let lifts = LiftsBySource::try_from(BTreeMap::from([(source, vec![lift])])).unwrap();
+		(SpecMsgInputs { records: vec![record], lifts }, committed)
+	}
+
+	#[test]
+	fn a_consuming_collation_appends_requires() {
+		let (inputs, committed) = consumed(5);
+		let tail = ump_signal_tail(&[], None, None, &inputs.records, Some(&inputs.lifts)).unwrap();
+		let requires = RequiresSet::try_from_iter([(ParaId::from(2000u32), committed)]).unwrap();
+		assert_eq!(tail.last(), Some(&UMPSignal::Requires(requires).encode()));
+	}
+
+	#[test]
+	fn records_without_lifts_fail_requires_synthesis() {
+		let (inputs, _) = consumed(1);
+		assert!(matches!(
+			ump_signal_tail(&[], None, None, &inputs.records, Some(&LiftsBySource::default())),
+			Err(SignalError::RequiresSynthesis(_))
+		));
 	}
 }

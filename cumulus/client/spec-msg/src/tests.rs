@@ -29,8 +29,8 @@ use codec::{Decode, Encode};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	leaf_hash, streams_root::streams_root, verify_messages, FetchError, FetchResponse,
-	MessagePosition, MessagesRequest, MessagesResponse, MmrFrontier, StreamId, StreamsRoot,
-	MAX_MESSAGES_PER_RESPONSE,
+	MessagePosition, MessagesRequest, MessagesResponse, MmrFrontier, Register, RegisterStatus,
+	StreamId, StreamsRoot, MAX_MESSAGES_PER_RESPONSE,
 };
 use parking_lot::{Mutex, RwLock};
 use sc_network::PeerId;
@@ -71,7 +71,7 @@ impl Model {
 		self.root()
 	}
 
-	fn root(&self) -> StreamsRoot {
+	pub(crate) fn root(&self) -> StreamsRoot {
 		let entries = self
 			.0
 			.iter()
@@ -535,9 +535,15 @@ fn a_channel_fetch_binds_the_stored_frontier() {
 	assert_eq!(run_fetch(&transport, &messages(a, 0, root, u32::MAX), Some(&stored)), unserved);
 	// A gap: the start is past the stored frontier.
 	assert_eq!(run_fetch(&transport, &messages(a, 4, root, u32::MAX), Some(&stored)), unserved);
-	// The same count with other contents.
+	// The same count with other contents: a response that verifies proves the stream under the
+	// root does not run through it.
 	let forged = frontier_at(&payloads(5, 6), 2);
-	assert_eq!(run_fetch(&transport, &messages(a, 2, root, u32::MAX), Some(&forged)), unserved);
+	let request = messages(a, 2, root, u32::MAX);
+	assert_eq!(run_fetch(&transport, &request, Some(&forged)), Err(RequestError::Diverged));
+	// A response that does not verify proves nothing.
+	let archive = transport.0[0].1.archive.clone();
+	let liar = ArchiveTransport(vec![(PeerId::random(), TestPeer { archive, tamper: true })]);
+	assert_eq!(run_fetch(&liar, &request, Some(&forged)), unserved);
 	// Without a stored frontier any start verifies.
 	assert!(run_fetch(&transport, &messages(a, 4, root, u32::MAX), None).is_ok());
 }
@@ -1010,6 +1016,11 @@ fn a_channel_without_a_watermark_keeps_everything() {
 	assert_eq!(served(&archive, &messages(a, 0, root2, u32::MAX)).unwrap().len(), 4);
 }
 
+fn register(up_to: u64) -> Vec<u8> {
+	let status = RegisterStatus::Open { max_message_size: 1024 };
+	Register { up_to: MessagePosition(up_to), status }.encode()
+}
+
 /// Two peers with the same archive. Only the second serves payloads.
 struct ArchivePeers {
 	archive: Arc<TestArchive>,
@@ -1051,4 +1062,68 @@ fn archive_rounds_rotate_peers_for_backfill() {
 		served(&archive.read(), &messages(stream, 2, root, u32::MAX)),
 		Ok(model.0[&stream][2..].to_vec())
 	);
+}
+
+/// Serves only the position for a head request, then serves the requested leaf.
+struct PositionOnlyHead {
+	archive: Arc<TestArchive>,
+	peer: PeerId,
+	other_frontier: Option<MmrFrontier>,
+	starts: Mutex<Vec<Option<MessagePosition>>>,
+}
+
+#[async_trait::async_trait]
+impl Transport for PositionOnlyHead {
+	fn peers(&self, _: ParaId) -> Vec<PeerId> {
+		vec![self.peer]
+	}
+
+	async fn request(&self, _: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		let req = MessagesRequest::decode(&mut &request[..]).unwrap();
+		self.starts.lock().push(req.start);
+		let cap = if req.start.is_none() { 0 } else { req.max_bytes };
+		let mut response = self.archive.serve_messages(&req, cap);
+		if let (Some(_), Some(frontier), Ok(reply)) =
+			(req.start, &self.other_frontier, &mut response)
+		{
+			reply.frontier = frontier.clone();
+		}
+		Ok(response.encode())
+	}
+}
+
+#[test]
+fn a_position_only_register_head_binds_the_second_read_to_the_first_frontier() {
+	let mut recipient = TestArchive::open(Arc::new(MemoryStore::default()));
+	let stream = ack(1000);
+	let root = import(
+		&mut recipient,
+		&mut Model::default(),
+		1,
+		vec![(stream, vec![register(2), register(4)])],
+	);
+	let archive = Arc::new(recipient);
+	let mut different = MmrFrontier::new();
+	different.append(leaf_hash(&register(1)));
+	for other_frontier in [None, Some(different)] {
+		let valid = other_frontier.is_none();
+		let peer = PositionOnlyHead {
+			archive: archive.clone(),
+			peer: PeerId::random(),
+			other_frontier,
+			starts: Mutex::default(),
+		};
+		let result = futures::executor::block_on(crate::fetch::fetch_register_head(
+			&peer,
+			2000.into(),
+			stream,
+			root,
+		));
+		assert_eq!(*peer.starts.lock(), [None, Some(MessagePosition(1))]);
+		if valid {
+			assert_eq!(result.unwrap().1, register(4));
+		} else {
+			assert!(result.is_err());
+		}
+	}
 }

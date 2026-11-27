@@ -22,18 +22,28 @@
 //! - [`fetch_protocol_config`] and [`run_request_handler`]: the `/spec-msg/fetch/1` protocol.
 //! - [`fetch()`]: the requester, which verifies each response before accepting it.
 //! - [`run_backfill`]: restores a seeded archive's missing history from its own peers.
+//! - [`Receiver`]: fetches under each source's newest included root, keeps what verifies, builds
+//!   the messaging inherent within a [`Budget`] and assembles each candidate's lifts.
+//! - [`run_receiver`], [`inherent_data`] and [`assembler`]: its ties to the chain and collator.
 
 #![warn(missing_docs)]
 
 pub mod archive;
 pub mod fetch;
+pub mod pool;
 pub mod protocol;
+pub mod receiver;
+pub mod relay;
+pub mod service;
 pub mod store;
 pub mod worker;
 
 pub use archive::{Archive, ArchiveError, Tip};
 pub use fetch::{fetch, NetworkTransport, RequestError, Transport};
 pub use protocol::{fetch_protocol_config, run_request_handler, PROTOCOL_NAME};
+pub use receiver::{Budget, ChainView, Receiver, SourceWants};
+pub use relay::{relay_has_api, NEWEST_INCLUDED_PROVIDES, NEWEST_INCLUDED_PROVIDES_VERSION};
+pub use service::{assembler, inherent_data, run_receiver};
 pub use store::{ArchiveStore, AuxArchiveStore, Batch, MemoryStore};
 pub use worker::{run_archiver, run_backfill, SERVING_HORIZON};
 
@@ -42,5 +52,9 @@ pub const LOG_TARGET: &str = "spec-msg";
 
 #[cfg(test)]
 mod archive_model;
+#[cfg(test)]
+mod receiver_model;
+#[cfg(test)]
+mod receiver_tests;
 #[cfg(test)]
 mod tests;
