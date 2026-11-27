@@ -783,7 +783,7 @@ fn configure_channels(
 	block.blocks()[0].header.clone()
 }
 
-/// A block that consumes three payloads from `source` on a channel to this para, the lift
+/// A block that consumes four payloads from `source` on a channel to this para, the lift
 /// binding them to a `StreamsRoot` that commits exactly those payloads, and that root.
 fn consuming_block(
 	client: &Client,
@@ -794,7 +794,7 @@ fn consuming_block(
 	let stream =
 		StreamId::Channel { recipient: test_runtime::PARACHAIN_ID.into(), domain: 0, num: 0 };
 	let payloads: Vec<Vec<u8>> = vec![
-		ChannelMessage::Hello { session: 1, version: 1 }.encode(),
+		ChannelMessage::Data(vec![0]).encode(),
 		ChannelMessage::Data(vec![1; 8]).encode(),
 		ChannelMessage::Data(vec![2; 8]).encode(),
 		ChannelMessage::Data(vec![3; 8]).encode(),
@@ -930,10 +930,10 @@ fn a_near_limit_bundle_validates_with_maximum_mmr_proofs() {
 	let parent = configure_channels(&client, genesis, vec![core_info(12)], calls);
 
 	let us = test_runtime::PARACHAIN_ID.into();
-	let hello = ChannelMessage::Hello { session: 1, version: 1 }.encode();
+	let first_leaf = ChannelMessage::Data(vec![0]).encode();
 	let register = Register {
 		up_to: MessagePosition(0),
-		status: RegisterStatus::Accepting { session: 1, min: 1, max: 1, max_message_size: 102400 },
+		status: RegisterStatus::Open { max_message_size: 102400 },
 	}
 	.encode();
 	let (far, skip) = longest_extension(leaf_hash(&register));
@@ -972,7 +972,7 @@ fn a_near_limit_bundle_validates_with_maximum_mmr_proofs() {
 		for (i, data) in reads.iter_mut().enumerate() {
 			let payloads = data.channels.entry(*channel).or_default();
 			if i == 0 {
-				payloads.push(hello.clone());
+				payloads.push(first_leaf.clone());
 			}
 			for _ in 0..3 {
 				let mut body = vec![0; body_len];
@@ -991,8 +991,8 @@ fn a_near_limit_bundle_validates_with_maximum_mmr_proofs() {
 		);
 	}
 	for (data, extra) in reads.iter_mut().zip(&channels[12..]) {
-		data.channels.insert(*extra, vec![hello.clone()]);
-		let (head, extension) = longest_extension(leaf_hash(&hello));
+		data.channels.insert(*extra, vec![first_leaf.clone()]);
+		let (head, extension) = longest_extension(leaf_hash(&first_leaf));
 		bind(extra.sender_data_stream(us), head.root().0, extension, vec![]);
 	}
 	let next_slot = client.runtime_api().get_last_timestamp(parent.hash()).unwrap() / 6000 + 1;

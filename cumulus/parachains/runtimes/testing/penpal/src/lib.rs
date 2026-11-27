@@ -684,10 +684,6 @@ impl cumulus_pallet_xcmp_queue::Config for Runtime {
 	type PriceForSiblingDelivery = PriceForSiblingParachainDelivery;
 }
 
-parameter_types! {
-	pub const SpecMsgSupportedVersions: core::ops::RangeInclusive<u8> = 1..=1;
-}
-
 /// Reserve the existing tail page once per channel with the queue book.
 pub struct SpecMsgChannelQueueWeight;
 impl frame_support::traits::Get<Weight> for SpecMsgChannelQueueWeight {
@@ -728,8 +724,6 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxBundleStreams = ConstU32<3000>;
 	// Stay below `MaxInFlight` to exercise partial consumption across blocks.
 	type MaxInboundMessagesPerItem = ConstU32<8>;
-	type MaxHelloPassPerBlock = ConstU32<8>;
-	type SupportedVersions = SpecMsgSupportedVersions;
 	type MaxMessageSize = ConstU32<102400>;
 	type MaxQueueFootprint = ConstU32<48>;
 	type QueueFootprint = cumulus_pallet_spec_messaging::QueueFootprintOf<

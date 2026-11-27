@@ -16,29 +16,31 @@
 //! XCM between PenpalA and PenpalB over Speculative Messaging instead of HRMP.
 
 use crate::imports::*;
-use cumulus_pallet_spec_messaging::{xcm_channel, OutChannels};
+use cumulus_pallet_spec_messaging::OutChannels;
 use westend_system_emulated_network::penpal_emulated_chain::{
 	penpal_runtime, PARA_ID_A, PARA_ID_B,
 };
 
 fn xcm_channel_open(to: u32) -> bool {
-	OutChannels::<penpal_runtime::Runtime>::get(xcm_channel(to.into()))
-		.is_some_and(|state| state.open.is_some_and(|session| session.opened))
+	OutChannels::<penpal_runtime::Runtime>::get(penpal_runtime::SpecMessaging::outbound_xcm_lane(
+		to.into(),
+	))
+	.is_some_and(|state| state.want_open && state.register.is_some())
 }
 
-/// Wait for the opening handshake before diverting new XCM from HRMP.
-fn open_xcm_channel_a_to_b() {
+/// Wait for the opening register before diverting new XCM from HRMP.
+fn open_xcm_channel_a_to_b(num: u16) {
 	let root = || penpal_runtime::RuntimeOrigin::root();
 	PenpalB::execute_with(|| {
 		assert_ok!(penpal_runtime::SpecMessaging::accept_open_channel(
 			root(),
 			PARA_ID_A.into(),
 			0,
-			0
+			num
 		));
 	});
 	PenpalA::execute_with(|| {
-		assert_ok!(penpal_runtime::SpecMessaging::open_channel(root(), PARA_ID_B.into(), 0, 0));
+		assert_ok!(penpal_runtime::SpecMessaging::open_channel(root(), PARA_ID_B.into(), 0, num));
 	});
 	for _ in 0..10 {
 		if PenpalA::execute_with(|| xcm_channel_open(PARA_ID_B)) {
@@ -57,7 +59,7 @@ fn open_xcm_channel_a_to_b() {
 
 #[test]
 fn xcm_goes_from_penpal_a_to_penpal_b_over_spec_msg() {
-	open_xcm_channel_a_to_b();
+	open_xcm_channel_a_to_b(0);
 
 	PenpalA::execute_with(|| {
 		let dest = VersionedLocation::from(Location::new(1, [Parachain(PARA_ID_B)]));
@@ -158,7 +160,7 @@ fn a_paid_transact_is_the_same_over_hrmp_and_spec_msg() {
 	let mut runs = Vec::new();
 	for transport in ["Sibling", "SpecMsg"] {
 		if transport == "SpecMsg" {
-			open_xcm_channel_a_to_b();
+			open_xcm_channel_a_to_b(0);
 		}
 		let before = balance();
 		send_a_to_b(paid_remark());
@@ -207,7 +209,7 @@ fn assets_trapped_over_hrmp_are_claimed_over_spec_msg() {
 	let assets: Assets = trapped.1.try_into().expect("a current version");
 	let claimed: Asset = assets.inner()[0].clone();
 
-	open_xcm_channel_a_to_b();
+	open_xcm_channel_a_to_b(0);
 	let before = PenpalB::execute_with(|| {
 		<penpal_runtime::Balances as frame_support::traits::fungible::Inspect<_>>::balance(
 			&sovereign,
@@ -275,7 +277,7 @@ fn dry_run_send_a_to_b() -> (Vec<Xcm<()>>, u128) {
 #[test]
 fn a_dry_run_forwards_the_same_xcm_and_fee_over_hrmp_and_spec_msg() {
 	let over_hrmp = dry_run_send_a_to_b();
-	open_xcm_channel_a_to_b();
+	open_xcm_channel_a_to_b(0);
 	let over_spec_msg = dry_run_send_a_to_b();
 	assert_eq!(over_hrmp.0.len(), 1);
 	assert_eq!(over_hrmp, over_spec_msg);
@@ -307,7 +309,7 @@ fn a_reserve_transfer_back_home_is_the_same_over_hrmp_and_spec_msg() {
 	let mut received = Vec::new();
 	for transport in ["Sibling", "SpecMsg"] {
 		if transport == "SpecMsg" {
-			open_xcm_channel_a_to_b();
+			open_xcm_channel_a_to_b(0);
 		}
 		let before = balance();
 		PenpalA::execute_with(|| {
@@ -352,6 +354,44 @@ fn queued_on_b() -> Vec<(&'static str, u64)> {
 }
 
 #[test]
+fn a_replacement_lane_waits_for_queued_xcm_and_delivers_on_its_own_origin() {
+	use cumulus_primitives_core::{AggregateMessageOrigin, InChannelId};
+	use penpal_runtime::{Runtime, RuntimeOrigin, SpecMessaging, XcmpQueue};
+	let root = RuntimeOrigin::root;
+	open_xcm_channel_a_to_b(0);
+	PenpalB::execute_with(|| {
+		assert_ok!(XcmpQueue::suspend_xcm_execution(root()));
+	});
+	send_a_to_b(Xcm(vec![UnsubscribeVersion]));
+	PenpalA::execute_with(|| {
+		assert_ok!(SpecMessaging::close_channel(root(), PARA_ID_B.into(), 0, 0));
+	});
+	let old = InChannelId { sender: PARA_ID_A.into(), domain: 0, num: 0 };
+	assert!(matches!(queued_on_b().as_slice(), [("SpecMsg", count)] if *count > 0));
+	PenpalB::execute_with(|| {
+		assert!(!SpecMessaging::consumed_streams().channels.contains_key(&old));
+		assert_eq!(
+			SpecMessaging::accept_open_channel(root(), old.sender, 0, 1),
+			Err(cumulus_pallet_spec_messaging::Error::<Runtime>::LaneBusy.into())
+		);
+		assert_ok!(XcmpQueue::resume_xcm_execution(root()));
+	});
+	assert!(queued_on_b().is_empty());
+	open_xcm_channel_a_to_b(1);
+	send_a_to_b(Xcm(vec![UnsubscribeVersion]));
+	let origins: Vec<_> = events_on_b()
+		.into_iter()
+		.filter_map(|event| match event {
+			penpal_runtime::RuntimeEvent::MessageQueue(
+				pallet_message_queue::Event::Processed { origin, success: true, .. },
+			) => Some(origin),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(origins, vec![AggregateMessageOrigin::SpecMsg(InChannelId { num: 1, ..old })]);
+}
+
+#[test]
 fn suspended_xcm_execution_holds_hrmp_and_spec_msg_alike() {
 	let root = || penpal_runtime::RuntimeOrigin::root();
 	let sovereign = sovereign_of_a_on_b();
@@ -365,7 +405,7 @@ fn suspended_xcm_execution_holds_hrmp_and_spec_msg_alike() {
 	};
 	for transport in ["Sibling", "SpecMsg"] {
 		if transport == "SpecMsg" {
-			open_xcm_channel_a_to_b();
+			open_xcm_channel_a_to_b(0);
 		}
 		PenpalB::execute_with(|| {
 			assert_ok!(penpal_runtime::XcmpQueue::suspend_xcm_execution(root()));
@@ -390,7 +430,7 @@ fn a_version_subscription_is_the_same_over_hrmp_and_spec_msg() {
 	let a = Location::new(1, [Parachain(PARA_ID_A)]);
 	for transport in ["Sibling", "SpecMsg"] {
 		if transport == "SpecMsg" {
-			open_xcm_channel_a_to_b();
+			open_xcm_channel_a_to_b(0);
 		}
 		PenpalA::execute_with(|| {
 			assert_ok!(penpal_runtime::PolkadotXcm::force_subscribe_version_notify(

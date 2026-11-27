@@ -22,11 +22,11 @@ use cumulus_pallet_parachain_system::{
 	relay_state_snapshot::{MessagingStateSnapshot, RelayDispatchQueueRemainingCapacity},
 	RelevantMessagingState,
 };
-use cumulus_pallet_spec_messaging::{xcm_channel, OutChannels, OutboundMessages};
+use cumulus_pallet_spec_messaging::{OutChannels, OutboundMessages};
 use cumulus_primitives_core::{AbridgedHrmpChannel, AggregateMessageOrigin, InChannelId, ParaId};
 use cumulus_primitives_spec_messaging::{
-	AppliedRegister, ChannelMessage, MessagePosition, OpenSession, OutChannelState, Register,
-	RegisterStatus, SessionParams, SPMS_ENGINE_ID,
+	AppliedRegister, ChannelMessage, MessagePosition, OutChannelState, Register, RegisterStatus,
+	SPMS_ENGINE_ID,
 };
 use frame_support::{
 	assert_ok,
@@ -63,24 +63,21 @@ fn xcm() -> Xcm<()> {
 	Xcm(vec![ClearOrigin])
 }
 
-/// Seed the state after a completed opening handshake.
+/// Seed the state after applying the opening register.
 fn open_spec_msg_channel() {
 	let max_message_size = 102400;
 	OutChannels::<Runtime>::insert(
-		xcm_channel(SIBLING.into()),
+		SpecMessaging::outbound_xcm_lane(SIBLING.into()),
 		OutChannelState {
 			want_open: true,
-			session: 1,
+
 			register: Some(AppliedRegister {
 				position: MessagePosition(0),
-				register: Register { up_to: MessagePosition(0), status: RegisterStatus::Opened },
+				register: Register {
+					up_to: MessagePosition(0),
+					status: RegisterStatus::Open { max_message_size },
+				},
 			}),
-			open: Some(OpenSession {
-				session: 1,
-				params: SessionParams { version: 1, max_message_size },
-				opened: true,
-			}),
-			closed_session: None,
 		},
 	);
 }
@@ -126,7 +123,9 @@ fn without_hrmp_xcm_goes_over_spec_msg_only_on_an_open_channel() {
 		// `WithUniqueTopic` appends a topic, so decode rather than compare.
 		open_spec_msg_channel();
 		assert_ok!(send_xcm::<XcmRouter>(sibling(), xcm()));
-		let sent = OutboundMessages::<Runtime>::get(xcm_channel(SIBLING.into()).data_stream());
+		let sent = OutboundMessages::<Runtime>::get(
+			SpecMessaging::outbound_xcm_lane(SIBLING.into()).data_stream(),
+		);
 		assert_eq!(sent.len(), 1);
 		let Ok(ChannelMessage::Data(data)) = ChannelMessage::decode_all(&mut &sent[0][..]) else {
 			panic!("XCM travels as a `Data` leaf");
@@ -149,7 +148,7 @@ fn a_closing_hrmp_channel_diverts_new_xcm_while_it_drains() {
 		open_spec_msg_channel();
 		assert_ok!(SpecMessaging::set_hrmp_closing(RuntimeOrigin::root(), SIBLING.into()));
 		assert_ok!(send_xcm::<XcmRouter>(sibling(), xcm()));
-		let stream = xcm_channel(SIBLING.into()).data_stream();
+		let stream = SpecMessaging::outbound_xcm_lane(SIBLING.into()).data_stream();
 		assert_eq!(OutboundMessages::<Runtime>::get(stream).len(), 1);
 	});
 }
@@ -229,8 +228,12 @@ fn an_xcm_one_framing_short_of_the_bound_is_the_largest_that_fits() {
 	new_test_ext().execute_with(|| {
 		open_spec_msg_channel();
 		// Channel framing counts toward the protocol's message bound.
-		assert_ok!(SpecMessaging::can_send(xcm_channel(SIBLING.into()), 102_395));
-		assert!(SpecMessaging::can_send(xcm_channel(SIBLING.into()), 102_396).is_err());
+		assert_ok!(SpecMessaging::can_send(
+			SpecMessaging::outbound_xcm_lane(SIBLING.into()),
+			102_395
+		));
+		assert!(SpecMessaging::can_send(SpecMessaging::outbound_xcm_lane(SIBLING.into()), 102_396)
+			.is_err());
 	});
 }
 
@@ -316,7 +319,7 @@ fn next_block() {
 }
 
 fn sent_topics() -> Vec<u8> {
-	let stream = xcm_channel(SIBLING.into()).data_stream();
+	let stream = SpecMessaging::outbound_xcm_lane(SIBLING.into()).data_stream();
 	OutboundMessages::<Runtime>::get(stream)
 		.iter()
 		.map(|leaf| {

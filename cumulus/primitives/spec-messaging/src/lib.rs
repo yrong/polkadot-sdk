@@ -45,8 +45,8 @@ mod conformance_vectors;
 mod test_utils;
 
 pub use channel::{
-	AppliedRegister, BroadcastId, ChannelMessage, InChannelId, InChannelState, OpenSession,
-	OutChannelId, OutChannelState, Register, RegisterStatus, SessionParams,
+	AppliedRegister, BroadcastId, ChannelMessage, InChannelId, InChannelState, InboundStatus,
+	OutChannelId, OutChannelState, Register, RegisterStatus,
 };
 pub use fetch::{
 	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagesRequest,

@@ -140,11 +140,12 @@ fn open_inbound<T: Config>(channel: InChannelId) {
 		channel,
 		InChannelState {
 			frontier: wide_frontier(),
-			session: 1,
-			status: RegisterStatus::Opened,
-			published: Some(Register { up_to: MessagePosition(0), status: RegisterStatus::Opened }),
-			open: Some(SessionParams { version: 1, max_message_size: T::MaxMsgLen::get() }),
-			draining: false,
+			status: InboundStatus::Open,
+			published: Some(Register {
+				up_to: MessagePosition(0),
+				status: RegisterStatus::Open { max_message_size: T::MaxMsgLen::get() },
+			}),
+			max_message_size: T::MaxMsgLen::get(),
 		},
 	);
 }
@@ -155,53 +156,23 @@ impl<T: Config> polkadot_runtime_parachains::EnsureForParachain for Pallet<T> {
 			frame_system::Pallet::<T>::note_finished_initialize();
 		}
 		mark_rolled_over::<T>();
-		open_outbound::<T>(xcm_channel(para), *T::SupportedVersions::get().start());
+		open_outbound::<T>(Pallet::<T>::outbound_xcm_lane(para));
 	}
 }
 
-/// An outbound channel that took part in session 1 and applied its `Opened`.
-fn open_outbound<T: Config>(channel: OutChannelId, version: u8) {
+fn open_outbound<T: Config>(channel: OutChannelId) {
+	LastOutboundLane::<T>::insert((channel.recipient, channel.domain), channel.num);
 	OutChannels::<T>::insert(
 		channel,
 		OutChannelState {
 			want_open: true,
-			session: 1,
-			register: Some(AppliedRegister {
-				position: MessagePosition(0),
-				register: Register { up_to: MessagePosition(0), status: RegisterStatus::Opened },
-			}),
-			open: Some(OpenSession {
-				session: 1,
-				params: SessionParams { version, max_message_size: T::MaxMsgLen::get() },
-				opened: true,
-			}),
-			closed_session: None,
-		},
-	);
-}
-
-/// An outbound channel that wants to open, with the recipient's `Accepting` register applied.
-fn accepting_outbound<T: Config>(channel: OutChannelId, want_open: bool) {
-	let supported = T::SupportedVersions::get();
-	OutChannels::<T>::insert(
-		channel,
-		OutChannelState {
-			want_open,
-			session: 1,
 			register: Some(AppliedRegister {
 				position: MessagePosition(0),
 				register: Register {
 					up_to: MessagePosition(0),
-					status: RegisterStatus::Accepting {
-						session: 1,
-						min: *supported.start(),
-						max: *supported.end(),
-						max_message_size: T::MaxMessageSize::get(),
-					},
+					status: RegisterStatus::Open { max_message_size: T::MaxMsgLen::get() },
 				},
 			}),
-			open: None,
-			closed_session: None,
 		},
 	);
 }
@@ -210,20 +181,20 @@ fn accepting_outbound<T: Config>(channel: OutChannelId, want_open: bool) {
 mod benchmarks {
 	use super::*;
 
-	/// The recipient's `Accepting` register is applied, so the call sends the `Hello`.
 	#[benchmark]
 	fn open_channel() -> Result<(), BenchmarkError> {
 		let origin = T::OpenChannelOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		accepting_outbound::<T>(channel, false);
-		build_tree_around::<T>(channel.data_stream());
-		mark_rolled_over::<T>();
+		let prior = OutChannelId { num: 0, ..channel };
+		let channel = OutChannelId { num: 1, ..channel };
+		LastOutboundLane::<T>::insert((prior.recipient, prior.domain), prior.num);
+		OutChannels::<T>::insert(prior, OutChannelState::default());
 
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, channel.recipient, channel.domain, channel.num);
 
-		assert_eq!(OutboundLeafHashes::<T>::get(channel.data_stream()).len(), 1);
+		assert!(OutChannels::<T>::get(channel).unwrap().want_open);
 		Ok(())
 	}
 
@@ -233,7 +204,7 @@ mod benchmarks {
 		let origin = T::ChannelManagementOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let peer = sibling::<T>(0);
-		open_outbound::<T>(xcm_channel(peer), 1);
+		open_outbound::<T>(Pallet::<T>::outbound_xcm_lane(peer));
 
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, peer);
@@ -286,26 +257,17 @@ mod benchmarks {
 		Ok(())
 	}
 
-	/// Reaccepting a closed channel whose frontier is wide.
 	#[benchmark]
 	fn accept_open_channel() -> Result<(), BenchmarkError> {
 		let origin = T::AcceptChannelOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let channel = InChannelId { sender: sibling::<T>(0), domain: 0, num: 0 };
-		InChannels::<T>::insert(
-			channel,
-			InChannelState {
-				frontier: wide_frontier(),
-				session: 1,
-				status: RegisterStatus::Closed { session: 1 },
-				published: Some(Register {
-					up_to: MessagePosition(0),
-					status: RegisterStatus::Closed { session: 1 },
-				}),
-				open: None,
-				draining: false,
-			},
-		);
+		LastInboundLane::<T>::insert((channel.sender, channel.domain), channel.num);
+		open_inbound::<T>(channel);
+		InChannels::<T>::mutate(channel, |state| {
+			state.as_mut().unwrap().status = InboundStatus::Closed
+		});
+		let channel = InChannelId { num: 1, ..channel };
 		build_tree_around::<T>(channel.ack_stream());
 
 		#[extrinsic_call]
@@ -313,18 +275,18 @@ mod benchmarks {
 
 		assert!(matches!(
 			InChannels::<T>::get(channel).map(|s| s.status),
-			Some(RegisterStatus::Accepting { .. })
+			Some(InboundStatus::Open)
 		));
 		Ok(())
 	}
 
-	/// The channel took part in its session, so the call sends the `CloseChannel`.
+	/// Closing an outbound lane appends its final leaf.
 	#[benchmark]
 	fn close_channel() -> Result<(), BenchmarkError> {
 		let origin = T::OpenChannelOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Weightless)?;
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		open_outbound::<T>(channel, 1);
+		open_outbound::<T>(channel);
 		mark_rolled_over::<T>();
 
 		#[extrinsic_call]
@@ -344,8 +306,31 @@ mod benchmarks {
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, channel.sender, channel.domain, channel.num);
 
-		assert!(InChannels::<T>::get(channel).is_some_and(|s| s.draining));
+		assert!(InChannels::<T>::get(channel).is_some_and(|s| s.status == InboundStatus::Closing));
 		Ok(())
+	}
+
+	#[benchmark]
+	fn force_close_inbound() -> Result<(), BenchmarkError> {
+		let origin = T::AcceptChannelOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+		let channel = InChannelId { sender: sibling::<T>(0), domain: 0, num: 0 };
+		open_inbound::<T>(channel);
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, channel.sender, channel.domain, channel.num);
+		assert!(InChannels::<T>::get(channel)
+			.is_some_and(|lane| lane.status == InboundStatus::ForceClosed));
+		Ok(())
+	}
+
+	#[benchmark]
+	fn outbound_xcm_lane() {
+		let peer = sibling::<T>(0);
+		LastOutboundLane::<T>::insert((peer, XCM_CHANNEL_DOMAIN), 1);
+		#[block]
+		{
+			assert_eq!(Pallet::<T>::outbound_xcm_lane(peer).num, 1);
+		}
 	}
 
 	/// `c` open inbound channels consumed, one message each. The `DataHandler` is not measured: its
@@ -410,19 +395,10 @@ mod benchmarks {
 		assert_bundle_full::<T>();
 	}
 
-	/// `r` register reads that each make the sender send a `Hello`, on new streams.
+	/// `r` register reads that each make the sender send a `Close`, on new streams.
 	#[benchmark(pov_mode = Measured)]
 	fn enact_registers(r: Linear<0, { T::MaxTouchedStreams::get() }>) {
-		let supported = T::SupportedVersions::get();
-		let register = Register {
-			up_to: MessagePosition(0),
-			status: RegisterStatus::Accepting {
-				session: 1,
-				min: *supported.start(),
-				max: *supported.end(),
-				max_message_size: T::MaxMessageSize::get(),
-			},
-		};
+		let register = Register { up_to: MessagePosition(0), status: RegisterStatus::Closing };
 		let mut data = MessagingInherentData::default();
 		for j in 0..r {
 			let channel = OutChannelId { recipient: sibling::<T>(j), domain: 0, num: 0 };
@@ -520,7 +496,7 @@ mod benchmarks {
 	#[benchmark]
 	fn send(b: Linear<0, { T::MaxMsgLen::get().saturating_sub(8) }>) {
 		let channel = OutChannelId { recipient: sibling::<T>(0), domain: 0, num: 0 };
-		open_outbound::<T>(channel, 1);
+		open_outbound::<T>(channel);
 		OutboundFrontier::<T>::insert(channel.data_stream(), wide_frontier());
 		OutChannels::<T>::mutate(channel, |state| {
 			if let Some(AppliedRegister { register, .. }) =
@@ -554,38 +530,6 @@ mod benchmarks {
 		assert!(Pallet::<T>::current_streams_root().is_none());
 	}
 
-	/// A Hello pass over `n` channels, each due a `Hello` on a stream with a wide frontier, in a
-	/// tree 64 deep.
-	#[benchmark(pov_mode = Measured)]
-	fn hello_pass(n: Linear<1, { T::MaxHelloPassPerBlock::get() }>) {
-		let channels: Vec<OutChannelId> = (0..n)
-			.map(|i| OutChannelId { recipient: sibling::<T>(i), domain: 0, num: 0 })
-			.collect();
-		let streams: Vec<StreamId> = channels.iter().map(OutChannelId::data_stream).collect();
-		build_tree_around::<T>(streams[0]);
-		for (channel, stream) in channels.iter().zip(&streams) {
-			accepting_outbound::<T>(*channel, true);
-			OutChannels::<T>::mutate(channel, |state| {
-				if let Some(AppliedRegister { register, .. }) =
-					state.as_mut().and_then(|s| s.register.as_mut())
-				{
-					register.up_to = MessagePosition((1 << 47) - 1);
-				}
-			});
-			OutboundFrontier::<T>::insert(*stream, wide_frontier());
-		}
-		mark_rolled_over::<T>();
-		HelloPassCursor::<T>::put(BoundedVec::default());
-
-		#[block]
-		{
-			Pallet::<T>::run_hello_pass();
-		}
-
-		assert_eq!(SendsThisBlock::<T>::get(), n);
-		assert_eq!(HelloPassCursor::<T>::exists(), n == T::MaxHelloPassPerBlock::get());
-	}
-
 	#[benchmark(pov_mode = Measured)]
 	fn clean_offboarded_peer(n: Linear<0, MAX_CLEANUP_CHANNELS>) {
 		let peer = sibling::<T>(0);
@@ -596,10 +540,7 @@ mod benchmarks {
 			let channel = InChannelId { sender: peer, domain: 0, num };
 			PausedInbound::<T>::insert(channel, ());
 			open_inbound::<T>(channel);
-			open_outbound::<T>(
-				OutChannelId { recipient: peer, domain: 0, num },
-				*T::SupportedVersions::get().start(),
-			);
+			open_outbound::<T>(OutChannelId { recipient: peer, domain: 0, num });
 			channels.try_push((0, num)).expect("benchmark range fits; qed");
 		}
 

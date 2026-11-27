@@ -5,7 +5,11 @@ doc:
     Penpal uses the new messaging pallet to send sibling XCM. To enable it in another runtime,
     configure the pallet as the parachain system's `ConsumptionRecordSource`, implement
     `SpecMsgApi` for collators, and use `EnqueueToXcmQueue` for the XCM lane. Run try-runtime
-    before narrowing `SupportedVersions` or reducing `MaxMsgLen` for live channels.
+    before reducing `MaxMsgLen` for live lanes.
+
+    Domain 0 carries XCM on single-use lanes numbered from zero.
+    Open the next lane number after the previous lane closes and its queue drains.
+    Force-closing abandons the unconsumed tail and releases the ordering guarantee.
 
     Place `SpecMsgRouter` before `XcmpQueue`. HRMP keeps priority until marked as closing.
     During cutover, new sends use the open spec-msg channel and fail if it closes. Drain both
@@ -25,7 +29,7 @@ crates:
 - name: cumulus-primitives-core
   bump: major
 - name: cumulus-primitives-spec-messaging
-  bump: minor
+  bump: major
 - name: cumulus-pallet-parachain-system
   bump: none
 - name: polkadot-omni-node-lib

@@ -358,10 +358,6 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 	type ConsumptionRecordSource = SpecMessaging;
 }
 
-parameter_types! {
-	pub const SpecMsgSupportedVersions: core::ops::RangeInclusive<u8> = 1..=1;
-}
-
 impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type SelfParaId = ParachainInfo;
 	type MaxMsgLen = ConstU32<{ 100 * 1024 }>;
@@ -372,8 +368,6 @@ impl cumulus_pallet_spec_messaging::Config for Runtime {
 	type MaxBundleStreams = ConstU32<3000>;
 	// A full inherent of 100 KiB messages, with its worst-case commit, must fit the 10 MiB PoV.
 	type MaxInboundMessagesPerItem = ConstU32<4>;
-	type MaxHelloPassPerBlock = ConstU32<8>;
-	type SupportedVersions = SpecMsgSupportedVersions;
 	type MaxMessageSize = ConstU32<{ 100 * 1024 }>;
 	type MaxQueueFootprint = ConstU32<48>;
 	type QueueFootprint = ();

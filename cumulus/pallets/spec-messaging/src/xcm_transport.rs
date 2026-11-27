@@ -22,6 +22,7 @@
 use crate::{
 	channel_policy::OutChannelPolicy, BlockStreamsRoot, Config, DeliveryFeeFactor, Error,
 	HrmpClosing, OnSpecMsgData, OutChannels, OutboundMessages, Pallet, QueueFootprintQuery,
+	WeightInfo,
 };
 use alloc::vec::Vec;
 use codec::{DecodeAll, DecodeLimit, Encode};
@@ -47,18 +48,6 @@ use xcm_builder::InspectMessageQueues;
 /// The channel `domain` XCM uses.
 pub const XCM_CHANNEL_DOMAIN: u8 = 0;
 
-/// The channel `num` XCM uses.
-pub const XCM_CHANNEL_NUM: u16 = 0;
-
-/// The outbound XCM channel to `peer`.
-pub fn xcm_channel(peer: ParaId) -> OutChannelId {
-	OutChannelId { recipient: peer, domain: XCM_CHANNEL_DOMAIN, num: XCM_CHANNEL_NUM }
-}
-
-fn is_xcm_channel(domain: u8, num: u16) -> bool {
-	domain == XCM_CHANNEL_DOMAIN && num == XCM_CHANNEL_NUM
-}
-
 /// [`OnSpecMsgData`] that forwards the XCM channel's payloads, in order, to the channel's message
 /// queue:
 ///
@@ -77,8 +66,8 @@ pub struct EnqueueToXcmQueue<Queue, EnqueueWeight>(PhantomData<(Queue, EnqueueWe
 impl<Queue: EnqueueMessage<InChannelId>, EnqueueWeight: Convert<u32, Weight>> OnSpecMsgData
 	for EnqueueToXcmQueue<Queue, EnqueueWeight>
 {
-	fn handles(domain: u8, num: u16) -> bool {
-		is_xcm_channel(domain, num)
+	fn handles(domain: u8, _num: u16) -> bool {
+		domain == XCM_CHANNEL_DOMAIN
 	}
 
 	fn on_data(source: ParaId, stream: StreamId, _position: MessagePosition, data: Vec<u8>) {
@@ -115,6 +104,10 @@ pub struct QueueFootprintOf<Queue, QueryWeight = ()>(PhantomData<(Queue, QueryWe
 impl<Queue: frame_support::traits::QueueFootprintQuery<InChannelId>, QueryWeight: Get<Weight>>
 	QueueFootprintQuery<InChannelId> for QueueFootprintOf<Queue, QueryWeight>
 {
+	fn is_empty(id: &InChannelId) -> bool {
+		Queue::footprint(*id).storage.count == 0
+	}
+
 	fn ready_pages(id: &InChannelId) -> u32 {
 		Queue::footprint(*id).ready_pages
 	}
@@ -175,16 +168,20 @@ where
 				return Err(SendError::NotApplicable);
 			},
 		};
-		let channel = xcm_channel(id);
 		let closing = HrmpClosing::<T>::contains_key(id);
 		let hrmp_open =
 			!closing && !matches!(ChannelInfo::get_channel_status(id), ChannelStatus::Closed);
-		let spec_msg_open = OutChannels::<T>::get(channel)
-			.is_some_and(|state| state.active_session(T::SupportedVersions::get()).is_some());
+		if hrmp_open {
+			*dest = Some(d);
+			return Err(SendError::NotApplicable);
+		}
+		let channel = Pallet::<T>::outbound_xcm_lane(id);
+		let spec_msg_open =
+			OutChannels::<T>::get(channel).is_some_and(|state| state.send_size_limit().is_some());
 		if closing && !spec_msg_open {
 			return Err(SendError::Transport("spec-msg XCM channel is closed during HRMP cutover"));
 		}
-		if hrmp_open || !spec_msg_open {
+		if !spec_msg_open {
 			*dest = Some(d);
 			return Err(SendError::NotApplicable);
 		}
@@ -232,9 +229,11 @@ where
 	}
 }
 
-/// Delivery also charges the fee-factor read and write for congestion tracking.
+/// Charge lane selection and the fee-factor update alongside the send.
 fn delivery_weight<T: Config>(channel: OutChannelId, len: u32) -> Weight {
-	Pallet::<T>::send_weight(channel, len).saturating_add(T::DbWeight::get().reads_writes(1, 1))
+	Pallet::<T>::send_weight(channel, len)
+		.saturating_add(T::WeightInfo::outbound_xcm_lane())
+		.saturating_add(T::DbWeight::get().reads_writes(1, 1))
 }
 
 /// Raise the channel's [`DeliveryFeeFactor`] after a send that leaves more than half of
@@ -296,8 +295,8 @@ impl<T: Config, ChannelInfo, VersionWrapper, Price> InspectMessageQueues
 	fn get_messages() -> Vec<(VersionedLocation, Vec<VersionedXcm<()>>)> {
 		OutboundMessages::<T>::iter()
 			.filter_map(|(stream, leaves)| {
-				let StreamId::Channel { recipient, domain, num } = stream else { return None };
-				if !is_xcm_channel(domain, num) {
+				let StreamId::Channel { recipient, domain, .. } = stream else { return None };
+				if domain != XCM_CHANNEL_DOMAIN {
 					return None;
 				}
 				let messages: Vec<_> = leaves

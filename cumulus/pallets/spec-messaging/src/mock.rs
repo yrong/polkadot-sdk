@@ -14,7 +14,6 @@
 // limitations under the License.
 
 use crate as cumulus_pallet_spec_messaging;
-use core::ops::RangeInclusive;
 use cumulus_primitives_core::AggregateMessageOrigin;
 use cumulus_primitives_spec_messaging::InChannelId;
 use frame_support::{
@@ -68,7 +67,6 @@ parameter_types! {
 	pub const MaxTouchedStreams: u32 = 8;
 	pub const MaxBundleStreams: u32 = 1024;
 	pub const MaxInboundMessagesPerItem: u32 = 16;
-	pub const MaxHelloPassPerBlock: u32 = 2;
 	pub static MaxMessageSize: u32 = 1024;
 	pub const MaxQueueFootprint: u32 = 4;
 	pub SelfParaId: ParaId = ParaId::from(SELF_PARA);
@@ -83,8 +81,6 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 	type MaxTouchedStreams = MaxTouchedStreams;
 	type MaxBundleStreams = MaxBundleStreams;
 	type MaxInboundMessagesPerItem = MaxInboundMessagesPerItem;
-	type MaxHelloPassPerBlock = MaxHelloPassPerBlock;
-	type SupportedVersions = SupportedVersions;
 	type MaxMessageSize = MaxMessageSize;
 	type MaxQueueFootprint = MaxQueueFootprint;
 	type QueueFootprint = MockQueueFootprint;
@@ -96,8 +92,6 @@ impl cumulus_pallet_spec_messaging::Config for Test {
 }
 
 parameter_types! {
-	/// The versions the pallet supports; tests change it to model a runtime upgrade.
-	pub static SupportedVersions: RangeInclusive<u8> = 1..=1;
 	/// Messages [`RecordingQueue`] received: `(channel, message)`.
 	pub static Enqueued: Vec<(InChannelId, Vec<u8>)> = Vec::new();
 	/// [`RecordingQueue`]'s `MaxMessageLen`: above the pallet's `MaxMsgLen` by default, so every
@@ -202,6 +196,10 @@ pub struct MockQueueFootprint;
 impl crate::QueueFootprintQuery<cumulus_primitives_spec_messaging::InChannelId>
 	for MockQueueFootprint
 {
+	fn is_empty(id: &cumulus_primitives_spec_messaging::InChannelId) -> bool {
+		Self::ready_pages(id) == 0
+	}
+
 	fn ready_pages(_: &cumulus_primitives_spec_messaging::InChannelId) -> u32 {
 		READY_PAGES.with(|p| p.get())
 	}

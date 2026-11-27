@@ -648,7 +648,7 @@ mod tests {
 			..Default::default()
 		};
 		check_inherent_decode(&[&[0][..], &data.encode()].concat());
-		let register = Register { up_to: MessagePosition(3), status: RegisterStatus::Opened };
+		let register = Register { up_to: MessagePosition(3), status: RegisterStatus::Closing };
 		check_inherent_decode(&[&[2][..], &register.encode()].concat());
 		check_inherent_decode(&[&[1][..], &ChannelMessage::Data(vec![7]).encode()].concat());
 

@@ -35,16 +35,16 @@ use alloc::{
 	vec::Vec,
 };
 use codec::{Compact, DecodeAll, Encode, MaxEncodedLen};
-use core::{marker::PhantomData, ops::RangeInclusive};
+use core::marker::PhantomData;
 use cumulus_primitives_core::CumulusDigestItem;
 use cumulus_primitives_spec_messaging::{
 	leaf_hash_with_version, streams_root::update_tree_leaf, AppliedRegister, ChannelMessage,
-	ConsumedStreams, ConsumptionRecord, InChannelId, InChannelState, InnerNode, Interval,
-	LossyRead, MessagePosition, MessagingInherentData, MmrExtensionProof, MmrFrontier, MmrRoot,
-	NodeKey, NodeLookup, NodeStore, OpenSession, OutChannelId, OutChannelState, Payload,
-	ProvideConsumptionRecord, Register, RegisterStatus, SessionParams, StreamId, StreamProof,
-	StreamsRoot, TreeError, TreeRootEntry, INHERENT_IDENTIFIER, LEAF_VERSION,
-	MAX_SPECULATIVE_MESSAGE_LEN, SPMS_ENGINE_ID,
+	ConsumedStreams, ConsumptionRecord, InChannelId, InChannelState, InboundStatus, InnerNode,
+	Interval, LossyRead, MessagePosition, MessagingInherentData, MmrExtensionProof, MmrFrontier,
+	MmrRoot, NodeKey, NodeLookup, NodeStore, OutChannelId, OutChannelState, Payload,
+	ProvideConsumptionRecord, Register, RegisterStatus, StreamId, StreamProof, StreamsRoot,
+	TreeError, TreeRootEntry, INHERENT_IDENTIFIER, LEAF_VERSION, MAX_SPECULATIVE_MESSAGE_LEN,
+	SPMS_ENGINE_ID,
 };
 use frame_support::{
 	ensure,
@@ -77,17 +77,17 @@ pub mod weights;
 pub mod xcm_transport;
 
 pub use weights::WeightInfo;
-pub use xcm_transport::{
-	xcm_channel, EnqueueToXcmQueue, QueueFootprintOf, SpecMsgRouter, XCM_CHANNEL_DOMAIN,
-	XCM_CHANNEL_NUM,
-};
+pub use xcm_transport::{EnqueueToXcmQueue, QueueFootprintOf, SpecMsgRouter, XCM_CHANNEL_DOMAIN};
 
 /// Query the memory footprint of a channel's delivery queue.
 pub trait QueueFootprintQuery<Id> {
 	/// Number of ready pages in the channel's delivery queue.
 	fn ready_pages(id: &Id) -> u32;
 
-	/// Charged once per channel item for [`Self::ready_pages`]. With [`EnqueueToXcmQueue`],
+	/// Includes overweight messages that can still be executed manually.
+	fn is_empty(id: &Id) -> bool;
+
+	/// Weight of a footprint query. With [`EnqueueToXcmQueue`],
 	/// include the proof of the existing tail page read by the channel's first enqueue.
 	fn ready_pages_weight() -> Weight {
 		Weight::zero()
@@ -95,6 +95,9 @@ pub trait QueueFootprintQuery<Id> {
 }
 
 impl<Id> QueueFootprintQuery<Id> for () {
+	fn is_empty(_: &Id) -> bool {
+		true
+	}
 	fn ready_pages(_: &Id) -> u32 {
 		0
 	}
@@ -179,15 +182,6 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxInboundMessagesPerItem: Get<u32>;
 
-		/// Supported channel versions sent and parsed; advertised when accepting.
-		#[pallet::constant]
-		type SupportedVersions: Get<RangeInclusive<u8>>;
-
-		/// Cap on the channels one block's pass over [`OutChannels`] visits after a change of
-		/// [`Self::SupportedVersions`]; at least 1.
-		#[pallet::constant]
-		type MaxHelloPassPerBlock: Get<u32>;
-
 		/// Advertised maximum message size when accepting an inbound channel.
 		#[pallet::constant]
 		type MaxMessageSize: Get<u32>;
@@ -270,15 +264,12 @@ pub mod pallet {
 	pub type OutChannels<T: Config> =
 		StorageMap<_, Twox64Concat, OutChannelId, OutChannelState, OptionQuery>;
 
-	/// The [`Config::SupportedVersions`] range last seen by `on_runtime_upgrade`.
+	/// Highest outbound lane number allocated per peer and domain, retained after cleanup.
 	#[pallet::storage]
-	pub type SeenVersions<T: Config> = StorageValue<_, (u8, u8), OptionQuery>;
-
-	/// The raw [`OutChannels`] key the Hello pass resumes after; empty to start over. A pass is
-	/// running while this is set.
+	pub type LastOutboundLane<T: Config> = StorageMap<_, Twox64Concat, (ParaId, u8), u16>;
+	/// Highest inbound lane number allocated per peer and domain, retained after cleanup.
 	#[pallet::storage]
-	pub type HelloPassCursor<T: Config> =
-		StorageValue<_, BoundedVec<u8, ConstU32<64>>, OptionQuery>;
+	pub type LastInboundLane<T: Config> = StorageMap<_, Twox64Concat, (ParaId, u8), u16>;
 
 	/// Receiver side, per inbound channel.
 	#[pallet::storage]
@@ -337,10 +328,10 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// An outbound channel was opened or reopened.
+		/// An outbound lane was opened.
 		ChannelOpened { channel: OutChannelId },
-		/// An inbound channel was accepted with session parameters.
-		ChannelAccepted { channel: InChannelId, session: u32 },
+		/// An inbound lane was accepted.
+		ChannelAccepted { channel: InChannelId },
 		/// An outbound channel was closed from our side.
 		ChannelClosed { channel: OutChannelId },
 		/// An inbound channel was closed from our side.
@@ -354,12 +345,14 @@ pub mod pallet {
 			peer: ParaId,
 			channels: BoundedVec<(u8, u16), ConstU32<MAX_CLEANUP_CHANNELS>>,
 		},
+		/// The receiver released the handover without waiting for the old queue to drain.
+		InboundChannelForceClosed { channel: InChannelId },
 	}
 
 	#[pallet::error]
 	#[derive(PartialEq, Eq)]
 	pub enum Error<T> {
-		/// Payload over [`Config::MaxMsgLen`] or session `max_message_size`.
+		/// Payload over [`Config::MaxMsgLen`] or the advertised `max_message_size`.
 		MessageTooBig,
 		/// Stream over [`Config::MaxMessagesPerBlock`] this block.
 		TooManyMessages,
@@ -381,11 +374,9 @@ pub mod pallet {
 		AlreadyEnacted,
 		/// A channel to this chain itself.
 		ChannelToSelf,
-		/// The channel is already open or accepted.
-		AlreadyOpen,
 		/// The inbound channel is already accepted.
 		AlreadyAccepted,
-		/// The channel is not open or active in supported versions.
+		/// The channel is not open for sending.
 		NotOpen,
 		/// The send would exceed the `MaxInFlight` credit gate.
 		NoCredit,
@@ -397,8 +388,10 @@ pub mod pallet {
 		AlreadyClosed,
 		/// Send attempted before pallet initialization (e.g. during runtime upgrade).
 		NotInitialized,
-		/// Session counter overflowed.
-		SessionOverflow,
+		/// Only the next unused lane number can be allocated.
+		UnexpectedLaneNumber,
+		/// The previous XCM lane is still open or its execution queue has messages.
+		LaneBusy,
 		/// An inherent item violated protocol admission rules.
 		NotAdmitted,
 		/// Inbound messages in one item exceed [`Config::MaxInboundMessagesPerItem`].
@@ -422,67 +415,20 @@ pub mod pallet {
 			if carried > 0 {
 				weight = weight.saturating_add(commit_weight::<T>(0, carried));
 			}
-			match Self::run_hello_pass() {
-				Some((visited, hellos)) => weight
-					.saturating_add(T::WeightInfo::hello_pass(visited))
-					.saturating_add(commit_weight::<T>(hellos, 0)),
-				None => weight,
-			}
+			weight
 		}
 
 		#[cfg(feature = "try-runtime")]
 		fn pre_upgrade() -> Result<Vec<u8>, sp_runtime::TryRuntimeError> {
-			let supported = T::SupportedVersions::get();
-			let max_len = T::MaxMsgLen::get();
 			for state in InChannels::<T>::iter_values() {
-				if let RegisterStatus::Accepting { min, max, max_message_size, .. } = state.status {
+				if state.is_watched() {
 					ensure!(
-						supported.contains(&min) && supported.contains(&max),
-						"spec-msg: upgrade drops an advertised inbound version"
-					);
-					ensure!(
-						max_message_size <= max_len,
+						state.max_message_size <= T::MaxMsgLen::get(),
 						"spec-msg: MaxMsgLen is below the advertised inbound message size"
-					);
-				}
-				if let Some(params) = state.open {
-					ensure!(
-						supported.contains(&params.version),
-						"spec-msg: upgrade drops an inbound session version"
-					);
-					ensure!(
-						params.max_message_size <= max_len,
-						"spec-msg: MaxMsgLen is below the session inbound message size"
-					);
-				}
-			}
-			for state in OutChannels::<T>::iter_values() {
-				if let Some(open) =
-					state.open.filter(|o| o.session == state.session && !state.closed(o.session))
-				{
-					ensure!(
-						supported.contains(&open.params.version),
-						"spec-msg: upgrade drops an outbound session version"
 					);
 				}
 			}
 			Ok(Vec::new())
-		}
-
-		/// Only schedules the Hello pass when [`Config::SupportedVersions`] changed: sends are
-		/// refused before initialization, so `on_initialize` does the work.
-		fn on_runtime_upgrade() -> Weight {
-			let supported = T::SupportedVersions::get();
-			let now = (*supported.start(), *supported.end());
-			let changed = match SeenVersions::<T>::get() {
-				Some(seen) => seen != now,
-				None => OutChannels::<T>::iter_keys().next().is_some(),
-			};
-			if changed {
-				HelloPassCursor::<T>::put(BoundedVec::default());
-			}
-			SeenVersions::<T>::put(now);
-			T::DbWeight::get().reads_writes(2, 2)
 		}
 
 		fn on_finalize(_n: BlockNumberFor<T>) {
@@ -530,14 +476,6 @@ pub mod pallet {
 			assert!(
 				T::MaxMsgLen::get() <= MAX_SPECULATIVE_MESSAGE_LEN,
 				"`MaxMsgLen` must not exceed `MAX_SPECULATIVE_MESSAGE_LEN`",
-			);
-			assert!(
-				!T::SupportedVersions::get().is_empty(),
-				"`SupportedVersions` must not be empty",
-			);
-			assert!(
-				T::MaxHelloPassPerBlock::get() >= 1,
-				"`MaxHelloPassPerBlock` must be at least 1"
 			);
 		}
 	}
@@ -593,11 +531,9 @@ pub mod pallet {
 			Ok(())
 		}
 
-		/// Open or reopen an outbound channel to `recipient`.
+		/// Open a fresh outbound lane to `recipient`.
 		#[pallet::call_index(1)]
-		#[pallet::weight(
-			T::WeightInfo::open_channel().saturating_add(commit_weight::<T>(1, 0))
-		)]
+		#[pallet::weight(T::WeightInfo::open_channel())]
 		pub fn open_channel(
 			origin: OriginFor<T>,
 			recipient: ParaId,
@@ -607,21 +543,29 @@ pub mod pallet {
 			T::OpenChannelOrigin::ensure_origin(origin)?;
 			ensure!(recipient != T::SelfParaId::get(), Error::<T>::ChannelToSelf);
 			let channel = OutChannelId { recipient, domain, num };
-			let mut state = OutChannels::<T>::get(channel).unwrap_or_default();
-			ensure!(!state.want_open, Error::<T>::AlreadyOpen);
-			state.want_open = true;
-
-			// A Hello that cannot be sent now fails the call: no later event would re-check it.
-			Self::evaluate_hello_rule(&channel, &mut state, Self::send_limit())?;
-			OutChannels::<T>::insert(channel, state);
+			let last = LastOutboundLane::<T>::get((recipient, domain));
+			ensure!(
+				Some(num) == last.map_or(Some(0), |n| n.checked_add(1)),
+				Error::<T>::UnexpectedLaneNumber
+			);
+			if let Some(last) = last.filter(|_| domain == XCM_CHANNEL_DOMAIN) {
+				ensure!(
+					!OutChannels::<T>::get(OutChannelId { num: last, ..channel })
+						.is_some_and(|lane| lane.want_open),
+					Error::<T>::LaneBusy
+				);
+			}
+			LastOutboundLane::<T>::insert((recipient, domain), num);
+			OutChannels::<T>::insert(channel, OutChannelState { want_open: true, register: None });
 			Self::deposit_event(Event::ChannelOpened { channel });
 			Ok(())
 		}
 
-		/// Accept an inbound channel from `sender`, allocating or stepping its session.
+		/// Accept a fresh inbound lane from `sender`.
 		#[pallet::call_index(2)]
 		#[pallet::weight(
 			T::WeightInfo::accept_open_channel()
+				.saturating_add(T::QueueFootprint::ready_pages_weight())
 				.saturating_add(commit_weight::<T>(0, 1))
 		)]
 		pub fn accept_open_channel(
@@ -634,35 +578,34 @@ pub mod pallet {
 			ensure!(sender != T::SelfParaId::get(), Error::<T>::ChannelToSelf);
 			ensure!(T::DataHandler::handles(domain, num), Error::<T>::UnsupportedLane);
 			let channel = InChannelId { sender, domain, num };
-			let mut state = InChannels::<T>::get(channel).unwrap_or_else(|| InChannelState {
-				frontier: MmrFrontier::new(),
-				session: 0,
-				status: RegisterStatus::Closed { session: 0 },
-				published: None,
-				open: None,
-				draining: false,
-			});
-
+			let last = LastInboundLane::<T>::get((sender, domain));
 			ensure!(
-				!matches!(state.status, RegisterStatus::Opened) && !state.draining,
-				Error::<T>::AlreadyOpen
+				Some(num) == last.map_or(Some(0), |n| n.checked_add(1)),
+				Error::<T>::UnexpectedLaneNumber
 			);
-
-			let session = state.session.checked_add(1).ok_or(Error::<T>::SessionOverflow)?;
-			let supported = T::SupportedVersions::get();
-			state.session = session;
-			state.status = RegisterStatus::Accepting {
-				session,
-				min: *supported.start(),
-				max: *supported.end(),
-				max_message_size: T::MaxMessageSize::get(),
-			};
-			state.open = None;
-			state.draining = false;
-
-			InChannels::<T>::insert(channel, state);
+			if let Some(last) = last.filter(|_| domain == XCM_CHANNEL_DOMAIN) {
+				let previous = InChannelId { num: last, ..channel };
+				let previous_status = InChannels::<T>::get(previous).map(|lane| lane.status);
+				let ready = match previous_status {
+					Some(InboundStatus::ForceClosed) => true,
+					None | Some(InboundStatus::Closed) => T::QueueFootprint::is_empty(&previous),
+					Some(InboundStatus::Open | InboundStatus::Closing) => false,
+				};
+				ensure!(ready, Error::<T>::LaneBusy);
+			}
+			let max_message_size = T::MaxMessageSize::get();
+			LastInboundLane::<T>::insert((sender, domain), num);
+			InChannels::<T>::insert(
+				channel,
+				InChannelState {
+					frontier: MmrFrontier::new(),
+					status: InboundStatus::Open,
+					max_message_size,
+					published: None,
+				},
+			);
 			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
-			Self::deposit_event(Event::ChannelAccepted { channel, session });
+			Self::deposit_event(Event::ChannelAccepted { channel });
 			Ok(())
 		}
 
@@ -683,12 +626,7 @@ pub mod pallet {
 			ensure!(state.want_open, Error::<T>::AlreadyClosed);
 			state.want_open = false;
 
-			let session = state.session;
-			if state.took_part_in(session) && !state.closed(session) {
-				let close = ChannelMessage::CloseChannel { session };
-				Self::append_to_stream(channel.data_stream(), close.encode())?;
-				state.closed_session = Some(session);
-			}
+			Self::append_to_stream(channel.data_stream(), ChannelMessage::Close.encode())?;
 			OutChannels::<T>::insert(channel, state);
 			Self::deposit_event(Event::ChannelClosed { channel });
 			Ok(())
@@ -709,23 +647,35 @@ pub mod pallet {
 			T::AcceptChannelOrigin::ensure_origin(origin)?;
 			let channel = InChannelId { sender, domain, num };
 			let mut state = InChannels::<T>::get(channel).ok_or(Error::<T>::UnknownChannel)?;
-			ensure!(
-				!matches!(state.status, RegisterStatus::Closed { .. }) && !state.draining,
-				Error::<T>::AlreadyClosed
-			);
-
-			if matches!(state.status, RegisterStatus::Opened) {
-				state.status = RegisterStatus::Closed { session: state.session };
-				state.draining = true;
-			} else {
-				state.status = RegisterStatus::Closed { session: state.session };
-				state.draining = false;
-				state.open = None;
-			}
-
+			ensure!(state.status == InboundStatus::Open, Error::<T>::AlreadyClosed);
+			state.status = InboundStatus::Closing;
 			InChannels::<T>::insert(channel, state);
 			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
 			Self::deposit_event(Event::InboundChannelClosed { channel });
+			Ok(())
+		}
+
+		/// Abandon the unconsumed tail and allow a replacement before queued XCM finishes.
+		#[pallet::call_index(10)]
+		#[pallet::weight(
+			T::WeightInfo::force_close_inbound().saturating_add(commit_weight::<T>(0, 1))
+		)]
+		pub fn force_close_inbound(
+			origin: OriginFor<T>,
+			sender: ParaId,
+			domain: u8,
+			num: u16,
+		) -> DispatchResult {
+			T::AcceptChannelOrigin::ensure_origin(origin)?;
+			let channel = InChannelId { sender, domain, num };
+			InChannels::<T>::try_mutate(channel, |lane| -> DispatchResult {
+				let state = lane.as_mut().ok_or(Error::<T>::UnknownChannel)?;
+				ensure!(state.status != InboundStatus::ForceClosed, Error::<T>::AlreadyClosed);
+				state.status = InboundStatus::ForceClosed;
+				Ok(())
+			})?;
+			PendingRegisterPublishes::<T>::mutate(|set| set.insert(channel));
+			Self::deposit_event(Event::InboundChannelForceClosed { channel });
 			Ok(())
 		}
 
@@ -760,8 +710,8 @@ pub mod pallet {
 		#[pallet::weight((T::WeightInfo::set_hrmp_closing(), DispatchClass::Operational))]
 		pub fn set_hrmp_closing(origin: OriginFor<T>, peer: ParaId) -> DispatchResult {
 			T::ChannelManagementOrigin::ensure_origin(origin)?;
-			let open = OutChannels::<T>::get(xcm_channel(peer))
-				.is_some_and(|state| state.active_session(T::SupportedVersions::get()).is_some());
+			let open = OutChannels::<T>::get(Self::outbound_xcm_lane(peer))
+				.is_some_and(|state| state.send_size_limit().is_some());
 			ensure!(open, Error::<T>::NotOpen);
 			HrmpClosing::<T>::insert(peer, ());
 			Ok(())
@@ -1331,7 +1281,7 @@ impl<T: Config> Pallet<T> {
 			if let Some(mut state) = InChannels::<T>::get(channel) {
 				let current = Register {
 					up_to: MessagePosition(state.frontier.leaf_count()),
-					status: state.status,
+					status: state.register_status(),
 				};
 				if state.published.as_ref() != Some(&current) {
 					let stream = channel.ack_stream();
@@ -1375,7 +1325,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Whether [`Self::send`] would accept `data_len` bytes on `channel` now: the block is
 	/// initialized and its root not committed, the encoded `Data` leaf fits [`Config::MaxMsgLen`]
-	/// and the session's `max_message_size`, the channel is open with credit left, and the stream
+	/// and the lane's `max_message_size`, the channel is open with credit left, and the stream
 	/// and the block have room. No side effects: before this block's [`Self::roll_over`], the
 	/// stored root and sends are the last block's, so it reads them as the roll-over would leave
 	/// them.
@@ -1393,9 +1343,8 @@ impl<T: Config> Pallet<T> {
 		ensure!(leaf_len <= u64::from(T::MaxMsgLen::get()), Error::<T>::MessageTooBig);
 
 		let state = OutChannels::<T>::get(channel).ok_or(Error::<T>::NotOpen)?;
-		let params =
-			state.active_session(T::SupportedVersions::get()).ok_or(Error::<T>::NotOpen)?;
-		ensure!(leaf_len <= u64::from(params.max_message_size), Error::<T>::MessageTooBig);
+		let max_size = state.send_size_limit().ok_or(Error::<T>::NotOpen)?;
+		ensure!(leaf_len <= u64::from(max_size), Error::<T>::MessageTooBig);
 
 		let stream = channel.data_stream();
 		let sent = OutboundFrontier::<T>::get(stream).leaf_count() +
@@ -1417,88 +1366,12 @@ impl<T: Config> Pallet<T> {
 		Self::append_to_stream(channel.data_stream(), ChannelMessage::Data(data).encode())
 	}
 
-	/// One block's step of the Hello pass, if one is scheduled: returns the channels visited and
-	/// the `Hello`s sent. The cursor stays before a channel the send limit stopped.
-	fn run_hello_pass() -> Option<(u32, u32)> {
-		use frame_support::storage::generator::StorageMap as _;
-		let cursor = HelloPassCursor::<T>::get()?;
-		let mut last = if cursor.is_empty() {
-			OutChannels::<T>::prefix_hash().to_vec()
-		} else {
-			cursor.into_inner()
-		};
-		let limit = Self::send_limit();
-		let (mut visited, mut hellos) = (0u32, 0u32);
-		let mut finished = true;
-		let max_channels = T::MaxHelloPassPerBlock::get();
-		for (channel, mut state) in
-			OutChannels::<T>::iter_from(last.clone()).take(max_channels as usize)
-		{
-			visited = visited.saturating_add(1);
-			match Self::evaluate_hello_rule(&channel, &mut state, limit) {
-				Ok(true) => {
-					OutChannels::<T>::insert(channel, state);
-					hellos = hellos.saturating_add(1);
-				},
-				Err(Error::<T>::TooManySends) => {
-					finished = false;
-					break;
-				},
-				Ok(false) | Err(_) => {},
-			}
-			last = OutChannels::<T>::hashed_key_for(channel);
+	pub fn outbound_xcm_lane(peer: ParaId) -> OutChannelId {
+		OutChannelId {
+			recipient: peer,
+			domain: XCM_CHANNEL_DOMAIN,
+			num: LastOutboundLane::<T>::get((peer, XCM_CHANNEL_DOMAIN)).unwrap_or_default(),
 		}
-		// A full pass step defers the end-of-map check to the next block.
-		if finished && visited < max_channels {
-			HelloPassCursor::<T>::kill();
-		} else {
-			let cursor = BoundedVec::try_from(last).expect("an `OutChannels` key fits; qed");
-			HelloPassCursor::<T>::put(cursor);
-		}
-		Some((visited, hellos))
-	}
-
-	/// Evaluate the Hello rule for an outbound channel, emitting `Hello` within `limit` if due.
-	fn evaluate_hello_rule(
-		channel: &OutChannelId,
-		state: &mut OutChannelState,
-		limit: u32,
-	) -> Result<bool, Error<T>> {
-		if !state.want_open {
-			return Ok(false);
-		}
-		let Some(applied) = &state.register else {
-			return Ok(false);
-		};
-		let RegisterStatus::Accepting { session, min, max, max_message_size } =
-			applied.register.status
-		else {
-			return Ok(false);
-		};
-		if state.took_part_in(session) {
-			return Ok(false);
-		}
-		let supported = T::SupportedVersions::get();
-		let version = (*supported.end()).min(max);
-		if version < (*supported.start()).max(min) {
-			return Ok(false);
-		}
-		let stream = channel.data_stream();
-		let sent = OutboundFrontier::<T>::get(stream).leaf_count() +
-			OutboundMessages::<T>::decode_len(stream).unwrap_or(0) as u64;
-		let up_to = applied.register.up_to.0;
-		if sent.saturating_sub(up_to) >= T::MaxInFlight::get() as u64 {
-			return Ok(false);
-		}
-
-		let hello = ChannelMessage::Hello { session, version };
-		Self::append_within(stream, hello.encode(), limit)?;
-		state.open = Some(OpenSession {
-			session,
-			params: SessionParams { version, max_message_size },
-			opened: false,
-		});
-		Ok(true)
 	}
 
 	/// Checks the stream and source caps for touching `stream`, and returns the proof bytes the
@@ -1586,56 +1459,18 @@ impl<T: Config> Pallet<T> {
 				break;
 			};
 
-			let mut pending_data = None;
-			let mut is_close = false;
-
-			match msg {
-				ChannelMessage::Hello { session, version } => {
-					if session < state.session {
-						// Stale: consumed and ignored.
-					} else {
-						let RegisterStatus::Accepting { session: s, min, max, max_message_size } =
-							state.status
-						else {
-							break;
-						};
-						if session != s || version < min || version > max || state.open.is_some() {
-							break;
-						}
-						state.session = session;
-						state.open = Some(SessionParams { version, max_message_size });
-						state.status = RegisterStatus::Opened;
-					}
-				},
+			let pending_data = match msg {
 				ChannelMessage::Data(data) => {
-					if !matches!(state.status, RegisterStatus::Opened) && !state.draining {
+					if payload.len() > state.max_message_size as usize {
 						break;
 					}
-					let Some(params) = state.open.as_ref() else {
-						break;
-					};
-					if payload.len() > params.max_message_size as usize {
-						break;
-					}
-					pending_data = Some(data);
+					Some(data)
 				},
-				ChannelMessage::CloseChannel { session } => {
-					if session < state.session {
-						// Stale: consumed and ignored.
-					} else {
-						if !matches!(state.status, RegisterStatus::Opened) && !state.draining {
-							break;
-						}
-						if session != state.session {
-							break;
-						}
-						state.status = RegisterStatus::Closed { session };
-						state.draining = false;
-						state.open = None;
-						is_close = true;
-					}
+				ChannelMessage::Close => {
+					state.status = InboundStatus::Closed;
+					None
 				},
-			}
+			};
 
 			let pos = MessagePosition(state.frontier.leaf_count());
 			if state
@@ -1651,8 +1486,8 @@ impl<T: Config> Pallet<T> {
 			}
 			admitted_payloads.push(payload.clone());
 
-			if is_close {
-				// Non-stale close finishes the item; subsequent payloads cannot be admitted.
+			if state.status == InboundStatus::Closed {
+				// A close is the final leaf on this lane.
 				break;
 			}
 		}
@@ -1698,26 +1533,9 @@ impl<T: Config> Pallet<T> {
 		ensure!(register.up_to.0 >= prev_up_to, Error::<T>::NotAdmitted);
 		ensure!(register.up_to.0 <= sent, Error::<T>::NotAdmitted);
 
-		match register.status {
-			RegisterStatus::Accepting { session, min, max, .. } => {
-				ensure!(min <= max, Error::<T>::NotAdmitted);
-				if session == state.session {
-					let Some(prev_status) = state.register.map(|r| r.register.status) else {
-						return Err(Error::<T>::NotAdmitted);
-					};
-					ensure!(prev_status == register.status, Error::<T>::NotAdmitted);
-				} else {
-					ensure!(session > state.session, Error::<T>::NotAdmitted);
-				}
-			},
-			RegisterStatus::Opened => {
-				ensure!(state.took_part_in(state.session), Error::<T>::NotAdmitted);
-			},
-			RegisterStatus::Closed { session } => {
-				ensure!(session >= state.session, Error::<T>::NotAdmitted);
-			},
+		if let (Some(previous), RegisterStatus::Open { .. }) = (state.register, register.status) {
+			ensure!(previous.register.status == register.status, Error::<T>::BadRegister);
 		}
-
 		let skip = state.register.map(|r| (r.position.0 + 1, read_pos.0));
 		Ok(AdmittedRegisterRead { skip, state, register, read_pos, end: frontier })
 	}
@@ -1768,33 +1586,17 @@ impl<T: Config> Pallet<T> {
 
 		state.register = Some(AppliedRegister { position: read_pos, register });
 		match register.status {
-			RegisterStatus::Accepting { session, .. } => {
-				state.session = session;
-				let _ =
-					Self::evaluate_hello_rule(&channel_id, &mut state, T::MaxSendsPerBlock::get());
+			RegisterStatus::Open { .. } => {},
+			RegisterStatus::Closing => {
+				// The credit gate leaves a stream slot, and the inherent has reserved block slots.
+				Self::append_within(
+					channel_id.data_stream(),
+					ChannelMessage::Close.encode(),
+					T::MaxSendsPerBlock::get(),
+				)?;
+				state.want_open = false;
 			},
-			RegisterStatus::Opened => {
-				if let Some(ref mut o) = state.open {
-					if o.session == state.session {
-						o.opened = true;
-					}
-				}
-			},
-			RegisterStatus::Closed { session } => {
-				state.session = session;
-				if state.took_part_in(session) && !state.closed(session) {
-					// Cannot fail: the gate keeps this block's sends below `MaxInFlight`, which
-					// `integrity_test` keeps below `MaxMessagesPerBlock`, and the inherent's
-					// sends have their own room in `MaxSendsPerBlock`.
-					let close = ChannelMessage::CloseChannel { session };
-					Self::append_within(
-						channel_id.data_stream(),
-						close.encode(),
-						T::MaxSendsPerBlock::get(),
-					)?;
-					state.closed_session = Some(session);
-				}
-			},
+			RegisterStatus::Closed => state.want_open = false,
 		}
 
 		OutChannels::<T>::insert(channel_id, state);
