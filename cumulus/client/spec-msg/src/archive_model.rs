@@ -393,19 +393,6 @@ impl Sim {
 			}
 		}
 
-		if self.finalized > 0 {
-			let at = &self.chain[self.finalized as usize];
-			let want: Vec<_> = at
-				.counts
-				.iter()
-				.filter(|(s, count)| is_channel(s) && **count > self.floor(s))
-				.map(|(s, _)| *s)
-				.collect();
-			let got = self.archive.unconfirmed_channels(&at.hash);
-			if got != want {
-				return Err(format!("[unconfirmed] archive {got:?}, model {want:?}"));
-			}
-		}
 		Ok(())
 	}
 

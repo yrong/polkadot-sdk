@@ -569,12 +569,18 @@ where
 		Ok(())
 	}
 
-	/// A pending seed always has a persisted floor, even before its first backfill.
-	pub(crate) fn seeded_payload_floor(&self, stream: &StreamId) -> Option<u64> {
-		self.load::<Floors>(&floors_key(stream))
-			.ok()
-			.flatten()
-			.map(|floors| floors.payload)
+	/// The missing prefix of a seeded stream that retention still requires.
+	pub(crate) fn backfill_range(
+		&self,
+		stream: &StreamId,
+		count: u64,
+	) -> Option<core::ops::Range<u64>> {
+		let floors = self.load::<Floors>(&floors_key(stream)).ok()??;
+		let target = match stream {
+			StreamId::Channel { .. } => floors.retained_from,
+			_ => count.saturating_sub(1),
+		};
+		Some(target..floors.payload)
 	}
 
 	/// The root `hash` is served under, and `stream`'s leaf count there.
@@ -845,21 +851,6 @@ where
 				.try_into()
 				.ok()?,
 		})
-	}
-
-	/// The channels at `finalized` that still hold payloads above their floor, or may owe a
-	/// backfill below it: their watermark decides both.
-	pub fn unconfirmed_channels(&self, finalized: &H) -> Vec<StreamId> {
-		let backfill = self.backfill_pending();
-		self.state_at(finalized)
-			.unwrap_or_default()
-			.into_iter()
-			.filter(|(stream, state)| {
-				matches!(stream, StreamId::Channel { .. }) &&
-					(state.leaf_count > self.floors(stream).payload || backfill.contains(stream))
-			})
-			.map(|(stream, _)| stream)
-			.collect()
 	}
 
 	/// Apply retention at `finalized`: drop boundaries imported before `horizon_cutoff` (never

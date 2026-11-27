@@ -21,25 +21,24 @@
 //! - **First start:** replay from the first block whose runtime has `SpecMsgApi`. If that block's
 //!   state is pruned (warp sync, or spec-msg enabled late), seed the archive at the newest
 //!   finalized block instead: each stream is then served from its leaf count there, until
-//!   [`run_watermark_reader`] backfills what it owes below from the own chain's peers.
-//! - **Finality:** apply retention with the watermarks [`run_watermark_reader`] has confirmed.
+//!   [`run_backfill`] backfills what it owes below from the own chain's peers.
+//! - **Finality:** apply retention with the sender runtime's applied ACKs at the finalized block.
 
 use crate::{
 	archive::Archive,
-	fetch::{fetch, fetch_register_head, RequestError, Rotating, Transport},
+	fetch::{fetch, RequestError, Rotating, Transport},
 	protocol::MAX_PAYLOAD_BYTES,
-	relay::FinalizedRoots,
 	store::ArchiveStore,
 	LOG_TARGET,
 };
-use codec::{Decode, DecodeAll, Encode};
+use codec::{Decode, Encode};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	streams_root::read_streams_root, FetchError, MessagePosition, MessagesRequest, MmrFrontier,
-	Register, SpecMsgApi, StreamId, StreamsRoot,
+	SpecMsgApi, StreamId, StreamsRoot,
 };
 use futures::{select, FutureExt, StreamExt};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use sc_client_api::{Backend, BlockchainEvents, FinalityNotifications, ImportNotifications};
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_blockchain::Backend as BlockchainBackend;
@@ -48,7 +47,7 @@ use sp_runtime::{
 	SaturatedConversion,
 };
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::BTreeMap,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -67,7 +66,6 @@ pub async fn run_archiver<Block, C, S>(
 	client: Arc<C>,
 	backend: Arc<impl Backend<Block>>,
 	archive: Arc<RwLock<Archive<Block::Hash, S>>>,
-	watermarks: Arc<Mutex<BTreeMap<StreamId, u64>>>,
 ) where
 	Block: BlockT,
 	C: ProvideRuntimeApi<Block> + BlockchainEvents<Block> + Send + Sync + 'static,
@@ -78,7 +76,7 @@ pub async fn run_archiver<Block, C, S>(
 	// dropped, so state pruning cannot remove a block's sends before they are archived.
 	let imports = client.every_import_notification_stream();
 	let finality = client.finality_notification_stream();
-	Archiver { client, chain: backend.blockchain(), archive, watermarks, stuck_at: None }
+	Archiver { client, chain: backend.blockchain(), archive, stuck_at: None }
 		.run(imports, finality)
 		.await;
 }
@@ -87,7 +85,6 @@ struct Archiver<'a, Block: BlockT, C, S> {
 	chain: &'a dyn BlockchainBackend<Block>,
 	client: Arc<C>,
 	archive: Arc<RwLock<Archive<Block::Hash, S>>>,
-	watermarks: Arc<Mutex<BTreeMap<StreamId, u64>>>,
 	/// The block whose unavailable state was last reported.
 	stuck_at: Option<Block::Hash>,
 }
@@ -350,7 +347,16 @@ where
 
 	/// Apply retention at `finalized`, if archived.
 	fn retain(&self, finalized: Block::Hash) -> bool {
-		let watermarks = self.watermarks.lock().clone();
+		let api = self.client.runtime_api();
+		let watermarks = match api.outbound_up_to(finalized) {
+			Ok(acks) => acks.into_iter().map(|(lane, pos)| (lane.data_stream(), pos.0)).collect(),
+			Err(error) => {
+				if !matches!(self.has_api(finalized), Ok(false)) {
+					log::warn!(target: LOG_TARGET, "outbound_up_to at {finalized:?} failed: {error}");
+				}
+				BTreeMap::new()
+			},
+		};
 		let cutoff = now().saturating_sub(SERVING_HORIZON.as_secs());
 		if let Err(e) = self.archive.write().retain(finalized, &watermarks, cutoff) {
 			log::warn!(target: LOG_TARGET, "Archive retention failed: {e:?}");
@@ -373,22 +379,17 @@ fn state_unavailable(error: &sp_api::ApiError) -> bool {
 	matches!(error, sp_api::ApiError::UnknownBlock(_))
 }
 
-/// Read the recipients' registers after each parachain finality notification, so the archiver can
-/// prune channels, then backfill a seeded archive. Only the newest notification is processed after
-/// a round.
-pub async fn run_watermark_reader<Block, C, S, T, R>(
+/// Fetch missing history from our own peers for a seeded archive.
+pub async fn run_backfill<Block, C, S, T>(
 	client: Arc<C>,
 	archive: Arc<RwLock<Archive<Block::Hash, S>>>,
-	watermarks: Arc<Mutex<BTreeMap<StreamId, u64>>>,
 	us: ParaId,
 	transport: Arc<T>,
-	roots: Arc<R>,
 ) where
 	Block: BlockT,
 	C: BlockchainEvents<Block>,
 	S: ArchiveStore,
 	T: Transport + ?Sized,
-	R: FinalizedRoots + ?Sized,
 {
 	let transport = Rotating::new(transport);
 	let mut finality = client.finality_notification_stream().fuse();
@@ -396,19 +397,17 @@ pub async fn run_watermark_reader<Block, C, S, T, R>(
 		while let Some(Some(newer)) = finality.next().now_or_never() {
 			finalized = newer;
 		}
-		read_watermarks(&archive, &finalized.hash, &watermarks, us, &transport, &*roots).await;
-		backfill(&archive, &finalized.hash, &watermarks, us, &transport).await;
+		backfill(&archive, &finalized.hash, us, &transport).await;
 	}
 }
 
 /// One round: fetch from the own chain's peers what each seeded stream owes below its floor. A
-/// channel owes its leaves from its watermark, once read; any other stream its head. Fetched under
+/// channel owes its leaves from its retained floor; any other stream its head. Fetched under
 /// `finalized`'s root, which the own peers still hold. A stream that fails waits for the next
 /// round.
 pub(crate) async fn backfill<H, S, T>(
 	archive: &RwLock<Archive<H, S>>,
 	finalized: &H,
-	watermarks: &Mutex<BTreeMap<StreamId, u64>>,
 	us: ParaId,
 	transport: &Rotating<T>,
 ) where
@@ -418,18 +417,13 @@ pub(crate) async fn backfill<H, S, T>(
 {
 	let pending = archive.read().backfill_pending();
 	for stream in pending {
-		let (served, floor) = {
+		let (under, count, range) = {
 			let archive = archive.read();
-			(archive.served_at(finalized, &stream), archive.seeded_payload_floor(&stream))
+			let Some((under, count)) = archive.served_at(finalized, &stream) else { continue };
+			let Some(range) = archive.backfill_range(&stream, count) else { continue };
+			(under, count, range)
 		};
-		let (Some((under, count)), Some(floor)) = (served, floor) else { continue };
-		let target = match stream {
-			StreamId::Channel { .. } => match watermarks.lock().get(&stream) {
-				Some(mark) => *mark,
-				None => continue,
-			},
-			_ => count.saturating_sub(1),
-		};
+		let (target, floor) = (range.start, range.end);
 		let response = if target >= floor {
 			None
 		} else {
@@ -443,7 +437,7 @@ pub(crate) async fn backfill<H, S, T>(
 		};
 		let mut archive = archive.write();
 		if !archive.backfill_pending().contains(&stream) ||
-			archive.seeded_payload_floor(&stream) != Some(floor)
+			archive.backfill_range(&stream, count) != Some(range)
 		{
 			continue;
 		}
@@ -514,58 +508,15 @@ async fn fetch_range<T: Transport + ?Sized>(
 	Some((frontier?, payloads))
 }
 
-/// One round: for each channel of `us` that still holds payloads at `finalized`, read the
-/// recipient's register under its finalized included root and raise the channel's watermark to the
-/// register's `up_to`. A channel that fails is skipped until the next round.
-pub(crate) async fn read_watermarks<H, S, T, R>(
-	archive: &RwLock<Archive<H, S>>,
-	finalized: &H,
-	watermarks: &Mutex<BTreeMap<StreamId, u64>>,
-	us: ParaId,
-	transport: &Rotating<T>,
-	roots: &R,
-) where
-	H: Encode + Decode + Copy + Eq + std::fmt::Debug,
-	S: ArchiveStore,
-	T: Transport + ?Sized,
-	R: FinalizedRoots + ?Sized,
-{
-	let channels = archive.read().unconfirmed_channels(finalized);
-	let mut recipients = BTreeSet::new();
-	for stream in channels {
-		let StreamId::Channel { recipient, domain, num } = stream else { continue };
-		let Some(under) = roots.finalized_included_root(recipient).await else {
-			log::debug!(target: LOG_TARGET, "No finalized root for {recipient:?}");
-			continue;
-		};
-		recipients.insert(recipient);
-		let ack = StreamId::Ack { recipient: us, domain, num };
-		let Ok((_, payload, _)) = fetch_register_head(transport, recipient, ack, under).await
-		else {
-			log::debug!(target: LOG_TARGET, "No register of {recipient:?} for {stream:?}");
-			continue;
-		};
-		let Ok(register) = Register::decode_all(&mut &payload[..]) else {
-			log::debug!(target: LOG_TARGET, "Unusable register of {recipient:?} for {stream:?}");
-			continue;
-		};
-		let mut watermarks = watermarks.lock();
-		let mark = watermarks.entry(stream).or_default();
-		*mark = (*mark).max(register.up_to.0);
-	}
-	for recipient in recipients {
-		transport.next_round(recipient);
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	use crate::tests::{channel, messages, payloads, Model};
 	use cumulus_primitives_spec_messaging::{
-		verify_messages, ConsumedStreams, ConsumptionRecord, SPMS_ENGINE_ID,
+		verify_messages, ConsumedStreams, ConsumptionRecord, OutChannelId, SPMS_ENGINE_ID,
 	};
+	use parking_lot::Mutex;
 	use polkadot_core_primitives::Hash;
 	use sc_client_api::{in_mem::Blockchain, BlockImportNotification, NewBlockState};
 	use sc_utils::mpsc::tracing_unbounded;
@@ -573,17 +524,27 @@ mod tests {
 
 	type Block = sp_runtime::generic::Block<Header, sp_runtime::OpaqueExtrinsic>;
 	type Sends = Vec<(StreamId, Vec<Vec<u8>>)>;
+	type Acks = BTreeMap<OutChannelId, MessagePosition>;
 
 	#[derive(Clone, Default)]
-	struct Runtime(Arc<Mutex<BTreeMap<Hash, Sends>>>);
+	struct Runtime {
+		sends: Arc<Mutex<BTreeMap<Hash, Sends>>>,
+		acks: Arc<Mutex<BTreeMap<Hash, Acks>>>,
+	}
 
 	sp_api::mock_impl_runtime_apis! {
 		impl SpecMsgApi<Block> for Runtime {
 			#[advanced]
 			fn outbound_messages(&self, at: Hash) -> Result<Sends, sp_api::ApiError> {
-				Ok(self.0.lock().get(&at).cloned().unwrap_or_default())
+				Ok(self.sends.lock().get(&at).cloned().unwrap_or_default())
 			}
 			fn outbound_frontiers() -> Vec<(StreamId, MmrFrontier)> { unreachable!() }
+			#[advanced]
+			fn outbound_up_to(&self, at: Hash) -> Result<Acks, sp_api::ApiError> {
+				self.acks.lock().get(&at).cloned().ok_or_else(|| {
+					sp_blockchain::Error::UnknownBlock(format!("{at:?}")).into()
+				})
+			}
 			fn consumed_streams() -> ConsumedStreams { unreachable!() }
 			fn max_touched_streams() -> u32 { unreachable!() }
 			fn consumption_record() -> ConsumptionRecord { unreachable!() }
@@ -613,7 +574,7 @@ mod tests {
 			let mut header = Header::new_from_number(1);
 			header.parent_hash = genesis.hash();
 			header.digest.push(DigestItem::Consensus(SPMS_ENGINE_ID, root.encode()));
-			runtime.0.lock().insert(header.hash(), sends);
+			runtime.sends.lock().insert(header.hash(), sends);
 			chain.insert(header.hash(), header.clone(), None, None, state, true).unwrap();
 			(header, root)
 		};
@@ -626,7 +587,6 @@ mod tests {
 			chain: &chain,
 			client: runtime.clone(),
 			archive: archive.clone(),
-			watermarks: Default::default(),
 			stuck_at: None,
 		};
 		futures::executor::block_on(async {
@@ -652,6 +612,46 @@ mod tests {
 				assert_eq!(response.payloads.into_inner(), payloads(tag, 1));
 			}
 		});
+	}
+
+	#[test]
+	fn retention_uses_only_the_ack_at_the_finalized_sender_block() {
+		let chain = Blockchain::<Block>::new();
+		let client = Arc::new(Runtime::default());
+		let archive = Arc::new(RwLock::new(Archive::open(crate::MemoryStore::default())));
+		let worker = Archiver {
+			chain: &chain,
+			client: client.clone(),
+			archive: archive.clone(),
+			stuck_at: None,
+		};
+		let lane = OutChannelId { recipient: 2000.into(), domain: 0, num: 1 };
+		let stream = lane.data_stream();
+		let finalized = Hash::repeat_byte(1);
+		let best = Hash::repeat_byte(2);
+		let sends = vec![(stream, payloads(1, 5))];
+		let root = Model::default().send(&sends);
+		archive
+			.write()
+			.import_block(finalized, Hash::zero(), 1, 0, sends, Some(root))
+			.unwrap();
+		archive.write().import_block(best, finalized, 2, 0, vec![], None).unwrap();
+		client.acks.lock().insert(best, [(lane, MessagePosition(5))].into());
+
+		assert!(worker.retain(finalized));
+		let request = messages(stream, 0, root, u32::MAX);
+		assert_eq!(archive.read().serve_messages(&request, u32::MAX).unwrap().payloads.len(), 5);
+
+		client.acks.lock().insert(finalized, [(lane, MessagePosition(2))].into());
+		assert!(worker.retain(finalized));
+		assert_eq!(
+			archive.read().serve_messages(&request, u32::MAX),
+			Err(FetchError::OutsideHorizon { lowest: MessagePosition(2) })
+		);
+		let request = messages(stream, 2, root, u32::MAX);
+		let reply = archive.read().serve_messages(&request, u32::MAX).unwrap();
+		verify_messages(&request, &reply).unwrap();
+		assert_eq!(reply.payloads.into_inner(), payloads(1, 5)[2..]);
 	}
 
 	#[test]

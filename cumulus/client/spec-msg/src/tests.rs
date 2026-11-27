@@ -22,15 +22,15 @@ use crate::{
 	fetch::{fetch, RequestError, Rotating, Transport},
 	protocol,
 	store::ArchiveStore,
-	worker::{backfill, read_watermarks},
-	Archive, ArchiveError, FinalizedRoots, MemoryStore,
+	worker::backfill,
+	Archive, ArchiveError, MemoryStore,
 };
 use codec::{Decode, Encode};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	leaf_hash, streams_root::streams_root, verify_messages, FetchError, FetchResponse,
-	MessagePosition, MessagesRequest, MessagesResponse, MmrFrontier, Register, RegisterStatus,
-	StreamId, StreamsRoot, MAX_MESSAGES_PER_RESPONSE,
+	MessagePosition, MessagesRequest, MessagesResponse, MmrFrontier, StreamId, StreamsRoot,
+	MAX_MESSAGES_PER_RESPONSE,
 };
 use parking_lot::{Mutex, RwLock};
 use sc_network::PeerId;
@@ -239,7 +239,7 @@ fn an_unreadable_floor_keeps_a_seeded_stream_pending() {
 	archive.seed(10, 9, 10, 0, frontiers, None).unwrap();
 	let archive = RwLock::new(archive);
 	let transport = rotating(vec![honest(&full)]);
-	let marks = Mutex::new([(stream, 2)].into());
+	archive.write().retain(10, &[(stream, 2)].into(), 0).unwrap();
 	let mut key = b"spec-msg/archive/v2/f".to_vec();
 	key.extend(stream.encode());
 	let saved = store.get(&key).unwrap();
@@ -249,10 +249,10 @@ fn an_unreadable_floor_keeps_a_seeded_stream_pending() {
 			.unwrap()
 	};
 	set_floor(vec![]);
-	futures::executor::block_on(backfill(&archive, &10, &marks, 2000.into(), &transport));
+	futures::executor::block_on(backfill(&archive, &10, 2000.into(), &transport));
 	assert!(archive.read().backfill_pending().contains(&stream));
 	set_floor(saved);
-	futures::executor::block_on(backfill(&archive, &10, &marks, 2000.into(), &transport));
+	futures::executor::block_on(backfill(&archive, &10, 2000.into(), &transport));
 	assert!(!archive.read().backfill_pending().contains(&stream));
 	assert_eq!(
 		served(&archive.read(), &messages(stream, 2, root, u32::MAX)),
@@ -265,19 +265,14 @@ fn a_round_backfills_each_seeded_stream_from_own_peers() {
 	let (seeded, full, model, root) = seeded_and_full();
 	let seeded = RwLock::new(seeded);
 	let transport = rotating(vec![honest(&full)]);
-	// `channel(1)` is confirmed up to 2, `channel(3)` past its floor; `channel(1)` before the
-	// watermark is read waits.
-	let watermarks = Mutex::new(BTreeMap::from([(channel(3), 2)]));
-	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
-	assert_eq!(seeded.read().backfill_pending(), [channel(1)].into());
-
-	watermarks.lock().insert(channel(1), 2);
-	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+	// Lane 1 has no applied ACK and needs all five leaves. Lane 3 is fully acknowledged.
+	seeded.write().retain(10, &[(channel(3), 2)].into(), 0).unwrap();
+	futures::executor::block_on(backfill(&seeded, &10, 2000.into(), &transport));
 	let seeded = seeded.read();
 	assert!(seeded.backfill_pending().is_empty());
 	assert_eq!(
-		served(&seeded, &messages(channel(1), 2, root, u32::MAX)),
-		Ok(model.0[&channel(1)][2..].to_vec())
+		served(&seeded, &messages(channel(1), 0, root, u32::MAX)),
+		Ok(model.0[&channel(1)].clone())
 	);
 	assert_eq!(served(&seeded, &head(ack(2), root, u32::MAX)), Ok(vec![payloads(2, 3)[2].clone()]));
 }
@@ -295,8 +290,8 @@ fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
 	};
 	let transport = rotating(vec![pruned(4), pruned(3)]);
 	let seeded = RwLock::new(seeded);
-	let watermarks = Mutex::new(BTreeMap::from([(channel(1), 1)]));
-	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+	seeded.write().retain(10, &[(channel(1), 1)].into(), 0).unwrap();
+	futures::executor::block_on(backfill(&seeded, &10, 2000.into(), &transport));
 
 	assert!(seeded.read().backfill_pending().contains(&channel(1)));
 	assert_eq!(
@@ -309,7 +304,7 @@ fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
 	);
 
 	let transport = rotating(vec![honest(&full)]);
-	futures::executor::block_on(backfill(&seeded, &10, &watermarks, 2000.into(), &transport));
+	futures::executor::block_on(backfill(&seeded, &10, 2000.into(), &transport));
 	let seeded = seeded.read();
 	assert!(!seeded.backfill_pending().contains(&channel(1)));
 	assert_eq!(served(&seeded, &messages(channel(1), 1, root, u32::MAX)), Ok(sent[1..].to_vec()));
@@ -1015,20 +1010,6 @@ fn a_channel_without_a_watermark_keeps_everything() {
 	assert_eq!(served(&archive, &messages(a, 0, root2, u32::MAX)).unwrap().len(), 4);
 }
 
-struct FakeRoots(Option<StreamsRoot>);
-
-#[async_trait::async_trait]
-impl FinalizedRoots for FakeRoots {
-	async fn finalized_included_root(&self, _para: ParaId) -> Option<StreamsRoot> {
-		self.0
-	}
-}
-
-fn register(up_to: u64) -> Vec<u8> {
-	let status = RegisterStatus::Open { max_message_size: 1024 };
-	Register { up_to: MessagePosition(up_to), status }.encode()
-}
-
 /// Two peers with the same archive. Only the second serves payloads.
 struct ArchivePeers {
 	archive: Arc<TestArchive>,
@@ -1060,9 +1041,8 @@ fn archive_rounds_rotate_peers_for_backfill() {
 	let archive = RwLock::new(seeded);
 	let transport = ArchivePeers::rotating(full);
 	let stream = channel(1);
-	let marks = Mutex::new([(stream, 2)].into());
-	let round =
-		|| futures::executor::block_on(backfill(&archive, &10, &marks, 2000.into(), &transport));
+	archive.write().retain(10, &[(stream, 2)].into(), 0).unwrap();
+	let round = || futures::executor::block_on(backfill(&archive, &10, 2000.into(), &transport));
 	round();
 	assert!(archive.read().backfill_pending().contains(&stream));
 	round();
@@ -1070,195 +1050,5 @@ fn archive_rounds_rotate_peers_for_backfill() {
 	assert_eq!(
 		served(&archive.read(), &messages(stream, 2, root, u32::MAX)),
 		Ok(model.0[&stream][2..].to_vec())
-	);
-}
-
-#[test]
-fn archive_rounds_rotate_peers_for_watermarks() {
-	let (sender, _, recipient, root) = register_setup(&[4]);
-	let transport = ArchivePeers::rotating(recipient);
-	let marks = Mutex::new(BTreeMap::new());
-	let round = || {
-		futures::executor::block_on(read_watermarks(
-			&sender,
-			&1,
-			&marks,
-			1000.into(),
-			&transport,
-			&FakeRoots(Some(root)),
-		))
-	};
-	round();
-	assert!(marks.lock().is_empty());
-	round();
-	assert_eq!(marks.lock().get(&channel(2000)), Some(&4));
-}
-
-/// The sender (para 1000) holds 6 sends to 2000 on `channel(2000)` at block 1. The recipient's
-/// archive holds one register per entry of `ups` on `ack(1000)`. Returns both roots.
-fn register_setup(
-	ups: &[u64],
-) -> (Arc<RwLock<TestArchive>>, StreamsRoot, Arc<TestArchive>, StreamsRoot) {
-	let mut sender = TestArchive::open(Arc::new(MemoryStore::default()));
-	let sender_root =
-		import(&mut sender, &mut Model::default(), 1, vec![(channel(2000), payloads(1, 6))]);
-	let mut recipient = TestArchive::open(Arc::new(MemoryStore::default()));
-	let registers = ups.iter().map(|up| register(*up)).collect();
-	let root = import(&mut recipient, &mut Model::default(), 1, vec![(ack(1000), registers)]);
-	(Arc::new(RwLock::new(sender)), sender_root, Arc::new(recipient), root)
-}
-
-/// Run one watermark round at block 1 against `peers`, then retain at block 1 with the result.
-fn round(
-	sender: &RwLock<TestArchive>,
-	watermarks: &Mutex<BTreeMap<StreamId, u64>>,
-	peers: Vec<(PeerId, TestPeer)>,
-	root: Option<StreamsRoot>,
-) {
-	futures::executor::block_on(read_watermarks(
-		sender,
-		&1,
-		watermarks,
-		1000.into(),
-		&rotating(peers),
-		&FakeRoots(root),
-	));
-	let marks = watermarks.lock().clone();
-	sender.write().retain(1, &marks, 0).unwrap();
-}
-
-/// The channel's payload floor at the sender, if it is above 0.
-fn lowest(sender: &RwLock<TestArchive>, sender_root: StreamsRoot) -> Option<u64> {
-	let req = messages(channel(2000), 0, sender_root, u32::MAX);
-	match sender.read().serve_messages(&req, u32::MAX) {
-		Err(FetchError::OutsideHorizon { lowest }) => Some(lowest.0),
-		_ => None,
-	}
-}
-
-#[test]
-fn the_floor_rises_to_the_verified_register() {
-	let (sender, sender_root, recipient, root) = register_setup(&[2, 4]);
-	let marks = Mutex::new(BTreeMap::new());
-	assert_eq!(sender.read().unconfirmed_channels(&1).len(), 1);
-	round(&sender, &marks, vec![honest(&recipient)], Some(root));
-	assert_eq!(marks.lock().get(&channel(2000)), Some(&4));
-	assert_eq!(lowest(&sender, sender_root), Some(4));
-	assert_eq!(sender.read().unconfirmed_channels(&1), vec![channel(2000)]);
-}
-
-/// Serves only the position for a head request, then serves the requested leaf.
-struct PositionOnlyHead {
-	archive: Arc<TestArchive>,
-	peer: PeerId,
-	other_frontier: Option<MmrFrontier>,
-	starts: Mutex<Vec<Option<MessagePosition>>>,
-}
-
-#[async_trait::async_trait]
-impl Transport for PositionOnlyHead {
-	fn peers(&self, _: ParaId) -> Vec<PeerId> {
-		vec![self.peer]
-	}
-
-	async fn request(&self, _: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
-		let req = MessagesRequest::decode(&mut &request[..]).unwrap();
-		self.starts.lock().push(req.start);
-		let cap = if req.start.is_none() { 0 } else { req.max_bytes };
-		let mut response = self.archive.serve_messages(&req, cap);
-		if let (Some(_), Some(frontier), Ok(reply)) =
-			(req.start, &self.other_frontier, &mut response)
-		{
-			reply.frontier = frontier.clone();
-		}
-		Ok(response.encode())
-	}
-}
-
-#[test]
-fn watermark_follows_a_position_only_head_and_checks_its_frontier() {
-	let (sender, _, recipient, root) = register_setup(&[2, 4]);
-	let mut different = MmrFrontier::new();
-	different.append(leaf_hash(&register(1)));
-	for (other_frontier, expected) in [(None, 4), (Some(different), 2)] {
-		let peer = Arc::new(PositionOnlyHead {
-			archive: recipient.clone(),
-			peer: PeerId::random(),
-			other_frontier,
-			starts: Mutex::default(),
-		});
-		let marks = Mutex::new(BTreeMap::from([(channel(2000), 2)]));
-		futures::executor::block_on(read_watermarks(
-			&sender,
-			&1,
-			&marks,
-			1000.into(),
-			&Rotating::new(peer.clone()),
-			&FakeRoots(Some(root)),
-		));
-		assert_eq!(*peer.starts.lock(), [None, Some(MessagePosition(1))]);
-		assert_eq!(marks.lock()[&channel(2000)], expected);
-	}
-}
-
-#[test]
-fn a_register_beyond_the_leaf_count_is_clamped() {
-	let (sender, sender_root, recipient, root) = register_setup(&[99]);
-	let marks = Mutex::new(BTreeMap::new());
-	round(&sender, &marks, vec![honest(&recipient)], Some(root));
-	assert_eq!(lowest(&sender, sender_root), Some(6));
-	assert!(sender.read().unconfirmed_channels(&1).is_empty());
-}
-
-#[test]
-fn no_root_changes_nothing() {
-	let (sender, sender_root, recipient, _) = register_setup(&[4]);
-	let marks = Mutex::new(BTreeMap::new());
-	round(&sender, &marks, vec![honest(&recipient)], None);
-	assert!(marks.lock().is_empty());
-	assert_eq!(lowest(&sender, sender_root), None);
-}
-
-#[test]
-fn a_lying_peer_changes_nothing_and_an_honest_one_after_it_wins() {
-	let (sender, sender_root, recipient, root) = register_setup(&[3]);
-	let marks = Mutex::new(BTreeMap::new());
-	let liar = || (PeerId::random(), TestPeer { archive: recipient.clone(), tamper: true });
-	round(&sender, &marks, vec![liar()], Some(root));
-	assert!(marks.lock().is_empty());
-	assert_eq!(lowest(&sender, sender_root), None);
-
-	round(&sender, &marks, vec![liar(), honest(&recipient)], Some(root));
-	assert_eq!(marks.lock().get(&channel(2000)), Some(&3));
-	assert_eq!(lowest(&sender, sender_root), Some(3));
-}
-
-#[test]
-fn a_stale_register_never_lowers_the_watermark() {
-	let (sender, sender_root, recipient, root) = register_setup(&[2]);
-	let marks = Mutex::new(BTreeMap::from([(channel(2000), 5)]));
-	round(&sender, &marks, vec![honest(&recipient)], Some(root));
-	assert_eq!(marks.lock().get(&channel(2000)), Some(&5));
-	assert_eq!(lowest(&sender, sender_root), Some(5));
-}
-
-#[test]
-fn a_channel_the_sender_no_longer_has_open_is_still_pruned() {
-	// The reader never asks the runtime: a channel (num 3) closed long ago is read like any other.
-	let closed = StreamId::Channel { recipient: 2000.into(), domain: 0, num: 3 };
-	let closed_ack = StreamId::Ack { recipient: 1000.into(), domain: 0, num: 3 };
-	let mut model = Model::default();
-	let mut sender = TestArchive::open(Arc::new(MemoryStore::default()));
-	let sender_root = import(&mut sender, &mut model, 1, vec![(closed, payloads(1, 4))]);
-	let mut recipient = TestArchive::open(Arc::new(MemoryStore::default()));
-	let root =
-		import(&mut recipient, &mut Model::default(), 1, vec![(closed_ack, vec![register(3)])]);
-	let (sender, recipient) = (RwLock::new(sender), Arc::new(recipient));
-	round(&sender, &Mutex::new(BTreeMap::new()), vec![honest(&recipient)], Some(root));
-	assert_eq!(
-		sender
-			.read()
-			.serve_messages(&messages(closed, 0, sender_root, u32::MAX), u32::MAX),
-		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
 	);
 }
