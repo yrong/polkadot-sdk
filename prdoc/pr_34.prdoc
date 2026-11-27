@@ -6,7 +6,7 @@ doc:
     Rotate the first archive peer between rounds, so a peer serving only proofs cannot stall
     backfill.
     Prune only channel leaves below the last `up_to` applied by the finalized sender runtime.
-    A closed lane can retain its unacknowledged tail.
+    After a forced close, the archive retains any tail the receiver did not acknowledge.
     Keep sibling payloads and proofs available until sender finality.
 crates:
 - name: cumulus-client-spec-msg
