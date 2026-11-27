@@ -1,0 +1,1054 @@
+// Copyright (C) Parity Technologies (UK) Ltd.
+// This file is part of Cumulus.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// Cumulus is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// Cumulus is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
+
+//! Every served response is checked with the requester's verifiers from the primitives, against
+//! roots computed independently of the archive.
+
+use crate::{
+	fetch::{fetch, RequestError, Rotating, Transport},
+	protocol,
+	store::ArchiveStore,
+	worker::backfill,
+	Archive, ArchiveError, MemoryStore,
+};
+use codec::{Decode, Encode};
+use cumulus_primitives_core::ParaId;
+use cumulus_primitives_spec_messaging::{
+	leaf_hash, streams_root::streams_root, verify_messages, FetchError, FetchResponse,
+	MessagePosition, MessagesRequest, MessagesResponse, MmrFrontier, StreamId, StreamsRoot,
+	MAX_MESSAGES_PER_RESPONSE,
+};
+use parking_lot::{Mutex, RwLock};
+use sc_network::PeerId;
+use std::{collections::BTreeMap, sync::Arc};
+
+pub(crate) type TestArchive = Archive<u64, Arc<MemoryStore>>;
+
+pub(crate) fn channel(peer: u32) -> StreamId {
+	StreamId::Channel { recipient: peer.into(), domain: 0, num: 0 }
+}
+
+pub(crate) fn ack(peer: u32) -> StreamId {
+	StreamId::Ack { recipient: peer.into(), domain: 0, num: 0 }
+}
+
+pub(crate) fn payloads(tag: u8, n: usize) -> Vec<Vec<u8>> {
+	(0..n).map(|i| vec![tag, i as u8, 0xAB]).collect()
+}
+
+/// The frontier over the first `n` of `payloads`.
+pub(crate) fn frontier_at(payloads: &[Vec<u8>], n: usize) -> MmrFrontier {
+	let mut frontier = MmrFrontier::new();
+	for payload in &payloads[..n] {
+		frontier.append(leaf_hash(payload));
+	}
+	frontier
+}
+
+/// The chain's sends so far, per stream, to compute roots without the archive.
+#[derive(Default, Clone)]
+pub(crate) struct Model(BTreeMap<StreamId, Vec<Vec<u8>>>);
+
+impl Model {
+	pub(crate) fn send(&mut self, sends: &[(StreamId, Vec<Vec<u8>>)]) -> StreamsRoot {
+		for (stream, payloads) in sends {
+			self.0.entry(*stream).or_default().extend(payloads.iter().cloned());
+		}
+		self.root()
+	}
+
+	fn root(&self) -> StreamsRoot {
+		let entries = self
+			.0
+			.iter()
+			.map(|(stream, payloads)| (*stream, frontier_at(payloads, payloads.len()).root().0))
+			.collect();
+		streams_root(&entries).unwrap()
+	}
+}
+
+/// Archive block `number` (hash = number) with `sends`, committing the model's root.
+pub(crate) fn import(
+	archive: &mut Archive<u64, impl ArchiveStore>,
+	model: &mut Model,
+	number: u64,
+	sends: Vec<(StreamId, Vec<Vec<u8>>)>,
+) -> StreamsRoot {
+	let root = model.send(&sends);
+	archive.import_block(number, number - 1, number, 0, sends, Some(root)).unwrap();
+	root
+}
+
+pub(crate) fn messages(
+	stream: StreamId,
+	start: u64,
+	under: StreamsRoot,
+	max_bytes: u32,
+) -> MessagesRequest {
+	MessagesRequest { stream, under, start: Some(MessagePosition(start)), max_bytes }
+}
+
+pub(crate) fn head(stream: StreamId, under: StreamsRoot, max_bytes: u32) -> MessagesRequest {
+	MessagesRequest { stream, under, start: None, max_bytes }
+}
+
+/// Serve and verify; return the verified payloads or the refusal.
+pub(crate) fn served(
+	archive: &Archive<u64, impl ArchiveStore>,
+	req: &MessagesRequest,
+) -> Result<Vec<Vec<u8>>, FetchError> {
+	let resp = archive.serve_messages(req, u32::MAX)?;
+	verify_messages(req, &resp).expect("a served response verifies");
+	Ok(resp.payloads.into_inner())
+}
+
+/// A peer of [`ArchiveTransport`]: it answers from `archive`, optionally with a tampered payload.
+pub(crate) struct TestPeer {
+	pub(crate) archive: Arc<TestArchive>,
+	pub(crate) tamper: bool,
+}
+
+/// A [`Transport`] whose peers call [`protocol::answer`] on in-memory archives.
+pub(crate) struct ArchiveTransport(pub(crate) Vec<(PeerId, TestPeer)>);
+
+#[async_trait::async_trait]
+impl Transport for ArchiveTransport {
+	fn peers(&self, _source: ParaId) -> Vec<PeerId> {
+		self.0.iter().map(|(peer, _)| *peer).collect()
+	}
+
+	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		let (_, served) = self.0.iter().find(|(p, _)| *p == peer).ok_or("unknown peer")?;
+		let answer = protocol::answer(&served.archive, &request).ok_or("refused")?;
+		if !served.tamper {
+			return Ok(answer);
+		}
+		let mut response = FetchResponse::decode(&mut &answer[..]).unwrap();
+		if let Ok(resp) = &mut response {
+			resp.payloads[0][0] ^= 0xFF;
+		}
+		Ok(response.encode())
+	}
+}
+
+fn run_fetch(
+	transport: &ArchiveTransport,
+	req: &MessagesRequest,
+	stored: Option<&MmrFrontier>,
+) -> Result<MessagesResponse, RequestError> {
+	futures::executor::block_on(fetch(transport, 1000.into(), req, stored))
+}
+
+fn honest(archive: &Arc<TestArchive>) -> (PeerId, TestPeer) {
+	(PeerId::random(), TestPeer { archive: archive.clone(), tamper: false })
+}
+
+fn rotating(peers: Vec<(PeerId, TestPeer)>) -> Rotating<ArchiveTransport> {
+	Rotating::new(Arc::new(ArchiveTransport(peers)))
+}
+
+/// A chain that sent 5 leaves on `channel(1)`, 3 on `ack(2)` and 2 on `channel(3)` before block
+/// 10: an archive seeded there, and one that archived the history as block 1.
+fn seeded_and_full() -> (TestArchive, Arc<TestArchive>, Model, StreamsRoot) {
+	let mut model = Model::default();
+	let sends =
+		vec![(channel(1), payloads(1, 5)), (ack(2), payloads(2, 3)), (channel(3), payloads(3, 2))];
+	let mut full = TestArchive::open(Arc::new(MemoryStore::default()));
+	let root = import(&mut full, &mut model, 1, sends);
+	let frontiers = model
+		.0
+		.iter()
+		.map(|(stream, sent)| (*stream, frontier_at(sent, sent.len())))
+		.collect();
+	let mut seeded = TestArchive::open(Arc::new(MemoryStore::default()));
+	seeded.seed(10, 9, 10, 0, frontiers, None).unwrap();
+	(seeded, Arc::new(full), model, root)
+}
+
+#[test]
+fn a_backfill_must_lead_to_the_seeded_peaks() {
+	let (mut seeded, _, model, root) = seeded_and_full();
+	let sent = &model.0[&channel(1)];
+
+	let mut forged = sent[2..].to_vec();
+	forged[0][0] ^= 0xFF;
+	let frontier = frontier_at(sent, 2);
+	assert_eq!(seeded.backfill(channel(1), 2, &frontier, &forged), Err(ArchiveError::Diverged));
+	assert_eq!(seeded.backfill(channel(1), 2, &frontier, &sent[2..4]), Err(ArchiveError::Diverged));
+	assert_eq!(
+		served(&seeded, &messages(channel(1), 2, root, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(5) })
+	);
+
+	seeded.backfill(channel(1), 2, &frontier, &sent[2..]).unwrap();
+	assert_eq!(served(&seeded, &messages(channel(1), 2, root, u32::MAX)), Ok(sent[2..].to_vec()));
+	assert!(!seeded.backfill_pending().contains(&channel(1)));
+}
+
+#[test]
+fn a_delayed_backfill_cannot_restore_a_confirmed_prefix() {
+	let (mut archive, _, base, seed_root) = seeded_and_full();
+	let stream = channel(1);
+	let mut a = base.clone();
+	let mut b = base.clone();
+	let root_a = import(&mut archive, &mut a, 11, vec![(stream, payloads(7, 1))]);
+	let sends = vec![(stream, payloads(8, 1))];
+	let root_b = b.send(&sends);
+	archive.import_block(21, 10, 11, 0, sends, Some(root_b)).unwrap();
+	let sent = &base.0[&stream];
+	archive.retain(10, &[(stream, 3)].into(), 0).unwrap();
+	assert_eq!(
+		archive.backfill(stream, 0, &frontier_at(sent, 0), sent),
+		Err(ArchiveError::Diverged)
+	);
+	assert!(archive.backfill_pending().contains(&stream));
+	archive.backfill(stream, 3, &frontier_at(sent, 3), &sent[3..]).unwrap();
+	for (root, model) in [(root_a, &a), (root_b, &b), (seed_root, &base)] {
+		assert_eq!(
+			served(&archive, &messages(stream, 3, root, u32::MAX)),
+			Ok(model.0[&stream][3..].to_vec())
+		);
+		assert_eq!(
+			served(&archive, &messages(stream, 2, root, u32::MAX)),
+			Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
+		);
+	}
+}
+
+#[test]
+fn an_unreadable_floor_keeps_a_seeded_stream_pending() {
+	let stream = channel(1);
+	let (_, full, model, root) = seeded_and_full();
+	let store = Arc::new(MemoryStore::default());
+	let mut archive = TestArchive::open(store.clone());
+	let frontiers = model.0.iter().map(|(s, sent)| (*s, frontier_at(sent, sent.len()))).collect();
+	archive.seed(10, 9, 10, 0, frontiers, None).unwrap();
+	let archive = RwLock::new(archive);
+	let transport = rotating(vec![honest(&full)]);
+	archive.write().retain(10, &[(stream, 2)].into(), 0).unwrap();
+	let mut key = b"spec-msg/archive/v2/f".to_vec();
+	key.extend(stream.encode());
+	let saved = store.get(&key).unwrap();
+	let set_floor = |bytes| {
+		store
+			.commit(crate::Batch { insert: vec![(key.clone(), bytes)], delete: vec![] })
+			.unwrap()
+	};
+	set_floor(vec![]);
+	futures::executor::block_on(backfill(&archive, &10, 2000.into(), &transport));
+	assert!(archive.read().backfill_pending().contains(&stream));
+	set_floor(saved);
+	futures::executor::block_on(backfill(&archive, &10, 2000.into(), &transport));
+	assert!(!archive.read().backfill_pending().contains(&stream));
+	assert_eq!(
+		served(&archive.read(), &messages(stream, 2, root, u32::MAX)),
+		Ok(model.0[&stream][2..].to_vec())
+	);
+}
+
+#[test]
+fn a_round_backfills_each_seeded_stream_from_own_peers() {
+	let (seeded, full, model, root) = seeded_and_full();
+	let seeded = RwLock::new(seeded);
+	let transport = rotating(vec![honest(&full)]);
+	// Lane 1 has no applied ACK and needs all five leaves. Lane 3 is fully acknowledged.
+	seeded.write().retain(10, &[(channel(3), 2)].into(), 0).unwrap();
+	futures::executor::block_on(backfill(&seeded, &10, 2000.into(), &transport));
+	let seeded = seeded.read();
+	assert!(seeded.backfill_pending().is_empty());
+	assert_eq!(
+		served(&seeded, &messages(channel(1), 0, root, u32::MAX)),
+		Ok(model.0[&channel(1)].clone())
+	);
+	assert_eq!(served(&seeded, &head(ack(2), root, u32::MAX)), Ok(vec![payloads(2, 3)[2].clone()]));
+}
+
+#[test]
+fn a_round_backfills_from_the_lowest_leaf_its_peers_kept() {
+	let (seeded, full, model, root) = seeded_and_full();
+	let sent = &model.0[&channel(1)];
+	// Two peers that kept `channel(1)` from 3 and from 4 only.
+	let pruned = |from: usize| {
+		let (mut peer, ..) = seeded_and_full();
+		peer.backfill(channel(1), from as u64, &frontier_at(sent, from), &sent[from..])
+			.unwrap();
+		(PeerId::random(), TestPeer { archive: Arc::new(peer), tamper: false })
+	};
+	let transport = rotating(vec![pruned(4), pruned(3)]);
+	let seeded = RwLock::new(seeded);
+	seeded.write().retain(10, &[(channel(1), 1)].into(), 0).unwrap();
+	futures::executor::block_on(backfill(&seeded, &10, 2000.into(), &transport));
+
+	assert!(seeded.read().backfill_pending().contains(&channel(1)));
+	assert_eq!(
+		served(&seeded.read(), &messages(channel(1), 3, root, u32::MAX)),
+		Ok(sent[3..].to_vec())
+	);
+	assert_eq!(
+		served(&seeded.read(), &messages(channel(1), 1, root, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
+	);
+
+	let transport = rotating(vec![honest(&full)]);
+	futures::executor::block_on(backfill(&seeded, &10, 2000.into(), &transport));
+	let seeded = seeded.read();
+	assert!(!seeded.backfill_pending().contains(&channel(1)));
+	assert_eq!(served(&seeded, &messages(channel(1), 1, root, u32::MAX)), Ok(sent[1..].to_vec()));
+}
+
+#[test]
+fn a_seeded_archive_serves_each_stream_from_its_leaf_count() {
+	// Before the seed block the chain sent 5 leaves on a channel and 3 on an ack stream.
+	let mut model = Model::default();
+	let before = model.send(&[(channel(1), payloads(1, 5)), (ack(2), payloads(2, 3))]);
+	let frontiers: Vec<_> = model
+		.0
+		.iter()
+		.map(|(stream, sent)| (*stream, frontier_at(sent, sent.len())))
+		.collect();
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	// The seed block sent nothing, so its header has no digest.
+	archive.seed(10, 9, 10, 0, frontiers.clone(), None).unwrap();
+
+	assert_eq!(served(&archive, &messages(channel(1), 5, before, u32::MAX)), Ok(vec![]));
+	assert_eq!(
+		served(&archive, &messages(channel(1), 4, before, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(5) })
+	);
+	assert_eq!(
+		served(&archive, &head(ack(2), before, u32::MAX)),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(3) })
+	);
+
+	// Later blocks build on the seeded peaks.
+	let after = import(&mut archive, &mut model, 11, vec![(channel(1), payloads(3, 2))]);
+	assert_eq!(served(&archive, &messages(channel(1), 5, after, u32::MAX)), Ok(payloads(3, 2)));
+	assert_eq!(archive.seed(12, 11, 12, 0, frontiers, None), Err(ArchiveError::NotEmpty));
+}
+
+#[test]
+fn messages_verify_under_every_served_root() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let (a, b) = (channel(2000), channel(3000));
+	let (pa, pb) = (payloads(1, 7), payloads(2, 2));
+	let root1 = import(&mut archive, &mut model, 1, vec![(a, pa[..3].to_vec()), (b, pb.clone())]);
+	// A block without sends: no root.
+	archive.import_block(2, 1, 2, 0, vec![], None).unwrap();
+	let root3 = import(&mut archive, &mut model, 3, vec![(a, pa[3..].to_vec())]);
+
+	// Everything from the start, under the newest root.
+	assert_eq!(served(&archive, &messages(a, 0, root3, u32::MAX)), Ok(pa.clone()));
+	// Mid-stream, under a budget of two payloads: the extension covers the rest.
+	assert_eq!(served(&archive, &messages(a, 2, root3, 6)), Ok(pa[2..4].to_vec()));
+	// Payload-free lift material, behind and caught up.
+	assert_eq!(served(&archive, &messages(a, 3, root3, 0)), Ok(vec![]));
+	assert_eq!(served(&archive, &messages(a, 7, root3, 0)), Ok(vec![]));
+	assert_eq!(served(&archive, &messages(a, 0, root3, 0)), Ok(vec![]));
+	// An older root fixes the older leaf count.
+	assert_eq!(served(&archive, &messages(a, 0, root1, u32::MAX)), Ok(pa[..3].to_vec()));
+	// An untouched stream is still proven under the newer root.
+	assert_eq!(served(&archive, &messages(b, 0, root3, u32::MAX)), Ok(pb));
+}
+
+#[test]
+fn every_refusal_is_typed() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root1 = import(&mut archive, &mut model, 1, vec![(a, payloads(1, 3))]);
+	let root2 = import(&mut archive, &mut model, 2, vec![(a, payloads(2, 4))]);
+
+	assert_eq!(
+		archive.serve_messages(&messages(a, 4, root1, 0), u32::MAX),
+		Err(FetchError::BeyondHead)
+	);
+	assert_eq!(
+		archive.serve_messages(&messages(channel(9), 0, root2, 0), u32::MAX),
+		Err(FetchError::UnknownStream)
+	);
+	assert_eq!(
+		archive.serve_messages(&head(channel(9), root2, 0), u32::MAX),
+		Err(FetchError::UnknownStream)
+	);
+	assert_eq!(
+		archive.serve_messages(&messages(a, 0, StreamsRoot(Default::default()), 0), u32::MAX),
+		Err(FetchError::UnknownRoot)
+	);
+
+	// Finalize block 2 with the receiver confirmed up to 5: the floor is 5.
+	archive.retain(2, &BTreeMap::from([(a, 5)]), 0).unwrap();
+	let lowest = MessagePosition(5);
+	assert_eq!(
+		archive.serve_messages(&messages(a, 3, root2, u32::MAX), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest })
+	);
+	// Proofs only need the nodes: also refused below the node floor, served at it.
+	assert_eq!(
+		archive.serve_messages(&messages(a, 3, root2, 0), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest })
+	);
+	assert_eq!(served(&archive, &messages(a, 5, root2, 0)), Ok(vec![]));
+}
+
+#[test]
+fn a_missing_payload_above_the_floor_is_an_archive_fault() {
+	let store = Arc::new(MemoryStore::default());
+	let mut archive = TestArchive::open(store.clone());
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, 3))]);
+	let payload_key = {
+		let mut key = b"spec-msg/archive/v2/w".to_vec();
+		key.extend(1u64.encode());
+		key.push(b'p');
+		key.extend(a.encode());
+		key.extend(1u64.to_be_bytes());
+		key
+	};
+	store
+		.commit(crate::Batch { insert: vec![], delete: vec![payload_key] })
+		.unwrap();
+	assert_eq!(
+		archive.serve_messages(&messages(a, 0, root, u32::MAX), u32::MAX),
+		Err(FetchError::UnknownRoot)
+	);
+}
+
+#[test]
+fn the_head_is_served_with_its_payload_or_its_position() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let r = ack(2000);
+	let registers = payloads(9, 6);
+	let root1 = import(&mut archive, &mut model, 1, vec![(r, registers[..5].to_vec())]);
+	let root2 = import(&mut archive, &mut model, 2, vec![(r, registers[5..].to_vec())]);
+
+	// The payload fits.
+	let req = head(r, root2, 1024);
+	let resp = archive.serve_messages(&req, u32::MAX).unwrap();
+	verify_messages(&req, &resp).unwrap();
+	assert_eq!(resp.frontier, frontier_at(&registers, 5));
+	assert_eq!(resp.payloads.into_inner(), vec![registers[5].clone()]);
+	// The head under the older root is the older leaf.
+	assert_eq!(served(&archive, &head(r, root1, 1024)), Ok(vec![registers[4].clone()]));
+
+	// The budget is too small: the position only, the extension covers the leaf.
+	let req = head(r, root2, 1);
+	let resp = archive.serve_messages(&req, u32::MAX).unwrap();
+	verify_messages(&req, &resp).unwrap();
+	assert_eq!(resp.frontier, frontier_at(&registers, 5));
+	assert!(resp.payloads.is_empty());
+	assert_eq!(resp.extension.leaf_count, 6);
+	// So is a zero budget, and a payload cap below the payload.
+	assert_eq!(served(&archive, &head(r, root2, 0)), Ok(vec![]));
+	let req = head(r, root2, u32::MAX);
+	let resp = archive.serve_messages(&req, 1).unwrap();
+	verify_messages(&req, &resp).unwrap();
+	assert!(resp.payloads.is_empty());
+
+	// A single-leaf stream heads from the empty frontier.
+	let other = ack(3000);
+	let root3 = import(&mut archive, &mut model, 3, vec![(other, payloads(7, 1))]);
+	assert_eq!(served(&archive, &head(other, root3, 0)), Ok(vec![]));
+	assert_eq!(served(&archive, &head(other, root3, 1024)), Ok(payloads(7, 1)));
+}
+
+#[test]
+fn nothing_new_is_empty_with_the_identity_extension() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let pa = payloads(1, 3);
+	let root = import(&mut archive, &mut model, 1, vec![(a, pa.clone())]);
+	let req = messages(a, 3, root, 1024);
+	let resp = archive.serve_messages(&req, u32::MAX).unwrap();
+	verify_messages(&req, &resp).unwrap();
+	assert_eq!(resp.frontier, frontier_at(&pa, 3));
+	assert!(resp.payloads.is_empty());
+	assert_eq!(
+		resp.extension,
+		cumulus_primitives_spec_messaging::MmrExtensionProof::identity(&resp.frontier)
+	);
+}
+
+#[test]
+fn the_server_cap_bounds_payloads() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, 5))]);
+	let req = messages(a, 0, root, u32::MAX);
+	let resp = archive.serve_messages(&req, 7).unwrap();
+	assert_eq!(resp.payloads.len(), 2);
+	verify_messages(&req, &resp).unwrap();
+}
+
+#[test]
+fn the_count_cap_bounds_payloads() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let cap = MAX_MESSAGES_PER_RESPONSE as usize;
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, cap + 1))]);
+	let req = messages(a, 0, root, u32::MAX);
+	let resp = archive.serve_messages(&req, u32::MAX).unwrap();
+	assert_eq!(resp.payloads.len(), cap);
+	verify_messages(&req, &resp).unwrap();
+
+	// The full response survives the wire.
+	let transport = ArchiveTransport(vec![honest(&Arc::new(archive))]);
+	let first = run_fetch(&transport, &req, None).unwrap();
+	assert_eq!(first.payloads.len(), cap);
+}
+
+#[test]
+fn a_channel_fetch_binds_the_stored_frontier() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let pa = payloads(1, 6);
+	let root = import(&mut archive, &mut model, 1, vec![(a, pa.clone())]);
+	let transport = ArchiveTransport(vec![honest(&Arc::new(archive))]);
+
+	// The stored frontier matches the start.
+	let stored = frontier_at(&pa, 2);
+	let resp = run_fetch(&transport, &messages(a, 2, root, u32::MAX), Some(&stored)).unwrap();
+	assert_eq!(resp.payloads.into_inner(), pa[2..].to_vec());
+
+	let unserved = Err(RequestError::Unserved { refusals: vec![] });
+	// A replay from 0 against a receiver that already consumed 2.
+	assert_eq!(run_fetch(&transport, &messages(a, 0, root, u32::MAX), Some(&stored)), unserved);
+	// A gap: the start is past the stored frontier.
+	assert_eq!(run_fetch(&transport, &messages(a, 4, root, u32::MAX), Some(&stored)), unserved);
+	// The same count with other contents.
+	let forged = frontier_at(&payloads(5, 6), 2);
+	assert_eq!(run_fetch(&transport, &messages(a, 2, root, u32::MAX), Some(&forged)), unserved);
+	// Without a stored frontier any start verifies.
+	assert!(run_fetch(&transport, &messages(a, 4, root, u32::MAX), None).is_ok());
+}
+
+#[test]
+fn a_lying_peer_is_skipped_for_an_honest_one() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let pa = payloads(1, 3);
+	let root = import(&mut archive, &mut model, 1, vec![(a, pa.clone())]);
+	let archive = Arc::new(archive);
+	let req = messages(a, 0, root, u32::MAX);
+	let liar = (PeerId::random(), TestPeer { archive: archive.clone(), tamper: true });
+
+	let transport = ArchiveTransport(vec![liar, honest(&archive)]);
+	assert_eq!(run_fetch(&transport, &req, None).unwrap().payloads.into_inner(), pa);
+
+	let liar = (PeerId::random(), TestPeer { archive: archive.clone(), tamper: true });
+	assert_eq!(
+		run_fetch(&ArchiveTransport(vec![liar]), &req, None),
+		Err(RequestError::Unserved { refusals: vec![] })
+	);
+	assert_eq!(run_fetch(&ArchiveTransport(vec![]), &req, None), Err(RequestError::NoPeers));
+}
+
+#[test]
+fn typed_refusals_reach_the_caller() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, 3))]);
+	let peer = honest(&Arc::new(archive));
+	let id = peer.0;
+	let transport = ArchiveTransport(vec![peer]);
+	assert_eq!(
+		run_fetch(&transport, &messages(a, 9, root, 0), None),
+		Err(RequestError::Unserved { refusals: vec![(id, FetchError::BeyondHead)] })
+	);
+}
+
+#[test]
+fn a_root_that_differs_from_the_header_is_not_served() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root = model.send(&[(a, payloads(1, 2))]);
+	let wrong = StreamsRoot(sp_core::H256::repeat_byte(7));
+	archive
+		.import_block(1, 0, 1, 0, vec![(a, payloads(1, 2))], Some(wrong))
+		.unwrap();
+	for under in [root, wrong] {
+		assert_eq!(
+			archive.serve_messages(&messages(a, 0, under, 0), u32::MAX),
+			Err(FetchError::UnknownRoot)
+		);
+	}
+
+	// The leaves are archived regardless; the next block is served.
+	let root2 = import(&mut archive, &mut model, 2, vec![(a, payloads(2, 1))]);
+	assert_eq!(served(&archive, &messages(a, 0, root2, u32::MAX)).unwrap().len(), 3);
+}
+
+#[test]
+fn sibling_roots_remain_servable_until_sender_finality() {
+	let stream = channel(2000);
+	let store = Arc::new(MemoryStore::default());
+	let mut archive = TestArchive::open(store.clone());
+	let mut parent = Model::default();
+	import(&mut archive, &mut parent, 1, vec![(stream, payloads(1, 1))]);
+
+	let red = payloads(2, 1);
+	let blue = payloads(3, 2);
+	let root_a = import(&mut archive, &mut parent.clone(), 2, vec![(stream, red.clone())]);
+	let req_a = messages(stream, 1, root_a, u32::MAX);
+	assert_eq!(served(&archive, &req_a), Ok(red.clone()));
+
+	let mut archive = TestArchive::open(store);
+	let sends_b = vec![(stream, blue.clone())];
+	let root_b = parent.send(&sends_b);
+	archive.import_block(12, 1, 2, 0, sends_b, Some(root_b)).unwrap();
+	let req_b = messages(stream, 1, root_b, u32::MAX);
+	assert_eq!(served(&archive, &req_b), Ok(blue.clone()));
+	assert_eq!(served(&archive, &req_a), Ok(red.clone()), "A is still live with B as best");
+
+	assert_eq!(served(&archive, &messages(stream, 3, root_a, 0)), Err(FetchError::BeyondHead));
+	let watermarks = BTreeMap::new();
+	archive.retain(1, &watermarks, 0).unwrap();
+	assert_eq!(served(&archive, &req_a), Ok(red));
+	assert_eq!(served(&archive, &req_b), Ok(blue.clone()));
+
+	archive.retain(12, &watermarks, 0).unwrap();
+	assert_eq!(served(&archive, &req_a), Err(FetchError::UnknownRoot));
+	assert_eq!(served(&archive, &req_b), Ok(blue));
+}
+
+#[test]
+fn finality_preserves_a_root_with_a_surviving_writer_after_restart() {
+	let store = Arc::new(MemoryStore::default());
+	let mut archive = TestArchive::open(store.clone());
+	let mut model = Model::default();
+	let stream = channel(2000);
+	import(&mut archive, &mut model, 1, vec![(stream, payloads(1, 3))]);
+	let sends = vec![(stream, payloads(2, 4))];
+	let root = model.send(&sends);
+	for hash in [2, 12] {
+		archive.import_block(hash, 1, 2, 0, sends.clone(), Some(root)).unwrap();
+	}
+	let req = messages(stream, 3, root, u32::MAX);
+	let keys = store.len();
+	archive.import_block(12, 1, 2, 0, sends.clone(), Some(root)).unwrap();
+	assert_eq!(store.len(), keys);
+	let mut archive = TestArchive::open(store.clone());
+	assert_eq!(served(&archive, &req), Ok(payloads(2, 4)));
+	archive.retain(12, &BTreeMap::new(), 0).unwrap();
+	let archive = TestArchive::open(store);
+	assert!(!archive.contains(&2));
+	assert_eq!(served(&archive, &req), Ok(payloads(2, 4)));
+}
+
+#[derive(Default)]
+struct ObservedStore {
+	inner: MemoryStore,
+	reads: std::sync::atomic::AtomicUsize,
+	unreadable_key: Mutex<Option<Vec<u8>>>,
+	writes_before_failure: Mutex<Option<usize>>,
+}
+
+impl ArchiveStore for ObservedStore {
+	fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+		self.try_get(key).ok().flatten()
+	}
+
+	fn try_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+		self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		if self.unreadable_key.lock().as_deref() == Some(key) {
+			return Err("injected read failure".into());
+		}
+		Ok(self.inner.get(key))
+	}
+
+	fn commit(&self, batch: crate::Batch) -> Result<(), String> {
+		let mut counter = self.writes_before_failure.lock();
+		if let Some(remaining) = counter.as_mut() {
+			if *remaining == 0 {
+				*counter = None;
+				return Err("injected write failure".into());
+			}
+			*remaining -= 1;
+		}
+		let deleted: std::collections::BTreeSet<_> = batch.delete.iter().collect();
+		assert!(batch.insert.iter().all(|(key, _)| !deleted.contains(key)));
+		self.inner.commit(batch)
+	}
+}
+
+#[test]
+fn a_sibling_import_retries_without_losing_the_first_child() {
+	let stream = channel(2000);
+	let store = Arc::new(ObservedStore::default());
+	let mut archive = Archive::open(store.clone());
+	let mut parent = Model::default();
+	import(&mut archive, &mut parent, 1, vec![(stream, payloads(1, 1))]);
+	let first = import(&mut archive, &mut parent.clone(), 2, vec![(stream, payloads(2, 1))]);
+	let sends = vec![(stream, payloads(3, 1))];
+	let sibling = parent.send(&sends);
+
+	let mut children = b"spec-msg/archive/v2/d".to_vec();
+	children.extend(1u64.encode());
+	*store.unreadable_key.lock() = Some(children);
+	assert!(matches!(
+		archive.import_block(12, 1, 2, 0, sends.clone(), Some(sibling)),
+		Err(ArchiveError::Store(_))
+	));
+	assert!(!archive.contains(&12));
+	assert_eq!(served(&archive, &head(stream, first, u32::MAX)), Ok(payloads(2, 1)));
+
+	*store.unreadable_key.lock() = None;
+	archive.import_block(12, 1, 2, 0, sends, Some(sibling)).unwrap();
+	archive.retain(12, &BTreeMap::new(), 0).unwrap();
+	assert_eq!(served(&archive, &head(stream, first, u32::MAX)), Err(FetchError::UnknownRoot));
+	assert_eq!(served(&archive, &head(stream, sibling, u32::MAX)), Ok(payloads(3, 1)));
+}
+
+#[test]
+fn a_finality_jump_resumes_after_a_rejected_promotion() {
+	let stream = channel(2000);
+	let store = Arc::new(ObservedStore::default());
+	let mut archive = Archive::open(store.clone());
+	let mut main = Model::default();
+	import(&mut archive, &mut main, 1, vec![(stream, payloads(1, 3))]);
+	let mut side = main.clone();
+	let losing = import(&mut archive, &mut side, 2, vec![(stream, payloads(2, 2))]);
+	let losing_child = import(&mut archive, &mut side, 3, vec![(stream, payloads(3, 2))]);
+	let mut other = main.clone();
+	let sends = vec![(stream, payloads(4, 2))];
+	let other_root = other.send(&sends);
+	archive.import_block(22, 1, 2, 0, sends, Some(other_root)).unwrap();
+	let sends = vec![(stream, payloads(5, 2))];
+	let winner = main.send(&sends);
+	archive.import_block(12, 1, 2, 0, sends, Some(winner)).unwrap();
+	archive.import_block(13, 12, 3, 0, vec![], None).unwrap();
+	let sends = vec![(stream, payloads(6, 1))];
+	let descendant = main.send(&sends);
+	archive.import_block(14, 13, 4, 0, sends, Some(descendant)).unwrap();
+	*store.writes_before_failure.lock() = Some(1);
+	assert!(matches!(archive.retain(13, &BTreeMap::new(), 0), Err(ArchiveError::Store(_))));
+	let mut archive = Archive::open(store.clone());
+	assert_eq!(archive.anchor().unwrap().unwrap().hash, 1);
+	for (root, bytes) in
+		[(losing, payloads(2, 2)), (other_root, payloads(4, 2)), (winner, payloads(5, 2))]
+	{
+		assert_eq!(served(&archive, &messages(stream, 3, root, u32::MAX)), Ok(bytes));
+	}
+	*store.writes_before_failure.lock() = Some(1);
+	assert!(matches!(archive.retain(13, &BTreeMap::new(), 0), Err(ArchiveError::Store(_))));
+	let mut archive = Archive::open(store);
+	assert_eq!(archive.anchor().unwrap().unwrap().hash, 12);
+	for root in [losing, losing_child, other_root] {
+		assert_eq!(served(&archive, &head(stream, root, u32::MAX)), Err(FetchError::UnknownRoot));
+	}
+	assert_eq!(
+		served(&archive, &messages(stream, 0, descendant, u32::MAX)),
+		Ok(main.0[&stream].clone())
+	);
+	archive.retain(13, &BTreeMap::new(), 0).unwrap();
+	archive.retain(1, &BTreeMap::new(), 0).unwrap();
+	assert_eq!(archive.anchor().unwrap().unwrap().hash, 13);
+}
+
+#[test]
+fn idle_ancestors_add_no_store_reads_to_a_fetch() {
+	fn read_count(idle: u64) -> usize {
+		let stream = channel(2000);
+		let store = Arc::new(ObservedStore::default());
+		let mut archive = Archive::open(store.clone());
+		let mut model = Model::default();
+		import(&mut archive, &mut model, 1, vec![(stream, payloads(1, 7))]);
+		for n in 2..idle + 2 {
+			archive.import_block(n, n - 1, n, 0, vec![], None).unwrap();
+		}
+		let root = import(&mut archive, &mut model, idle + 2, vec![(stream, payloads(2, 3))]);
+		let archive = Archive::open(store.clone());
+		use std::sync::atomic::Ordering::Relaxed;
+		store.reads.store(0, Relaxed);
+		assert_eq!(
+			served(&archive, &messages(stream, 6, root, 3)),
+			Ok(vec![model.0[&stream][6].clone()])
+		);
+		store.reads.load(Relaxed)
+	}
+	let short = read_count(1);
+	let long = read_count(256);
+	println!("Fetch reads with 1 and 256 idle ancestors: {short} and {long}");
+	assert_eq!(short, long);
+}
+
+#[test]
+fn the_archive_resumes_after_a_restart() {
+	let store = Arc::new(MemoryStore::default());
+	let mut model = Model::default();
+	let a = channel(2000);
+	{
+		let mut archive = TestArchive::open(store.clone());
+		import(&mut archive, &mut model, 1, vec![(a, payloads(1, 3))]);
+		archive.import_block(2, 1, 2, 0, vec![], None).unwrap();
+	}
+	let mut archive = TestArchive::open(store);
+	assert_eq!(archive.tip().map(|tip| tip.hash), Some(2));
+	let root = import(&mut archive, &mut model, 3, vec![(a, payloads(2, 2))]);
+	assert_eq!(served(&archive, &messages(a, 0, root, u32::MAX)).unwrap().len(), 5);
+}
+
+#[test]
+fn retention_drops_below_the_watermark_and_past_the_horizon() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let (a, r) = (channel(2000), ack(2000));
+	let (pa, pr) = (payloads(1, 6), payloads(9, 3));
+	// Block 1 is old; blocks 2 and 3 are within the horizon.
+	let root1 = model.send(&[(a, pa[..3].to_vec()), (r, pr[..1].to_vec())]);
+	archive
+		.import_block(1, 0, 1, 10, vec![(a, pa[..3].to_vec()), (r, pr[..1].to_vec())], Some(root1))
+		.unwrap();
+	let root2 = model.send(&[(a, pa[3..].to_vec()), (r, pr[1..2].to_vec())]);
+	archive
+		.import_block(
+			2,
+			1,
+			2,
+			100,
+			vec![(a, pa[3..].to_vec()), (r, pr[1..2].to_vec())],
+			Some(root2),
+		)
+		.unwrap();
+	let root3 = model.send(&[(r, pr[2..].to_vec())]);
+	archive
+		.import_block(3, 2, 3, 100, vec![(r, pr[2..].to_vec())], Some(root3))
+		.unwrap();
+
+	// Block 3 is finalized; the receiver confirmed the channel up to 4; the horizon cuts at 50.
+	let watermarks = BTreeMap::from([(a, 4)]);
+	archive.retain(3, &watermarks, 50).unwrap();
+
+	// The channel: nothing below the watermark, everything above it.
+	assert_eq!(
+		archive.serve_messages(&messages(a, 3, root3, u32::MAX), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(4) })
+	);
+	assert_eq!(served(&archive, &messages(a, 4, root3, u32::MAX)), Ok(pa[4..].to_vec()));
+	assert_eq!(served(&archive, &messages(a, 4, root2, 0)), Ok(vec![]));
+	// Block 1 is past the horizon: its root is no longer served.
+	assert_eq!(
+		archive.serve_messages(&messages(a, 0, root1, 0), u32::MAX),
+		Err(FetchError::UnknownRoot)
+	);
+	// The register stream keeps what block 2's root needs, and serves its heads.
+	for under in [root2, root3] {
+		assert!(served(&archive, &head(r, under, 1024)).is_ok());
+	}
+	assert_eq!(
+		archive.serve_messages(&messages(r, 0, root3, 1024), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(1) })
+	);
+
+	// Retention is idempotent, and later blocks still archive and serve.
+	archive.retain(3, &watermarks, 50).unwrap();
+	let root4 = import(&mut archive, &mut model, 4, vec![(a, payloads(4, 1))]);
+	assert_eq!(served(&archive, &messages(a, 4, root4, u32::MAX)).unwrap().len(), 3);
+}
+
+#[test]
+fn the_handler_decodes_strictly() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, 2))]);
+	let req = messages(a, 0, root, u32::MAX);
+	let encoded = req.encode();
+
+	let answer = protocol::answer(&archive, &encoded).unwrap();
+	let resp = FetchResponse::decode(&mut &answer[..]).unwrap().unwrap();
+	verify_messages(&req, &resp).unwrap();
+	assert_eq!(resp.payloads.len(), 2);
+
+	// A refusal is an answer too.
+	let unknown = messages(a, 0, StreamsRoot(Default::default()), 0).encode();
+	let answer = protocol::answer(&archive, &unknown).unwrap();
+	assert_eq!(FetchResponse::decode(&mut &answer[..]).unwrap(), Err(FetchError::UnknownRoot));
+
+	let mut trailing = encoded.clone();
+	trailing.push(0);
+	assert!(protocol::answer(&archive, &trailing).is_none());
+	assert!(protocol::answer(&archive, &[0xFF]).is_none());
+}
+
+#[test]
+fn a_pruned_state_still_serves_later_blocks_without_sends() {
+	let store = Arc::new(MemoryStore::default());
+	let mut archive = TestArchive::open(store.clone());
+	let mut model = Model::default();
+	let (a, r) = (channel(2000), ack(2000));
+	// Blocks 1 to 3 are past the horizon. Block 2 supersedes block 1's root; blocks 3 and 4 send
+	// nothing and point at block 2's state.
+	let root1 = model.send(&[(a, payloads(1, 3)), (r, payloads(9, 1))]);
+	archive
+		.import_block(1, 0, 1, 10, vec![(a, payloads(1, 3)), (r, payloads(9, 1))], Some(root1))
+		.unwrap();
+	let root2 = model.send(&[(a, payloads(2, 2)), (r, payloads(8, 1))]);
+	archive
+		.import_block(2, 1, 2, 10, vec![(a, payloads(2, 2)), (r, payloads(8, 1))], Some(root2))
+		.unwrap();
+	archive.import_block(3, 2, 3, 10, vec![], None).unwrap();
+	archive.import_block(4, 3, 4, 100, vec![], None).unwrap();
+	archive.retain(4, &BTreeMap::new(), 50).unwrap();
+
+	// The superseded root is gone; the current one, an idle sender's newest included, is served.
+	assert_eq!(
+		archive.serve_messages(&messages(a, 0, root1, 0), u32::MAX),
+		Err(FetchError::UnknownRoot)
+	);
+	assert_eq!(served(&archive, &messages(a, 0, root2, u32::MAX)).unwrap().len(), 5);
+	assert_eq!(served(&archive, &head(r, root2, 1024)), Ok(payloads(8, 1)));
+	// Its `Ack` stream keeps the head only: the floor comes from the oldest kept state.
+	assert_eq!(
+		archive.serve_messages(&messages(r, 0, root2, 1024), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(1) })
+	);
+	// Idempotent.
+	archive.retain(4, &BTreeMap::new(), 50).unwrap();
+	assert!(served(&archive, &head(r, root2, 1024)).is_ok());
+
+	// After a restart the tip's state is still known, so the next root is right.
+	let mut archive = TestArchive::open(store);
+	assert!(served(&archive, &head(r, root2, 1024)).is_ok());
+	let root5 = model.send(&[(a, payloads(5, 2))]);
+	archive
+		.import_block(5, 4, 5, 200, vec![(a, payloads(5, 2))], Some(root5))
+		.unwrap();
+	assert_eq!(served(&archive, &messages(a, 5, root5, u32::MAX)), Ok(payloads(5, 2)));
+
+	// Once a kept block sends again, the old state is superseded and goes with its root.
+	archive.retain(5, &BTreeMap::new(), 150).unwrap();
+	assert_eq!(
+		archive.serve_messages(&head(r, root2, 1024), u32::MAX),
+		Err(FetchError::UnknownRoot)
+	);
+	assert_eq!(served(&archive, &messages(a, 5, root5, u32::MAX)), Ok(payloads(5, 2)));
+	assert!(served(&archive, &head(r, root5, 1024)).is_ok());
+}
+
+#[test]
+fn retention_keeps_every_leaf_the_oldest_kept_block_sent() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let (e, r) = (StreamId::Broadcast { domain: 0, subdomain: 0, num: 0 }, ack(2000));
+	let (first, second) = (payloads(1, 2), payloads(2, 3));
+	// Block 1 sends two events and is finalized: it is the first and oldest kept block, so both
+	// stay, not only the head.
+	let root1 = model.send(&[(e, first.clone())]);
+	archive
+		.import_block(1, 0, 1, 10, vec![(e, first.clone())], Some(root1))
+		.unwrap();
+	archive.retain(1, &BTreeMap::new(), 50).unwrap();
+	assert_eq!(served(&archive, &messages(e, 0, root1, u32::MAX)), Ok(first));
+
+	// Block 2 sends three more; block 1 passes the horizon. Block 2's events all stay.
+	let root2 = model.send(&[(e, second.clone())]);
+	archive
+		.import_block(2, 1, 2, 100, vec![(e, second.clone())], Some(root2))
+		.unwrap();
+	archive.retain(2, &BTreeMap::new(), 50).unwrap();
+	assert_eq!(served(&archive, &messages(e, 2, root2, u32::MAX)), Ok(second.clone()));
+	assert_eq!(
+		archive.serve_messages(&messages(e, 1, root2, u32::MAX), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(2) })
+	);
+	// Again, once block 1's boundary is gone: the floor stays.
+	archive.retain(2, &BTreeMap::new(), 50).unwrap();
+	assert_eq!(served(&archive, &messages(e, 2, root2, u32::MAX)), Ok(second.clone()));
+
+	// Block 3 sends no events; block 2 passes the horizon. The head stays, with the frontier
+	// before it.
+	let root3 = model.send(&[(r, payloads(9, 1))]);
+	archive
+		.import_block(3, 2, 3, 200, vec![(r, payloads(9, 1))], Some(root3))
+		.unwrap();
+	archive.retain(3, &BTreeMap::new(), 150).unwrap();
+	assert_eq!(served(&archive, &head(e, root3, 1024)), Ok(second[2..].to_vec()));
+	assert_eq!(
+		archive.serve_messages(&messages(e, 3, root3, u32::MAX), u32::MAX),
+		Err(FetchError::OutsideHorizon { lowest: MessagePosition(4) })
+	);
+}
+
+#[test]
+fn a_channel_without_a_watermark_keeps_everything() {
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root1 = model.send(&[(a, payloads(1, 3))]);
+	archive
+		.import_block(1, 0, 1, 10, vec![(a, payloads(1, 3))], Some(root1))
+		.unwrap();
+	let root2 = model.send(&[(a, payloads(2, 1))]);
+	archive
+		.import_block(2, 1, 2, 100, vec![(a, payloads(2, 1))], Some(root2))
+		.unwrap();
+	archive.retain(2, &BTreeMap::new(), 50).unwrap();
+	assert_eq!(served(&archive, &messages(a, 0, root2, u32::MAX)).unwrap().len(), 4);
+}
+
+/// Two peers with the same archive. Only the second serves payloads.
+struct ArchivePeers {
+	archive: Arc<TestArchive>,
+	peers: [PeerId; 2],
+}
+
+impl ArchivePeers {
+	fn rotating(archive: Arc<TestArchive>) -> Rotating<Self> {
+		Rotating::new(Arc::new(Self { archive, peers: [PeerId::random(), PeerId::random()] }))
+	}
+}
+
+#[async_trait::async_trait]
+impl Transport for ArchivePeers {
+	fn peers(&self, _: ParaId) -> Vec<PeerId> {
+		self.peers.to_vec()
+	}
+
+	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		let request = MessagesRequest::decode(&mut &request[..]).unwrap();
+		let cap = if peer == self.peers[0] { 0 } else { request.max_bytes };
+		Ok(self.archive.serve_messages(&request, cap).encode())
+	}
+}
+
+#[test]
+fn archive_rounds_rotate_peers_for_backfill() {
+	let (seeded, full, model, root) = seeded_and_full();
+	let archive = RwLock::new(seeded);
+	let transport = ArchivePeers::rotating(full);
+	let stream = channel(1);
+	archive.write().retain(10, &[(stream, 2)].into(), 0).unwrap();
+	let round = || futures::executor::block_on(backfill(&archive, &10, 2000.into(), &transport));
+	round();
+	assert!(archive.read().backfill_pending().contains(&stream));
+	round();
+	assert!(!archive.read().backfill_pending().contains(&stream));
+	assert_eq!(
+		served(&archive.read(), &messages(stream, 2, root, u32::MAX)),
+		Ok(model.0[&stream][2..].to_vec())
+	);
+}

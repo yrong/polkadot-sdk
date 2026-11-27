@@ -1,0 +1,13 @@
+title: 'spec-msg: fetch protocol and sender archive'
+doc:
+- audience: Node Operator
+  description: Archive and serve outgoing messaging streams with finalized-watermark retention and
+    own-chain backfill. Retry missing channel history until served or confirmed.
+    Rotate the first archive peer between rounds, so a peer serving only proofs cannot stall
+    backfill.
+    Prune only channel leaves below the last `up_to` applied by the finalized sender runtime.
+    After a forced close, the archive retains any tail the receiver did not acknowledge.
+    Keep sibling payloads and proofs available until sender finality.
+crates:
+- name: cumulus-client-spec-msg
+  bump: minor
