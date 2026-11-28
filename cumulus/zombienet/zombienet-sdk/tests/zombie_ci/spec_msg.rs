@@ -1241,9 +1241,7 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
 
-		open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER, 0).await?;
-		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
-		wait_for_hrmp_snapshot(&sender).await?;
+		open_both_channels(&relay, &sender, &receiver).await?;
 		let (_, outbound) = channel_states(&sender, &receiver).await?;
 		if !outbound.get(&out_channel()).is_some_and(is_open) {
 			return Err(anyhow!("the spec-msg channel is not open alongside HRMP"));
@@ -1269,6 +1267,19 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 	tokio::time::timeout(Duration::from_secs(360), test)
 		.await
 		.map_err(|_| anyhow!("HRMP preference test exceeded six minutes"))?
+}
+
+async fn open_both_channels(
+	relay: &OnlineClient<PolkadotConfig>,
+	sender: &OnlineClient<PolkadotConfig>,
+	receiver: &OnlineClient<PolkadotConfig>,
+) -> Result<(), anyhow::Error> {
+	let alice = dev::alice();
+	tokio::try_join!(
+		open_spec_msg_channel(sender, receiver, SENDER, RECEIVER, 0),
+		open_hrmp_channel(relay, SENDER, RECEIVER, 8, 1024, &alice, 120),
+	)?;
+	wait_for_hrmp_snapshot(sender).await
 }
 
 async fn wait_for_hrmp_snapshot(
@@ -1513,9 +1524,7 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
-		open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER, 0).await?;
-		open_hrmp_channel(&relay, SENDER, RECEIVER, 8, 1024, &dev::alice(), 120).await?;
-		wait_for_hrmp_snapshot(&sender).await?;
+		open_both_channels(&relay, &sender, &receiver).await?;
 
 		let mut blocks = receiver.blocks().subscribe_finalized().await?;
 		let mut expected = BTreeMap::new();
