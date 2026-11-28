@@ -2439,7 +2439,7 @@ async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
 	Ok(())
 }
 
-/// How long the bundle test sends traffic: `SPEC_MSG_BUNDLE_SECS`, 120 by default.
+/// Maximum time the bundle test sends traffic: `SPEC_MSG_BUNDLE_SECS`, 120 by default.
 fn bundle_secs() -> u64 {
 	std::env::var("SPEC_MSG_BUNDLE_SECS")
 		.ok()
@@ -2510,11 +2510,21 @@ fn bundles(blocks: &[BundleBlock]) -> Vec<Vec<BundleBlock>> {
 	out
 }
 
-/// Penpal builds three blocks per relay block on one core, so each PoV bundles them, as Asset Hub
-/// Westend does. The sender sends batches for `SPEC_MSG_BUNDLE_SECS`, so the receiver consumes in
-/// several blocks of one bundle, whose single `Requires` the relay must accept. The sender reads
-/// the receiver's register at most once per bundle. The receiver must consume and settle the whole
-/// stream.
+fn consuming_blocks(bundle: &[BundleBlock]) -> usize {
+	bundle.iter().filter(|block| block.consumed).count()
+}
+
+fn has_completed_bundle(blocks: &[BundleBlock], min_consuming: usize) -> bool {
+	// The next bundle's first block marks the end of the previous one.
+	bundles(blocks).windows(2).any(|pair| {
+		let bundle = &pair[0];
+		bundle[0].index.unwrap_or(0) == 0 && consuming_blocks(bundle) >= min_consuming
+	})
+}
+
+/// The receiver consumes in several blocks of one bundle, whose single `Requires` the relay
+/// must accept. The sender reads the receiver's register at most once per bundle. The receiver
+/// must consume and settle the whole stream.
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
@@ -2541,6 +2551,11 @@ async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> 
 	let deadline = std::time::Instant::now() + Duration::from_secs(bundle_secs());
 	let mut batches = 0u32;
 	while std::time::Instant::now() < deadline {
+		if has_completed_bundle(&consuming.lock().unwrap(), 2) &&
+			has_completed_bundle(&reading.lock().unwrap(), 1)
+		{
+			break;
+		}
 		match force_batch(&sender, (0..20).map(|_| send_xcm_to(RECEIVER)).collect()).await {
 			Ok(_) => batches += 1,
 			Err(error) => log::warn!("A batch of sends failed: {error}"),
@@ -2570,10 +2585,7 @@ async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> 
 	// Per bundle: how many of its blocks consumed from the other chain.
 	let summary = |name: &str, blocks: &[BundleBlock]| {
 		let bundles = bundles(blocks);
-		let per_bundle: Vec<usize> = bundles
-			.iter()
-			.map(|b| b.iter().filter(|block| block.consumed).count())
-			.collect();
+		let per_bundle: Vec<usize> = bundles.iter().map(|b| consuming_blocks(b)).collect();
 		let multi = bundles.iter().filter(|b| b.len() > 1).count();
 		log::info!(
 			"{name}: {} finalized blocks in {} bundles, {multi} with several blocks; bundles where \
