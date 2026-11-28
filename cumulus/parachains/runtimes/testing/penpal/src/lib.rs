@@ -294,7 +294,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	system_version: 1,
 };
 
-const RELAY_PARENT_OFFSET: u32 = 0;
+const RELAY_PARENT_OFFSET: u32 = 1;
+
+/// Blocks per relay block; the collator bundles them into one PoV.
+const BLOCK_PROCESSING_VELOCITY: u32 = 3;
 
 // Unit = the base number of indivisible units for balances
 pub const UNIT: Balance = 1_000_000_000_000;
@@ -597,7 +600,7 @@ type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
 	Runtime,
 	RELAY_CHAIN_SLOT_DURATION_MILLIS,
 	BLOCK_PROCESSING_VELOCITY,
-	UNINCLUDED_SEGMENT_CAPACITY,
+	{ (UNINCLUDED_SEGMENT_CAPACITY + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY },
 >;
 
 impl cumulus_pallet_parachain_system::Config for Runtime {
@@ -615,7 +618,7 @@ impl cumulus_pallet_parachain_system::Config for Runtime {
 		Runtime,
 		RELAY_CHAIN_SLOT_DURATION_MILLIS,
 		BLOCK_PROCESSING_VELOCITY,
-		UNINCLUDED_SEGMENT_CAPACITY,
+		{ (UNINCLUDED_SEGMENT_CAPACITY + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY },
 	>;
 
 	type RelayParentOffset = ConstU32<RELAY_PARENT_OFFSET>;
@@ -1240,6 +1243,12 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 
 		fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
 			genesis_config_presets::preset_names()
+		}
+	}
+
+	impl cumulus_primitives_core::TargetBlockRate<Block> for Runtime {
+		fn target_block_rate() -> u32 {
+			BLOCK_PROCESSING_VELOCITY
 		}
 	}
 
