@@ -32,7 +32,7 @@ export ZOMBIENET_SDK_BASE_DIR=$(mktemp -d)
 **One command** boots the network and runs the test:
 
 ```
-cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_msg_delivers -- --nocapture
+SPEC_MSG_STEPS=deliver cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_msg_delivers_xcm_without_hrmp -- --nocapture
 ```
 
 **Two steps**, for a talk:
@@ -41,7 +41,7 @@ cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_ms
    Ctrl-C stops the nodes.
 
    ```
-   SPEC_MSG_STANDBY=1 cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_msg_delivers -- --nocapture
+   SPEC_MSG_STANDBY=1 cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_msg_delivers_xcm_without_hrmp -- --nocapture
    ```
 
 2. Demo, about 1.5 minutes, in a second terminal. It connects to the running nodes, opens and accepts the channel,
@@ -49,12 +49,19 @@ cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_ms
    it does not use `ZOMBIENET_SDK_BASE_DIR`: only the log commands in section 3 do.
 
    ```
-   SPEC_MSG_ATTACH=1 cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_msg_delivers -- --nocapture
+   SPEC_MSG_ATTACH=1 SPEC_MSG_STEPS=deliver cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci spec_msg_delivers_xcm_without_hrmp -- --nocapture
    ```
 
 - Step 2 can run again on the same network: it skips the open and sends another message. Restart step 1 before
   a talk, so the audience sees the channel open. After a test-only change, keep step 1 running.
 - Run the `cargo test` command once before the talk, so the test crate is compiled.
+
+For the functional tests, run each name in its own harness process. The networks use the same ports.
+The default delivery test covers `deliver,batch,limits`. The other delivery cases are
+`spec_msg_outage_and_two_way_delivery`, `spec_msg_backpressure`, `spec_msg_lane_handover` and
+`spec_msg_full_credit_close`. To run the original sequence on one network, set
+`SPEC_MSG_STEPS=deliver,batch,limits,outage,backpressure,two-way,handover,full-close` on
+`spec_msg_delivers_xcm_without_hrmp`.
 
 The test prints six checkpoints. Each one is read from chain state:
 
@@ -145,10 +152,14 @@ cargo test --release -p cumulus-zombienet-sdk-tests --features zombie-ci --test 
 ```
 
 Run the same command with `spec_msg_hrmp_cutover_and_rollback` to follow queued HRMP and spec-msg sends through cutover, rollback, and relay channel closure. The test checks each message ID and transport in finalized receiver blocks.
+Use `spec_msg_closed_channel_during_hrmp_cutover` for send refusal and recovery on a closed
+spec-msg lane. Use `spec_msg_hrmp_drain_with_sender_backlog` for a drain snapshot with bytes
+queued on the sender and an empty relay channel.
+
 
 ## Latency against HRMP
 
-`spec_msg_vs_hrmp_latency -- --ignored --nocapture` replaces `spec_msg_delivers -- --nocapture`. It compares
+`spec_msg_vs_hrmp_latency -- --ignored --nocapture` replaces `spec_msg_delivers_xcm_without_hrmp -- --nocapture`. It compares
 spec-msg with HRMP on the same chains. It takes 10 samples per path by default: set `SPEC_MSG_SAMPLES=2` for a
 short check (about 8 minutes). It boots its own network, so it does not use the two-step flow.
 

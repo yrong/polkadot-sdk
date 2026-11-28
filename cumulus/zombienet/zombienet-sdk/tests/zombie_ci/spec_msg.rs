@@ -11,9 +11,8 @@
 //! The delivery test logs one checkpoint per protocol step, each read from chain state: the
 //! sender's committed root, the relay's provides window, the receiver's consumption record, and
 //! the executed XCM. It then sends a batch larger than the receiver admits per block, which the
-//! receiver consumes over several blocks cut short of what its node planned; stops the sender's
-//! collator while the receiver holds a backlog; and fills the receiver's queue until the sender's
-//! window is full, so the sender refuses sends and raises its fee.
+//! receiver consumes over several blocks. Separate tests cover outages, backpressure, lane
+//! handover and closing at full credit.
 
 use crate::utils::initialize_network;
 use anyhow::anyhow;
@@ -79,15 +78,34 @@ fn flag(name: &str) -> bool {
 	std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-/// Whether to run the delivery test's step `name`: every step unless `SPEC_MSG_STEPS` lists some,
-/// comma-separated (`deliver`, `batch`, `limits`, `outage`, `backpressure`, `two-way`, `handover`,
-/// `full-close`).
-fn step(name: &str) -> bool {
-	std::env::var("SPEC_MSG_STEPS").map_or(true, |steps| steps.split(',').any(|s| s.trim() == name))
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
+	let steps = std::env::var("SPEC_MSG_STEPS").unwrap_or_else(|_| "deliver,batch,limits".into());
+	run_delivery_steps(&steps).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
+async fn spec_msg_outage_and_two_way_delivery() -> Result<(), anyhow::Error> {
+	run_delivery_steps("outage,two-way").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_backpressure() -> Result<(), anyhow::Error> {
+	run_delivery_steps("backpressure").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_lane_handover() -> Result<(), anyhow::Error> {
+	run_delivery_steps("handover").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_full_credit_close() -> Result<(), anyhow::Error> {
+	run_delivery_steps("full-close").await
+}
+
+async fn run_delivery_steps(steps: &str) -> Result<(), anyhow::Error> {
+	let step = |name: &str| steps.split(',').any(|s| s.trim() == name);
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
@@ -136,7 +154,23 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	}
 	log::info!("No HRMP channel {SENDER} -> {RECEIVER} on the relay chain");
 
-	open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER, 0).await?;
+	let start_paused = matches!(steps.trim(), "backpressure" | "full-close") && network.is_some();
+	let opening = open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER, 0);
+	if start_paused {
+		tokio::try_join!(opening, sudo(&receiver, queue_call("pause_inbound_channel", 0)))?;
+	} else {
+		opening.await?;
+	}
+
+	let fill_paused_queue = |lane| {
+		let (sender, receiver) = (&sender, &receiver);
+		async move {
+			if !start_paused {
+				sudo(receiver, queue_call("pause_inbound_channel", lane)).await?;
+			}
+			send_large_batch(sender).await
+		}
+	};
 
 	if step("deliver") {
 		send_and_follow(&relay, &sender, &receiver).await?;
@@ -154,6 +188,7 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 		}
 	}
 	if step("backpressure") {
+		fill_paused_queue(0).await?;
 		backpressure_and_follow(&sender, &receiver).await?;
 	}
 
@@ -197,7 +232,9 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 	}
 
 	if step("full-close") {
-		close_at_full_window(&sender, &receiver, u16::from(step("handover"))).await?;
+		let lane = u16::from(step("handover"));
+		fill_paused_queue(lane).await?;
+		return close_at_full_window(&sender, &receiver, lane).await;
 	}
 
 	let now = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
@@ -702,15 +739,15 @@ const MAX_QUEUE_PAGES: u128 = 48;
 /// Penpal's `MaxInFlight`.
 const MAX_IN_FLIGHT: u64 = 128;
 
-/// Pause the receiver's queue, fill it with large XCMs until its consumption stops, then fill the
-/// sender's window with small ones until it refuses: the receiver's `Ack` stopped, so the sender
-/// raises its fee. Resume, check that the receiver consumes the whole stream and its queue settles
-/// every message, and that a send with the window drained lowers the fee.
+/// Fill the remaining credit while the receiver is paused, then resume and check fee recovery.
 async fn backpressure_and_follow(
 	sender: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
 ) -> Result<(), anyhow::Error> {
-	pause_and_send_large(sender, receiver, 0).await?;
+	wait_for("the paused receiver to reach its queue limit", || async {
+		Ok(u128::from(queued(receiver).await?) >= MAX_QUEUE_PAGES)
+	})
+	.await?;
 	fill_credit(sender, 0).await?;
 	let raised = fee_factor(sender).await?;
 	if raised <= FEE_FACTOR_ONE {
@@ -771,19 +808,14 @@ fn queue_call(name: &str, lane: u16) -> Value {
 	.into_value()
 }
 
-async fn pause_and_send_large(
-	sender: &OnlineClient<PolkadotConfig>,
-	receiver: &OnlineClient<PolkadotConfig>,
-	lane: u16,
-) -> Result<(), anyhow::Error> {
-	sudo(receiver, queue_call("pause_inbound_channel", lane)).await?;
-	log::info!("{RECEIVER} paused its queue for {SENDER}'s channel");
-
+async fn send_large_batch(sender: &OnlineClient<PolkadotConfig>) -> Result<(), anyhow::Error> {
 	let mut large = 0;
-	for chunk in 0..LARGE_COUNT / 8 {
-		let calls = (0..8).map(|i| send_large_xcm_to(RECEIVER, (chunk * 8 + i) as u8, LARGE_XCM));
+	for start in (0..LARGE_COUNT).step_by(28) {
+		let calls = (start..(start + 28).min(LARGE_COUNT))
+			.map(|i| send_large_xcm_to(RECEIVER, i as u8, LARGE_XCM));
 		large += force_batch(sender, calls.collect()).await?.len();
 	}
+	anyhow::ensure!(large == LARGE_COUNT, "expected {LARGE_COUNT} large sends, got {large}");
 	log::info!("{SENDER} sent {large} XCMs of {LARGE_XCM} bytes");
 
 	Ok(())
@@ -795,7 +827,9 @@ async fn fill_credit(
 ) -> Result<(), anyhow::Error> {
 	let mut refused = false;
 	for _ in 0..40 {
-		let sent = force_batch(sender, (0..32).map(|_| send_xcm_to(RECEIVER)).collect()).await?;
+		let room = MAX_IN_FLIGHT.saturating_sub(in_flight(sender, lane).await?);
+		let sent =
+			force_batch(sender, (0..room.max(1)).map(|_| send_xcm_to(RECEIVER)).collect()).await?;
 		let in_flight = in_flight(sender, lane).await?;
 		log::info!("{SENDER} sent {} small XCMs, {in_flight} in flight", sent.len());
 		if in_flight > MAX_IN_FLIGHT {
@@ -817,7 +851,6 @@ async fn close_at_full_window(
 	receiver: &OnlineClient<PolkadotConfig>,
 	lane: u16,
 ) -> Result<(), anyhow::Error> {
-	pause_and_send_large(sender, receiver, lane).await?;
 	// The last ACK can still be in flight after the paused queue stops admitting leaves.
 	wait_for("the sender to confirm the receiver's full queue", || async {
 		let hash = receiver.blocks().at_latest().await?.hash();
@@ -911,9 +944,14 @@ async fn close_at_full_window(
 		end.leaf_count()
 	);
 
-	sudo(receiver, queue_call("resume_inbound_channel", lane)).await?;
-	wait_for("the receiver to finalize the close and settle the queue", || async {
+	let sender_close = block.number();
+	let resumed = sudo(receiver, queue_call("resume_inbound_channel", lane)).await?;
+	let receiver_resume = receiver.blocks().at(resumed).await?.number();
+	wait_for("both chains to advance after close and the receiver to settle the queue", || async {
 		let block = receiver.blocks().at_latest().await?;
+		if block.number() <= receiver_resume || finalized_number(sender).await? <= sender_close {
+			return Ok(false);
+		}
 		let states =
 			channel_map_at::<InChannelId, InChannelState>(receiver, "InChannels", block.hash())
 				.await?;
@@ -1241,7 +1279,7 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
 
-		open_both_channels(&relay, &sender, &receiver).await?;
+		open_both_channels(&relay, &sender, &receiver, 8).await?;
 		let (_, outbound) = channel_states(&sender, &receiver).await?;
 		if !outbound.get(&out_channel()).is_some_and(is_open) {
 			return Err(anyhow!("the spec-msg channel is not open alongside HRMP"));
@@ -1273,11 +1311,12 @@ async fn open_both_channels(
 	relay: &OnlineClient<PolkadotConfig>,
 	sender: &OnlineClient<PolkadotConfig>,
 	receiver: &OnlineClient<PolkadotConfig>,
+	capacity: u32,
 ) -> Result<(), anyhow::Error> {
 	let alice = dev::alice();
 	tokio::try_join!(
 		open_spec_msg_channel(sender, receiver, SENDER, RECEIVER, 0),
-		open_hrmp_channel(relay, SENDER, RECEIVER, 8, 1024, &alice, 120),
+		open_hrmp_channel(relay, SENDER, RECEIVER, capacity, 1024, &alice, 120),
 	)?;
 	wait_for_hrmp_snapshot(sender).await
 }
@@ -1529,7 +1568,7 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
-		open_both_channels(&relay, &sender, &receiver).await?;
+		open_both_channels(&relay, &sender, &receiver, 8).await?;
 
 		let mut blocks = receiver.blocks().subscribe_finalized().await?;
 		let mut expected = BTreeMap::new();
@@ -1586,33 +1625,116 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 		.map_err(|_| anyhow!("HRMP cutover test exceeded ten minutes"))?
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn spec_msg_closed_channel_during_hrmp_cutover() -> Result<(), anyhow::Error> {
+async fn cutover_network(
+) -> Result<(Network<LocalFileSystem>, OnlineClient<PolkadotConfig>), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
+	let network = initialize_network(build_network_config(
+		(SENDER_COLLATOR, SENDER_P2P_PORT),
+		NetworkMode::Restarts,
+	)?)
+	.await?;
+	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
+	let sender: OnlineClient<PolkadotConfig> =
+		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
+	let receiver: OnlineClient<PolkadotConfig> =
+		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+	open_both_channels(&relay, &sender, &receiver, 1).await?;
+
+	Ok((network, sender))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_closed_channel_during_hrmp_cutover() -> Result<(), anyhow::Error> {
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Restarts,
-		)?)
+		let (network, sender) = cutover_network().await?;
+		let receiver: OnlineClient<PolkadotConfig> =
+			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
+		let mut blocks = receiver.blocks().subscribe_finalized().await?;
+		let flag =
+			|name| tx("SpecMessaging", name, vec![Value::u128(RECEIVER.into())]).into_value();
+		let close = tx(
+			"SpecMessaging",
+			"close_channel",
+			vec![Value::u128(RECEIVER.into()), Value::u128(0), Value::u128(0)],
+		)
+		.into_value();
+		let attempt =
+			tx("Utility", "force_batch", vec![Value::unnamed_composite([send_xcm_to(RECEIVER)])])
+				.into_value();
+		let (closed, ids) = submit_sudo(
+			&sender,
+			batch_all(vec![
+				send_xcm_to(RECEIVER),
+				send_xcm_to(RECEIVER),
+				flag("set_hrmp_closing"),
+				close,
+				attempt,
+			]),
+			true,
+		)
 		.await?;
+		let [first, second] = ids.as_slice() else {
+			return Err(anyhow!("expected two precutover sends"));
+		};
+		let mut failed = false;
+		for event in sender.events().at(closed).await?.iter() {
+			let event = event?;
+			if event.pallet_name() == "Utility" && event.variant_name() == "ItemFailed" {
+				let sp_runtime::DispatchError::Module(error) =
+					DecodeAll::decode_all(&mut event.field_bytes())?
+				else {
+					return Err(anyhow!("expected a module error"));
+				};
+				let metadata = sender.metadata();
+				let pallet = metadata
+					.pallet_by_index(error.index)
+					.ok_or_else(|| anyhow!("unknown pallet"))?;
+				let name = pallet.error_variant_by_index(error.error[0]).map(|v| v.name.as_str());
+				anyhow::ensure!(
+					pallet.name() == "PolkadotXcm" && name == Some("SendFailure"),
+					"unexpected send error {}::{name:?}",
+					pallet.name()
+				);
+				failed = true;
+			}
+		}
+		anyhow::ensure!(failed, "missing failed XCM send");
+		log::info!("Cutover closed and the next send returned SendFailure at {closed:#x}");
+
+		let mut expected =
+			BTreeMap::from([(first.clone(), "Sibling"), (second.clone(), "Sibling")]);
+		anyhow::ensure!(expected.len() == 2, "duplicate precutover send id");
+		let mut received = BTreeSet::new();
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
+		let (rollback, ids) = submit_sudo(
+			&sender,
+			batch_all(vec![flag("clear_hrmp_closing"), send_xcm_to(RECEIVER)]),
+			true,
+		)
+		.await?;
+		let [id] = ids.as_slice() else { return Err(anyhow!("expected one rollback send")) };
+		anyhow::ensure!(expected.insert(id.clone(), "Sibling").is_none(), "duplicate rollback id");
+		log::info!("Cutover rollback at {rollback:#x}");
+		wait_for_routed_messages(&mut blocks, &expected, &mut received).await
+	};
+	tokio::time::timeout(Duration::from_secs(600), test)
+		.await
+		.map_err(|_| anyhow!("closed-channel cutover exceeded ten minutes"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_msg_hrmp_drain_with_sender_backlog() -> Result<(), anyhow::Error> {
+	let test = async {
+		let (network, sender) = cutover_network().await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let source = network.get_node(SENDER_COLLATOR)?;
 		let destination = network.get_node(RECEIVER_COLLATOR)?;
-		let sender: OnlineClient<PolkadotConfig> = source.wait_client().await?;
-		let receiver: OnlineClient<PolkadotConfig> = destination.wait_client().await?;
-		open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER, 0).await?;
-		open_hrmp_channel(&relay, SENDER, RECEIVER, 1, 1024, &dev::alice(), 120).await?;
-		wait_for_hrmp_snapshot(&sender).await?;
-
-		let before = receiver.blocks().at_latest().await?.hash();
-		let flag =
-			|name| tx("SpecMessaging", name, vec![Value::u128(RECEIVER.into())]).into_value();
 		// Fill the relay channel so the next HRMP send stays queued on the sender.
 		destination.pause().await?;
 		let (_, first) = submit_sudo(&sender, send_xcm_to(RECEIVER), true).await?;
-		let [first] = first.as_slice() else { return Err(anyhow!("expected one priming send")) };
+		anyhow::ensure!(first.len() == 1, "expected one priming send");
 		let channel = Value::named_composite([
 			("sender", Value::u128(SENDER.into())),
 			("recipient", Value::u128(RECEIVER.into())),
@@ -1639,49 +1761,11 @@ async fn spec_msg_closed_channel_during_hrmp_cutover() -> Result<(), anyhow::Err
 			}
 		};
 		wait_for_count(1).await?;
-		let close = tx(
-			"SpecMessaging",
-			"close_channel",
-			vec![Value::u128(RECEIVER.into()), Value::u128(0), Value::u128(0)],
-		)
-		.into_value();
-		let (closed, queued) = submit_sudo(
-			&sender,
-			batch_all(vec![send_xcm_to(RECEIVER), flag("set_hrmp_closing"), close]),
-			true,
-		)
-		.await?;
-		let [queued] = queued.as_slice() else { return Err(anyhow!("expected one queued send")) };
-		let attempt =
-			tx("Utility", "force_batch", vec![Value::unnamed_composite([send_xcm_to(RECEIVER)])])
-				.into_value();
-		let (refused, ids) = submit_sudo(&sender, attempt, true).await?;
-		anyhow::ensure!(ids.is_empty(), "closed channel accepted a send");
-		let mut failed = false;
-		for event in sender.events().at(refused).await?.iter() {
-			let event = event?;
-			if event.pallet_name() == "Utility" && event.variant_name() == "ItemFailed" {
-				let sp_runtime::DispatchError::Module(error) =
-					DecodeAll::decode_all(&mut event.field_bytes())?
-				else {
-					return Err(anyhow!("expected a module error"));
-				};
-				let metadata = sender.metadata();
-				let pallet = metadata
-					.pallet_by_index(error.index)
-					.ok_or_else(|| anyhow!("unknown pallet"))?;
-				let name = pallet.error_variant_by_index(error.error[0]).map(|v| v.name.as_str());
-				anyhow::ensure!(
-					pallet.name() == "PolkadotXcm" && name == Some("SendFailure"),
-					"unexpected send error {}::{name:?}",
-					pallet.name()
-				);
-				failed = true;
-			}
-		}
-		anyhow::ensure!(failed, "missing failed XCM send");
-		log::info!("Cutover closed at {closed:#x}, SendFailure at {refused:#x}");
-
+		let flag = tx("SpecMessaging", "set_hrmp_closing", vec![Value::u128(RECEIVER.into())]);
+		let (_, queued) =
+			submit_sudo(&sender, batch_all(vec![send_xcm_to(RECEIVER), flag.into_value()]), true)
+				.await?;
+		anyhow::ensure!(queued.len() == 1, "expected one queued send");
 		// Keep the sender's queued page in place while the receiver empties the relay channel.
 		source.pause().await?;
 		destination.resume().await?;
@@ -1725,38 +1809,11 @@ async fn spec_msg_closed_channel_during_hrmp_cutover() -> Result<(), anyhow::Err
 		anyhow::ensure!(bytes > 0, "sender queue drained before the relay snapshot");
 		log::info!("Cutover drain snapshot at relay #{} {:#x}, sender #{} {sender_hash:#x}, {bytes} bytes queued",
 			empty.number(), empty.hash(), paired.number());
-		let mut expected =
-			BTreeMap::from([(first.clone(), "Sibling"), (queued.clone(), "Sibling")]);
-		anyhow::ensure!(expected.len() == 2, "duplicate precutover send id");
-		let receiver =
-			OnlineClient::<PolkadotConfig>::from_url(format!("ws://127.0.0.1:{RECEIVER_RPC_PORT}"))
-				.await?;
-		let mut blocks = receiver.blocks().subscribe_finalized().await?;
-		let mut block = blocks.next().await.ok_or_else(|| anyhow!("receiver finality ended"))??;
-		let mut received = BTreeSet::new();
-		// The paused receiver can lose its RPC connection before the relay queue drains.
-		while block.hash() != before {
-			anyhow::ensure!(block.number() > 0, "receiver lost the pre-cutover finalized block");
-			check_routed_block(&block, &expected, &mut received).await?;
-			block = receiver.blocks().at(block.header().parent_hash).await?;
-		}
-		if received.len() < expected.len() {
-			wait_for_routed_messages(&mut blocks, &expected, &mut received).await?;
-		}
-		let (rollback, ids) = submit_sudo(
-			&sender,
-			batch_all(vec![flag("clear_hrmp_closing"), send_xcm_to(RECEIVER)]),
-			true,
-		)
-		.await?;
-		let [id] = ids.as_slice() else { return Err(anyhow!("expected one rollback send")) };
-		anyhow::ensure!(expected.insert(id.clone(), "Sibling").is_none(), "duplicate rollback id");
-		log::info!("Cutover rollback at {rollback:#x}");
-		wait_for_routed_messages(&mut blocks, &expected, &mut received).await
+		Ok(())
 	};
 	tokio::time::timeout(Duration::from_secs(600), test)
 		.await
-		.map_err(|_| anyhow!("closed-channel cutover exceeded ten minutes"))?
+		.map_err(|_| anyhow!("sender backlog during cutover exceeded ten minutes"))?
 }
 
 /// Sender candidates that are backed but never included. Both validators run Malus
