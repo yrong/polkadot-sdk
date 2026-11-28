@@ -1327,9 +1327,14 @@ async fn spec_msg_routes_across_three_parachains() -> Result<(), anyhow::Error> 
 		let b: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
 		let c: OnlineClient<PolkadotConfig> = network.get_node("eve")?.wait_client().await?;
-		open_spec_msg_channel(&a, &b, SENDER, RECEIVER, 0).await?;
-		open_spec_msg_channel(&a, &c, SENDER, THIRD, 0).await?;
-		open_spec_msg_channel(&c, &b, THIRD, RECEIVER, 0).await?;
+		submit_open(&a, &b, SENDER, RECEIVER, 0).await?;
+		submit_open(&a, &c, SENDER, THIRD, 0).await?;
+		submit_open(&c, &b, THIRD, RECEIVER, 0).await?;
+		tokio::try_join!(
+			wait_opened(&a, &b, RECEIVER, 0),
+			wait_opened(&a, &c, THIRD, 0),
+			wait_opened(&c, &b, RECEIVER, 0),
+		)?;
 
 		let at_b = b.blocks().subscribe_finalized().await?;
 		let at_c = c.blocks().subscribe_finalized().await?;
