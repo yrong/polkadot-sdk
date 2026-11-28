@@ -114,13 +114,12 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 		let receiver: OnlineClient<PolkadotConfig> =
 			network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
 
-		let start = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
-		wait_for("both chains to finalize a block", || {
-			advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
-		})
-		.await?;
-
 		if flag("SPEC_MSG_STANDBY") {
+			let start = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
+			wait_for("both chains to finalize a block", || {
+				advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
+			})
+			.await?;
 			log::info!(
 				"Standby ready: {SENDER} and {RECEIVER} are producing blocks. \
 				 Run with SPEC_MSG_ATTACH=1 in another terminal (Ctrl-C to stop)."
