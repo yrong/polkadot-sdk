@@ -1176,12 +1176,6 @@ async fn late_node_steps(
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 	let receiver: OnlineClient<PolkadotConfig> =
 		network.get_node(RECEIVER_COLLATOR)?.wait_client().await?;
-	let start = (finalized_number(&sender).await?, finalized_number(&receiver).await?);
-	wait_for("both chains to finalize a block", || {
-		advanced(&sender, &receiver, (start.0 + 1, start.1 + 1))
-	})
-	.await?;
-
 	open_spec_msg_channel(&sender, &receiver, SENDER, RECEIVER, 0).await?;
 	let blocks = receiver.blocks().subscribe_finalized().await?;
 	let (hash, ids) = submit_sudo(&sender, send_xcm_to(RECEIVER), true).await?;
